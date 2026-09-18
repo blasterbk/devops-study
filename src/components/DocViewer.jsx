@@ -2,9 +2,12 @@ import React, { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { Copy, Check, ArrowLeft, ArrowRight, Layers, CheckCircle2, Circle, GitFork, Terminal, Code2, Workflow, Network } from 'lucide-react';
+import { Copy, Check, ArrowLeft, ArrowRight, Layers, CheckCircle2, Circle, GitFork, Terminal, Code2, Workflow, Network, Bookmark } from 'lucide-react';
 import MermaidDiagram from './MermaidDiagram';
+import ChapterNotes from './ChapterNotes';
 import { normalizeDiagram } from '../utils/diagramUtils';
+import { getReadingTime } from '../utils/readingTime';
+import { useSwipeNavigation } from '../hooks/useSwipeNavigation';
 
 function getNodeText(node) {
   if (!node) return '';
@@ -181,12 +184,19 @@ function CalloutBlock({ children, quoteText }) {
   );
 }
 
-export default function DocViewer({ doc, allDocs, onSelectDoc, isCompleted, onToggleComplete, theme }) {
+export default function DocViewer({ doc, allDocs, onSelectDoc, isCompleted, onToggleComplete, theme, isBookmarked, onToggleBookmark }) {
   if (!doc) return null;
 
   const currentIndex = allDocs.findIndex(d => d.id === doc.id);
   const prevDoc = currentIndex > 0 ? allDocs[currentIndex - 1] : null;
   const nextDoc = currentIndex < allDocs.length - 1 ? allDocs[currentIndex + 1] : null;
+  const readingTime = getReadingTime(doc.body);
+
+  // Swipe gestures for mobile chapter navigation
+  useSwipeNavigation({
+    onNext: () => nextDoc && onSelectDoc(nextDoc),
+    onPrev: () => prevDoc && onSelectDoc(prevDoc)
+  });
 
   const renderHeading = ({ level, children }) => {
     const text = getNodeText(children).replace(/\r/g, '').trim();
@@ -220,23 +230,48 @@ export default function DocViewer({ doc, allDocs, onSelectDoc, isCompleted, onTo
           </span>
         </div>
 
-        {/* Mark Completed Toggle Button */}
-        <button
-          onClick={() => onToggleComplete(doc.id)}
-          className="btn"
-          style={{
-            padding: '0.4rem 0.8rem',
-            borderRadius: '20px',
-            fontSize: '0.82rem',
-            background: isCompleted ? 'rgba(16, 185, 129, 0.12)' : 'var(--bg-tertiary)',
-            color: isCompleted ? 'var(--accent-emerald)' : 'var(--text-secondary)',
-            borderColor: isCompleted ? 'rgba(16, 185, 129, 0.3)' : 'var(--border-color)',
-            fontWeight: 600
-          }}
-        >
-          {isCompleted ? <CheckCircle2 size={16} color="var(--accent-emerald)" /> : <Circle size={16} color="var(--text-muted)" />}
-          <span>{isCompleted ? 'Completed' : 'Mark as Complete'}</span>
-        </button>
+        {/* Mark Completed Toggle Button + Bookmark */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          {/* Reading time badge */}
+          <span style={{
+            fontSize: '0.73rem', color: 'var(--text-muted)',
+            padding: '0.2rem 0.5rem', borderRadius: '4px',
+            background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)'
+          }}>
+            {readingTime.text}
+          </span>
+
+          {/* Bookmark toggle */}
+          <button
+            onClick={() => onToggleBookmark?.(doc.id)}
+            className="btn"
+            style={{ padding: '0.4rem 0.6rem', borderRadius: '8px' }}
+            title={isBookmarked ? 'Remove bookmark' : 'Bookmark this chapter'}
+          >
+            <Bookmark
+              size={15}
+              color={isBookmarked ? 'var(--accent-amber)' : 'var(--text-muted)'}
+              fill={isBookmarked ? 'var(--accent-amber)' : 'none'}
+            />
+          </button>
+
+          <button
+            onClick={() => onToggleComplete(doc.id)}
+            className="btn"
+            style={{
+              padding: '0.4rem 0.8rem',
+              borderRadius: '20px',
+              fontSize: '0.82rem',
+              background: isCompleted ? 'rgba(16, 185, 129, 0.12)' : 'var(--bg-tertiary)',
+              color: isCompleted ? 'var(--accent-emerald)' : 'var(--text-secondary)',
+              borderColor: isCompleted ? 'rgba(16, 185, 129, 0.3)' : 'var(--border-color)',
+              fontWeight: 600
+            }}
+          >
+            {isCompleted ? <CheckCircle2 size={16} color="var(--accent-emerald)" /> : <Circle size={16} color="var(--text-muted)" />}
+            <span>{isCompleted ? 'Completed' : 'Mark as Complete'}</span>
+          </button>
+        </div>
       </div>
 
       {/* Main Markdown Content */}
@@ -288,6 +323,9 @@ export default function DocViewer({ doc, allDocs, onSelectDoc, isCompleted, onTo
       >
         {doc.body}
       </ReactMarkdown>
+
+      {/* Chapter Notes */}
+      <ChapterNotes docId={doc.id} />
 
       {/* Footer Navigation (Previous & Next Chapter) */}
       <div style={{
@@ -351,7 +389,7 @@ export default function DocViewer({ doc, allDocs, onSelectDoc, isCompleted, onTo
         <kbd style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', padding: '0.1rem 0.35rem', borderRadius: '3px', fontFamily: 'var(--font-mono)' }}>Alt+←</kbd>
         {' '}Prev{' · '}
         <kbd style={{ background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', padding: '0.1rem 0.35rem', borderRadius: '3px', fontFamily: 'var(--font-mono)' }}>Alt+→</kbd>
-        {' '}Next
+        {' '}Next · Swipe ↔ on mobile
       </div>
     </main>
   );

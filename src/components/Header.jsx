@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Sun, Moon, Menu, CheckCircle2, Terminal, X, ArrowRight, Layers } from 'lucide-react';
+import { Search, Sun, Moon, Menu, CheckCircle2, Terminal, X, ArrowRight, Layers, Bookmark, Type } from 'lucide-react';
 
 export default function Header({ 
   docs = [],
@@ -8,7 +8,12 @@ export default function Header({
   onToggleTheme, 
   onToggleSidebar, 
   totalDocs, 
-  completedDocsCount 
+  completedDocsCount,
+  streak = 0,
+  fontSize = 16,
+  onFontSizeChange,
+  onOpenBookmarks,
+  bookmarkCount = 0
 }) {
   const percent = totalDocs > 0 ? Math.round((completedDocsCount / totalDocs) * 100) : 0;
   
@@ -289,6 +294,59 @@ export default function Header({
             }} />
           </div>
         </div>
+
+        {/* Font Size Controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }} className="header-progress-container">
+          <button
+            className="btn"
+            onClick={() => onFontSizeChange?.(Math.max(13, fontSize - 1))}
+            style={{ padding: '0.35rem 0.5rem', fontSize: '0.78rem', fontWeight: 700 }}
+            title="Decrease font size"
+          >
+            A−
+          </button>
+          <button
+            className="btn"
+            onClick={() => onFontSizeChange?.(Math.min(22, fontSize + 1))}
+            style={{ padding: '0.35rem 0.5rem', fontSize: '0.88rem', fontWeight: 700 }}
+            title="Increase font size"
+          >
+            A+
+          </button>
+        </div>
+
+        {/* Bookmarks button */}
+        <button
+          className="btn"
+          onClick={onOpenBookmarks}
+          style={{ padding: '0.4rem 0.6rem', position: 'relative' }}
+          title="Bookmarks"
+        >
+          <Bookmark size={17} color="var(--accent-amber)" />
+          {bookmarkCount > 0 && (
+            <span style={{
+              position: 'absolute', top: '-4px', right: '-4px',
+              background: 'var(--accent-amber)', color: '#000',
+              borderRadius: '50%', width: '16px', height: '16px',
+              fontSize: '0.62rem', fontWeight: 700,
+              display: 'flex', alignItems: 'center', justifyContent: 'center'
+            }}>{bookmarkCount}</span>
+          )}
+        </button>
+
+        {/* Streak badge */}
+        {streak > 0 && (
+          <div className="header-progress-container" style={{
+            display: 'flex', alignItems: 'center', gap: '0.3rem',
+            padding: '0.3rem 0.6rem',
+            borderRadius: '20px',
+            background: 'rgba(245,158,11,0.12)',
+            border: '1px solid rgba(245,158,11,0.25)',
+            fontSize: '0.78rem', fontWeight: 700, color: 'var(--accent-amber)'
+          }}>
+            🔥 {streak}d
+          </div>
+        )}
 
         <button 
           className="btn" 
