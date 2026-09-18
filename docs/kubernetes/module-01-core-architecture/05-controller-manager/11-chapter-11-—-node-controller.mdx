@@ -1,0 +1,1615 @@
+---
+title: "Chapter 11 — Node Controller"
+sidebar_position: 11
+module: "Module 1.5 — Controller Manager Internals"
+description: "> **Goal:** Understand how the Kubernetes **Node Controller** continuously monitors every Node in the cluster, detects failures, updates Node health, applies ta..."
+---
+
+# Module 1.5 — Kubernetes Controller Manager Internals
+
+# Chapter 11 — Node Controller
+
+> **Goal:** Understand how the Kubernetes **Node Controller** continuously monitors every Node in the cluster, detects failures, updates Node health, applies taints, evicts Pods from unhealthy Nodes, and enables self-healing at the infrastructure level.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Node heartbeats: kubelet updates the Node Lease every 10s
+> 2. Node Lease objects: efficient heartbeat in kube-node-lease namespace
+> 3. Node Conditions: Ready, MemoryPressure, DiskPressure, PIDPressure
+> 4. Node failure detection: NodeMonitorGracePeriod (40s default)
+> 5. Automatic tainting: node.kubernetes.io/not-ready, unreachable
+> 6. Pod eviction: triggered after NodeEvictionRate delay
+> 7. Zone-aware eviction: reduced rate when multiple nodes fail in one zone
+> 8. Node lifecycle: CIDR assignment, cloud-provider integration
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Node Controller like a building security monitoring system.
+
+```text
+Building Security Analogy:
+
+Each floor (Node) has a check-in sensor (Node Lease heartbeat)
+Security control room (Node Controller) monitors all sensors
+If a sensor misses 4 check-ins (NodeMonitorGracePeriod): alert raised
+Floor marked as unsafe (Node tainted: not-ready)
+Occupants (Pods) ordered to evacuate after a grace period (eviction)
+If multiple floors fail in one zone: slower evacuation to avoid panic
+Once floor reports healthy again: taint removed, floor reopens
+```
+
+| Building Security | Node Controller |
+| :--- | :--- |
+| Floor check-in sensor | Node Lease heartbeat (updated by kubelet every 10s) |
+| Security control room | Node Controller |
+| Missed check-ins threshold | `NodeMonitorGracePeriod` (default 40s) |
+| Floor marked unsafe | Node tainted `node.kubernetes.io/not-ready` |
+| Occupant evacuation order | Pod eviction after `NodeEvictionRate` delay |
+| Multi-floor failure: slow eviction | Zone-aware eviction: reduced eviction rate |
+
+> **Important:** Pod eviction from an unhealthy Node is **not instant**. Kubernetes waits for `tolerationSeconds` (default 300s for `not-ready` taint) before evicting Pods. This grace period prevents mass evictions from transient network blips. Evicted Pods are **gracefully terminated** using `terminationGracePeriodSeconds` — not force-killed immediately.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes Architecture
+- kubelet
+- API Server
+- etcd
+- Controller Manager
+- Pods
+- Scheduler
+- Taints and Tolerations (basic concepts)
+
+---
+
+# Where Does the Node Controller Fit?
+
+So far we have learned:
+
+```text
+Deployment Controller
+
+v
+
+ReplicaSet Controller
+
+v
+
+StatefulSet Controller
+
+v
+
+Job Controller
+
+v
+
+CronJob Controller
+```
+
+All these Controllers assume:
+
+```text
+Nodes
+
+Are Healthy
+```
+
+But what happens when:
+
+- A server crashes?
+- Power fails?
+- Network disconnects?
+- kubelet stops?
+- Entire Availability Zone fails?
+
+Who detects these failures?
+
+The answer is:
+
+```text
+Node Controller
+```
+
+---
+
+# Why Node Controller Exists
+
+Imagine a cluster:
+
+```text
+Node A
+
+Running
+
+v
+
+10 Pods
+```
+
+Suddenly:
+
+```text
+Power Failure
+```
+
+Pods disappear.
+
+Question:
+
+Who notices?
+
+Who informs the Scheduler?
+
+Who evicts the Pods?
+
+Who enables recovery?
+
+Answer:
+
+```text
+Node Controller
+```
+
+---
+
+# High-Level Architecture
+
+```text
+                  kubelet
+
+                     |
+
+          Heartbeats / Node Lease
+
+                     |
+
+                API Server
+
+                     |
+
+            Node Controller
+
+                     |
+
+      ┌──────────────┼──────────────┐
+
+      ▼              ▼              ▼
+
+ Update Status   Apply Taints   Evict Pods
+
+                     |
+
+                     ▼
+
+               Scheduler Creates
+               Replacement Pods
+```
+
+---
+
+# Responsibilities
+
+The Node Controller is responsible for:
+
+- Monitoring Node health
+- Tracking heartbeats
+- Monitoring Node Leases
+- Updating Node Conditions
+- Detecting failures
+- Applying NoExecute taints
+- Triggering Pod eviction
+- Monitoring Availability Zones
+- Recovering workloads
+
+The Node Controller does **not** run workloads.
+
+---
+
+# Relationship with kubelet
+
+Every Node runs:
+
+```text
+kubelet
+```
+
+The kubelet periodically reports:
+
+```text
+I Am Alive
+```
+
+This is called:
+
+```text
+Heartbeat
+```
+
+The Node Controller consumes these heartbeats.
+
+---
+
+# Node Heartbeats
+
+Every healthy Node periodically sends heartbeat information.
+
+Conceptually:
+
+```text
+Node
+
+v
+
+Heartbeat
+
+v
+
+API Server
+
+v
+
+Node Controller
+```
+
+Heartbeats prove the Node is alive.
+
+---
+
+# Why Heartbeats?
+
+Without heartbeats:
+
+```text
+Node Silent
+
+v
+
+Alive?
+
+v
+
+Dead?
+
+v
+
+Unknown
+```
+
+The control plane would have no reliable way to determine Node health.
+
+---
+
+# Heartbeat Timeline
+
+```text
+00:00
+
+Heartbeat
+
+v
+
+00:10
+
+Heartbeat
+
+v
+
+00:20
+
+Heartbeat
+
+v
+
+00:30
+
+Heartbeat
+```
+
+Regular heartbeats indicate a healthy Node.
+
+---
+
+# Traditional Node Status Updates
+
+Originally,
+
+kubelets periodically updated:
+
+```text
+Node Status
+```
+
+This included:
+
+- Capacity
+- Conditions
+- Addresses
+- System information
+
+Updating the entire Node object frequently is relatively expensive.
+
+---
+
+# Node Lease
+
+Modern Kubernetes optimizes heartbeat traffic using:
+
+```text
+Lease Objects
+```
+
+under:
+
+```text
+coordination.k8s.io
+```
+
+Every Node owns a Lease.
+
+---
+
+# Why Node Lease?
+
+Instead of continuously updating the large Node object:
+
+```text
+Entire Node Object
+
+v
+
+Large Update
+```
+
+kubelet usually updates:
+
+```text
+Small Lease Object
+```
+
+This greatly reduces API Server and etcd load.
+
+---
+
+# Lease Architecture
+
+```text
+kubelet
+
+v
+
+Update Lease
+
+v
+
+API Server
+
+v
+
+Lease Object
+
+v
+
+Node Controller
+```
+
+The Lease becomes the primary heartbeat mechanism.
+
+---
+
+# Lease Example
+
+Conceptually:
+
+```text
+Lease
+
+Holder
+
+worker-01
+
+Renew Time
+
+10:45:20
+```
+
+The renewal time changes frequently while the Node is healthy.
+
+---
+
+# Heartbeat vs Lease
+
+| Node Status | Node Lease |
+|-------------|------------|
+| Large object | Lightweight object |
+| Updated less frequently | Updated frequently |
+| Contains conditions and metadata | Primarily heartbeat information |
+| Higher write cost | Lower write cost |
+
+Both mechanisms work together.
+
+---
+
+# Node Conditions
+
+Every Node maintains health conditions.
+
+Examples:
+
+```text
+Ready
+
+MemoryPressure
+
+DiskPressure
+
+PIDPressure
+
+NetworkUnavailable
+```
+
+These represent the Node's operational state.
+
+---
+
+# Ready Condition
+
+The most important condition is:
+
+```text
+Ready
+```
+
+Possible values:
+
+```text
+True
+
+False
+
+Unknown
+```
+
+---
+
+# Ready=True
+
+```text
+Node Healthy
+
+v
+
+Scheduler
+
+May Schedule Pods
+```
+
+---
+
+# Ready=False
+
+The Node is reachable,
+
+but not capable of accepting or running workloads correctly.
+
+Examples:
+
+- kubelet unhealthy
+- critical system failure
+- startup problems
+
+---
+
+# Ready=Unknown
+
+Usually indicates:
+
+```text
+Controller
+
+Cannot Reach
+
+kubelet
+```
+
+Most commonly caused by communication failures or Node outages.
+
+---
+
+# Memory Pressure
+
+Suppose:
+
+```text
+RAM
+
+Almost Full
+```
+
+Condition:
+
+```text
+MemoryPressure=True
+```
+
+The Scheduler may avoid placing additional Pods on the Node.
+
+---
+
+# Disk Pressure
+
+Example:
+
+```text
+Disk
+
+98%
+
+Used
+```
+
+Condition:
+
+```text
+DiskPressure=True
+```
+
+This helps prevent Nodes from running completely out of storage.
+
+---
+
+# PID Pressure
+
+Linux limits:
+
+```text
+Processes
+```
+
+Suppose:
+
+```text
+Maximum PIDs
+
+Reached
+```
+
+Condition:
+
+```text
+PIDPressure=True
+```
+
+---
+
+# NetworkUnavailable
+
+If networking is unavailable:
+
+```text
+CNI Failure
+
+v
+
+NetworkUnavailable=True
+```
+
+Pods may not communicate correctly.
+
+---
+
+# Node Monitoring
+
+The Node Controller continuously observes:
+
+```text
+Node Objects
+
+v
+
+Node Leases
+
+v
+
+Conditions
+
+v
+
+Heartbeat Age
+```
+
+This monitoring loop never stops.
+
+---
+
+# Monitoring Workflow
+
+```text
+Observe Nodes
+
+v
+
+Observe Leases
+
+v
+
+Evaluate Conditions
+
+v
+
+Healthy?
+
+ |
+
+ +-- Yes
+
+ |
+
+ ▼
+
+Continue
+
+ |
+
+ +-- No
+
+      |
+
+      ▼
+
+Recovery Actions
+```
+
+---
+
+# Failure Detection
+
+Suppose:
+
+```text
+Heartbeat Stops
+```
+
+The Node Controller evaluates:
+
+```text
+Last Heartbeat
+
+v
+
+Timeout?
+
+ |
+
+ +-- No
+
+ |
+
+ ▼
+
+Healthy
+
+ |
+
+ +-- Yes
+
+      |
+
+      ▼
+
+Node Unreachable
+```
+
+---
+
+# Example
+
+Timeline:
+
+```text
+10:00
+
+Heartbeat
+
+v
+
+10:10
+
+Heartbeat
+
+v
+
+10:20
+
+Heartbeat
+
+v
+
+Nothing
+
+v
+
+Timeout
+
+v
+
+Node Failure
+```
+
+---
+
+# Failure Detection Process
+
+```text
+Heartbeat Missing
+
+v
+
+Lease Expired
+
+v
+
+Ready=Unknown
+
+v
+
+Apply Taint
+
+v
+
+Eviction Starts
+```
+
+The Scheduler does **not** detect Node failures.
+
+The Node Controller does.
+
+---
+
+# Node Failure States
+
+Conceptually:
+
+```text
+Healthy
+
+v
+
+Heartbeat Lost
+
+v
+
+Unknown
+
+v
+
+Not Ready
+
+v
+
+Recovery
+```
+
+The exact timing depends on controller configuration.
+
+---
+
+# Taints
+
+When a Node becomes unhealthy,
+
+the Node Controller applies taints.
+
+Common examples include:
+
+```text
+node.kubernetes.io/not-ready
+
+node.kubernetes.io/unreachable
+```
+
+These are typically applied with the `NoExecute` effect during Node failure scenarios.
+
+---
+
+# Why Taints?
+
+Suppose:
+
+```text
+Dead Node
+```
+
+Without taints:
+
+```text
+Pods
+
+Remain
+
+Forever
+```
+
+Users would incorrectly believe workloads are still running.
+
+---
+
+# NoExecute Taints
+
+Conceptually:
+
+```text
+Node Failure
+
+v
+
+Apply
+
+NoExecute Taint
+
+v
+
+Pods Without Toleration
+
+Evicted
+```
+
+This allows workloads to recover elsewhere.
+
+---
+
+# Eviction
+
+The Node Controller does **not** delete Pods immediately after a transient heartbeat loss.
+
+Instead,
+
+it begins the eviction process after the Node is considered unhealthy and applicable grace periods have elapsed.
+
+---
+
+# Eviction Workflow
+
+```text
+Node Unreachable
+
+v
+
+Apply Taint
+
+v
+
+Pod Has Toleration?
+
+ |
+
+ +-- Yes
+
+ |
+
+ ▼
+
+Wait
+
+ |
+
+ +-- No
+
+      |
+
+      ▼
+
+Evict Pod
+```
+
+Pods are recreated by their owning Controllers.
+
+---
+
+# Relationship with ReplicaSet
+
+Suppose:
+
+```text
+ReplicaSet
+
+5 Pods
+```
+
+Node fails.
+
+```text
+2 Pods Lost
+```
+
+Workflow:
+
+```text
+Node Controller
+
+v
+
+Evict Pods
+
+v
+
+ReplicaSet Controller
+
+v
+
+Create Replacements
+
+v
+
+Scheduler
+
+v
+
+Healthy Nodes
+```
+
+Controllers cooperate.
+
+---
+
+# Zone Awareness
+
+Large clusters often span:
+
+```text
+Zone A
+
+Zone B
+
+Zone C
+```
+
+The Node Controller is aware of zone-level health.
+
+---
+
+# Why Zone Awareness?
+
+Suppose:
+
+```text
+Entire Zone
+
+Power Failure
+```
+
+Hundreds of Nodes disappear simultaneously.
+
+Immediate mass eviction could overwhelm the remaining infrastructure.
+
+---
+
+# Zone Monitoring
+
+Conceptually:
+
+```text
+Monitor Zone
+
+v
+
+Healthy Nodes
+
+v
+
+Too Many Failures?
+
+v
+
+Adjust Eviction Behavior
+```
+
+The Node Controller reduces eviction rates during large-scale failures to avoid cascading disruption.
+
+---
+
+# Example
+
+```text
+Zone A
+
+100 Nodes
+
+v
+
+95 Nodes Lost
+```
+
+Instead of instantly evicting every Pod,
+
+the controller applies rate limiting to recovery actions.
+
+---
+
+# Recovery Workflow
+
+Complete sequence:
+
+```text
+Node Healthy
+
+v
+
+Heartbeat Lost
+
+v
+
+Lease Expires
+
+v
+
+Ready=Unknown
+
+v
+
+NoExecute Taint
+
+v
+
+Pod Eviction
+
+v
+
+Owning Controller
+
+v
+
+New Pods Created
+
+v
+
+Scheduler
+
+v
+
+Healthy Nodes
+
+v
+
+Application Restored
+```
+
+---
+
+# Relationship with Scheduler
+
+Node Controller:
+
+```text
+Detect Failure
+```
+
+Scheduler:
+
+```text
+Schedule Replacement Pods
+```
+
+The Scheduler relies on updated Node state.
+
+---
+
+# Relationship with kubelet
+
+kubelet:
+
+```text
+Send Heartbeats
+
+v
+
+Update Lease
+
+v
+
+Update Conditions
+```
+
+Node Controller:
+
+```text
+Consume
+
+v
+
+Evaluate
+
+v
+
+React
+```
+
+---
+
+# Relationship with API Server
+
+All communication flows through:
+
+```text
+kubelet
+
+v
+
+API Server
+
+v
+
+Node Controller
+```
+
+The Node Controller never communicates directly with kubelets.
+
+---
+
+# Relationship with etcd
+
+Node objects and Lease objects are stored in:
+
+```text
+etcd
+```
+
+The API Server mediates all reads and writes.
+
+---
+
+# Complete Production Workflow
+
+```text
+kubelet
+
+v
+
+Update Lease
+
+v
+
+API Server
+
+v
+
+Node Informer
+
+v
+
+Node Controller
+
+v
+
+Evaluate Heartbeat
+
+v
+
+Node Healthy?
+
+ |
+
+ +-- Yes
+
+ |
+
+ ▼
+
+Continue Monitoring
+
+ |
+
+ +-- No
+
+      |
+
+      ▼
+
+Update Conditions
+
+v
+
+Apply NoExecute Taint
+
+v
+
+Evict Pods
+
+v
+
+ReplicaSet / StatefulSet / Job Controller
+
+v
+
+Create Replacement Pods
+
+v
+
+Scheduler
+
+v
+
+Healthy Node
+
+v
+
+kubelet
+
+v
+
+Application Running
+```
+
+---
+
+# Production Example 1
+
+Power Failure
+
+```text
+Worker Node
+
+Power Off
+
+v
+
+Heartbeat Stops
+
+v
+
+Lease Expires
+
+v
+
+Node Controller
+
+v
+
+Evict Pods
+
+v
+
+ReplicaSet
+
+v
+
+Replacement Pods
+```
+
+Application availability is restored.
+
+---
+
+# Production Example 2
+
+Disk Full
+
+```text
+Disk Usage
+
+100%
+
+v
+
+DiskPressure=True
+
+v
+
+Scheduler Avoids Node
+```
+
+The Node remains monitored while preventing additional workload placement.
+
+---
+
+# Production Example 3
+
+Memory Exhaustion
+
+```text
+RAM Full
+
+v
+
+MemoryPressure=True
+
+v
+
+Node Condition Updated
+
+v
+
+Scheduling Decisions Adjusted
+```
+
+---
+
+# Production Example 4
+
+Availability Zone Failure
+
+```text
+Zone Failure
+
+v
+
+Many Nodes Lost
+
+v
+
+Rate-Limited Evictions
+
+v
+
+Controlled Recovery
+```
+
+This reduces the risk of overwhelming surviving Nodes.
+
+---
+
+# Production Example 5
+
+Network Partition
+
+```text
+Node
+
+Disconnected
+
+v
+
+Lease Stops Updating
+
+v
+
+Ready=Unknown
+
+v
+
+NoExecute Taint
+
+v
+
+Pods Rescheduled
+```
+
+When connectivity returns,
+
+the Node can become Ready again after healthy heartbeats resume.
+
+---
+
+# Performance Considerations
+
+The Node Controller scales efficiently because it:
+
+- Uses Shared Informers
+- Reads Node Leases instead of full Node updates whenever possible
+- Processes Node events through WorkQueues
+- Applies rate limiting during large failures
+- Cooperates with workload Controllers instead of directly recreating Pods
+
+---
+
+# Production Best Practices
+
+✔ Enable Node Lease support (default in modern Kubernetes).
+
+✔ Monitor heartbeat latency.
+
+✔ Monitor Ready condition transitions.
+
+✔ Alert on frequent Node flapping.
+
+✔ Configure workloads with appropriate PodDisruptionBudgets where applicable.
+
+✔ Use multiple Availability Zones for production clusters.
+
+✔ Investigate recurring MemoryPressure and DiskPressure conditions.
+
+✔ Regularly validate Node recovery procedures.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The Scheduler detects failed Nodes.
+
+Wrong.
+
+The Node Controller detects Node failures.
+
+---
+
+### ❌ Misconception 2
+
+The Node Controller recreates Pods.
+
+Wrong.
+
+Workload Controllers (ReplicaSet, StatefulSet, Job, etc.) create replacement Pods.
+
+---
+
+### ❌ Misconception 3
+
+Node Leases replace Node objects.
+
+Wrong.
+
+Leases provide lightweight heartbeats, while Node objects still store conditions and metadata.
+
+---
+
+### ❌ Misconception 4
+
+A missed heartbeat immediately deletes all Pods.
+
+Wrong.
+
+The controller first detects failure, updates Node state, applies taints, and then performs eviction according to Kubernetes policies and grace periods.
+
+---
+
+### ❌ Misconception 5
+
+MemoryPressure means the Node has already crashed.
+
+Wrong.
+
+It is an early warning condition indicating resource pressure.
+
+---
+
+### ❌ Misconception 6
+
+Zone Awareness schedules Pods across zones.
+
+Wrong.
+
+The Scheduler places Pods. The Node Controller uses zone awareness to manage failure recovery behavior.
+
+---
+
+### ❌ Misconception 7
+
+The Node Controller communicates directly with kubelet.
+
+Wrong.
+
+Communication occurs through the API Server using Node and Lease objects.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the responsibility of the Node Controller?
+
+To monitor Node health, detect failures, update Node conditions, apply taints, and initiate Pod eviction.
+
+---
+
+### Q2. What is a Node heartbeat?
+
+A periodic signal from kubelet indicating that the Node is alive.
+
+---
+
+### Q3. Why were Node Leases introduced?
+
+To reduce the overhead of frequent full Node status updates by using lightweight Lease objects for heartbeats.
+
+---
+
+### Q4. What is the purpose of the Ready condition?
+
+It indicates whether the Node is healthy enough to accept and run workloads.
+
+---
+
+### Q5. How does Kubernetes detect Node failures?
+
+The Node Controller monitors heartbeat freshness and Lease renewals.
+
+---
+
+### Q6. What happens after a Node becomes unreachable?
+
+The Node Controller updates conditions, applies appropriate taints, and begins Pod eviction according to Kubernetes policies.
+
+---
+
+### Q7. Who recreates Pods after eviction?
+
+The owning Controller, such as a ReplicaSet Controller or StatefulSet Controller.
+
+---
+
+### Q8. Why is zone awareness important?
+
+It prevents aggressive mass eviction during large-scale zone failures, improving overall cluster stability.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Node remains NotReady | kubelet failure, network connectivity issues, or underlying Node problems |
+| Pods remain on failed Node | Eviction delay, tolerations, or communication issues |
+| Frequent Ready/NotReady transitions | Network instability, overloaded kubelet, or infrastructure issues |
+| Scheduler avoids Node | MemoryPressure, DiskPressure, PIDPressure, or NotReady condition |
+| Large-scale recovery is slow | Zone-aware eviction rate limiting during widespread failures |
+| Lease not updating | kubelet stopped, API Server unreachable, or network partition |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does Kubernetes need the Node Controller?
+2. What is a Node heartbeat?
+3. Why were Node Leases introduced?
+4. What is the difference between a Node Lease and a Node object?
+5. What are Node Conditions?
+6. How does the Node Controller detect failures?
+7. Why are taints applied to unhealthy Nodes?
+8. What is Pod eviction?
+9. How does zone awareness improve recovery?
+10. Which Controller recreates Pods after eviction?
+11. How does the Node Controller interact with kubelet?
+12. What is the complete Node recovery workflow?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the **Node Controller** continuously monitors the health of Kubernetes Nodes and enables infrastructure self-healing.
+
+You learned:
+
+- Why the Node Controller exists
+- How kubelet heartbeats indicate Node health
+- How lightweight Node Leases improve heartbeat scalability
+- The purpose of Node Conditions such as Ready, MemoryPressure, DiskPressure, PIDPressure, and NetworkUnavailable
+- How the Node Controller monitors Nodes and detects failures
+- How taints prevent workloads from remaining on unhealthy Nodes
+- How Pod eviction enables workload recovery
+- How zone awareness prevents cascading failures during large outages
+- The complete production recovery workflow from heartbeat loss to workload restoration
+
+The **Node Controller** is one of the most critical Controllers in Kubernetes. While workload Controllers manage application state, the Node Controller manages **infrastructure health**. By combining **heartbeats**, **Lease objects**, **Node Conditions**, **failure detection**, **taints**, **evictions**, and **zone-aware recovery**, it ensures that workloads automatically migrate away from failed infrastructure, enabling resilient, production-grade Kubernetes clusters.
+
+---
+
+# Next Chapter
+
+**Chapter 12 — Service & EndpointSlice Controllers**
+
+In the next chapter, we'll explore how Kubernetes connects Pods to stable virtual services.
+
+Topics include:
+
+- Service Controller Architecture
+- Endpoint vs EndpointSlice
+- EndpointSlice Controller
+- Service Reconciliation
+- Selector-Based Endpoints
+- Headless Services
+- Topology-Aware Routing
+- External Load Balancers
+- Production Networking Workflow
+
+You'll learn how Kubernetes continuously discovers healthy Pods, builds EndpointSlices, and enables reliable service discovery and load balancing across the cluster.
+```

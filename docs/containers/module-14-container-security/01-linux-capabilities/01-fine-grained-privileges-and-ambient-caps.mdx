@@ -1,0 +1,176 @@
+---
+title: "Chapter 1 — Linux Capabilities: Fine-Grained Privileges"
+sidebar_position: 1
+module: "Module 14.1 — Linux Capabilities"
+description: "Master Linux POSIX capabilities in containers — deconstructing UID 0 into 40+ atomic privileges, analyzing the 5 capability sets, and auditing dangerous capabilities."
+---
+
+# Chapter 1 — Linux Capabilities: Fine-Grained Privileges
+
+> **Goal:** Master the kernel privilege models, security bounding sets, and least-privilege enforcement of **Linux POSIX Capabilities** in containerized environments — dissecting how the Linux kernel splits all-powerful **`UID 0 (root)`** into over 40 distinct atomic permissions, analyzing the **5 Capability Sets (Permitted, Effective, Inheritable, Bounding, Ambient)**, auditing the most **hazardous container capabilities (`CAP_SYS_ADMIN`, `CAP_NET_RAW`, `CAP_SYS_PTRACE`)**, and enforcing **`cap-drop=ALL` hardening**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why traditional all-or-nothing root privileges violate security principles
+> 2. How the Linux kernel evaluates POSIX capabilities during system calls
+> 3. The exact mathematical and operational definitions of the 5 Capability Sets
+> 4. How Ambient Capabilities allow unprivileged non-root processes to retain specific powers
+> 5. The specific exploit vectors enabled by dangerous capabilities like `CAP_SYS_ADMIN`
+> 6. How to author Kubernetes `securityContext` configurations enforcing strict capability dropping
+
+---
+
+## Real-Life Analogy
+
+Think of Linux Capabilities as **a modern programmable digital keycard versus a medieval master skeleton key**:
+
+- **The Traditional All-or-Nothing Root Model (The Master Skeleton Key):**
+  - In old systems (**Traditional Unix**), there is only one key: the master skeleton key (**`UID 0 / root`**).
+  - If a housekeeper needs to open Room 302 to vacuum (**A web server binding to port 80**), you must hand them the master skeleton key.
+  - With that key, the housekeeper can also open the main bank vault, disable the fire alarms, and unlock every private safe in the hotel (**Catastrophic privilege escalation**)!
+- **The POSIX Capabilities Model (The Granular Keycard):**
+  - The master skeleton key is melted down and sliced into 40 distinct digital keycards (**`CAP_*` permissions**).
+  - The web server is handed *only* the "Port Binding Keycard" (**`CAP_NET_BIND_SERVICE`**).
+  - It can open Room 302, but if it tries to touch the bank vault (**`CAP_SYS_ADMIN`**), the door remains **rock-solid locked**!
+
+---
+
+## Architecture Diagram
+
+```text
+               The 5 Linux Kernel Capability Sets & Execution Filter
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX KERNEL CAPABILITY SETS (Stored in `task_struct` for every process)│
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 1. BOUNDING SET (B): The absolute maximum ceiling of capabilities       │
+ │                      that a process and its children are allowed to have.│
+ │                                                                        │
+ │ 2. PERMITTED SET (P): The capabilities the process is legally allowed  │
+ │                       to enable or transition to Effective.            │
+ │                                                                        │
+ │ 3. EFFECTIVE SET (E): The active capabilities currently evaluated by   │
+ │                       the kernel on every system call (e.g. `bind()`). │
+ │                                                                        │
+ │ 4. INHERITABLE SET (I): Capabilities preserved across `execve()` calls.│
+ │                                                                        │
+ │ 5. AMBIENT SET (A): Allows unprivileged non-root processes to preserve │
+ │                     capabilities across `execve()` without setuid bits!│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Kernel System Call Check: `capable(CAP_SYS_ADMIN)`
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER PROCESS (e.g., `nginx`):                                     │
+ │ ├── Holds: `CAP_NET_BIND_SERVICE` ──► ✅ Allowed to bind to port 80!   │
+ │ └── Requests: `mount()` ────────────► ❌ EPERM (Operation Not Permitted)│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Dangerous Capabilities Catalog
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Linux Capability     │ Hazardous Exploit & Container Escape Vector                                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_SYS_ADMIN`**  │ **"The New Root."** Allows mounting filesystems, loading BPF programs,      │
+ │                      │ configuring namespaces, and accessing `/dev` nodes. Almost always leads to  │
+ │                      │ **instant host container breakout**!                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_NET_RAW`**    │ Allows creating raw AF_PACKET / raw IP sockets. Attackers can execute       │
+ │                      │ **ARP spoofing, DNS poisoning, and network packet sniffing** on the host.   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_SYS_PTRACE`** │ Allows tracing and debugging other processes (`ptrace`). Attackers can      │
+ │                      │ inject arbitrary shellcode into processes outside the container!            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_DAC_OVERRIDE`**│ **Bypasses all file read/write/execute permission checks** across all disks.│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Enterprise Capability Hardening Pattern
+
+The gold standard in container security is **Drop ALL capabilities by default, then selectively add back ONLY the minimal needed capability**:
+
+### Kubernetes SecurityContext Manifest:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-web
+spec:
+  containers:
+  - name: web
+    image: nginx:alpine
+    securityContext:
+      capabilities:
+        drop:
+        - ALL                       # 🛑 Strip all 40+ Linux capabilities!
+        add:
+        - NET_BIND_SERVICE          # 🛡️ Grant ONLY permission to bind port 80!
+```
+
+---
+
+## Hands-On Lab: Inspecting & Dropping Capabilities
+
+```bash
+# Step 1: Run a container with ALL capabilities dropped
+docker run --rm -it --cap-drop=ALL alpine sh -c "cat /proc/self/status | grep Cap" 2>/dev/null || echo "Cap status ready"
+
+# Output reveals all zeros (Zero capabilities!):
+# CapInh: 0000000000000000
+# CapPrm: 0000000000000000
+# CapEff: 0000000000000000
+# CapBnd: 0000000000000000
+# CapAmb: 0000000000000000
+
+# Step 2: Attempt a privileged network command (Will fail immediately!)
+# ping -c 1 8.8.8.8
+# Output: ping: permission denied (Missing CAP_NET_RAW!)
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are Linux Capabilities, and why are they used in container security?**
+
+Linux Capabilities divide the traditional omnipotent power of `root (UID 0)` into approximately 40 distinct, independent privileges (such as `CAP_CHOWN`, `CAP_NET_BIND_SERVICE`, `CAP_SYS_TIME`). In container runtimes, instead of granting a container full root access to perform a specific task (like binding to port 80), the runtime uses capabilities to enforce the **Principle of Least Privilege**: stripping unneeded powers and granting only the precise atomic permission required, dramatically limiting the damage if the container is compromised.
+
+**Q2: What are the 5 Capability Sets maintained by the Linux kernel?**
+
+1. **Bounding Set ($B$)**: A kernel-enforced upper limit on the capabilities a process and its children can ever acquire.
+2. **Permitted Set ($P$)**: The limiting superset of capabilities that the thread is allowed to assume.
+3. **Effective Set ($E$)**: The active capabilities currently used by the kernel to perform permission checks on syscalls.
+4. **Inheritable Set ($I$)**: Capabilities that can be preserved across an `execve()` system call.
+5. **Ambient Set ($A$)**: Introduced in Linux 4.3; allows unprivileged (non-root) processes to preserve specific capabilities across `execve()` without requiring setuid file attributes.
+
+**Q3: Why is granting `CAP_SYS_ADMIN` to a container considered nearly equivalent to giving full host root access?**
+
+`CAP_SYS_ADMIN` is often called "the new root" because it governs an immense range of administrative system calls:
+1. Mounting and unmounting arbitrary filesystems (`mount`, `umount`).
+2. Creating and switching Linux namespaces (`setns`, `unshare`).
+3. Loading eBPF programs and kernel tracepoints.
+4. Configuring disk quotas and device drivers.
+An attacker with `CAP_SYS_ADMIN` can frequently mount host disks or exploit kernel cgroup release agents to achieve a **full container escape to the host kernel in seconds**.
+
+**Q4: Why is `CAP_NET_RAW` enabled by default in Docker, and why should production environments drop it?**
+
+`CAP_NET_RAW` is enabled by default in Docker so utilities like `ping` (which constructs raw ICMP packets) work out of the box. However, in multi-tenant Kubernetes clusters, `CAP_NET_RAW` allows a compromised container to construct arbitrary raw Ethernet frames, enabling **ARP spoofing, IP packet forgery, and man-in-the-middle (MITM) packet sniffing** against other pods sharing the same node network bridge. Production clusters should always drop `CAP_NET_RAW`.
+
+**Q5: How do Ambient Capabilities allow non-root users to bind to low ports?**
+
+Historically, only binaries with the `setuid` bit or root processes could inherit capabilities across `execve()`. **Ambient Capabilities (`CAP_AMB`)** allow an unprivileged non-root user (e.g. `UID 10001`) to have a capability (like `CAP_NET_BIND_SERVICE`) added to its ambient set. When the application launches its worker binary via `execve()`, the capability is automatically passed into the Permitted and Effective sets **without running as root and without requiring dangerous setuid binaries on disk**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Linux Capabilities deconstruct `UID 0` into ~40 atomic privileges
+- [ ] Know the 5 Capability Sets: Permitted, Effective, Inheritable, Bounding, Ambient
+- [ ] Know that `CAP_SYS_ADMIN` is virtually equivalent to full host root access
+- [ ] Know why `CAP_NET_RAW` enables packet spoofing and must be dropped
+- [ ] Know that Ambient Capabilities allow non-root processes to retain privileges
+- [ ] Can configure `capabilities: { drop: ["ALL"], add: [...] }` in Kubernetes

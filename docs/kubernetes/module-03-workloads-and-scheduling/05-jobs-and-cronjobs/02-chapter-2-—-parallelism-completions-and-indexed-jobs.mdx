@@ -1,0 +1,287 @@
+---
+title: "Chapter 2 — Indexed Jobs & Parallel Sharding"
+sidebar_position: 2
+module: "Module 3.5 — Jobs & CronJobs"
+description: "Master Kubernetes Indexed Jobs — completionMode Indexed mechanics, JOB_COMPLETION_INDEX environment variable injection, sharded batch processing, distributed ML dataset partitioning, and backoffLimitPerIndex."
+---
+
+# Chapter 2 — Parallelism, Completions & Indexed Jobs
+
+> **Goal:** Master advanced batch parallelism patterns in Kubernetes — understanding the difference between standard count-based Jobs and `completionMode: Indexed`, utilizing `JOB_COMPLETION_INDEX` for deterministic distributed sharding, implementing `backoffLimitPerIndex` for fault-tolerant data pipelines, and architecting work-queue vs. fixed-shard processing pipelines.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural difference between Non-Indexed (Count-Based) and Indexed Jobs
+> 2. How the Job controller injects `JOB_COMPLETION_INDEX` ($0 \dots N-1$) into each container
+> 3. How to partition big data, video transcoding chunks, and ML training datasets across shards
+> 4. How the controller handles single-shard failures by recreating the specific failed index
+> 5. How `backoffLimitPerIndex` (Kubernetes 1.29+ GA) prevents a single bad record from failing an entire job
+> 6. How to build distributed parallel batch workflows without external message brokers
+
+---
+
+## Real-Life Analogy
+
+Think of processing **a 1,000-page historical book for digital scanning and OCR translation**:
+
+- **Non-Indexed Work Queue (Count-Based Job):** You dump 1,000 loose pages into a big cardboard box in the middle of the room. You hire 4 scanners (`parallelism: 4`). Each scanner walks to the box, grabs a random page, scans it, and marks one tick on a whiteboard. The job is done when the whiteboard reaches 1,000 ticks (`completions: 1,000`). If a scanner faints, another worker just grabs the next loose page.
+- **Indexed Job (`completionMode: Indexed`):** The book is neatly divided into 4 specific chapters: Chapter 0 (Pages 1–250), Chapter 1 (Pages 251–500), Chapter 2 (Pages 501–750), and Chapter 3 (Pages 751–1,000).
+  - Worker 0 is explicitly handed badge `JOB_COMPLETION_INDEX=0` and scans Chapter 0.
+  - Worker 3 is handed `JOB_COMPLETION_INDEX=3` and scans Chapter 3.
+  - If Worker 2's scanner jams and crashes, management doesn't start the whole book over; they hire a replacement worker specifically assigned to `JOB_COMPLETION_INDEX=2` to finish Chapter 2.
+
+---
+
+## Architecture Diagram
+
+```text
+               Indexed Job Architecture & Shard Execution
+
+ Job Spec: completions: 4, parallelism: 2, completionMode: Indexed
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes Job Controller                                              │
+ │ Maintains index status: [ Index 0, Index 1, Index 2, Index 3 ]         │
+ └──────────────────────┬─────────────────────────┬───────────────────────┘
+                        │ Batch 1 (Parallelism=2) │
+                        ▼                         ▼
+ ┌──────────────────────────────┐       ┌──────────────────────────────┐
+ │ Pod: indexed-job-0-9x4la     │       │ Pod: indexed-job-1-4k2pw     │
+ │ ENV: JOB_COMPLETION_INDEX=0  │       │ ENV: JOB_COMPLETION_INDEX=1  │
+ │ Task: Process Shard 0 (0-25%)│       │ Task: Process Shard 1(25-50%)│
+ └──────────────┬───────────────┘       └──────────────┬───────────────┘
+                │ Succeeded                            │ Succeeded
+                ▼                                      ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Job Controller records: Index 0: DONE, Index 1: DONE                   │
+ │ Launches Batch 2 for remaining indexes: [ Index 2, Index 3 ]           │
+ └──────────────────────┬─────────────────────────┬───────────────────────┘
+                        │                         │
+                        ▼                         ▼
+ ┌──────────────────────────────┐       ┌──────────────────────────────┐
+ │ Pod: indexed-job-2-7b8da     │       │ Pod: indexed-job-3-1m3sq     │
+ │ ENV: JOB_COMPLETION_INDEX=2  │       │ ENV: JOB_COMPLETION_INDEX=3  │
+ │ Task: Process Shard 2(50-75%)│       │ Task: Process Shard 3(75-100)│
+ └──────────────────────────────┘       └──────────────────────────────┘
+```
+
+---
+
+## Non-Indexed vs Indexed Completion Modes
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Non-Indexed (`NonIndexed`)      │ Indexed (`Indexed`)             │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Completion Metric**     │ Raw count of successful exits   │ Every index $0 \to N-1$ must    │
+ │                           │ (`status.succeeded == N`)       │ succeed at least once           │
+ │ **Pod Identity**          │ Anonymous & interchangeable     │ Deterministic `JOB_COMPLETION_  │
+ │                           │                                 │ INDEX` environment variable     │
+ │ **Failure Recovery**      │ Spawns any generic new Pod      │ Recreates the EXACT failed index│
+ │ **Work Allocation**       │ Requires external message queue │ Self-contained static sharding  │
+ │ **Best For**              │ RabbitMQ / SQS task consumers   │ BigData shards, ML datasets,    │
+ │                           │                                 │ video chunk rendering           │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## How `completionMode: Indexed` Operates
+
+When you configure `spec.completionMode: Indexed`:
+1. The Job requires an explicit `.spec.completions` value (e.g. `N = 4`).
+2. For each Pod created, the Job controller automatically:
+   - Sets the environment variable `JOB_COMPLETION_INDEX` to the integer index (e.g. `0`, `1`, `2`, `3`).
+   - Injects the annotation `batch.kubernetes.io/job-completion-index: "0"`.
+   - Names the Pod using the format `<job-name>-<index>-<hash>` (e.g. `video-render-2-7b8f9`).
+3. The Job is only complete when **all indexes from $0$ to $N-1$ have recorded a successful completion**.
+
+---
+
+## Production Use Cases for Indexed Jobs
+
+### 1. Database & Big Data Table Sharding
+A script can process a 100-million-row table by dividing it into $N$ ranges:
+$$\text{OFFSET} = \text{JOB\_COMPLETION\_INDEX} \times 10{,}000{,}000$$
+
+### 2. Distributed Machine Learning Data Preprocessing
+Each worker downloads and tokenizes a specific chunk of the training dataset:
+```python
+import os
+shard_id = int(os.environ["JOB_COMPLETION_INDEX"])
+total_shards = 10
+download_dataset_shard(f"s3://ml-data/train-part-{shard_id}.parquet")
+```
+
+### 3. Video Transcoding
+A 60-minute video is split into six 10-minute segments. Shard $K$ transcodes segment $K \times 10$ to $(K+1) \times 10$.
+
+---
+
+## Fault Tolerance: `backoffLimitPerIndex` (Kubernetes 1.29+ GA)
+
+In standard Indexed Jobs, if index 2 crashes repeatedly, it will consume the entire Job's `backoffLimit`, causing the entire Job to abort even if all other 99 indexes succeeded.
+
+`backoffLimitPerIndex` enables per-index retry isolation:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: resilient-data-pipeline
+spec:
+  completions: 10
+  parallelism: 3
+  completionMode: Indexed
+  
+  # Allow each index to fail up to 2 times independently!
+  backoffLimitPerIndex: 2
+  
+  # Maximum number of total indexes that are allowed to fail permanently
+  maxFailedIndexes: 1
+```
+
+```text
+ With backoffLimitPerIndex:
+ - If Index 0, 1, 3, 4 succeed, but Index 2 fails 2 times:
+   ──► Only Index 2 is marked Failed.
+   ──► The other indexes finish their work.
+   ──► Because maxFailedIndexes: 1, the overall Job is marked Complete (Partial Success)!
+```
+
+---
+
+## Complete Production Indexed Job Manifest
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: image-processing-shards
+  namespace: batch-processing
+  labels:
+    app: image-processor
+spec:
+  completions: 4
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimitPerIndex: 2
+  maxFailedIndexes: 0
+  ttlSecondsAfterFinished: 600
+
+  template:
+    metadata:
+      labels:
+        app: image-processor
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: worker
+        image: python:3.11-alpine
+        command:
+        - "python"
+        - "-c"
+        - |
+          import os, time, sys
+          shard = os.environ.get("JOB_COMPLETION_INDEX", "0")
+          print(f"=== Worker Booted for SHARD: {shard} ===")
+          print(f"Connecting to storage bucket: s3://assets/chunk-{shard}.tar.gz")
+          time.sleep(4)
+          print(f"=== Shard {shard} processed successfully! ===")
+          sys.exit(0)
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+```
+
+---
+
+## Hands-On Lab: Deploying an Indexed Job & Inspecting Shards
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace indexed-lab
+
+# Step 2: Deploy an Indexed Job with 4 shards
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shard-demo
+  namespace: indexed-lab
+spec:
+  completions: 4
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: processor
+        image: alpine:latest
+        command:
+        - "sh"
+        - "-c"
+        - |
+          echo "Executing on Pod: \$(hostname)"
+          echo "My assigned shard index is: \$JOB_COMPLETION_INDEX"
+          sleep 5
+          exit 0
+EOF
+
+# Step 3: Watch Pod creation and notice the indexed naming convention
+kubectl get pods -n indexed-lab -w
+
+# Step 4: Verify the individual shard indexes in the logs
+for pod in $(kubectl get pods -n indexed-lab -l batch.kubernetes.io/job-name=shard-demo -o jsonpath='{.items[*].metadata.name}'); do
+  echo "--- Logs for $pod ---"
+  kubectl logs $pod -n indexed-lab
+done
+
+# Step 5: Inspect completed indexes in Job status
+kubectl get job shard-demo -n indexed-lab -o yaml | grep -A 8 "status:"
+# Observe completedIndexes: "0-3"
+
+# Step 6: Clean up lab
+kubectl delete namespace indexed-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is an Indexed Job in Kubernetes, and how does it differ from a standard Job?**
+
+In a standard Job (`completionMode: NonIndexed`), the Job controller simply counts the total number of Pods that terminate with exit code 0 until `.spec.completions` is reached; all Pods are anonymous and interchangeable. In an Indexed Job (`completionMode: Indexed`), each Pod is assigned a deterministic integer index from $0$ to $\text{completions}-1$. The Job controller injects this index into the container via the `JOB_COMPLETION_INDEX` environment variable and tracks completion per index, requiring every distinct index to succeed.
+
+**Q2: How do containers inside an Indexed Job discover their assigned shard index?**
+
+The Kubernetes Job admission webhook and controller automatically inject the `JOB_COMPLETION_INDEX` environment variable into every container within the Pod. Application code (e.g. Python, Go, Node.js) reads this variable (`os.environ["JOB_COMPLETION_INDEX"]`) at runtime to determine its slice of work, such as database query offsets, S3 partition keys, or video segment numbers.
+
+**Q3: What happens if one specific index fails in an Indexed Job?**
+
+If the Pod executing index $K$ crashes or exits non-zero, the Job controller recreates a new Pod specifically assigned to index $K$ (preserving `JOB_COMPLETION_INDEX=K`). It does not restart already-succeeded indexes ($0 \dots K-1$), nor does it skip index $K$. The replacement Pod attempts to process that specific shard until it succeeds or until the retry budget is exhausted.
+
+**Q4: What is `backoffLimitPerIndex`, and what problem does it solve?**
+
+Introduced in Kubernetes 1.28/1.29, `backoffLimitPerIndex` sets a dedicated retry limit for each individual index rather than sharing a global `backoffLimit` across all shards. In large batch jobs (e.g. 100 shards), a corrupt data record in Shard #5 could fail 6 times and exhaust a global `backoffLimit: 6`, killing the entire 100-shard pipeline. `backoffLimitPerIndex` isolates failures so only the corrupt shard fails, allowing the remaining 99 shards to complete successfully.
+
+**Q5: When should you choose an Indexed Job over an external message queue (e.g. RabbitMQ/Kafka)?**
+
+Indexed Jobs are ideal for static, predictable batch workloads where the total dataset size or partition count is known in advance (e.g. daily backups of 20 database tables, 50 video chunks, or 10 ML parameter sweeps). They eliminate the operational complexity of deploying, securing, and maintaining an external message broker. External message queues are preferred for dynamic, unbounded, streaming event streams where tasks arrive unpredictably in real-time.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Indexed Jobs are declared with `completionMode: Indexed`
+- [ ] Know that each Pod receives `JOB_COMPLETION_INDEX` ($0 \dots N-1$)
+- [ ] Know that every index from $0$ to $\text{completions}-1$ must succeed
+- [ ] Know how Indexed Jobs enable database, ML, and video chunk sharding
+- [ ] Know that the controller recreates the specific failed index on crash
+- [ ] Know how `backoffLimitPerIndex` prevents single-shard failures from aborting jobs
+- [ ] Can verify completed indexes using `kubectl get job <name> -o yaml`

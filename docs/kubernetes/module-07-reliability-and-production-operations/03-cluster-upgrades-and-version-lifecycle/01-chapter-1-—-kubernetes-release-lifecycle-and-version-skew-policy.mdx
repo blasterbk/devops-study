@@ -1,0 +1,200 @@
+---
+title: "Chapter 1 — Release Lifecycle & Version Skew"
+sidebar_position: 1
+module: "Module 7.3 — Cluster Upgrades & Lifecycle"
+description: "Master Kubernetes release cycles and official version skew policies — 3-release annual cadences, N-3 Kubelet skew allowances, sequential upgrade rules, and deprecated API audits."
+---
+
+# Chapter 1 — Kubernetes Release Lifecycle & Version Skew Policy
+
+> **Goal:** Master the official Kubernetes version lifecycle and component compatibility matrix — understanding the 3-release annual cadence, dissecting the **Official Version Skew Policy** across `kube-apiserver`, `kubelet`, controllers, and `kubectl`, analyzing why minor version upgrades can **never skip versions** ($1.28 \to 1.29 \to 1.30$), and auditing clusters for deprecated API removals using automated discovery tools.
+>
+> By the end of this chapter, you will understand:
+> 1. The 3-release annual release cadence and 1-year active security support window
+> 2. The exact version skew rules governing `kube-apiserver`, `kube-controller-manager`, and `kubelet`
+> 3. The Kubernetes 1.28+ expansion of Kubelet version skew from $N-2$ to **$N-3$**
+> 4. Why skipping minor versions during upgrades causes catastrophic control plane corruption
+> 5. How API deprecation policies guarantee stability between `alpha`, `beta`, and `GA` versions
+> 6. How to audit cluster manifests for deprecated API objects using `kubent` and `pluto`
+
+---
+
+## Real-Life Analogy
+
+Think of the Kubernetes Version Skew Policy as **the compatibility rules between a central airport air traffic control tower, airplane flight computers, and pilot radio headsets**:
+
+- **The Central Tower Anchor (`kube-apiserver` - Version $N$):** The main airport radar tower operates on the newest international radar protocol (**Version 1.30**).
+- **The Co-Located Tower Controllers (`kube-controller-manager` & `kube-scheduler` - $N$ or $N-1$):** The deputy flight director sitting inside the same tower can run software that is at most 1 version behind (**Version 1.29 or 1.30**). If the deputy ran a version *newer* than the radar screen, they would issue commands the tower radar doesn't understand (**Control Plane Desynchronization**).
+- **The Airplane Fleet (`kubelet` on Worker Nodes - $N-3$ Tolerance):** Commercial passenger jets (**Worker Nodes**) cannot be recalled and rewired every month. The airport allows older planes to land safely as long as their flight computers are within 3 versions (**Version 1.27 through 1.30**).
+- **The No-Skip Rule (The Sequential Staircase):** You cannot jump from the 1st floor to the 3rd floor without stepping on the 2nd floor (**Upgrades must proceed $1.28 \to 1.29 \to 1.30$**). Skipping the 2nd floor bypasses crucial internal structural wiring (**`etcd` data schema migrations**), causing the staircase to collapse.
+
+---
+
+## Architecture Diagram
+
+```text
+               Official Kubernetes Component Version Skew Matrix
+
+ CENTRAL CONTROL PLANE ANCHOR (kube-apiserver: Version N = v1.30)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ kube-apiserver (Version 1.30) ◄── Must ALWAYS be upgraded FIRST!       │
+ └──────┬───────────────────────────┬───────────────────────────┬─────────┘
+        │                           │                           │
+        ▼ Allowed Skew: N or N-1    ▼ Allowed Skew: N-3 (K8s 1.28+) Allowed: N ± 1
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ Controllers & Scheduler│  │ Worker Node Kubelets   │  │ Client CLI: `kubectl`  │
+ │ Version: 1.30 (N) or   │  │ Version: 1.30 (N),     │  │ Version: 1.29, 1.30,   │
+ │ Version: 1.29 (N-1)    │  │ 1.29 (N-1), 1.28 (N-2),│  │ or 1.31 (N ± 1)       │
+ │ [ CANNOT BE NEWER! ]   │  │ or 1.27 (N-3)          │  │                        │
+ └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ THE SEQUENTIAL UPGRADE RULE (No Skipping Allowed!):
+ [ v1.28 ] ──► [ v1.29 ] ──► [ v1.30 ]  (CORRECT: 100% Supported & Safe)
+ [ v1.28 ] ────────────────► [ v1.30 ]  (FATAL ERROR: Bypasses API migrations!)
+```
+
+---
+
+## Official Version Skew Matrix (Kubernetes 1.28+)
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Component                 │ Supported Version Range         │ Example (When API Server = 1.30)│
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kube-apiserver`**      │ **The Reference Version ($N$)** │ **v1.30.x**                     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kube-controller-**     │ $N$ or $N-1$                    │ **v1.30.x** or **v1.29.x**      │
+ │ **manager`**              │ (Must not exceed API server)    │                                 │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kube-scheduler`**      │ $N$ or $N-1$                    │ **v1.30.x** or **v1.29.x**      │
+ │                           │ (Must not exceed API server)    │                                 │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kubelet` (Nodes)**     │ **$N$, $N-1$, $N-2$, or $N-3$** │ **v1.30.x**, **v1.29.x**,       │
+ │                           │ *(Expanded from $N-2$ in 1.28+)*│ **v1.28.x**, or **v1.27.x**     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kubectl` (CLI)**       │ $N-1$, $N$, or $N+1$            │ **v1.29.x**, **v1.30.x**, 1.31  │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+> [!IMPORTANT]
+> **Kubelet $N-3$ Skew Allowance:** Starting in Kubernetes 1.28 (KEP-4355), the Kubelet version skew allowance was officially expanded from 2 minor versions ($N-2$) to **3 minor versions ($N-3$)**. This allows large enterprises with 5,000+ nodes to upgrade control planes through annual cycles while rolling out node OS and Kubelet updates at a more manageable, staged pace.
+
+---
+
+## Why Minor Version Skips are Strictly Forbidden
+
+```text
+ Why You CANNOT Upgrade Directly from v1.28 to v1.30:
+ 1. Storage Version Hashes: When Kubernetes transitions an API object (e.g. from v1beta1 to v1), 
+    intermediate versions perform internal schema translation and etcd storage version migrations.
+ 2. Flag Removals: CLI flags deprecated in 1.28 are permanently removed in 1.29; jumping to 1.30 
+    causes immediate control plane crash loops due to unrecognized arguments.
+ 3. Pre-flight Validation: `kubeadm upgrade apply` explicitly blocks upgrades if the target 
+    version is greater than $N+1$.
+```
+
+---
+
+## API Deprecation Policy Rules
+
+The Kubernetes project enforces a formal deprecation policy to protect production workloads:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ API Stability Level  │ Deprecation & Removal Guarantee                                             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **GA (Stable)**      │ **Guaranteed for at least 12 months or 3 minor releases** after deprecation │
+ │ (e.g. `v1`)          │ announcement before removal. No breaking schema changes allowed.            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Beta**             │ Deprecated for at least **3 minor releases (approx 9 months)** before       │
+ │ (e.g. `v1beta1`)     │ removal. Deprecated beta APIs are disabled by default in new clusters.      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Alpha**            │ May be modified or removed in any minor release without prior notice.       │
+ │ (e.g. `v1alpha1`)    │ Disabled by default in production clusters.                                 │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Auditing Clusters for Deprecated APIs
+
+Before initiating any cluster upgrade, audit all deployed manifests for deprecated API objects:
+
+```bash
+# 1. Install and run Kube-No-Trouble (kubent) to scan live cluster APIs
+sh -c "$(curl -sSL https://git.io/install-kubent)"
+kubent
+```
+
+```text
+ Sample kubent Output:
+ __________________________________________________________________________
+ >>> Deprecated APIs In Use:
+ * Ingress/v1beta1 in namespace 'production' (Deleted in v1.22, Rule: ingress)
+   -> Replacement: networking.k8s.io/v1
+ * HorizontalPodAutoscaler/v2beta2 in 'staging' (Deleted in v1.26)
+   -> Replacement: autoscaling/v2
+ __________________________________________________________________________
+```
+
+---
+
+## Hands-On Lab: Inspecting Cluster Component Versions
+
+```bash
+# Step 1: Query API Server and Control Plane versions
+kubectl version --short 2>/dev/null || kubectl version
+
+# Step 2: Query Kubelet versions across all worker nodes
+kubectl get nodes -o custom-columns=NAME:.metadata.name,KUBELET_VERSION:.status.nodeInfo.kubeletVersion,OS:.status.nodeInfo.osImage
+
+# Step 3: Validate supported API versions currently active in the cluster
+kubectl api-versions | sort | head -n 15
+
+# Step 4: Check for resources using beta API endpoints
+kubectl api-resources --verbs=list --namespaced -o name | grep "v1beta" || echo "Zero deprecated beta APIs detected"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the official Kubernetes Version Skew Policy, and why is `kube-apiserver` the anchor?**
+
+The Kubernetes Version Skew Policy defines the allowable version differences between control plane components, worker nodes, and client tools. `kube-apiserver` is the single authoritative anchor ($N$):
+1. `kube-controller-manager` and `kube-scheduler` can be at most 1 version older ($N-1$) and can **never be newer** than `kube-apiserver`.
+2. `kubelet` on worker nodes can be up to **3 minor versions older ($N-3$)** in Kubernetes 1.28+ (e.g. 1.27 Kubelets with a 1.30 API server).
+3. `kubectl` CLI can be 1 version older or newer ($N\pm 1$).
+
+**Q2: Why is it impossible to skip a minor version (e.g. jumping from 1.28 to 1.30) during a cluster upgrade?**
+
+Skipping minor versions violates the fundamental upgrade contract of Kubernetes. Each minor release introduces `etcd` schema transformations, converts deprecated API types in storage, and drops deprecated runtime arguments. Jumping across two minor versions bypasses intermediate schema migration hooks, leading to unparseable `etcd` records, broken controller loops, and cluster boot failures. `kubeadm` strictly blocks upgrades that exceed $N+1$.
+
+**Q3: What was the motivation behind expanding Kubelet version skew from $N-2$ to $N-3$ in Kubernetes 1.28?**
+
+Because Kubernetes releases 3 minor versions per year, an $N-2$ skew required operators to upgrade every physical worker node in their fleet within roughly 8 months to maintain support. In large-scale enterprise environments with tens of thousands of bare-metal nodes, physical OS and kernel upgrades take months. Expanding to $N-3$ allows organizations to support worker nodes across a full **1-year operational window**, aligning node upgrades with annual maintenance cycles.
+
+**Q4: How does the Kubernetes API deprecation policy ensure backward compatibility for developers?**
+
+The API deprecation policy guarantees that: (1) **GA (v1)** APIs can never be removed or undergo breaking structural changes within the same major version; (2) Deprecated GA APIs must be supported for at least 12 months or 3 minor releases after announcement; (3) **Beta (v1beta1)** APIs must be supported for at least 3 minor releases; and (4) New features must graduate through Alpha $\to$ Beta $\to$ GA, preventing unvetted changes from destabilizing production clusters.
+
+**Q5: How do you identify whether any deployed workloads are using deprecated APIs prior to an upgrade?**
+
+DevOps teams use automated static and runtime analysis tools:
+- **`kubent` (Kube-No-Trouble)**: Scans live cluster objects and Helm release metadata in `etcd`, cross-referencing API groups against known removal schedules.
+- **`pluto` (Fairwinds)**: Scans static Helm charts, GitOps repositories, and live clusters for deprecated API versions.
+- **API Server Audit Logs**: Inspects `requestReceived` audit logs filtering for `annotations["k8s.io/deprecated"] == "true"`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Kubernetes ships 3 minor releases per year with a 1-year support window
+- [ ] Know the version skew rules: API Server ($N$), Controllers ($N-1$), Kubelet ($N-3$), Kubectl ($N\pm 1$)
+- [ ] Know that Kubelet skew expanded from $N-2$ to $N-3$ in Kubernetes 1.28
+- [ ] Know why minor version upgrades must ALWAYS proceed sequentially ($1.28 \to 1.29 \to 1.30$)
+- [ ] Know that GA APIs require 12 months of deprecation notice before removal
+- [ ] Can audit clusters for deprecated APIs using `kubent` and `pluto`
+- [ ] Can check node Kubelet versions using `kubectl get nodes -o wide`

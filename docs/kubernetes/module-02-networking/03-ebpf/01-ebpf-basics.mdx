@@ -1,0 +1,343 @@
+---
+title: "Chapter 1 — eBPF Basics"
+sidebar_position: 1
+module: "Module 2.3 — eBPF"
+description: "Deep dive into eBPF fundamentals — the virtual machine inside the Linux kernel, program types, maps, the verifier, JIT compilation, and why eBPF is revolutionizing Kubernetes networking, observability, and security."
+---
+
+# Chapter 1 — eBPF Basics
+
+> **Goal:** Understand what eBPF is at the kernel level — how programs are verified, JIT-compiled, and attached to hooks — and why it enables Kubernetes tools like Cilium and Falco to operate at kernel speed without kernel modules.
+>
+> By the end of this chapter, you will understand:
+> 1. What eBPF is and how it differs from traditional kernel modules
+> 2. The eBPF execution model: bytecode → verifier → JIT → kernel hook
+> 3. The main eBPF program types relevant to networking (XDP, TC, socket)
+> 4. eBPF maps — shared data structures between kernel and userspace
+> 5. How eBPF programs are loaded and attached from userspace
+> 6. Why eBPF is safer than kernel modules and how the verifier guarantees this
+
+---
+
+## Real-Life Analogy
+
+Traditional kernel modules are like **hiring a contractor who moves into your house** (the kernel): they have full access to everything, can break anything, and are hard to remove once installed. If the contractor makes a mistake, the whole house can collapse (kernel panic).
+
+eBPF is like hiring a contractor who works in a **sandboxed workspace with a building inspector** (the verifier). The inspector checks every plan before construction begins — guaranteeing no structural damage is possible. The contractor can only use approved tools, must finish in bounded time, and the workspace is automatically cleaned up when the job is done.
+
+The output quality can be just as good as a traditional contractor — but with safety guarantees that make it viable in production at any scale.
+
+---
+
+## Architecture Diagram
+
+```text
+                    eBPF Execution Model
+
+  Userspace (Go/C/Rust program)
+  ┌──────────────────────────────────────────────────────┐
+  │  1. Write eBPF program in C (subset)                 │
+  │  2. Compile to eBPF bytecode with clang/LLVM         │
+  │  3. Load via bpf() syscall                           │
+  └─────────────────────────┬────────────────────────────┘
+                            │ bpf() syscall
+  ┌─────────────────────────▼────────────────────────────┐
+  │  Linux Kernel                                        │
+  │                                                      │
+  │  ┌─────────────────┐                                 │
+  │  │  eBPF Verifier   │  Checks:                       │
+  │  │                  │  - No infinite loops            │
+  │  │                  │  - No out-of-bounds memory      │
+  │  │                  │  - No uninitialized reads       │
+  │  │                  │  - Terminates in bounded steps  │
+  │  └────────┬─────────┘                                │
+  │           │ Verified bytecode                        │
+  │  ┌────────▼─────────┐                                │
+  │  │  JIT Compiler     │  Bytecode → native CPU        │
+  │  │  (x86/ARM64)      │  instructions (near-native    │
+  │  │                   │  performance)                 │
+  │  └────────┬──────────┘                               │
+  │           │ Native code attached to hook             │
+  │  ┌────────▼──────────────────────────────────────┐   │
+  │  │  Hook Points                                   │   │
+  │  │  XDP (pre-stack) │ TC (traffic control)        │   │
+  │  │  kprobes         │ tracepoints                 │   │
+  │  │  socket ops      │ LSM (security)              │   │
+  │  └───────────────────────────────────────────────┘   │
+  └──────────────────────────────────────────────────────┘
+```
+
+---
+
+## What eBPF Is
+
+**eBPF (extended Berkeley Packet Filter)** is a virtual machine embedded in the Linux kernel that allows running sandboxed programs in kernel space without writing kernel modules.
+
+### History
+
+- **1992**: BPF (original) — used only for packet filtering (`tcpdump`)
+- **2014**: eBPF added to Linux 3.18 — generalized to any kernel event, not just packets
+- **2016**: XDP (eXpress Data Path) added — eBPF at NIC driver level
+- **2020+**: Production use in Cilium, Falco, bcc, bpftrace, Katran, Meta infrastructure
+
+### eBPF vs Kernel Modules
+
+| Aspect | Kernel Module | eBPF Program |
+|--------|--------------|-------------|
+| **Safety** | Can crash kernel | Verifier guarantees safety |
+| **Loading** | Requires root + recompile for kernel | Load at runtime, no recompile |
+| **Termination** | Can have infinite loops | Must terminate (bounded loops) |
+| **Memory access** | Arbitrary kernel memory | Sandboxed, verified bounds |
+| **Upgrade** | Requires kernel version match | Portable via BTF (CO-RE) |
+| **Rollback** | Complex, risky | Detach program — instant rollback |
+
+---
+
+## eBPF Program Types for Networking
+
+### XDP (eXpress Data Path)
+
+XDP programs run at the **NIC driver level** — before the packet enters the kernel's networking stack. This is the earliest possible interception point:
+
+```text
+Packet arrives at NIC
+  → NIC DMA into memory
+  → XDP program executes (before sk_buff allocation)
+    → Actions: XDP_PASS, XDP_DROP, XDP_TX, XDP_REDIRECT
+  → If XDP_PASS: packet enters kernel network stack
+```
+
+XDP is used for:
+- DDoS mitigation (drop malicious packets at wire speed, 10s of millions pps)
+- Load balancing (Meta's Katran uses XDP for L4 load balancing)
+- Packet redirection to userspace (AF_XDP for DPDK-like performance)
+
+```c
+// Minimal XDP program: drop all UDP packets
+SEC("xdp")
+int xdp_drop_udp(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    
+    if (eth + 1 > data_end) return XDP_PASS;
+    if (eth->h_proto != htons(ETH_P_IP)) return XDP_PASS;
+    
+    struct iphdr *ip = (void *)(eth + 1);
+    if (ip + 1 > data_end) return XDP_PASS;
+    if (ip->protocol == IPPROTO_UDP) return XDP_DROP;
+    
+    return XDP_PASS;
+}
+```
+
+### TC (Traffic Control)
+
+TC programs attach to the **traffic control** subsystem — after the kernel has allocated an `sk_buff` (socket buffer) for the packet. They can read AND modify packet data:
+
+```text
+Ingress TC hook (after NIC, before routing):
+  ← Read/modify/drop incoming packets
+
+Egress TC hook (after routing, before NIC transmission):
+  ← Read/modify/drop outgoing packets
+```
+
+Cilium uses TC hooks to:
+- Enforce NetworkPolicy (drop packets that violate policy)
+- Implement Service DNAT (rewrite destination IP for ClusterIP packets)
+- Apply bandwidth limits
+- Inject Pod identity into packets
+
+```bash
+# View TC programs attached to an interface
+tc filter show dev eth0 ingress
+tc filter show dev eth0 egress
+```
+
+### Socket-Level Programs
+
+```text
+sock_ops     → Called on TCP socket state changes (connect, accept, close)
+sk_msg       → Intercepts sendmsg() calls on sockets
+sk_skb       → Applied to data flowing through a socket map
+sockmap      → Redirects between sockets (zero-copy socket forwarding)
+```
+
+Cilium uses `sockops` + `sk_msg` for **direct socket connection acceleration** — connecting a client socket directly to the server socket without routing through the kernel's network stack.
+
+---
+
+## eBPF Maps: Shared State Between Kernel and Userspace
+
+**eBPF maps** are key-value data structures shared between eBPF programs (in kernel) and userspace applications. They are the primary mechanism for:
+- Passing configuration from userspace to kernel eBPF programs
+- Returning data from kernel eBPF programs to userspace
+- Sharing state between multiple eBPF programs
+
+```c
+// Define a map in eBPF C code
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10000);
+    __type(key, __u32);    // Key: IPv4 address
+    __type(value, __u64);  // Value: packet count
+} packet_counter SEC(".maps");
+
+// Use the map in an XDP program
+SEC("xdp")
+int count_packets(struct xdp_md *ctx) {
+    __u32 src_ip = /* extract from packet */;
+    __u64 *count = bpf_map_lookup_elem(&packet_counter, &src_ip);
+    if (count) {
+        __sync_fetch_and_add(count, 1);
+    }
+    return XDP_PASS;
+}
+```
+
+```python
+# Access the same map from userspace (Python with bcc)
+from bcc import BPF
+
+b = BPF(src_file="count_packets.c")
+fn = b.load_func("count_packets", BPF.XDP)
+b.attach_xdp("eth0", fn)
+
+packet_counter = b["packet_counter"]
+# Read entries: packet_counter.items() → [(IP, count), ...]
+```
+
+### Common Map Types
+
+| Map Type | Description | Use Case |
+|----------|-------------|----------|
+| `BPF_MAP_TYPE_HASH` | Hash table (O(1) lookup) | Policy lookup by IP, port |
+| `BPF_MAP_TYPE_ARRAY` | Fixed-size array (O(1) by index) | Configuration, per-CPU stats |
+| `BPF_MAP_TYPE_PERCPU_HASH` | Per-CPU hash (no lock contention) | High-throughput counters |
+| `BPF_MAP_TYPE_LRU_HASH` | Hash with LRU eviction | Connection tracking |
+| `BPF_MAP_TYPE_RINGBUF` | Ring buffer for events | High-speed event streaming to userspace |
+| `BPF_MAP_TYPE_SOCKMAP` | Socket references | Socket-level redirection |
+| `BPF_MAP_TYPE_DEVMAP` | Network device references | XDP packet redirection |
+
+---
+
+## The eBPF Verifier
+
+The verifier is what makes eBPF safe. Before any program runs, the kernel's verifier performs **static analysis** of every possible execution path:
+
+```text
+Checks performed:
+
+1. No unreachable instructions
+2. No loops with unbounded iterations
+   (bounded loops allowed since Linux 5.3)
+3. All memory accesses are within bounds
+   (checked by tracking pointer ranges)
+4. No use of uninitialized registers/memory
+5. Context pointer rules obeyed
+   (can't dereference XDP context like arbitrary pointer)
+6. Helper function arguments are correct types
+7. Program terminates within instruction limit
+   (default: 1,000,000 verified instructions)
+```
+
+If verification fails, `bpf()` syscall returns `-EACCES` and `verifier_log` contains the error.
+
+```bash
+# View verifier output (on failure)
+bpftool prog load myprogram.o /sys/fs/bpf/myprogram verbose
+# Output: detailed per-instruction verification trace
+```
+
+---
+
+## Loading and Inspecting eBPF Programs
+
+```bash
+# List all loaded eBPF programs on a system
+bpftool prog list
+# Output:
+# 42: xdp  name xdp_drop_udp  loaded_at 2024-01-01T10:00:00+0000
+# 43: sched_cls  name cali_tc_ingress  loaded_at ...  (Calico TC hook)
+
+# Inspect a specific program
+bpftool prog show id 42
+bpftool prog dump xlated id 42  # Dump verified bytecode
+bpftool prog dump jited id 42   # Dump JIT-compiled native code
+
+# List all eBPF maps
+bpftool map list
+bpftool map dump id 15  # Dump map contents
+
+# View programs attached to an interface
+bpftool net list dev eth0
+
+# Pin a program to the filesystem (persist across process exit)
+bpftool prog pin id 42 /sys/fs/bpf/my_program
+
+# Load a program from an object file
+bpftool prog load myprogram.o /sys/fs/bpf/myprogram \
+  map name packet_counter /sys/fs/bpf/my_map
+```
+
+---
+
+## CO-RE: Compile Once, Run Everywhere
+
+A major challenge with kernel eBPF: kernel data structures change between versions. CO-RE (Compile Once — Run Everywhere) solves this:
+
+```text
+Traditional eBPF:
+  Compile for kernel 5.15 → only runs on 5.15
+
+CO-RE eBPF:
+  Compile once with BTF (BPF Type Format)
+  → Program records which kernel struct fields it uses
+  → At load time, kernel relocates field offsets to match current kernel version
+  → Same binary runs on kernel 5.10, 5.15, 6.0, 6.6
+```
+
+```bash
+# Check if kernel BTF is available (required for CO-RE)
+ls /sys/kernel/btf/vmlinux
+
+# Modern Kubernetes nodes (5.10+) have BTF built in
+uname -r  # Check kernel version
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is eBPF and how does it differ from writing a kernel module?**
+
+eBPF is a sandboxed virtual machine in the Linux kernel that runs verified, JIT-compiled programs at kernel hook points — without kernel module compilation or kernel restarts. Unlike kernel modules that have full kernel access (and can cause kernel panics), eBPF programs are verified before loading: the verifier checks for infinite loops, out-of-bounds memory access, and uninitialized reads. Programs can be loaded and unloaded at runtime. The JIT compiler produces native code comparable in performance to C kernel code.
+
+**Q2: What is the difference between XDP and TC eBPF hook points?**
+
+XDP (eXpress Data Path) runs at the NIC driver level, before the kernel allocates an `sk_buff` — it's the earliest possible interception point, allowing packet processing at line rate (millions of packets per second). TC (traffic control) runs after `sk_buff` allocation, at the traffic control layer. TC programs have more context (full packet data in sk_buff) and can modify packets more easily. XDP is used for DDoS mitigation and fast forwarding; TC is used by Cilium for NetworkPolicy enforcement and Service DNAT.
+
+**Q3: What are eBPF maps and how do they enable communication between kernel and userspace?**
+
+eBPF maps are kernel-managed key-value data structures accessible from both eBPF programs (in kernel) and userspace via the `bpf()` syscall. An eBPF program can write events or metrics into a map; userspace reads them. Conversely, userspace can write policy rules into a map; the eBPF program reads them for each packet. Common types: `BPF_MAP_TYPE_HASH` (O(1) lookup), `BPF_MAP_TYPE_RINGBUF` (event streaming), `BPF_MAP_TYPE_SOCKMAP` (socket redirection).
+
+**Q4: What does the eBPF verifier check and what happens if verification fails?**
+
+The verifier checks: no infinite loops, no out-of-bounds memory accesses (tracks pointer ranges statically), no uninitialized register reads, valid helper function arguments, and that the program terminates within the instruction limit (1M instructions). If any check fails, the `bpf()` syscall returns `-EACCES` and the program is not loaded. The verifier produces a detailed log showing which instruction failed and why.
+
+**Q5: What is CO-RE and why is it important for eBPF portability?**
+
+CO-RE (Compile Once — Run Everywhere) allows a single eBPF binary to run across different Linux kernel versions. Traditional eBPF programs embed kernel struct layouts at compile time — they break when kernel internal structures change. CO-RE records accessed struct fields using BTF (BPF Type Format) metadata. At load time, the kernel relocates field offsets to match the running kernel's actual layout. This enables eBPF programs to be distributed as binaries without recompilation — critical for tools like Cilium, Falco, and bpftrace that run on diverse kernel versions.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know what eBPF is: a sandboxed VM in the Linux kernel for running verified programs at hook points
+- [ ] Understand the eBPF execution flow: C code → clang/LLVM → bytecode → verifier → JIT → hook
+- [ ] Know the difference between XDP (pre-stack, driver level) and TC (post-stack, sk_buff level) hooks
+- [ ] Understand eBPF maps — key-value stores shared between kernel eBPF programs and userspace
+- [ ] Know what the verifier checks (bounds, loops, uninitialized reads, termination)
+- [ ] Understand CO-RE/BTF — compile once, run on any kernel version
+- [ ] Can use `bpftool prog list`, `bpftool map list`, and `tc filter show` to inspect eBPF programs

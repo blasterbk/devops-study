@@ -1,0 +1,262 @@
+---
+title: "Chapter 2 — Pod Networking"
+sidebar_position: 2
+module: "Module 2.1 — Networking Fundamentals"
+description: "Deep dive into how Pod networking works at the Linux kernel level — veth pairs, bridges, network namespaces, the pause container, and the complete packet path from one Pod to another on the same node."
+---
+
+# Chapter 2 — Pod Networking
+
+> **Goal:** Understand exactly how a Pod gets its network — from the pause container's namespace, to the veth pair, to the Linux bridge — and trace a complete packet flow between two Pods on the same node.
+>
+> By the end of this chapter, you will understand:
+> 1. What the pause (infra) container is and why it exists
+> 2. How a veth pair connects a Pod to the host network
+> 3. How a Linux bridge (`cbr0`) connects multiple Pods on the same node
+> 4. The step-by-step packet journey from Pod A to Pod B on the same node
+> 5. How to inspect and debug pod networking using `ip`, `bridge`, and `nsenter`
+> 6. What ARP is and how it's used within the node's Pod network
+
+---
+
+## Real-Life Analogy
+
+Imagine a **hotel floor** with private rooms (Pods) and a shared hallway (the Linux bridge):
+
+- Each **room** has its own **room phone** (`eth0` inside the Pod's netns) with its own extension number (Pod IP).
+- Each room has a **cable running through the wall** (`veth pair`) to a **switchboard in the hallway** (Linux bridge `cbr0`).
+- When Room 101 calls Room 102, the call goes: Room 101 phone → cable through wall → hallway switchboard → cable through wall → Room 102 phone.
+- The **housekeeping team** (CNI plugin) wires up each room when a guest checks in and disconnects it when they check out.
+
+No calls go through the lobby (host network). Rooms don't even know the lobby exists.
+
+---
+
+## Architecture Diagram
+
+```text
+                        Node (192.168.1.10)
+    ┌───────────────────────────────────────────────────┐
+    │                                                   │
+    │   Pod A netns              Pod B netns            │
+    │  ┌───────────┐            ┌───────────┐           │
+    │  │  eth0     │            │  eth0     │           │
+    │  │10.244.1.5 │            │10.244.1.8 │           │
+    │  └─────┬─────┘            └─────┬─────┘           │
+    │        │ veth pair              │ veth pair        │
+    │  ┌─────┴─────┐            ┌─────┴─────┐           │
+    │  │ vethA1b2  │            │ vethC3d4  │           │
+    │  └─────┬─────┘            └─────┬─────┘           │
+    │        └──────────┬─────────────┘                 │
+    │              ┌────┴─────┐                         │
+    │              │  cbr0    │  (Linux Bridge)          │
+    │              │10.244.1.1│                         │
+    │              └────┬─────┘                         │
+    │                   │                               │
+    │              ┌────┴─────┐                         │
+    │              │   eth0   │  (Node physical NIC)    │
+    │              │192.168.1.10                        │
+    │              └──────────┘                         │
+    └───────────────────────────────────────────────────┘
+```
+
+---
+
+## The Pause Container: The Network Namespace Owner
+
+Every Kubernetes Pod has a **hidden container** you never see in `kubectl get pods` — the **pause container** (also called the infra container or sandbox container).
+
+```bash
+# On the node, you can see it with crictl
+crictl ps --name pause
+
+# Output example:
+# CONTAINER  IMAGE                    CREATED   STATE    NAME   POD
+# a1b2c3d4   pause:3.9                2h ago    Running  pause  nginx-pod
+```
+
+### Why does the pause container exist?
+
+The pause container's **sole job** is to create and hold the network namespace. All other containers in the Pod (your app containers) then **join** this existing namespace.
+
+```text
+Pod creation sequence:
+1. kubelet → container runtime (containerd)
+2. Runtime creates pause container → creates new netns
+3. CNI plugin called → configures eth0 in pause's netns
+4. App containers (nginx, sidecar) created → join pause's netns
+5. All containers in Pod share the same IP, same network stack
+```
+
+This design means:
+- If your nginx container crashes and restarts, the network namespace (and IP) is **preserved** — it's still owned by the running pause container.
+- All containers in a Pod can communicate via `localhost` because they share the same network stack.
+
+```bash
+# Two containers in the same Pod on the same loopback
+# Container A (nginx) listening on :80
+# Container B (sidecar) can reach it via localhost:80
+curl localhost:80  # works from container B
+```
+
+---
+
+## The veth Pair: The Wire Through the Wall
+
+A **veth (virtual ethernet) pair** is a pair of linked virtual network interfaces. Anything written into one end comes out the other end — like two ends of a pipe.
+
+```bash
+# Create a veth pair (the CNI plugin does this automatically)
+ip link add vethA type veth peer name vethB
+
+# vethA and vethB are now linked. Send data into vethA → comes out vethB
+```
+
+**How CNI uses veth pairs for Pods:**
+
+```text
+Step 1: CNI creates veth pair
+  veth0  ←→  veth1
+
+Step 2: veth0 is moved into the Pod's network namespace (renamed to eth0)
+  Pod netns: eth0 (was veth0)
+  Host netns: veth1 (renamed to vethA1b2c3d4)
+
+Step 3: IP address assigned to eth0 inside Pod netns
+  ip addr add 10.244.1.5/24 dev eth0  (run inside Pod's netns)
+
+Step 4: Default route added inside Pod netns
+  ip route add default via 10.244.1.1  (gateway = bridge IP)
+
+Step 5: veth1 (host side) attached to the bridge
+  ip link set vethA1b2c3d4 master cbr0
+```
+
+---
+
+## The Linux Bridge: The Floor Switchboard
+
+The **Linux bridge** (`cbr0` in older Kubernetes, or named by CNI plugins) is a virtual Layer 2 switch in the host's root network namespace. It connects all the host-side veth interfaces together.
+
+```bash
+# Inspect the bridge on a node
+bridge link show
+ip link show type bridge
+
+# See all veth interfaces attached to the bridge
+bridge link show dev cbr0
+
+# Show MAC address table (ARP cache for bridge)
+bridge fdb show br cbr0
+```
+
+When Pod A sends a packet to Pod B on the same node:
+
+```text
+1. Pod A's kernel looks up destination 10.244.1.8 in its routing table
+   → Route: 10.244.1.0/24 via 10.244.1.1 dev eth0
+   → Or direct: 10.244.1.8 is in the same /24 subnet → ARP
+
+2. Pod A sends ARP request: "Who has 10.244.1.8?"
+   → Exits eth0 → through veth pair → arrives at cbr0
+
+3. cbr0 forwards ARP to all attached veth interfaces (broadcast)
+   → Pod B's veth receives the ARP request → enters Pod B's netns
+
+4. Pod B responds: "10.244.1.8 is at MAC aa:bb:cc:dd:ee:02"
+   → Exits Pod B's eth0 → through veth → back to cbr0 → to Pod A
+
+5. Pod A now has the MAC. Sends the actual packet:
+   Src IP: 10.244.1.5, Dst IP: 10.244.1.8
+   Src MAC: aa:bb:cc:dd:ee:01, Dst MAC: aa:bb:cc:dd:ee:02
+   Path: Pod A eth0 → vethA → cbr0 → vethB → Pod B eth0
+
+No NAT, no IP rewriting. Packet arrives at Pod B with source IP 10.244.1.5.
+```
+
+---
+
+## Hands-On: Inspecting Pod Networking
+
+```bash
+# 1. Find the pause container PID for a running Pod
+POD_NAME="nginx-pod"
+POD_NS="default"
+
+# Get container IDs
+kubectl get pod $POD_NAME -n $POD_NS -o jsonpath='{.status.containerStatuses[*].containerID}'
+
+# Find pause container PID via crictl
+PAUSE_ID=$(crictl ps --name pause | grep $POD_NAME | awk '{print $1}')
+PID=$(crictl inspect $PAUSE_ID | jq '.info.pid')
+
+# 2. Enter the Pod's network namespace
+nsenter -t $PID -n ip addr
+nsenter -t $PID -n ip route
+nsenter -t $PID -n ss -tlnp  # listening sockets
+
+# 3. Find the veth pair on the host
+# The Pod's eth0 has an ifindex. Find its peer on the host.
+nsenter -t $PID -n cat /sys/class/net/eth0/iflink
+# Output: e.g., 15
+ip link | grep "^15:"  # Find the host-side veth by ifindex
+
+# 4. Inspect the bridge
+bridge link show
+ip addr show cbr0
+
+# 5. Trace a packet (needs tcpdump)
+# On the host-side veth (e.g., veth12345):
+tcpdump -i veth12345 -nn
+```
+
+---
+
+## What Happens When a Pod is Deleted
+
+```text
+1. kubelet calls container runtime to delete Pod
+2. Runtime calls CNI plugin with DEL command
+3. CNI plugin:
+   - Removes the veth from the bridge
+   - Deletes the veth pair (both ends disappear automatically)
+   - Returns the IP back to IPAM
+   - Removes any iptables rules for this Pod
+4. Pod's network namespace is deleted (when the pause container exits)
+5. IP is now available for a new Pod
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the pause container and why does Kubernetes use it?**
+
+The pause container creates and holds the Pod's network namespace. All other containers in the Pod join this namespace, giving them a shared IP and network stack. Its purpose is to decouple the network lifecycle from the app container lifecycle — if the app crashes and restarts, the network namespace (and Pod IP) is preserved because the pause container keeps running.
+
+**Q2: What is a veth pair and how does it connect a Pod to the host network?**
+
+A veth pair is two virtual network interfaces linked at the kernel level — anything written into one end appears at the other. CNI moves one end into the Pod's network namespace (as `eth0`) and keeps the other in the host namespace, attaching it to a Linux bridge. This creates a virtual wire from inside the Pod to the host's network layer.
+
+**Q3: Why can all containers in a Pod communicate via localhost?**
+
+Because they all share the same network namespace. Network namespaces include the loopback interface. Since all containers in a Pod join the same namespace (owned by the pause container), they share the same `lo` interface, the same IP, and the same port table. A bind on `:80` in one container is visible to all others in the same Pod.
+
+**Q4: What happens to a Pod's IP if its application container crashes?**
+
+Nothing — the IP is preserved. The pause container continues running and holds the network namespace. The application container is restarted by the container runtime into the same existing namespace. The Pod IP stays the same throughout.
+
+**Q5: How does a packet travel from Pod A to Pod B on the same node?**
+
+Pod A sends the packet to its default gateway (the bridge IP). The packet exits through `eth0`, crosses the veth pair to the host, arrives at the Linux bridge (`cbr0`). The bridge uses its MAC address table (populated via ARP) to forward the packet out the correct veth port to Pod B's host-side veth. The packet enters Pod B's namespace through the veth and arrives at Pod B's `eth0`. No NAT occurs; the source IP remains Pod A's IP.
+
+---
+
+## Summary Checksheet
+
+- [ ] Understand what the pause container is and why it holds the network namespace
+- [ ] Can explain a veth pair and how it bridges the Pod's network namespace to the host
+- [ ] Know what a Linux bridge does and how it forwards packets between Pods on the same node
+- [ ] Can trace the full packet path from Pod A to Pod B on the same node (ARP → MAC table → veth)
+- [ ] Can use `nsenter`, `ip link`, and `bridge` to inspect Pod networking on a real node
+- [ ] Understand that a Pod's IP is preserved when its app container restarts (pause container keeps the netns)

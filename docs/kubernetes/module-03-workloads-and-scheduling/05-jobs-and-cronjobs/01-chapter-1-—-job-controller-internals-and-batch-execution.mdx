@@ -1,0 +1,338 @@
+---
+title: "Chapter 1 — Job Controller & Batch Execution"
+sidebar_position: 1
+module: "Module 3.5 — Jobs & CronJobs"
+description: "Master Kubernetes Job controller internals — batch execution model, completions vs parallelism, ttlSecondsAfterFinished automated garbage collection, activeDeadlineSeconds, and suspend/resume mechanics."
+---
+
+# Chapter 1 — Job Controller & Batch Execution
+
+> **Goal:** Master the internal architecture and operational mechanics of the Kubernetes Job controller — understanding how batch execution differs from continuous service reconciliation, how `completions` and `parallelism` govern execution flow, how `ttlSecondsAfterFinished` prevents etcd resource exhaustion, how `activeDeadlineSeconds` enforces wall-clock execution bounds, and how Job suspension enables external scheduling queues.
+>
+> By the end of this chapter, you will understand:
+> 1. The fundamental difference between continuous workloads (Deployments) and run-to-completion workloads (Jobs)
+> 2. The reconciliation loop of the Job controller inside `kube-controller-manager`
+> 3. How the Job controller tracks Pod completions using deterministic label selectors
+> 4. How `ttlSecondsAfterFinished` automates cleanup of finished batch Pods
+> 5. How `activeDeadlineSeconds` terminates runaway or deadlocked batch jobs
+> 6. How the `suspend` field integrates Kubernetes with enterprise batch schedulers (Kueue, Volcano)
+
+---
+
+## Real-Life Analogy
+
+Think of a Kubernetes Job as a **contracted moving company hired to move 100 boxes into a new office**:
+
+- **Continuous Service (Deployments):** A security guard standing at the front door 24/7 (`restartPolicy: Always`). If the guard falls asleep or faints, the manager immediately wakes them up or replaces them so the post is never empty.
+- **Batch Workload (Jobs):** Moving 100 boxes into the office (`completions: 100`):
+  - You hire 4 movers to work simultaneously (`parallelism: 4`).
+  - As each mover carries a box inside and sets it down successfully (exit code `0`), they walk back and grab another box.
+  - Once all 100 boxes are stacked inside, the moving job is **Complete** (`status.succeeded: 100`). The movers punch out and leave; you don't keep paying them to stand around.
+  - If a mover drops and shatters a box (exit code non-zero), the foreman checks the contract's retry limit (`backoffLimit: 6`). If too many boxes are broken, the contract is cancelled and marked **Failed**.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Job Controller Lifecycle Loop
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Job Spec: completions: 4, parallelism: 2, backoffLimit: 3              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌──────────────────────────────────┴─────────────────────────────────────┐
+ │ Job Controller Loop (kube-controller-manager)                          │
+ │                                                                        │
+ │   Active Pods = 2 (Parallelism Limit)                                  │
+ │   Succeeded Pods = 0 / 4                                               │
+ └──────────────┬─────────────────────────────────────────┬───────────────┘
+                │ Spawns 2 Pods in parallel               │
+                ▼                                         ▼
+ ┌──────────────────────────────┐          ┌──────────────────────────────┐
+ │ Pod 1 (job-xxxx-1)           │          │ Pod 2 (job-xxxx-2)           │
+ │ Status: Running              │          │ Status: Running              │
+ └──────────────┬───────────────┘          └──────────────┬───────────────┘
+                │ Exit 0 (Succeeded)                      │ Exit 0 (Succeeded)
+                ▼                                         ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Job Controller Updates Status: Succeeded: 2 / 4                        │
+ │ Spawns remaining 2 Pods (Pod 3, Pod 4)                                 │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ All 4 Pods Completed! Job Condition: Complete: True                    │
+ │ ttlSecondsAfterFinished timer starts (e.g. 300s)                       │
+ │ ──► After 300s: Job and all 4 Pods are deleted from etcd!              │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Batch Execution vs Continuous Services
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Deployment / ReplicaSet         │ Job                             │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Execution Target**      │ Run indefinitely (24/7)         │ Run to completion (Finite task) │
+ │ **Pod Exit 0 Behavior**   │ Treated as unexpected; restarts │ Treated as SUCCESS; counted     │
+ │                           │ container immediately           │ toward `.spec.completions`      │
+ │ **restartPolicy**         │ Must be `Always`                │ Must be `OnFailure` or `Never`  │
+ │ **Scale Concept**         │ Target concurrent replicas ($N$)│ Target total completions ($M$)  │
+ │ **Post-Completion**       │ Continues running               │ Transitions to `Complete` phase │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Job Controller Internals & Tracking Selectors
+
+When you submit a Job manifest, the API server automatically injects unique tracking metadata:
+1. **`batch.kubernetes.io/job-name`:** Label matching the Job's metadata name.
+2. **`batch.kubernetes.io/controller-uid`:** Label containing the Job's unique UUID.
+3. The Job controller uses these selectors to identify, count, and reconcile its child Pods across cluster nodes without conflicting with other batch workloads.
+
+---
+
+## Core Execution Parameters: `completions` & `parallelism`
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Parameter            │ Definition & Behavioral Rules                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`completions`**    │ The total number of Pods that must terminate successfully (exit code `0`)   │
+ │                      │ for the Job to be marked `Complete`. Default: `1`.                          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`parallelism`**    │ The maximum number of Pods allowed to execute concurrently at any given    │
+ │                      │ time. Default: `1`. If omitted, defaults to `1`.                            │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Common Batch Patterns:
+- **Single Pod Task:** `completions: 1, parallelism: 1` (e.g., one-off DB schema migration).
+- **Fixed Task Pool:** `completions: 10, parallelism: 3` (10 tasks processed 3 at a time).
+- **Work Queue (Dynamic):** `completions: 1, parallelism: 5` with `restartPolicy: OnFailure` (workers pull from external Redis/RabbitMQ queue; Job finishes when first worker exits 0 after queue is empty).
+
+---
+
+## Automated Cleanup: `ttlSecondsAfterFinished`
+
+Completed Job Pods do not consume CPU or memory, but their metadata remains stored in `etcd`, and their logs remain in node storage. In high-throughput clusters running thousands of jobs daily, completed Pods will exhaust etcd storage if not cleaned up.
+
+The `ttlSecondsAfterFinished` field enables automated garbage collection by the TTL-after-finished controller:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nightly-report
+spec:
+  # Automatically delete Job and child Pods 120 seconds after completion or failure!
+  ttlSecondsAfterFinished: 120
+  template:
+    ...
+```
+
+```text
+ TTL Lifecycle Behavior:
+ - When Job finishes (status Complete or Failed), the TTL controller starts a countdown.
+ - Once `ttlSecondsAfterFinished` expires, the Job and all associated Pods are cascadingly deleted.
+ - If set to `0`, the Job is eligible for immediate deletion right after finishing.
+```
+
+---
+
+## Wall-Clock Timeouts: `activeDeadlineSeconds`
+
+To prevent a buggy, hung, or deadlocked batch job from running forever and monopolizing expensive GPU/CPU nodes, set `activeDeadlineSeconds`:
+
+```yaml
+spec:
+  activeDeadlineSeconds: 3600    # Maximum 1 hour of total wall-clock runtime
+```
+
+### What Happens When `activeDeadlineSeconds` Expires?
+1. The Job controller immediately sends `SIGTERM` followed by `SIGKILL` to all currently running child Pods.
+2. The Job's status condition is updated to:
+   ```yaml
+   conditions:
+   - type: Failed
+     status: "True"
+     reason: DeadlineExceeded
+     message: Job was active longer than specified deadline
+   ```
+3. No further retries are attempted.
+
+---
+
+## Job Suspension & Queue Schedulers (`suspend`)
+
+Kubernetes 1.24+ fully supports the `.spec.suspend` field (boolean):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: heavy-ml-training
+spec:
+  suspend: true    # <--- Job is created in PENDING/PAUSED state!
+  template:
+    ...
+```
+
+- When `suspend: true`, the Job controller creates **zero Pods**.
+- This is used by modern batch orchestration engines (like **Kueue** or **Volcano**) to manage cluster-wide resource quotas and priority queues.
+- When cluster resources become available, the external queue manager patches `suspend: false`, and the Job controller immediately begins launching workers.
+
+---
+
+## Complete Production Batch Job Manifest
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-warehouse-export
+  namespace: analytics
+  labels:
+    app: analytics-export
+spec:
+  completions: 6
+  parallelism: 2
+  backoffLimit: 4
+  activeDeadlineSeconds: 1800       # 30 minute maximum budget
+  ttlSecondsAfterFinished: 600      # Prune 10 minutes after completion
+
+  template:
+    metadata:
+      labels:
+        app: analytics-export
+    spec:
+      restartPolicy: OnFailure       # Mandatory: OnFailure or Never
+      containers:
+      - name: exporter
+        image: python:3.11-slim
+        command:
+        - "python"
+        - "-c"
+        - |
+          import time, random, sys
+          print("Starting data export shard processing...")
+          time.sleep(5)
+          print("Shard export completed successfully!")
+          sys.exit(0)
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+```
+
+---
+
+## Hands-On Lab: Parallelism, TTL Pruning & Failure Handling
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace job-lab
+
+# Step 2: Deploy a parallel batch Job with TTL cleanup
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: parallel-batch
+  namespace: job-lab
+spec:
+  completions: 4
+  parallelism: 2
+  ttlSecondsAfterFinished: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: worker
+        image: alpine:latest
+        command: ["sh", "-c", "echo 'Processing task on '$(hostname); sleep 4; exit 0"]
+EOF
+
+# Step 3: Watch the Job controller execute 2 Pods at a time until 4 completions are reached
+kubectl get pods -n job-lab -w
+
+# Step 4: Inspect Job completion status
+kubectl get job parallel-batch -n job-lab
+# Verify COMPLETIONS: 4/4
+
+# Step 5: Observe automated TTL cleanup
+echo "Waiting for TTL controller to prune Job after 20 seconds..."
+sleep 25
+kubectl get jobs -n job-lab
+# Notice: No resources found! The Job and Pods were automatically deleted!
+
+# Step 6: Test activeDeadlineSeconds failure timeout
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: timeout-demo
+  namespace: job-lab
+spec:
+  activeDeadlineSeconds: 5   # Kill after 5 seconds
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: stuck-worker
+        image: alpine:latest
+        command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 7: Wait for deadline exceeded failure
+sleep 8
+kubectl get job timeout-demo -n job-lab -o yaml | grep -A 5 "conditions:"
+# Observe reason: DeadlineExceeded
+
+# Step 8: Clean up lab
+kubectl delete namespace job-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between a Kubernetes Job and a Deployment?**
+
+A Deployment manages continuous, long-running services (like web APIs or message brokers) where a container termination is considered an unexpected failure, triggering an immediate restart (`restartPolicy: Always`). A Job manages finite, run-to-completion batch workloads (like database backups or report generation) where container exit code `0` is considered a successful completion, advancing the `.status.succeeded` count until `.spec.completions` is reached, at which point the Job finishes and ceases execution.
+
+**Q2: How do `completions` and `parallelism` interact in a Job specification?**
+
+`.spec.completions` defines the total number of successful Pod terminations (exit code 0) required for the entire Job to be marked `Complete`. `.spec.parallelism` defines the maximum number of Pods that the Job controller is permitted to execute concurrently at any given moment. For example, with `completions: 10` and `parallelism: 2`, the Job controller will run 2 Pods at a time in 5 successive batches until all 10 have finished.
+
+**Q3: What problem does `ttlSecondsAfterFinished` solve, and what happens if it is not configured?**
+
+Completed Job objects and their terminated Pods remain indefinitely in `etcd` and API server memory to allow operators to inspect logs and exit statuses. In active clusters executing hundreds or thousands of automated batch jobs daily, this causes severe `etcd` database bloat and slows down API server queries. Setting `ttlSecondsAfterFinished` activates an automated TTL controller that deletes the Job and all associated child Pods after a specified number of seconds post-completion.
+
+**Q4: What is `activeDeadlineSeconds` in a Job, and how does it differ from `backoffLimit`?**
+
+`backoffLimit` sets the maximum number of individual Pod failure retries allowed before the entire Job is marked failed. In contrast, `activeDeadlineSeconds` sets an absolute wall-clock duration limit (in seconds) for the entire Job from the moment it starts, regardless of how many Pods have run or failed. If `activeDeadlineSeconds` is reached, all running Pods are terminated immediately, and the Job transitions to `Failed` with reason `DeadlineExceeded`.
+
+**Q5: What is the purpose of the `.spec.suspend` field in a Job?**
+
+The `.spec.suspend` boolean allows a Job to be created in an inactive, suspended state without spawning any child Pods. This primitive is essential for external batch queuing and gang-scheduling controllers (such as CNCF Kueue or Volcano). Users submit batch Jobs in a suspended state; the external scheduler places the Jobs into fair-share priority queues and patches `.spec.suspend: false` only when cluster resources and GPU quotas become available.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Jobs manage run-to-completion workloads requiring `OnFailure` or `Never`
+- [ ] Know how `completions` (total target) and `parallelism` (concurrency) interact
+- [ ] Know that `ttlSecondsAfterFinished` prevents etcd resource exhaustion
+- [ ] Know that `activeDeadlineSeconds` sets an absolute wall-clock timeout on Jobs
+- [ ] Know how `.spec.suspend` integrates with Kueue and Volcano batch schedulers
+- [ ] Know that Job Pods are labeled with `batch.kubernetes.io/controller-uid`
+- [ ] Can track Job execution status with `kubectl get jobs` and `kubectl describe job`

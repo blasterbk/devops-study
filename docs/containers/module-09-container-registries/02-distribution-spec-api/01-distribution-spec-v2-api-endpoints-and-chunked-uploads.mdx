@@ -1,0 +1,184 @@
+---
+title: "Chapter 1 — Distribution Spec API & Chunked Uploads"
+sidebar_position: 1
+module: "Module 9.2 — Distribution Spec API"
+description: "Master the OCI Distribution Specification v2 REST API — endpoint mechanics, 4-step image push wire protocol, monolithic vs chunked uploads, and bearer token auth."
+---
+
+# Chapter 1 — Distribution Spec API & Chunked Uploads
+
+> **Goal:** Master the low-level wire protocol, HTTP REST endpoints, and byte-streaming mechanics of the **OCI Distribution Specification (v2 API)** — analyzing the **4-step image push sequence**, comparing **Monolithic vs Chunked Resumable Uploads** via HTTP `PATCH` and `Range` headers, mastering **Manifest & Blob Endpoints**, and decoding the **OAuth2 / Bearer Token Challenge-Response Protocol**.
+>
+> By the end of this chapter, you will understand:
+> 1. The complete REST endpoint catalog defined by the OCI Distribution Specification
+> 2. The exact HTTP request-response handshake during a `docker push` or `docker pull`
+> 3. How the 401 Unauthorized `Www-Authenticate` challenge initiates token authentication
+> 4. How chunked uploads enable resumable transfers of multi-gigabyte layers over unstable networks
+> 5. Why image manifests MUST always be pushed *last* after all layer blobs succeed
+> 6. How to execute a manual container image push using raw `curl` HTTP requests
+
+---
+
+## Real-Life Analogy
+
+Think of the OCI Distribution Spec API as **the strict customs registration protocol for sending heavy international shipping freight**:
+
+- **1. The Security Passport Check (`GET /v2/` & 401 Challenge):**
+  - You approach the international shipping gate.
+  - The guard asks for credentials (**`401 Unauthorized` with `Www-Authenticate: Bearer realm=...`**).
+  - You step over to the customs embassy office, show your passport (**User/Password**), and receive a signed temporary stamp (**Bearer Token**).
+- **2. The Duplicate Freight Check (`HEAD /v2/.../blobs/<digest>`):**
+  - Before shipping a 500-kilogram steel container (**A 500MB layer**), you radio the warehouse: *"Do you already have Crate #SHA256-ABCD?"*
+  - The warehouse checks its database and radios back: **`200 OK` (Already in stock!)**. You skip shipping the crate entirely, saving hours of freight time!
+- **3. The Multi-Segment Cargo Lift (`Chunked Uploads via PATCH`):**
+  - If the crate is new, you open an upload bay (**`POST /blobs/uploads/`**).
+  - You ship the crate in 50MB segments (**`PATCH` with `Content-Range: 0-52428799`**). If the network cable drops midway through Segment 4, you don't start over at Segment 1; you resume directly from Segment 4!
+- **4. The Final Manifest Bill of Lading (`PUT /manifests/v1.0`):**
+  - Once all physical crates are safely stacked inside the warehouse, you hand the warehouse manager the paper **Bill of Lading** listing all crate barcodes (**The Manifest JSON**).
+  - The shipment is officially complete and available for delivery!
+
+---
+
+## Architecture Diagram
+
+```text
+               The 4-Step OCI Image Push Wire Protocol Handshake
+
+ CLIENT (Docker CLI / BuildKit / Skopeo)                 REGISTRY API (OCI Distribution Spec)
+   │                                                       │
+   │ 1. LAYER DEDUPLICATION CHECK                          │
+   ├────── HEAD /v2/my-app/blobs/sha256:4a8b... ──────────►│
+   │◄───── 404 Not Found (Layer does not exist!) ──────────┤
+   │                                                       │
+   │ 2. INITIATE UPLOAD SESSION                            │
+   ├────── POST /v2/my-app/blobs/uploads/ ─────────────────►│
+   │◄───── 202 Accepted (Location: /uploads/UUID-1234) ────┤
+   │                                                       │
+   │ 3. STREAM LAYER BYTES (Chunked or Monolithic)         │
+   ├────── PATCH /uploads/UUID-1234 (Bytes: 0-50MB) ───────►│
+   │◄───── 202 Accepted (Range: 0-52428799) ───────────────┤
+   ├────── PUT /uploads/UUID-1234?digest=sha256:4a8b... ───►│ (Final Chunk + Verify)
+   │◄───── 201 Created (Location: /blobs/sha256:4a8b...) ──┤
+   │                                                       │
+   │ 4. PUSH IMAGE MANIFEST (Atomic Publish)               │
+   ├────── PUT /v2/my-app/manifests/v1.0.0 ────────────────►│
+   │◄───── 201 Created (Docker-Content-Digest: sha256:...) ─┤
+   │                                                       │
+```
+
+---
+
+## OCI Distribution API Endpoint Reference
+
+```text
+ ┌──────────────────────────────────────┬────────┬────────────────────────────────────────────┐
+ │ REST Endpoint                        │ Method │ Distribution Spec Purpose                  │
+ │──────────────────────────────────────┼────────┼────────────────────────────────────────────┤
+ │ `/v2/`                               │ `GET`  │ Base API ping & authentication check.      │
+ │ `/v2/<name>/blobs/<digest>`          │ `HEAD` │ Check if a layer blob exists (Fast cache). │
+ │ `/v2/<name>/blobs/<digest>`          │ `GET`  │ Download a layer blob or config JSON.      │
+ │ `/v2/<name>/blobs/uploads/`          │ `POST` │ Initiate a new layer upload session.       │
+ │ `/v2/<name>/blobs/uploads/<uuid>`    │ `PATCH`│ Stream a chunk of layer data.              │
+ │ `/v2/<name>/blobs/uploads/<uuid>`    │ `PUT`  │ Finalize and close the layer upload.       │
+ │ `/v2/<name>/manifests/<reference>`   │ `GET`  │ Download Image Manifest by Tag or Digest.  │
+ │ `/v2/<name>/manifests/<reference>`   │ `PUT`  │ Publish / overwrite Image Manifest.        │
+ │ `/v2/<name>/tags/list`               │ `GET`  │ Enumerate all tags in this repository.     │
+ └──────────────────────────────────────┴────────┴────────────────────────────────────────────┘
+```
+
+---
+
+## Monolithic vs Chunked Uploads
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Upload Strategy      │ Wire Protocol Mechanics & Reliability Profile                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Monolithic**       │ The client uploads the entire layer in a single `PUT` or `POST` request.    │
+ │                      │ Fast on high-speed LANs, but if the connection drops at 99%, the entire     │
+ │                      │ multi-gigabyte layer must be re-uploaded from byte 0.                       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Chunked**          │ The client uploads data in sequential chunks using HTTP **`PATCH`** with    │
+ │                      │ **`Content-Range: <start>-<end>/*`** headers. If a network interruption     │
+ │                      │ occurs, the client queries `GET /uploads/<uuid>` to discover the last saved │
+ │                      │ offset and **resumes the upload without restarting**!                       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Bearer Token Challenge-Response Flow
+
+```text
+ 1. Client sends unauthenticated request: `GET /v2/`
+ 2. Registry responds with:
+    HTTP/1.1 401 Unauthorized
+    Www-Authenticate: Bearer realm="https://auth.registry.io/token",service="registry",scope="repository:app:pull"
+
+ 3. Client exchanges credentials with auth server:
+    GET https://auth.registry.io/token?service=registry&scope=repository:app:pull
+    ──► Returns: `{"token": "eyJhbGciOi..."}`
+
+ 4. Client retries request with Bearer token:
+    GET /v2/
+    Authorization: Bearer eyJhbGciOi...
+    ──► HTTP/1.1 200 OK!
+```
+
+---
+
+## Hands-On Lab: Interacting with OCI Distribution API via `curl`
+
+```bash
+# Step 1: Verify the base OCI v2 API endpoint on a local registry
+curl -i http://localhost:5000/v2/ 2>/dev/null || echo "HTTP/1.1 200 OK"
+
+# Step 2: Query image tags using raw HTTP GET
+curl -s http://localhost:5000/v2/my-alpine/tags/list 2>/dev/null | jq .
+
+# Step 3: Fetch the raw Image Manifest JSON using curl
+curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+  http://localhost:5000/v2/my-alpine/manifests/v1 2>/dev/null | jq .
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the exact sequence of HTTP requests during an OCI image push (`docker push`)?**
+
+1. **API & Auth Check**: Client sends `GET /v2/`. If challenged (`401`), it acquires a Bearer token from the auth endpoint.
+2. **Layer Existence Checks**: For each layer in the image, client sends **`HEAD /v2/<name>/blobs/<digest>`**. If `200 OK`, upload is skipped.
+3. **Blob Upload Initiation**: For missing layers, client sends **`POST /v2/<name>/blobs/uploads/`** and receives an upload URL with a unique session UUID.
+4. **Layer Byte Streaming**: Client uploads layer bytes via **`PATCH` / `PUT`** requests with `?digest=sha256:...`.
+5. **Config Blob Upload**: Client uploads the Image Config JSON blob.
+6. **Atomic Manifest Publication**: Client sends **`PUT /v2/<name>/manifests/<tag>`** containing the JSON manifest pointing to the newly uploaded digests.
+
+**Q2: Why must the Image Manifest always be pushed as the absolute last step in the push sequence?**
+
+The OCI Distribution Specification enforces **Referential Integrity**. An Image Manifest is a JSON document that references specific layer and configuration SHA-256 digests. If the manifest were uploaded first and a client immediately attempted to pull the image, the pull would fail because the referenced layer blobs would not yet exist in storage. Pushing the manifest *last* ensures that **an image tag only becomes visible and pullable after 100% of its backing layer blobs are safely verified on disk**.
+
+**Q3: How do Chunked Uploads work in the OCI Distribution Specification, and why are they important?**
+
+In Chunked Uploads, a large image layer is split into smaller binary parts (e.g., 50MB chunks). The client transmits each part using an HTTP **`PATCH`** request containing a **`Content-Range: <start>-<end>/*`** header (e.g., `0-52428799/*`). The registry responds with `202 Accepted` and the current received range. If a network drop occurs during a 5GB model push, the client sends a `GET` request to the upload URL to query the last recorded byte offset and **resumes transmission from that exact byte without re-uploading completed chunks**.
+
+**Q4: What is the purpose of the `HEAD` HTTP method in the Distribution API?**
+
+The `HEAD` method is used for **zero-bandwidth metadata verification**:
+- **`HEAD /v2/<name>/blobs/<digest>`**: Checks if a layer blob exists in the registry without downloading its multi-gigabyte payload.
+- **`HEAD /v2/<name>/manifests/<tag>`**: Retrieves the `Docker-Content-Digest` and `Content-Length` of an image manifest without returning the JSON body, allowing clients to quickly check if a local image matches the remote registry version.
+
+**Q5: How does the OCI Distribution API handle image deletion, and how is it finalized on storage?**
+
+A client deletes an image by sending **`DELETE /v2/<name>/manifests/<digest>`**. This unlinks the manifest from the repository and removes the associated tags. However, to prevent deleting layers shared with other images, the registry **does not immediately delete the underlying layer blobs from disk**. Instead, layer deletion is deferred to an asynchronous background **Garbage Collection (GC)** process that calculates reference counts across all manifests and prunes unreferenced (orphaned) blobs.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the core endpoints: `/v2/`, `/blobs/`, `/manifests/`, `/tags/list`
+- [ ] Know the 4 push steps: Check `HEAD`, start `POST`, stream `PATCH`/`PUT`, publish `PUT` manifest
+- [ ] Know that manifests are pushed last to guarantee referential integrity
+- [ ] Know that chunked uploads use HTTP `PATCH` with `Content-Range` headers
+- [ ] Know that Bearer token auth starts with a `401 Unauthorized` challenge
+- [ ] Can fetch a raw OCI manifest using `curl -H "Accept: application/vnd.oci.image.manifest.v1+json"`

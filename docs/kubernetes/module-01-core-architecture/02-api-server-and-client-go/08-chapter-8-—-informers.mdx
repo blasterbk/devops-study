@@ -1,0 +1,315 @@
+---
+title: "Chapter 8 — Informers"
+sidebar_position: 8
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand how Informers abstract the Watch API into a high-level pattern, provide a local in-memory cache, deliver typed events to handlers, and manage reconnection automatically."
+---
+
+# Chapter 8 — Informers
+
+> **Goal:** Understand how Informers abstract the Watch API into a high-level pattern used by every Kubernetes controller — providing a local cache, typed event handlers, and automatic reconnection logic.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. What an Informer is and why it exists
+> 2. Informer internal components: Reflector, Store, Controller
+> 3. The List + Watch cycle managed by the Reflector
+> 4. The local in-memory object cache (Store)
+> 5. Event Handlers: AddFunc, UpdateFunc, DeleteFunc
+> 6. The DeltaFIFO queue
+> 7. Resync: why periodic reconciliation exists
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Common interview questions include:
+
+> **How does a Kubernetes controller watch for Pod changes without directly calling the Watch API?**
+
+> **How does a controller have a local cache of all Pods without querying the API Server on every reconciliation?**
+
+> **What is the difference between an Informer and a raw Watch?**
+
+Every Kubernetes controller — including `kube-controller-manager`, `kube-scheduler`, and every Operator you write — is built on **Informers**.
+
+Without understanding Informers, you cannot:
+- Write correct, production-grade controllers
+- Understand why `client-go` caches work the way they do
+- Debug controllers that miss events or fail to reconcile
+- Understand how Shared Informers optimize multi-controller clusters
+
+---
+
+# Real-Life Analogy
+
+Think of an Informer like a newspaper subscription service.
+
+```text
+Polling (buying paper every day to check):
+  You visit newsstand every morning, even if no news happened
+
+Watch (raw):
+  You get a phone call every time a headline appears — fragile if phone dies
+
+Informer (subscription):
+  Newspaper office sends all papers to your door (List)
+  Then delivers each new edition as printed (Watch stream)
+  If delivery fails, they resend missing editions automatically
+  You also keep your own copy at home (local cache)
+```
+
+| Newspaper Subscription | Kubernetes Informer |
+| :--- | :--- |
+| Initial batch delivery of all papers | List operation (initial state snapshot) |
+| Daily new edition delivery | Watch stream (change events) |
+| Your home archive | In-memory local cache (Store) |
+| Re-delivery on missed edition | Reconnect + Re-List on Watch failure |
+| Reading your archive at any time | Controller reads from local cache (no API call) |
+
+---
+
+# Why Raw Watches Are Not Enough
+
+A raw Watch API solves real-time event delivery, but has practical problems for controllers:
+
+```text
+Problem 1: No local cache
+  Every reconciliation would require a GET to the API Server
+  -> High API Server load for large clusters
+
+Problem 2: No automatic reconnection
+  On network failure, the Watch drops events
+  -> Controller must manually implement List+Watch recovery
+
+Problem 3: No resync
+  If an event was missed, the controller never re-checks the object
+  -> Silent inconsistency
+
+Problem 4: Thread safety
+  Raw event streams must be carefully synchronized
+  -> Complex, error-prone concurrent code
+```
+
+**Informers solve all four problems.**
+
+---
+
+# Informer Architecture
+
+An Informer has three internal components:
+
+```text
+kube-apiserver
+        |
+        v  (List+Watch)
+   Reflector
+        |
+        v  (raw delta events)
+   DeltaFIFO Queue
+        |
+        v  (processed events)
+   Indexer/Store (in-memory cache)
+        |
+        +----> Event Handlers (AddFunc, UpdateFunc, DeleteFunc)
+        |
+        +----> Lister (read from cache, not API Server)
+```
+
+---
+
+## 1. Reflector
+
+The Reflector manages the List + Watch lifecycle:
+
+```text
+Start
+  |
+  v
+LIST all objects from kube-apiserver
+  Store full snapshot in DeltaFIFO as SYNC events
+  Record resourceVersion from List response
+  |
+  v
+WATCH from recorded resourceVersion
+  Stream ADDED/MODIFIED/DELETED events into DeltaFIFO
+  |
+  v
+On disconnect or 410 Gone:
+  -> Re-LIST from current state
+  -> Start new WATCH from new resourceVersion
+```
+
+The Reflector is responsible for keeping the local cache in sync with the API Server. It runs in a background goroutine and handles all reconnection automatically.
+
+---
+
+## 2. DeltaFIFO Queue
+
+DeltaFIFO is a special FIFO queue that stores **deltas** — change events for each object:
+
+```text
+DeltaFIFO contents per key (namespace/name):
+
+nginx-pod:
+  [ADDED    -> Pod{...}]
+  [MODIFIED -> Pod{...}]
+  [SYNC     -> Pod{...}]
+```
+
+Key properties:
+- Events for the **same object are coalesced** — only the latest state matters
+- Prevents processing a stale version if many events arrive quickly
+- Allows the processor to handle each key sequentially
+
+---
+
+## 3. Indexer / Store
+
+The Store is an in-memory cache of all objects the Informer is watching:
+
+```text
+Store contents:
+  default/nginx-1 -> Pod{...}
+  default/nginx-2 -> Pod{...}
+  production/app  -> Pod{...}
+```
+
+Key properties:
+- Controllers **always read from the Store**, not from the API Server
+- Reads are extremely fast (no network round-trip)
+- The Store is kept in sync by the Reflector
+
+The **Indexer** extends the Store with secondary indices for fast lookup (e.g., all Pods with a specific label or on a specific Node).
+
+---
+
+## 4. Event Handlers
+
+Informers deliver typed events to registered handlers:
+
+```go
+informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+    AddFunc: func(obj interface{}) {
+        pod := obj.(*v1.Pod)
+        fmt.Printf("Pod added: %s/%s\n", pod.Namespace, pod.Name)
+    },
+    UpdateFunc: func(oldObj, newObj interface{}) {
+        // Called when object is modified
+    },
+    DeleteFunc: func(obj interface{}) {
+        // Called when object is deleted
+    },
+})
+```
+
+Event handlers typically **enqueue the object key** into a work queue for deferred reconciliation rather than processing directly in the handler.
+
+---
+
+# Resync
+
+Informers support an optional **resync interval**. When resync fires, all objects currently in the Store are re-delivered as `UpdateFunc` events, even if they haven't changed.
+
+```text
+Resync fires every 30 seconds (configurable):
+  -> All cached Pods re-delivered as UpdateFunc events
+  -> Controller re-reconciles every Pod
+  -> Catches any state drift that was missed
+```
+
+> **Important:** Resync is a **local-only** event — it re-delivers from the in-memory Store, not by querying the API Server. It is a safety net for events that might have been dropped, not a polling mechanism.
+
+---
+
+# Complete Informer Lifecycle
+
+```text
+1. Create Informer for Pods
+  |
+  v
+2. Reflector: LIST /api/v1/pods
+   -> Populate Store with all current Pods
+   -> Record resourceVersion: "183000"
+  |
+  v
+3. Reflector: WATCH from rv 183000
+   -> Stream events into DeltaFIFO
+  |
+  v
+4. New Pod created (rv 183001):
+   DeltaFIFO receives ADDED event
+  |
+  v
+5. Processor dequeues event:
+   -> Updates Store
+   -> Calls AddFunc handler
+   -> Handler enqueues "default/new-pod" into WorkQueue
+  |
+  v
+6. Controller goroutine dequeues from WorkQueue:
+   -> Reads "default/new-pod" from Store (no API call)
+   -> Reconciles desired vs actual state
+  |
+  v
+7. Watch disconnects:
+   Reflector detects, re-LISTs, starts new Watch
+   (transparent to controller)
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. What is an Informer?
+An Informer is a `client-go` component that maintains a local in-memory cache of Kubernetes objects by running the List + Watch pattern automatically. It delivers typed events (AddFunc, UpdateFunc, DeleteFunc) to registered handlers and manages all reconnection logic transparently.
+
+### Q2. What is the Reflector?
+The Reflector is the internal Informer component responsible for executing the List + Watch lifecycle: performing the initial List, storing the snapshot, starting a Watch, and handling reconnection on failure.
+
+### Q3. What is the DeltaFIFO Queue?
+A FIFO queue inside the Informer that buffers raw change events (deltas) from the Reflector before they are processed. It coalesces multiple rapid changes to the same object, ensuring only the latest state is processed.
+
+### Q4. Why do controllers read from the Informer cache instead of the API Server?
+Reading from the in-memory Store is instantaneous and generates no network traffic. It allows controllers to reconcile objects without adding any load to the API Server.
+
+### Q5. What is resync and why is it needed?
+Resync is a periodic re-delivery of all cached objects as UpdateFunc events, triggered by a configurable interval. It is a safety net to re-process any object whose reconciliation may have been missed due to an earlier event processing error.
+
+### Q6. What is the difference between a Watch and an Informer?
+A Watch is a low-level HTTP streaming API that delivers raw JSON events. An Informer is a high-level abstraction on top of Watch that adds: a local cache (Store), typed event handlers, automatic reconnection (Reflector), event coalescing (DeltaFIFO), and periodic resync.
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| Controller misses events after restart | Watch cache expired; Reflector did not re-List | Ensure Informer is used (not raw Watch); check Reflector logs |
+| Stale data in controller | Controller reads from API Server instead of Store | Refactor to read from `informer.GetStore()` / Lister |
+| High API Server load from controller | Polling or direct Gets per reconciliation | Move all reads to Informer cache |
+| Event handler panic causes missed events | Unhandled panic in AddFunc/UpdateFunc | Recover panics in event handlers and re-enqueue |
+| Resync causing unnecessary API Server writes | ResyncPeriod too short | Increase ResyncPeriod; make UpdateFunc idempotent (no-op if no actual change) |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain what an Informer is and the four problems it solves over raw Watches.
+2. Describe the three internal Informer components: Reflector, DeltaFIFO, Store.
+3. Trace the complete List+Watch+event delivery lifecycle of an Informer.
+4. Explain why controllers read from the Informer Store instead of the API Server.
+5. Explain what resync is, how it works, and why it is needed.
+6. Describe the DeltaFIFO queue and why it coalesces events.
+7. Write the correct event handler registration pattern and explain the UpdateFunc signature.
+
+---
+
+# Next Chapter
+
+**Chapter 9 — Shared Informers**
+
+In the next chapter, you'll learn why running multiple separate Informers for the same resource is wasteful, and how `SharedIndexInformer` and `SharedInformerFactory` allow multiple controllers to share a single Informer and cache.

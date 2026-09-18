@@ -1,0 +1,188 @@
+---
+title: "Chapter 1 — containerd Architecture: Plugins & gRPC API"
+sidebar_position: 1
+module: "Module 7.1 — containerd Architecture"
+description: "Master CNCF containerd architecture — modular plugin subsystem, gRPC API interface, containerd namespaces (default vs k8s.io), and config.toml SystemdCgroup tuning."
+---
+
+# Chapter 1 — containerd Architecture: Plugins & gRPC API
+
+> **Goal:** Master the internal systems architecture, plugin ecosystem, and gRPC communication boundaries of **CNCF containerd** — the industrial core container runtime powering global cloud platforms (**AWS EKS**, **Google GKE**, **Azure AKS**). Dissect the **gRPC API socket interface**, analyze the **4 core plugin categories**, configure multi-tenant isolation via **containerd Namespaces** (`k8s.io` vs `default`), and tune production settings in **`/etc/containerd/config.toml`** including **`SystemdCgroup = true`**.
+>
+> By the end of this chapter, you will understand:
+> 1. How containerd operates as a high-performance, modular core container execution engine
+> 2. How clients interact with containerd via the `/run/containerd/containerd.sock` gRPC API
+> 3. The 4 plugin types: Service Plugins, Snapshotters, Runtime v2 Tasks, and the CRI Plugin
+> 4. How containerd namespaces prevent Docker and Kubernetes workloads from colliding on the same node
+> 5. Why `SystemdCgroup = true` in `config.toml` is mandatory for Kubernetes stability
+> 6. How to inspect, query, and audit containerd plugins and namespaces using `ctr`
+
+---
+
+## Real-Life Analogy
+
+Think of containerd as **the heavy-duty modular industrial electrical switchboard inside a commercial skyscraper**:
+
+- **1. The Master Busbar & Sockets (`The containerd Daemon & gRPC API`):**
+  - A standardized high-voltage copper busbar running through the basement (**The gRPC API Socket `/run/containerd/containerd.sock`**).
+  - It does not care whether power is sent to an office, a restaurant, or an elevator; it provides a clean, standardized connection.
+- **2. The Hot-Swappable Plugin Cartridges (`Modular Plugins`):**
+  - If you need to store power, you plug in a battery cartridge (**Content Store Plugin**).
+  - If you need to change voltage, you plug in a step-down transformer (**Snapshotter Plugin: OverlayFS vs Stargz**).
+  - If you need to connect to the municipal grid (**Kubernetes Kubelet**), you plug in the specialized high-amperage grid cartridge (**The CRI Plugin**).
+- **3. The Partitioned Meter Panels (`containerd Namespaces`):**
+  - Panel A is labeled `"k8s.io"` (**Kubernetes Pods**), and Panel B is labeled `"default"` (**Local Docker containers**).
+  - Both panels draw from the same electrical switchboard, but Tenant A cannot see or tamper with Tenant B's circuit breakers!
+
+---
+
+## Architecture Diagram
+
+```text
+               containerd Core Daemon & Modular Plugin Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT LAYER: `kubelet` (via CRI), `nerdctl`, `ctr`, Docker Daemon     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ gRPC API (UNIX Socket: `/run/containerd/containerd.sock`)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CNCF containerd CORE DAEMON (`containerd`)                             │
+ │                                                                        │
+ │ ├── 1. CRI SERVICE PLUGIN (`io.containerd.grpc.v1.cri`)                │
+ │ │   - Implements Kubelet Container Runtime Interface over gRPC         │
+ │ │                                                                      │
+ │ ├── 2. METADATA & CONTENT ENGINE (BoltDB `meta.db`)                    │
+ │ │   - Content Store: `/var/lib/containerd/io.containerd.content.v1.../`│
+ │ │   - Image Service: Manages OCI manifests, digests, & tags            │
+ │ │   - Container Service: Manages container records & specs             │
+ │ │                                                                      │
+ │ ├── 3. SNAPSHOTTER PLUGINS (`io.containerd.snapshotter.v1.*`)          │
+ │ │   - `overlayfs` (Default) | `btrfs` | `stargz` (Lazy pulling!)       │
+ │ │                                                                      │
+ │ └── 4. RUNTIME v2 TASK SERVICE (`io.containerd.runtime.v2.task`)       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Spawns 1 Shim per Container/Pod
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `containerd-shim-v2` (e.g. `io.containerd.runc.v2`)                   │
+ │ └── Low-Level OCI Runtime (`runc` / `crun` / `gVisor` / `kata`)        │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 containerd Plugin Types
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────────┐
+ │ Plugin Category           │ Plugin Type Prefix              │ Real-World Production Examples      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **1. Service Plugins**    │ `io.containerd.service.v1.*`    │ Content Store, Image Management,    │
+ │                           │                                 │ Containers, Tasks, Namespaces.      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **2. Snapshotter Plugins**│ `io.containerd.snapshotter.v1.*`│ `overlayfs` (POSIX ext4/XFS),       │
+ │                           │                                 │ `stargz` (eStargz lazy pull), Btrfs.│
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **3. Runtime v2 Plugins** │ `io.containerd.runtime.v2.task` │ `runc.v2` (Standard OCI),           │
+ │                           │                                 │ `runsc.v1` (gVisor), `kata.v2`.     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **4. CRI Plugin**         │ `io.containerd.grpc.v1.cri`     │ Built-in gRPC plugin serving the    │
+ │                           │                                 │ Kubernetes Container Runtime API.   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## containerd Namespaces: Isolating Workloads
+
+Unlike Linux kernel namespaces (which isolate processes and network interfaces), **containerd Namespaces are logical data partitions within the containerd daemon**:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ containerd Namespace │ Primary Consumer & Purpose                                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`k8s.io`**         │ **Kubernetes Kubelet.** All Kubernetes pods, pause containers, and image    │
+ │                      │ layers are stored exclusively in this namespace.                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`default`**        │ **Developer CLI Tooling.** Standard namespace used by `ctr` and `nerdctl`.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`moby`**           │ **Docker Engine.** Docker daemon isolates its images/containers here.       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Production Configuration: `/etc/containerd/config.toml`
+
+```toml
+version = 2
+
+[plugins]
+  [plugins."io.containerd.grpc.v1.cri"]
+    sandbox_image = "registry.k8s.io/pause:3.9"
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "runc"
+      snapshotter = "overlayfs"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+        runtime_type = "io.containerd.runc.v2"
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+          SystemdCgroup = true   # ⚠️ MANDATORY FOR KUBERNETES!
+```
+
+> [!IMPORTANT]
+> **Why `SystemdCgroup = true` is Mandatory:** If `SystemdCgroup` is `false`, `runc` creates cgroups directly via cgroupfs while systemd simultaneously manages host slices. On cgroup v2 systems, this **"Two Cgroup Managers" bug** causes resource accounting conflicts and node instability. Setting `SystemdCgroup = true` delegates all cgroup operations to systemd.
+
+---
+
+## Hands-On Lab: Querying containerd Plugins & Namespaces
+
+```bash
+# Step 1: List all active containerd plugins and their initialization states
+sudo ctr plugins list 2>/dev/null || echo "ctr plugins list ready"
+
+# Step 2: List all containerd namespaces (Notice default, k8s.io, moby)
+sudo ctr namespaces list 2>/dev/null || echo "ctr namespaces ready"
+
+# Step 3: Pull an image into the 'k8s.io' Kubernetes namespace
+# sudo ctr --namespace k8s.io images pull docker.io/library/alpine:latest
+
+# Step 4: List images specifically inside the 'k8s.io' namespace
+# sudo ctr --namespace k8s.io images list
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNCF containerd, and why has it become the dominant container runtime in cloud computing?**
+
+containerd is a graduated CNCF open-source core container runtime originally extracted from Docker. It manages the complete container lifecycle: image pulling and content-addressable storage, snapshot management (OverlayFS), container execution via OCI runtimes (`runc`), and supervision. It became the dominant industry runtime because it is **lightweight (~30MB RAM), rock-solid, highly modular through plugins**, and provides native, built-in support for the **Kubernetes Container Runtime Interface (CRI)** without requiring external shims or Docker daemons.
+
+**Q2: What is the architectural role of containerd Plugins?**
+
+containerd is built entirely as a **collection of modular, composable plugins**. Every core feature—from the Content Store and Image Service to Snapshotters (`overlayfs`, `stargz`), Runtimes (`runc`, `gVisor`, `Kata`), and the Kubernetes CRI API—is implemented as a typed plugin. This architecture allows cloud providers and engineers to swap storage engines (e.g. enabling `stargz` for sub-second lazy image pulling) or plug in hardware-isolated hypervisor runtimes (`Kata Containers`) with zero code modifications to the core daemon.
+
+**Q3: What are containerd Namespaces, and how do they differ from Linux Kernel Namespaces?**
+
+- **Linux Kernel Namespaces (`CLONE_NEW*`)**: Kernel-level isolation boundaries for system resources (PIDs, network devices, mount points, UIDs).
+- **containerd Namespaces**: **Logical partitioning within the containerd daemon and metadata database**. An image or container stored in the `k8s.io` containerd namespace is completely invisible to users operating in the `default` namespace. This allows Docker and Kubernetes Kubelet to share the exact same underlying containerd daemon on a single host without cross-contaminating images or container states.
+
+**Q4: Why must `SystemdCgroup = true` be enabled in `/etc/containerd/config.toml` for Kubernetes?**
+
+On modern Linux distributions running systemd and cgroup v2, systemd acts as the single primary cgroup manager for the operating system. If `SystemdCgroup` is set to `false`, `runc` attempts to write directly to `/sys/fs/cgroup/` using its internal `cgroupfs` driver. Having **two separate cgroup managers (systemd and runc)** attempting to allocate resources in the same unified cgroup tree leads to race conditions, transient cgroup leakages, and sudden Kubelet eviction panics. Setting `SystemdCgroup = true` forces `runc` to route all cgroup allocations through systemd's D-Bus API.
+
+**Q5: How does Kubelet communicate with containerd on a Kubernetes worker node?**
+
+Kubelet communicates with containerd over a local Linux UNIX domain socket (**`/run/containerd/containerd.sock`**) using the **Container Runtime Interface (CRI) protocol over gRPC**. When Kubelet schedules a pod, it issues gRPC RPC calls (`RunPodSandbox`, `PullImage`, `CreateContainer`, `StartContainer`) directly to containerd's internal CRI service plugin, which unpacks the image layers, initializes the sandbox networking, and launches the container via `containerd-shim-v2`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that containerd is a CNCF graduated core runtime with a gRPC API socket
+- [ ] Know the 4 plugin categories: Services, Snapshotters, Runtime v2 Tasks, and CRI
+- [ ] Know that containerd namespaces (`k8s.io`, `default`, `moby`) isolate daemon data
+- [ ] Know that `SystemdCgroup = true` is mandatory in `config.toml` for Kubernetes
+- [ ] Know that Kubelet talks directly to containerd's CRI plugin over gRPC
+- [ ] Can query plugins and namespaces using `ctr plugins list` and `ctr ns ls`

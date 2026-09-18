@@ -1,0 +1,319 @@
+---
+title: "Chapter 4 — Taints, Tolerations & Dedicated Nodes"
+sidebar_position: 4
+module: "Module 3.6 — Advanced Scheduling"
+description: "Master Kubernetes Taints and Tolerations — NoSchedule, PreferNoSchedule, NoExecute eviction mechanics, tolerationSeconds grace delays, built-in node condition taints, and dedicated node pool patterns."
+---
+
+# Chapter 4 — Taints & Tolerations
+
+> **Goal:** Master the node repulsion and pod admission mechanics of Kubernetes Taints and Tolerations — understanding how taints protect specialized hardware, how `NoExecute` evicts non-tolerating workloads, how `tolerationSeconds` handles network partitions gracefully, how node condition controllers inject built-in taints, and how to construct dedicated node pools by pairing taints with node affinity.
+>
+> By the end of this chapter, you will understand:
+> 1. The complementary relationship: Taints repel Pods; Tolerations allow admission
+> 2. The operational differences between `NoSchedule`, `PreferNoSchedule`, and `NoExecute`
+> 3. How `tolerationSeconds` creates a time-delayed eviction buffer during node failures
+> 4. How the Node Lifecycle Controller uses condition taints (`not-ready`, `unreachable`)
+> 5. How to combine Taints (repulsion) + NodeAffinity (attraction) for dedicated node pools
+> 6. How to write exact (`Equal`) vs wildcard (`Exists`) tolerations
+
+---
+
+## Real-Life Analogy
+
+Think of taints and tolerations as **hazardous environment safety gear in a chemical manufacturing plant**:
+
+- **The Tainted Room (The Tainted Node):** Room 402 is filled with toxic chlorine fumes. The plant manager hangs a danger sign on the door: `hazard=chlorine:NoSchedule` (The Taint).
+- **The Untolerating Worker (Standard Pod):** A regular office worker arrives at Room 402 without safety equipment. The security system stops them at the door and refuses entry (repelled by `NoSchedule`).
+- **The Tolerating Worker (Specialized Pod):** A certified hazmat technician wearing an oxygen mask with a chlorine filter (`toleration: hazard=chlorine`) arrives. Security recognizes the mask and allows them to enter and work inside Room 402.
+- **The Eviction Siren (`NoExecute`):** If a clean room suddenly springs a gas leak while workers are inside, the alarm switches to `hazard=chlorine:NoExecute`. Any worker without an oxygen mask is immediately evacuated (evicted). Workers with a 5-minute emergency oxygen tank (`tolerationSeconds: 300`) have 5 minutes to finish critical tasks before they must evacuate.
+
+---
+
+## Architecture Diagram
+
+```text
+               Taint Effects & Toleration Matching Matrix
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Worker Node: gpu-worker-01                                             │
+ │ Taint: dedicated=gpu:NoSchedule                                        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           ▼                                                 ▼
+ ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+ │ Pod: web-frontend                │     │ Pod: deep-learning-trainer       │
+ │ Tolerations: NONE                │     │ Tolerations:                     │
+ │                                  │     │ - key: dedicated                 │
+ │                                  │     │   operator: Equal                │
+ │ Result: REPELLED & REJECTED!     │     │   value: gpu                     │
+ │ (Cannot schedule on this node)   │     │   effect: NoSchedule             │
+ │                                  │     │                                  │
+ │                                  │     │ Result: TOLERATED & ADMITTED!    │
+ └──────────────────────────────────┘     └──────────────────────────────────┘
+```
+
+---
+
+## Taint Anatomy & Effects
+
+A taint consists of a `Key`, an optional `Value`, and a mandatory `Effect`:
+$$\text{<key>}=\text{<value>}:\text{<effect>}$$
+
+```bash
+# Applying a taint via CLI
+kubectl taint nodes worker-01 dedicated=gpu:NoSchedule
+
+# Removing a taint (append a minus sign)
+kubectl taint nodes worker-01 dedicated=gpu:NoSchedule-
+```
+
+### The Three Taint Effects:
+
+```text
+ ┌───────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ Taint Effect              │ Operational Behavior                                                   │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`NoSchedule`**          │ **Hard Rejection for New Pods.**                                       │
+ │                           │ New Pods without a matching toleration cannot schedule on this node.   │
+ │                           │ Pods *already running* on the node are NOT affected or evicted.       │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`PreferNoSchedule`**    │ **Soft Preference.**                                                   │
+ │                           │ The scheduler attempts to avoid placing non-tolerating Pods here, but  │
+ │                           │ will place them on this node if no other untainted capacity exists.    │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`NoExecute`**           │ **Immediate Eviction & Rejection.**                                    │
+ │                           │ New Pods without toleration are rejected. Existing Pods currently      │
+ │                           │ running on the node that lack a matching toleration are EVICTED!       │
+ └───────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Delayed Eviction: `tolerationSeconds` with `NoExecute`
+
+When a node experiences a hardware fault or network partition, Kubernetes automatically taints the node with:
+```text
+node.kubernetes.io/unreachable:NoExecute
+node.kubernetes.io/not-ready:NoExecute
+```
+
+By default, all standard Kubernetes Pods have an automatic toleration with `tolerationSeconds: 300` (5 minutes) for these taints.
+
+```yaml
+tolerations:
+- key: "node.kubernetes.io/unreachable"
+  operator: "Exists"
+  effect: "NoExecute"
+  tolerationSeconds: 300    # Stay running for 5 minutes before eviction!
+```
+
+```text
+ Why tolerationSeconds matters:
+ - If a worker node suffers a transient 30-second network glitch, Kubelet misses heartbeats.
+ - Because `tolerationSeconds: 300` is active, Kubernetes DOES NOT immediately evict all Pods.
+ - The network recovers after 30s ──► Node returns to Ready ──► Zero unnecessary pod restarts!
+ - If the node remains dead after 300s, eviction occurs, and Pods reschedule onto healthy nodes.
+```
+
+---
+
+## Toleration Operators: `Equal` vs `Exists`
+
+```yaml
+spec:
+  tolerations:
+  # 1. Exact Match: Must match key, value, and effect
+  - key: "dedicated"
+    operator: "Equal"
+    value: "gpu"
+    effect: "NoSchedule"
+
+  # 2. Key Match: Matches key with ANY value
+  - key: "dedicated"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+  # 3. Universal Wildcard: Matches ALL keys, values, and effects!
+  - operator: "Exists"
+```
+
+---
+
+## The Dedicated Node Pool Pattern: Taints + NodeAffinity
+
+> [!IMPORTANT]
+> **A Taint is a REPELLENT, not an ATTRACtor!**
+> Applying `dedicated=gpu:NoSchedule` to a node ensures that non-GPU Pods won't land on it. However, a GPU Pod with a toleration can still schedule on any *ordinary* worker node!
+
+To create a **true dedicated node pool** (where only GPU pods run on GPU nodes, and GPU pods *only* run on GPU nodes), you must **combine Taints with NodeAffinity**:
+
+```text
+ The Dedicated Node Pool Formula:
+
+ 1. On the Node:
+    - Label:  accelerator=nvidia-h100
+    - Taint:  dedicated=gpu:NoSchedule
+
+ 2. On the Pod:
+    - Toleration: Tolerates `dedicated=gpu:NoSchedule` (Allows landing on GPU node)
+    - NodeAffinity: Requires `accelerator=nvidia-h100` (Forces landing on GPU node)
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-training-worker
+spec:
+  replicas: 2
+  template:
+    spec:
+      # 1. Attraction: Force Pod to schedule on GPU nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: accelerator
+                operator: In
+                values: ["nvidia-h100"]
+
+      # 2. Permission: Allow Pod to bypass the GPU node taint
+      tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "gpu"
+        effect: "NoSchedule"
+
+      containers:
+      - name: trainer
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+```
+
+---
+
+## Hands-On Lab: Testing Taint Rejection & NoExecute Eviction
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace taint-lab
+
+# Step 2: Identify a worker node to test
+TEST_NODE=$(kubectl get nodes --no-headers | head -n 1 | awk '{print $1}')
+echo "Target worker node: $TEST_NODE"
+
+# Step 3: Deploy a Pod running on the node
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: innocent-pod
+  namespace: taint-lab
+spec:
+  nodeName: $TEST_NODE    # Explicitly place on this node
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+kubectl wait --for=condition=Ready pod/innocent-pod -n taint-lab --timeout=30s
+
+# Step 4: Apply a NoSchedule taint and verify innocent-pod is STILL RUNNING
+kubectl taint nodes $TEST_NODE security=high:NoSchedule
+kubectl get pod innocent-pod -n taint-lab
+# Status remains: Running! (NoSchedule does not evict existing pods).
+
+# Step 5: Try to deploy a new pod without toleration (Observe Pending state)
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: blocked-pod
+  namespace: taint-lab
+spec:
+  nodeName: $TEST_NODE
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 6: Apply a NoExecute taint and watch innocent-pod get INSTANTLY EVICTED!
+kubectl taint nodes $TEST_NODE emergency=evacuate:NoExecute
+
+# Observe: innocent-pod is immediately terminated!
+kubectl get pods -n taint-lab
+
+# Step 7: Deploy a resilient Pod with a matching toleration
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hazmat-pod
+  namespace: taint-lab
+spec:
+  nodeName: $TEST_NODE
+  tolerations:
+  - key: "security"
+    operator: "Equal"
+    value: "high"
+    effect: "NoSchedule"
+  - key: "emergency"
+    operator: "Equal"
+    value: "evacuate"
+    effect: "NoExecute"
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Verify hazmat-pod schedules and runs successfully!
+kubectl wait --for=condition=Ready pod/hazmat-pod -n taint-lab --timeout=30s
+
+# Step 8: Clean up taints and lab
+kubectl taint nodes $TEST_NODE security=high:NoSchedule-
+kubectl taint nodes $TEST_NODE emergency=evacuate:NoExecute-
+kubectl delete namespace taint-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between a Taint and a Toleration?**
+
+A Taint is a property applied to **Node objects** that allows the node to repel a set of Pods that do not possess matching permissions. A Toleration is a property declared in a **Pod specification** (`spec.tolerations`) that allows (but does not force) the Pod to schedule onto nodes possessing matching taints. Taints act as access control barriers on nodes, while tolerations act as keys that bypass those barriers.
+
+**Q2: How do the three taint effects (`NoSchedule`, `PreferNoSchedule`, `NoExecute`) differ?**
+
+- `NoSchedule`: Prevents new Pods lacking matching tolerations from being scheduled on the node. Existing Pods currently running on the node are unaffected.
+- `PreferNoSchedule`: Soft constraint. The scheduler tries to avoid placing non-tolerating Pods on the node, but will place them there if no other untainted resources are available.
+- `NoExecute`: Rejects new non-tolerating Pods AND immediately evicts any currently running Pods on the node that lack a matching toleration.
+
+**Q3: How does `tolerationSeconds` function with a `NoExecute` taint?**
+
+`tolerationSeconds` defines the time duration (in seconds) that a Pod will remain bound to a node after a `NoExecute` taint is applied. For example, if a node loses connectivity and receives `node.kubernetes.io/unreachable:NoExecute`, a Pod with `tolerationSeconds: 300` will continue running on that node for 5 minutes. If the node recovers within 5 minutes, the Pod is not disrupted; if the node remains unhealthy after 300 seconds, the Pod is evicted and rescheduled.
+
+**Q4: Why does dedicating a node pool require both Taints and NodeAffinity?**
+
+Applying a taint (e.g. `dedicated=gpu:NoSchedule`) only repels general-purpose workloads from landing on expensive GPU nodes. However, it does not prevent a GPU Pod (which tolerates the taint) from accidentally scheduling on a standard, non-GPU node. To create a mutually exclusive dedicated node pool, you must pair the Taint on the node with `NodeAffinity` on the Pod, ensuring general pods are repelled from GPU nodes and GPU pods are attracted exclusively to GPU nodes.
+
+**Q5: What is the difference between `operator: Equal` and `operator: Exists` in a toleration?**
+
+`operator: Equal` (the default) requires the toleration to match the exact `key`, `value`, and `effect` specified in the taint. `operator: Exists` checks only for the existence of the taint `key` and matches regardless of what value is stored in the taint (the `value` field must be omitted). Setting an empty `operator: Exists` toleration without specifying any key acts as a universal wildcard, tolerating all taints across the cluster.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Taints are on Nodes and Tolerations are on Pods
+- [ ] Know the 3 effects: `NoSchedule` (block new), `PreferNoSchedule` (soft block), `NoExecute` (evict running)
+- [ ] Know that `tolerationSeconds` provides delayed eviction buffers during node failures
+- [ ] Know the difference between `operator: Equal` and `operator: Exists`
+- [ ] Know that an empty `operator: Exists` tolerates all taints in the cluster
+- [ ] Know how to pair Taints (repel) + NodeAffinity (attract) for dedicated node pools
+- [ ] Can add and remove node taints using `kubectl taint nodes <node> <key>=<val>:<effect>`

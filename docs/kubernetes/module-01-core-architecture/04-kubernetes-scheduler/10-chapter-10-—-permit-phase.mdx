@@ -1,0 +1,1504 @@
+---
+title: "Chapter 10 — Permit Phase"
+sidebar_position: 10
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand one of the most advanced extension points in the Kubernetes Scheduling Framework—the **Permit Phase**. Learn how Permit Plugins can tempo..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 10 — Permit Phase
+
+> **Goal:** Understand one of the most advanced extension points in the Kubernetes Scheduling Framework—the **Permit Phase**. Learn how Permit Plugins can temporarily pause scheduling, approve or reject scheduling decisions, coordinate multiple Pods through Gang Scheduling, handle timeouts, and enable sophisticated scheduling policies for production workloads.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why the Permit phase exists (final gate before binding)
+> 2. Three Permit outcomes: Approve, Wait, Reject
+> 3. Gang scheduling: holding Pods until the full group can schedule
+> 4. Permit timeout: what happens when Wait expires
+> 5. How Permit interacts with Reserve and Unreserve
+> 6. WaitingPod API: how plugins approve or reject waiting Pods
+> 7. Real production use cases: Volcano, Coscheduling
+> 8. Permit plugin implementation guide
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Permit Phase like a visa approval waiting period.
+
+```text
+Visa Application Analogy:
+
+Passport submitted (scheduling completed: Node selected)
+Visa officer reviews (Permit plugin evaluates)
+Approve: board immediately (binding proceeds)
+Wait: application under review (Pod held, binding paused)
+Reject: denied entry (Pod returned to unschedulable queue)
+Timeout: application abandoned, reapply later (Permit timeout)
+```
+
+| Visa Application | Permit Phase |
+| :--- | :--- |
+| Passport submitted | Scheduling complete: Node selected, reserved |
+| Visa officer | Permit plugin |
+| Visa approved | Permit returns Approve -> binding proceeds |
+| Application under review | Permit returns Wait -> Pod held |
+| Visa denied | Permit returns Reject -> scheduling fails |
+| Application timeout | Permit Wait timeout -> Pod re-queued |
+
+> **Important:** Permit Wait is **bounded by a timeout**. If no plugin approves the waiting Pod before the timeout expires, the Pod is **rejected** and returns to the Scheduling Queue for a retry — it is not dropped. The timeout prevents Pods from blocking the binding cycle indefinitely.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Scheduling Framework
+- Scheduling Cycle
+- Reserve Phase
+- Scheduler Cache
+- Binding Cycle
+- Kubernetes Jobs
+- Pod Priority
+
+---
+
+# Where Does Permit Fit?
+
+The Scheduling Framework executes:
+
+```text
+Scheduling Queue
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+PreBind
+
+v
+
+Bind
+```
+
+Permit executes **after resources have been reserved** but **before binding begins**.
+
+---
+
+# Why Does the Permit Phase Exist?
+
+Imagine Kubernetes schedules a Pod.
+
+Everything succeeds:
+
+```text
+Filter
+
+✓
+
+v
+
+Score
+
+✓
+
+v
+
+Reserve
+
+✓
+```
+
+Normally,
+
+the Scheduler would immediately bind the Pod.
+
+But what if we want to wait?
+
+---
+
+# Real-World Example
+
+Suppose an AI training workload needs:
+
+```text
+8 Pods
+
+v
+
+Start Together
+```
+
+If Kubernetes starts only one Pod:
+
+```text
+Pod-1
+
+Running
+
+v
+
+Waiting
+
+v
+
+Waiting
+
+v
+
+Waiting...
+```
+
+GPU resources remain idle.
+
+This is inefficient.
+
+Instead,
+
+all Pods should begin together.
+
+This is exactly what the Permit phase enables.
+
+---
+
+# Simple Definition
+
+The Permit Phase is:
+
+> **A Scheduling Framework extension point that can temporarily pause, approve, or reject a scheduling decision before binding occurs.**
+
+Unlike Filter or Score,
+
+Permit controls **when** scheduling continues.
+
+---
+
+# High-Level Architecture
+
+```text
+Scheduling Complete
+
+v
+
+Reserve
+
+v
+
+Permit Plugin
+
+      |
+
+ ┌────┼────┐
+
+ ▼    ▼    ▼
+
+Wait Approve Reject
+
+ |     |      |
+
+ ▼     ▼      ▼
+
+Pause Bind   Rollback
+```
+
+---
+
+# Why Isn't Reserve Enough?
+
+Reserve prevents race conditions.
+
+Permit solves a different problem.
+
+Reserve answers:
+
+```text
+Can I safely reserve
+resources?
+```
+
+Permit answers:
+
+```text
+Should I proceed
+right now?
+```
+
+These are different decisions.
+
+---
+
+# Permit Plugin
+
+The Scheduling Framework provides:
+
+```text
+Permit Plugin
+```
+
+Purpose:
+
+> **Control whether scheduling continues immediately, waits, or stops.**
+
+---
+
+# Permit Plugin Interface
+
+Conceptually:
+
+```text
+Selected Node
+
+v
+
+Permit()
+
+v
+
+Wait?
+
+Approve?
+
+Reject?
+```
+
+Every Permit Plugin returns one of three outcomes.
+
+---
+
+# Three Possible Results
+
+```text
+Permit()
+
+v
+
+WAIT
+
+or
+
+APPROVE
+
+or
+
+REJECT
+```
+
+Each result changes Scheduler behavior.
+
+---
+
+# WAIT
+
+The most unique feature of Permit is:
+
+```text
+WAIT
+```
+
+Instead of continuing,
+
+the Scheduler pauses the Pod.
+
+---
+
+# WAIT Workflow
+
+```text
+Reserve
+
+v
+
+Permit
+
+v
+
+WAIT
+
+v
+
+Pod Stored
+
+v
+
+Approval Later
+
+v
+
+Bind
+```
+
+The Pod is **not bound** yet.
+
+---
+
+# What Happens During WAIT?
+
+The Scheduler maintains:
+
+```text
+Reserved Resources
+
+✓
+
+Scheduler Cache
+
+✓
+
+Assumed Pod
+
+✓
+```
+
+But:
+
+```text
+API Server Updated?
+
+No
+
+Container Started?
+
+No
+```
+
+The Pod exists only within the Scheduler's internal workflow.
+
+---
+
+# Example
+
+Training job:
+
+```text
+Pod-1
+
+v
+
+WAIT
+
+Pod-2
+
+v
+
+WAIT
+
+Pod-3
+
+v
+
+WAIT
+
+Pod-4
+
+v
+
+WAIT
+```
+
+Nothing starts yet.
+
+---
+
+# APPROVE
+
+Eventually,
+
+someone or something approves waiting Pods.
+
+Result:
+
+```text
+WAIT
+
+v
+
+APPROVE
+
+v
+
+PreBind
+
+v
+
+Bind
+
+v
+
+Running
+```
+
+Scheduling continues normally.
+
+---
+
+# Who Approves?
+
+Approval may come from:
+
+- Another Permit Plugin
+- A Gang Scheduler
+- A Custom Scheduler Extension
+- An External Controller
+- A Scheduling Framework implementation
+
+The Scheduler itself does not automatically approve arbitrary waiting Pods; approval depends on plugin logic.
+
+---
+
+# Example
+
+Permit Plugin waits until:
+
+```text
+8 Pods Ready
+```
+
+Once all arrive:
+
+```text
+Approve
+
+v
+
+All Continue
+
+v
+
+Bind
+```
+
+---
+
+# REJECT
+
+Sometimes scheduling must stop.
+
+Example:
+
+```text
+External System
+
+v
+
+Resource Gone
+```
+
+The Permit Plugin returns:
+
+```text
+REJECT
+```
+
+---
+
+# REJECT Workflow
+
+```text
+Reserve
+
+v
+
+Permit
+
+v
+
+REJECT
+
+v
+
+Unreserve
+
+v
+
+Rollback
+
+v
+
+Requeue
+```
+
+Nothing reaches the API Server.
+
+---
+
+# Difference Between Reject and Filter Failure
+
+Filter failure:
+
+```text
+Node
+
+Cannot Run Pod
+```
+
+Permit rejection:
+
+```text
+Node Was Valid
+
+v
+
+Policy Says
+
+Don't Continue
+```
+
+Filtering evaluates feasibility.
+
+Permit evaluates scheduling policy.
+
+---
+
+# Gang Scheduling
+
+Gang Scheduling is the most famous Permit use case.
+
+---
+
+# What is Gang Scheduling?
+
+Suppose a distributed application needs:
+
+```text
+Coordinator
+
++
+
+4 Workers
+```
+
+Starting only one Worker is useless.
+
+Instead:
+
+```text
+Coordinator
+
+v
+
+Worker-1
+
+v
+
+Worker-2
+
+v
+
+Worker-3
+
+v
+
+Worker-4
+
+v
+
+Start Together
+```
+
+---
+
+# Why Gang Scheduling?
+
+Examples:
+
+- MPI
+- TensorFlow Distributed
+- PyTorch Distributed
+- Spark Executors
+- Ray Clusters
+- HPC Applications
+
+These workloads depend on multiple Pods becoming available together.
+
+---
+
+# Without Gang Scheduling
+
+```text
+Worker-1
+
+Running
+
+v
+
+Waiting
+
+v
+
+Idle
+```
+
+Resources are wasted.
+
+---
+
+# With Gang Scheduling
+
+```text
+Pod A
+
+WAIT
+
+Pod B
+
+WAIT
+
+Pod C
+
+WAIT
+
+Pod D
+
+WAIT
+
+v
+
+All Approved
+
+v
+
+All Bound
+```
+
+Resources are used efficiently.
+
+---
+
+# Gang Scheduling Architecture
+
+```text
+Pods
+
+v
+
+Permit Plugin
+
+v
+
+Waiting Group
+
+v
+
+Enough Members?
+
+ |
+
+ +-- No
+
+ |
+
+ ▼
+
+ WAIT
+
+ |
+
+ +-- Yes
+
+      |
+
+      ▼
+
+ APPROVE ALL
+
+      |
+
+      ▼
+
+ Binding
+```
+
+---
+
+# Multi-Pod Scheduling
+
+Permit enables scheduling decisions that involve multiple Pods instead of just one.
+
+Traditional scheduling:
+
+```text
+Pod A
+
+v
+
+Schedule
+
+v
+
+Bind
+```
+
+Permit allows:
+
+```text
+Pod A
+
+WAIT
+
+v
+
+Pod B
+
+WAIT
+
+v
+
+Pod C
+
+WAIT
+
+v
+
+Group Decision
+
+v
+
+Bind All
+```
+
+---
+
+# Why Multi-Pod Scheduling?
+
+Some workloads require:
+
+- Simultaneous startup
+- Shared resources
+- Collective synchronization
+- Distributed initialization
+- Barrier-based execution
+
+Permit provides the scheduling barrier.
+
+---
+
+# Scheduling Barrier
+
+Think of WAIT as a barrier.
+
+```text
+Pod
+
+v
+
+WAIT
+
+v
+
+Barrier
+
+v
+
+Release
+
+v
+
+Continue
+```
+
+No Pod crosses until approval.
+
+---
+
+# Timeout
+
+What if approval never arrives?
+
+Pods cannot wait forever.
+
+---
+
+# Timeout Workflow
+
+```text
+WAIT
+
+v
+
+Timer Starts
+
+v
+
+Approved?
+
+ |
+
+ +-- Yes
+
+ |
+
+ ▼
+
+ Continue
+
+ |
+
+ +-- No
+
+      |
+
+      ▼
+
+ Timeout
+
+      |
+
+      ▼
+
+ Reject
+
+      |
+
+      ▼
+
+ Rollback
+```
+
+---
+
+# Example
+
+Permit configuration:
+
+```text
+Timeout
+
+60 Seconds
+```
+
+Timeline:
+
+```text
+0 sec
+
+WAIT
+
+v
+
+30 sec
+
+Still Waiting
+
+v
+
+60 sec
+
+Timeout
+
+v
+
+Reject
+
+v
+
+Rollback
+```
+
+---
+
+# Why Timeout Exists
+
+Without timeout:
+
+```text
+WAIT
+
+v
+
+Forever
+```
+
+Reserved resources would never be released.
+
+Timeout guarantees forward progress.
+
+---
+
+# Timeout and Reservation
+
+During waiting:
+
+```text
+Resources
+
+Remain Reserved
+```
+
+If timeout occurs:
+
+```text
+Unreserve
+
+v
+
+Resources Released
+```
+
+This prevents resource leakage.
+
+---
+
+# Complete Permit Lifecycle
+
+```text
+Scheduling Complete
+
+v
+
+Reserve
+
+v
+
+Permit
+
+      |
+
+ ┌────┼────┐
+
+ ▼    ▼    ▼
+
+Wait Approve Reject
+
+ |      |      |
+
+ ▼      ▼      ▼
+
+Timer  PreBind Rollback
+
+ |
+
+ ▼
+
+Timeout?
+
+ |
+
+ +-- Yes
+
+ |
+
+ ▼
+
+Reject
+
+ |
+
+ +-- No
+
+      |
+
+      ▼
+
+Approve
+
+      |
+
+      ▼
+
+PreBind
+
+      |
+
+      ▼
+
+Bind
+```
+
+---
+
+# Production Example 1
+
+AI Training Cluster
+
+Training Job:
+
+```text
+16 GPUs
+
+v
+
+16 Pods
+```
+
+Permit Plugin:
+
+```text
+Wait Until
+
+16 Pods Reserved
+
+v
+
+Approve
+
+v
+
+Bind Together
+```
+
+---
+
+# Production Example 2
+
+Spark Cluster
+
+Components:
+
+```text
+Driver
+
++
+
+10 Executors
+```
+
+Executors wait.
+
+Driver waits.
+
+Once enough components are available:
+
+```text
+Approve
+
+v
+
+Cluster Starts
+```
+
+---
+
+# Production Example 3
+
+High-Performance Computing
+
+Simulation:
+
+```text
+64 Compute Pods
+```
+
+Partial startup:
+
+```text
+Inefficient
+```
+
+Permit waits until:
+
+```text
+64 Pods Ready
+```
+
+Then releases all.
+
+---
+
+# Production Example 4
+
+External Resource Coordination
+
+Suppose a workload needs:
+
+- Kubernetes resources
+- External license
+- Hardware reservation
+
+Workflow:
+
+```text
+Reserve
+
+v
+
+Permit WAIT
+
+v
+
+External Approval
+
+v
+
+APPROVE
+
+v
+
+Bind
+```
+
+If the external system denies access:
+
+```text
+REJECT
+
+v
+
+Rollback
+```
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Scheduling Queue
+
+v
+
+Scheduler Cache
+
+v
+
+Filter
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+PreBind
+
+v
+
+Bind
+
+v
+
+API Server
+```
+
+Permit is the final decision point before Kubernetes commits the scheduling decision.
+
+---
+
+# Internal Scheduler Workflow
+
+```text
+Winning Node
+
+v
+
+Reserve
+
+v
+
+Assumed Pod
+
+v
+
+Permit Plugin
+
+v
+
+WAIT
+
+v
+
+Approval
+
+v
+
+PreBind
+
+v
+
+Bind
+```
+
+Failure path:
+
+```text
+Permit
+
+v
+
+Reject
+
+v
+
+Unreserve
+
+v
+
+Remove Assumed Pod
+
+v
+
+Restore Scheduler Cache
+
+v
+
+Requeue Pod
+```
+
+---
+
+# Performance Considerations
+
+Permit should be used carefully.
+
+Every waiting Pod:
+
+- Occupies Scheduler memory
+- Holds reserved resources
+- Delays scheduling completion
+
+Excessive waiting can reduce scheduling throughput.
+
+Well-designed Permit plugins:
+
+- Minimize wait duration
+- Use reasonable timeouts
+- Avoid unnecessary waiting groups
+
+---
+
+# Production Best Practices
+
+✔ Use Permit only when coordination across Pods is required.
+
+✔ Configure realistic timeout values.
+
+✔ Always release resources on timeout or rejection.
+
+✔ Keep Permit plugin logic lightweight and deterministic.
+
+✔ Avoid long-running network calls inside Permit.
+
+✔ Use Gang Scheduling only for workloads that truly require synchronized startup.
+
+✔ Monitor waiting Pods and timeout events.
+
+✔ Ensure Permit plugins cooperate correctly with Reserve and Unreserve.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Permit chooses the best Node.
+
+Wrong.
+
+Node selection is already complete before Permit executes.
+
+---
+
+### ❌ Misconception 2
+
+WAIT means the Pod is running.
+
+Wrong.
+
+The Pod is only waiting inside the Scheduler. Binding has not occurred.
+
+---
+
+### ❌ Misconception 3
+
+Resources are released while a Pod waits.
+
+Wrong.
+
+Reserved resources remain allocated in the Scheduler Cache until approval or rollback.
+
+---
+
+### ❌ Misconception 4
+
+Permit replaces the Reserve phase.
+
+Wrong.
+
+Reserve protects resource accounting. Permit controls scheduling progression.
+
+---
+
+### ❌ Misconception 5
+
+Gang Scheduling is built into every Kubernetes cluster.
+
+Wrong.
+
+The Scheduling Framework provides the Permit extension point, but Gang Scheduling behavior typically requires additional plugins or scheduler extensions.
+
+---
+
+### ❌ Misconception 6
+
+Timeout automatically binds waiting Pods.
+
+Wrong.
+
+Timeout usually results in rejection and rollback, not approval.
+
+---
+
+### ❌ Misconception 7
+
+Permit Plugins are useful for every workload.
+
+Wrong.
+
+Most applications do not require coordinated multi-Pod scheduling.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the purpose of the Permit phase?
+
+To pause, approve, or reject scheduling after reservation but before binding.
+
+---
+
+### Q2. What are the three possible Permit Plugin outcomes?
+
+WAIT, APPROVE, and REJECT.
+
+---
+
+### Q3. What happens when a Permit Plugin returns WAIT?
+
+The Pod remains reserved in the Scheduler while binding is delayed until approval or timeout.
+
+---
+
+### Q4. What happens when a Permit Plugin returns APPROVE?
+
+Scheduling proceeds to the PreBind and Bind phases.
+
+---
+
+### Q5. What happens when a Permit Plugin returns REJECT?
+
+The Scheduler rolls back the reservation through `Unreserve()` and requeues the Pod.
+
+---
+
+### Q6. Why is Gang Scheduling commonly implemented using Permit?
+
+Because Permit can delay binding until all required Pods are ready to start together.
+
+---
+
+### Q7. Why is a timeout required during WAIT?
+
+To prevent Pods from waiting indefinitely and holding reserved resources forever.
+
+---
+
+### Q8. What is the relationship between Reserve and Permit?
+
+Reserve temporarily reserves resources, while Permit decides whether scheduling should continue immediately, wait, or stop.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pods remain in WAIT state | Approval condition has not been satisfied or coordinating controller is not responding |
+| Frequent Permit timeouts | Timeout value too short or workload cannot satisfy synchronization conditions |
+| Resources appear unavailable while Pods are waiting | Reserved resources are held until approval or rollback |
+| Gang-scheduled workload never starts | Required number of Pods or external approval condition is not being met |
+| Pods repeatedly requeued | Permit rejection or timeout triggers rollback and another scheduling attempt |
+| Reduced scheduling throughput | Too many Pods spending long periods in the WAIT state |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does the Permit phase exist?
+2. What is the role of a Permit Plugin?
+3. What are the three possible outcomes of `Permit()`?
+4. What happens when a Pod enters the WAIT state?
+5. Who or what can approve a waiting Pod?
+6. How does REJECT differ from a Filter failure?
+7. Why is Gang Scheduling implemented using Permit?
+8. What is a scheduling barrier?
+9. Why is timeout handling necessary?
+10. What happens to reserved resources when a timeout occurs?
+11. How does Permit enable multi-Pod scheduling?
+12. Why should Permit plugins be used sparingly?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the Permit phase allows Kubernetes to **delay or control the final commitment** of a scheduling decision.
+
+You learned:
+
+- Why the Permit phase exists
+- How Permit Plugins return WAIT, APPROVE, or REJECT
+- How WAIT temporarily pauses scheduling while keeping resources reserved
+- How APPROVE allows scheduling to continue to binding
+- How REJECT triggers rollback through `Unreserve()`
+- Why Permit is the foundation for Gang Scheduling and coordinated multi-Pod workloads
+- How timeout handling prevents indefinite resource reservation
+- How Permit enables advanced scheduling policies without modifying the core Scheduler
+
+The Permit phase introduces a powerful synchronization point into the Scheduling Framework. While most workloads proceed directly from Reserve to Bind, complex distributed applications can use Permit to coordinate multiple Pods, enforce external policies, and ensure that resources are committed only when all scheduling conditions have been satisfied.
+
+---
+
+# Next Chapter
+
+**Chapter 11 — Bind Phase**
+
+In the next chapter, we'll examine the final step where Kubernetes commits the scheduling decision.
+
+Topics include:
+
+- Bind Plugins
+- Default Binder
+- API Server Binding Request
+- `spec.nodeName` Update
+- Binding Object
+- Scheduler-to-API Server Communication
+- Binding Failures
+- PostBind Plugins
+- End-to-End Binding Workflow
+
+You'll learn exactly how a selected Node becomes permanently associated with a Pod and how the Scheduler hands control over to the kubelet.
+```

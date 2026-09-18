@@ -1,0 +1,301 @@
+---
+title: "Chapter 2 — Cilium Architecture"
+sidebar_position: 2
+module: "Module 2.3 — eBPF"
+description: "Deep dive into Cilium's eBPF architecture — how cilium-agent compiles and loads eBPF programs, the endpoint map lifecycle, BPF filesystem pinning, policy compilation pipeline, and the data path for Pod-to-Pod and Service traffic."
+---
+
+# Chapter 2 — Cilium's eBPF Architecture
+
+> **Goal:** Understand how Cilium translates Kubernetes NetworkPolicy and Service objects into eBPF programs and maps, how endpoints are tracked, and how data flows through Cilium's dataplane for Pod-to-Pod and ClusterIP Service traffic.
+>
+> By the end of this chapter, you will understand:
+> 1. How cilium-agent compiles and loads eBPF programs per endpoint
+> 2. The BPF filesystem — how programs and maps are pinned persistently
+> 3. Cilium's endpoint lifecycle: from Pod creation to eBPF program attachment
+> 4. The policy compilation pipeline: NetworkPolicy → eBPF map entries
+> 5. The complete data path for Pod-to-Pod traffic through Cilium
+> 6. How Cilium handles Service ClusterIP DNAT in eBPF
+
+---
+
+## Real-Life Analogy
+
+Cilium-agent is like a **custom law firm for each apartment** (Pod) in a building:
+
+When a new tenant (Pod) moves in, the firm:
+1. Creates a **personalized rule book** (compiled eBPF program) based on the tenant's specific lease terms (NetworkPolicy)
+2. Installs **smart locks** at each entrance (TC hooks on the veth pair) that enforce the rule book
+3. Stores a **tenant identity card** (endpoint identity in eBPF map)
+
+When a visitor (packet) arrives, the smart lock instantly checks the rule book using the visitor's badge number — no human guard (iptables rule scanning) needed. When the tenant leaves (Pod deleted), the locks are removed and the rule book is destroyed.
+
+---
+
+## Architecture Diagram
+
+```text
+              Cilium eBPF Data Path Overview
+
+  Pod A (identity: 12345)          Pod B (identity: 67890)
+  ┌─────────────────────┐          ┌─────────────────────┐
+  │   eth0              │          │   eth0              │
+  └──────────┬──────────┘          └──────────┬──────────┘
+             │ veth pair                       │ veth pair
+  ┌──────────▼──────────┐          ┌──────────▼──────────┐
+  │  lxcXXXXXX          │          │  lxcYYYYYY          │
+  │  (host-side veth)   │          │  (host-side veth)   │
+  │                     │          │                     │
+  │  TC egress hook:    │          │  TC ingress hook:   │
+  │  bpf_lxc.o          │          │  bpf_lxc.o          │
+  │  - Lookup policy    │          │  - Check identity   │
+  │  - Apply DNAT       │ ───────▶ │  - Apply policy     │
+  │  - Redirect/drop    │          │  - Pass or drop     │
+  └─────────────────────┘          └─────────────────────┘
+
+  eBPF Maps (shared state):
+  ┌──────────────────────────────────────────────────────┐
+  │  cilium_lxc          - Endpoint map (IP → identity)  │
+  │  cilium_policy_*     - Per-endpoint policy maps      │
+  │  cilium_lb_backends  - Service backend map           │
+  │  cilium_ct_*         - Connection tracking tables    │
+  │  cilium_ipcache      - Cluster-wide IP → identity    │
+  └──────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Endpoint Lifecycle
+
+When Kubernetes schedules a Pod on a Cilium-managed node:
+
+```text
+Step 1: Container runtime creates pause container → new netns
+         containerd calls Cilium CNI plugin
+
+Step 2: Cilium CNI plugin calls cilium-agent via Unix socket
+         Request: "I have a new endpoint at netns=/proc/12345/ns/net"
+
+Step 3: cilium-agent processes the new endpoint:
+  a. Allocates IP from IPAM pool
+  b. Creates veth pair (lxcXXXXXX ↔ eth0 in Pod netns)
+  c. Assigns endpoint identity based on Pod labels
+     {app: frontend, env: prod} → identity 12345
+
+Step 4: cilium-agent compiles eBPF programs for this endpoint:
+  - Template: /var/run/cilium/state/<endpoint-id>/bpf_lxc.c
+  - Compiled with endpoint-specific constants (identity, IPs)
+  - Loaded into kernel and attached to lxcXXXXXX TC hooks
+
+Step 5: Policy map populated:
+  - Reads all CiliumNetworkPolicy / NetworkPolicy objects
+  - Computes which identities are allowed to communicate
+  - Writes allowed identity pairs into cilium_policy_<id> map
+
+Step 6: ipcache updated:
+  - Maps Pod IP 10.244.1.5 → identity 12345
+  - Distributed to all other nodes via Cilium's KVStore
+```
+
+---
+
+## BPF Filesystem: Persistent Program Storage
+
+eBPF programs and maps are stored on the **BPF filesystem** (`/sys/fs/bpf`), allowing them to persist beyond the process that loaded them:
+
+```bash
+# Cilium's BPF filesystem layout
+ls /sys/fs/bpf/cilium/
+# cilium_calls_*        ← Tail call programs (jump tables)
+# cilium_ct_*           ← Connection tracking maps
+# cilium_ipcache        ← IP → identity mapping (cluster-wide)
+# cilium_lb_backends    ← Service load balancer backends
+# cilium_lb_services    ← Service VIP → backend map
+# cilium_lxc            ← Endpoint map (all local Pods)
+# cilium_policy_*       ← Per-endpoint policy maps
+
+# Per-endpoint programs and maps
+ls /var/run/cilium/state/
+# 12345/  ← Endpoint ID directory
+#   bpf_lxc.c      ← Template C source
+#   bpf_lxc.o      ← Compiled eBPF object
+#   bpf_lxc.ll     ← LLVM IR (for debugging)
+#   ep_config.h    ← Per-endpoint compile-time constants
+
+# Inspect endpoint eBPF programs
+bpftool prog list | grep cil
+# 42: sched_cls name cil_to_container  ← TC ingress to Pod
+# 43: sched_cls name cil_from_container  ← TC egress from Pod
+```
+
+---
+
+## The Policy Compilation Pipeline
+
+Cilium's policy engine translates Kubernetes NetworkPolicy (and CiliumNetworkPolicy) into eBPF map entries:
+
+```text
+Input: NetworkPolicy YAML
+  → Allow: app=frontend → app=backend, port 8080
+
+Translation:
+  1. cilium-agent watches API for NetworkPolicy changes
+  2. Labels {app: frontend} → identity set (e.g., {12345, 12346, ...})
+     (computed via selector matching against endpoint identities)
+  3. Policy is distilled to: "allow identity {12345, 12346} on port 8080"
+  4. Written into cilium_policy_<backend-endpoint-id> map:
+     Key: (identity=12345, protocol=TCP, port=8080) → Value: ALLOW
+     Key: (identity=12346, protocol=TCP, port=8080) → Value: ALLOW
+     Key: (wildcard) → Value: DROP
+
+At packet time (TC hook on backend Pod's veth):
+  1. Incoming packet arrives
+  2. TC program looks up src IP in cilium_ipcache map → gets identity 12345
+  3. Looks up (identity=12345, TCP, port=8080) in policy map
+  4. Gets ALLOW → passes packet to Pod
+  Total: 2 hash map lookups (O(1))
+```
+
+---
+
+## Pod-to-Pod Data Path (Same Node)
+
+```text
+Pod A (10.244.1.5, identity 12345) → Pod B (10.244.1.8, identity 67890)
+
+1. Pod A sends packet via eth0
+2. Packet exits Pod A's netns → enters lxcAAAA (host-side veth)
+
+3. TC egress hook fires on lxcAAAA (cil_from_container):
+   - Look up dst 10.244.1.8 in cilium_lxc map → "it's a local endpoint"
+   - Check egress policy for identity 12345 → allowed
+   - Redirect packet to lxcBBBB's ingress (skip kernel routing)
+
+4. TC ingress hook fires on lxcBBBB (cil_to_container):
+   - Look up src identity (12345) in cilium_ipcache
+   - Check ingress policy for Pod B → allowed
+   - Pass packet into Pod B's netns
+```
+
+No iptables, no routing table lookup. Two TC hooks + 3 map lookups. Packet goes directly from one veth to the other via an eBPF redirect call.
+
+---
+
+## Pod-to-Pod Data Path (Cross Node)
+
+```text
+Pod A (10.244.1.5, Node A) → Pod C (10.244.2.3, Node B)
+
+On Node A:
+1. TC egress hook on lxcAAAA:
+   - Look up 10.244.2.3 in cilium_ipcache → "remote identity, on Node B"
+   - Encapsulate (VXLAN or native routing) with Pod A's identity in header
+   - Route via physical NIC to Node B
+
+On Node B:
+2. TC ingress hook on physical NIC:
+   - Decapsulate (if VXLAN)
+   - Extract sender identity from packet metadata
+   - Look up identity in cilium_ipcache
+   
+3. TC ingress hook on lxcCCCC:
+   - Identity already resolved
+   - Policy check: does identity 12345 (Pod A) have access to Pod C?
+   - ALLOW → deliver to Pod C
+```
+
+---
+
+## Service ClusterIP in eBPF
+
+Cilium's eBPF handles Service DNAT without kube-proxy:
+
+```text
+Pod A → ClusterIP 10.96.0.10:80 (Service "backend-svc")
+
+TC egress hook on lxcAAAA (or socket-level hook):
+1. Detect: dst IP is a ClusterIP (lookup in cilium_lb_services map)
+2. Select backend using consistent hashing:
+   backends = [10.244.1.8:8080, 10.244.2.3:8080]
+   chosen = hash(src_ip, src_port) % len(backends) → 10.244.1.8:8080
+3. Rewrite dst IP: 10.96.0.10:80 → 10.244.1.8:8080
+4. Record DNAT entry in connection tracking map (cilium_ct_*)
+5. Continue with normal Pod-to-Pod forwarding
+
+Return path (10.244.1.8 → Pod A):
+6. TC hook on lxcAAAA ingress:
+   Look up CT entry: src=10.244.1.8:8080 → translate back to 10.96.0.10:80
+   Pod A sees response from the ClusterIP, not the backend Pod IP
+```
+
+---
+
+## Hands-On: Inspecting Cilium eBPF
+
+```bash
+# 1. List all Cilium-managed endpoints
+kubectl exec -n kube-system cilium-<id> -- cilium endpoint list
+
+# 2. Inspect eBPF programs for a specific endpoint
+ENDPOINT_ID=12345
+kubectl exec -n kube-system cilium-<id> -- \
+  bpftool prog list | grep -A2 "endpoint $ENDPOINT_ID"
+
+# 3. Dump the ipcache map (IP → identity mapping)
+kubectl exec -n kube-system cilium-<id> -- cilium bpf ipcache list
+
+# 4. Dump the Service load balancer map
+kubectl exec -n kube-system cilium-<id> -- cilium bpf lb list
+kubectl exec -n kube-system cilium-<id> -- cilium bpf lb list --backends
+
+# 5. Dump connection tracking table
+kubectl exec -n kube-system cilium-<id> -- cilium bpf ct list global
+
+# 6. Check policy enforcement for an endpoint
+kubectl exec -n kube-system cilium-<id> -- cilium policy get
+kubectl exec -n kube-system cilium-<id> -- \
+  cilium endpoint get $ENDPOINT_ID | jq '.[].status.policy'
+
+# 7. Monitor live packet events
+kubectl exec -n kube-system cilium-<id> -- cilium monitor --type drop
+kubectl exec -n kube-system cilium-<id> -- cilium monitor --type l7
+
+# 8. Dump raw eBPF bytecode for a program
+bpftool prog dump xlated id 42 | head -50
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Cilium compile eBPF programs and when does compilation happen?**
+
+Cilium-agent generates a per-endpoint C template (`bpf_lxc.c`) with endpoint-specific compile-time constants (endpoint ID, IP, security identity). It compiles this to eBPF bytecode using clang/LLVM embedded in the agent binary. Compilation happens at: (1) endpoint creation (new Pod), (2) policy change affecting that endpoint, (3) Cilium restart/upgrade. The compiled object is loaded into the kernel and attached to TC hooks on the endpoint's veth interface.
+
+**Q2: What are the key eBPF maps Cilium uses and what does each store?**
+
+`cilium_lxc` — maps local endpoint IPs to their identity, interface index, and MAC. `cilium_ipcache` — maps all cluster IPs (local and remote) to endpoint identities. `cilium_policy_*` — per-endpoint maps of allowed (identity, protocol, port) tuples. `cilium_lb_services` / `cilium_lb_backends` — Service VIPs to backend Pod selections. `cilium_ct_*` — connection tracking for DNAT state (Service hairpinning).
+
+**Q3: How does Cilium forward a packet from Pod A to Pod B on the same node without routing?**
+
+The TC egress hook on Pod A's host-side veth detects that the destination (Pod B's IP) is a local endpoint (found in `cilium_lxc` map). Instead of letting the packet go through the kernel's routing table and bridge, the eBPF program calls `bpf_redirect()` to send the packet directly to Pod B's veth ingress. The TC ingress hook on Pod B's veth then performs the policy check. Total: two hook executions + three map lookups, bypassing all normal kernel routing and bridging.
+
+**Q4: How does Cilium handle Service ClusterIP traffic without kube-proxy?**
+
+When a packet targets a ClusterIP, Cilium's TC hook (or socket-level hook) detects this via the `cilium_lb_services` map and selects a backend using consistent hashing. It performs an in-kernel DNAT — rewriting the destination IP/port to the backend Pod's IP/port. The DNAT mapping is stored in `cilium_ct_*` (connection tracking). Return traffic is reverse-NATed using the same CT entry. No iptables DNAT rules are created; no kube-proxy process is running.
+
+**Q5: What is the BPF filesystem and why does Cilium pin programs and maps to it?**
+
+The BPF filesystem (`/sys/fs/bpf`) is a special filesystem where eBPF programs and maps can be pinned (persisted as filesystem objects). Normally, eBPF programs are reference-counted — they disappear when the process that loaded them exits. By pinning to `bpffs`, Cilium's eBPF programs and maps survive agent restarts. This means that if cilium-agent crashes and restarts, the existing eBPF dataplane continues forwarding traffic and enforcing policy uninterrupted during the recovery window.
+
+---
+
+## Summary Checksheet
+
+- [ ] Understand Cilium compiles per-endpoint eBPF programs from C templates with endpoint-specific constants
+- [ ] Know the key eBPF maps: cilium_lxc, cilium_ipcache, cilium_policy_*, cilium_lb_*, cilium_ct_*
+- [ ] Understand the endpoint lifecycle: Pod created → veth + TC hooks → policy compiled → maps populated
+- [ ] Know the same-node packet path: TC egress hook → bpf_redirect() → TC ingress hook (no routing)
+- [ ] Understand Service DNAT in eBPF: cilium_lb_services lookup → consistent hash → in-kernel DNAT → CT entry
+- [ ] Know why BPF filesystem pinning is important (programs survive agent restarts)
+- [ ] Can use `cilium endpoint list`, `cilium bpf ipcache list`, and `cilium monitor` to inspect the dataplane

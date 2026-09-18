@@ -1,0 +1,168 @@
+---
+title: "Chapter 1 — Troubleshooting CAPI & Machine Failures"
+sidebar_position: 1
+module: "Module 9.10 — Fleet Troubleshooting Labs"
+description: "Master Cluster API (CAPI) troubleshooting — cloud IAM/quota errors, machines stuck in Provisioning, cloud-init boot logs, and Kubeadm join failures."
+---
+
+# Chapter 1 — Troubleshooting CAPI Bootstrap & Machine Failures
+
+> **Goal:** Master SRE root-cause analysis and recovery runbooks for declarative infrastructure provisioning failures in **Cluster API (CAPI)** — diagnosing cloud provider IAM permission blocks and vCPU quota exhaustions (`CAPA`/`CAPG`/`CAPZ`), debugging virtual machines stuck in **`Provisioning`** or **`Pending`** states, extracting `cloud-init` user-data boot logs, and resolving `kubeadm init` and `kubeadm join` control plane connection timeouts.
+>
+> By the end of this chapter, you will understand:
+> 1. How to interpret CAPI condition trees using the `clusterctl describe cluster` tool
+> 2. The 3 most frequent root causes of Machines stuck in `Provisioning`
+> 3. How cloud provider IAM roles and security groups block Kubelet cluster registration
+> 4. How to retrieve serial console logs and `/var/log/cloud-init-output.log` from failing VMs
+> 5. How to resolve expired bootstrap tokens and mismatched Kubeadm control-plane endpoints
+> 6. How to author systematic SRE recovery runbooks for failed cluster provisioning
+
+---
+
+## Real-Life Analogy
+
+Think of troubleshooting Cluster API infrastructure failures as **diagnosing why an automated prefabricated home assembly factory has stopped producing houses**:
+
+- **The Blueprint Inspection (`clusterctl describe cluster`):** The master factory dashboard displays an error light. You open the hierarchical status tree: *"The foundation is poured (**VPC exists**), but Robot 3 is frozen (**Machine stuck in `Provisioning`**)."*
+- **Failure 1: The Credit Card Decline (Cloud Quota / IAM Permission Error):** The robot tried to purchase steel beams from the cloud supplier (**AWS EC2**), but the cloud supplier replied: *"Your AWS account has hit its vCPU quota limit, or your IAM role lacks `ec2:RunInstances` permissions."*
+- **Failure 2: The Construction Worker Who Couldn't Read the Blueprint (`cloud-init` Script Failure):** The virtual machine booted up, but when it ran its startup script (**`cloud-init`**), it couldn't download `containerd` because the subnet lacked an internet gateway (**Missing NAT Gateway**), causing the worker to freeze on line 12.
+- **Failure 3: The Broken Walkie-Talkie (`kubeadm join` Security Group Block):** The worker booted successfully, but when they tried to call the master control tower on radio channel 6443 (**Port 6443**), the security fence (**Security Group Rule**) blocked the signal, causing the worker to wait forever in silence!
+
+---
+
+## Architecture Diagram
+
+```text
+               Cluster API SRE Failure Mode & Diagnostic Tree
+
+ MANAGEMENT CLUSTER: Executes `clusterctl describe cluster prod-cluster --show-conditions`
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Cluster: `prod-cluster` (Phase: `Provisioning`, Ready: `False`)        │
+ │ ├── ControlPlane: `KubeadmControlPlane` (Ready: `False`)               │
+ │ │   └── Machine: `prod-control-plane-01` (Phase: `Provisioning`!)     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ├───────────────────────┬───────────────────────┐
+                    ▼ FAILURE MODE 1        ▼ FAILURE MODE 2        ▼ FAILURE MODE 3
+ ┌──────────────────────────┐ ┌───────────────────────────┐ ┌──────────────────────────┐
+ │ CLOUD IAM / QUOTA BLOCK  │ │ CLOUD-INIT BOOT FAILURE   │ │ SECURITY GROUP TIMEOUT   │
+ │ CAPA Controller Error:   │ │ VM Console Output:        │ │ Kubelet Error:           │
+ │ `UnauthorizedOperation:  │ │ `Could not resolve host:  │ │ `connect: connection     │
+ │ You are not authorized   │ │ pkgs.k8s.io` (No NAT GW;  │ │ refused: port 6443`      │
+ │ to perform ec2:RunInst`  │ │ containerd failed install)│ │ (NLB SG blocks worker IP)│
+ └──────────────────────────┘ └───────────────────────────┘ └──────────────────────────┘
+```
+
+---
+
+## The 4-Stage SRE Diagnostic Protocol for CAPI
+
+```bash
+# STEP 1: Inspect the global CAPI condition tree
+clusterctl describe cluster prod-cluster --show-conditions -n default
+
+# STEP 2: Query the underlying infrastructure resource events (e.g. AWSCluster)
+kubectl describe awscluster prod-cluster -n default
+
+# STEP 3: Identify the specific failing Machine and check its conditions
+kubectl describe machine prod-control-plane-01 -n default
+
+# STEP 4: Inspect the provider controller pod logs for cloud API rejections
+kubectl logs -n capa-system -l control-plane=capa-controller-manager --tail=100 | grep -i "error"
+```
+
+---
+
+## Root Cause 1: Debugging `cloud-init` Startup Failures
+
+When a Machine reaches `status.phase: Running` in CAPI (the cloud VM exists) but the Kubernetes Node never joins the cluster, **the `cloud-init` startup script failed inside the VM**:
+
+```bash
+# 1. Fetch AWS EC2 System Serial Console Output (Without SSH access!)
+aws ec2 get-console-output --instance-id i-0123456789abcdef0 --output text
+
+# 2. If SSH is available, inspect the cloud-init execution log directly:
+tail -n 100 /var/log/cloud-init-output.log
+
+# Common Culprit: Failed to download containerd packages due to missing outbound NAT route!
+# Output: "HTTPError: 503 Service Unavailable: https://download.docker.com/linux/ubuntu"
+```
+
+---
+
+## Root Cause 2: Diagnosing `KubeadmControlPlane` Certificate & Token Expiry
+
+If a control plane node fails to join during a rolling cluster upgrade:
+
+```text
+ ┌──────────────────────────────────┬─────────────────────────────┬───────────────────────────────────┐
+ │ Error Message in Kubeadm Logs    │ Underlying Root Cause       │ Remediation Runbook               │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `cluster CA certificate is       │ The `KubeadmControlPlane`   │ Recreate the bootstrap token or   │
+ │ invalid or expired`              │ token expired ($> 15\text{m}$)│ trigger a forced reconciliation via│
+ │                                  │ during long provisioning.   │ `clusterctl reconcile`.           │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `failed to dial control plane    │ Network Load Balancer (NLB) │ Verify that security group port   │
+ │ load balancer on :6443`          │ security group blocks VPC.  │ 6443 allows traffic from workers. │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `etcd cluster is not healthy`    │ Previous master node was    │ Restore etcd quorum; ensure at    │
+ │                                  │ terminated prematurely.     │ least 2 of 3 masters are healthy. │
+ └──────────────────────────────────┴─────────────────────────────┴───────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Simulating and Debugging a Failed CAPI Machine
+
+```bash
+# Step 1: Query all failing Machines in the management cluster
+kubectl get machines -A -o json 2>/dev/null | jq '.items[] | select(.status.phase!="Running") | {name: .metadata.name, cluster: .spec.clusterName, phase: .status.phase, failureReason: .status.failureReason, failureMessage: .status.failureMessage}' 2>/dev/null || echo "CAPI query active"
+
+# Step 2: Extract failure messages directly from Machine status
+# kubectl get machine prod-worker-01 -o jsonpath='{.status.failureMessage}'
+
+# Step 3: Trigger an immediate manual reboot/remediation of a failed Machine
+# kubectl delete machine prod-worker-01
+# (MachineSet controller automatically provisions a fresh replacement VM!)
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How do you debug a Cluster API Machine that is indefinitely stuck in the `Provisioning` state?**
+
+A Machine stuck in `Provisioning` indicates that CAPI requested the cloud instance, but the VM has not successfully initialized as a ready Kubernetes Node. SRE diagnostic workflow:
+1. Run `clusterctl describe cluster <name> --show-conditions` to pinpoint failing components.
+2. Inspect the Infrastructure Provider object (`kubectl describe awsmachine <name>`) for cloud API errors (IAM permissions, vCPU quotas, subnet availability).
+3. If the VM is running in the cloud, extract `/var/log/cloud-init-output.log` via cloud serial console logs to verify whether package installation (`containerd`, `kubelet`) failed due to network or DNS misconfigurations.
+
+**Q2: What causes `UnauthorizedOperation` errors in the `capa-controller-manager` logs?**
+
+`UnauthorizedOperation` indicates that the AWS IAM Role or ServiceAccount attached to the CAPA controller **lacks the required AWS IAM permissions** to provision infrastructure (e.g. missing `ec2:RunInstances`, `ec2:CreateSecurityGroup`, `iam:PassRole`, or `elasticloadbalancing:CreateLoadBalancer`). This is resolved by updating the IAM policy attached to the CAPI controller's IRSA (IAM Roles for Service Accounts) role.
+
+**Q3: How does CAPI handle control plane recovery if an etcd master node crashes during a rolling upgrade?**
+
+The `KubeadmControlPlane` (KCPC) controller includes built-in safety health checks. Before cordoning or deleting any master node, KCPC checks **etcd quorum health** by executing `etcdctl endpoint health` across all active masters. If a master node is unhealthy or etcd quorum would be lost ($< (N/2)+1$), KCPC **halts the upgrade immediately**, preventing the cluster from suffering catastrophic quorum collapse.
+
+**Q4: What is the purpose of `MachineHealthCheck.spec.remediationTemplate` in CAPI?**
+
+By default, when `MachineHealthCheck` detects a dead node, it deletes the `Machine` resource, causing the `MachineSet` to provision a brand-new VM from scratch. By configuring a **`remediationTemplate`** (such as the Metal3 BareMetalRemediation or Self-Node-Remediation operator), CAPI can execute out-of-band power cycles (IPMI / iLO / IPMI power resets) on bare-metal hardware before resorting to permanent node deletion.
+
+**Q5: How do you force CAPI to provision a new worker node if a physical VM in AWS was manually terminated in the AWS console?**
+
+Because CAPI operates on continuous **reconciliation loops**, if an EC2 instance is terminated out-of-band:
+1. The CAPA controller compares the live EC2 API against the `AWSMachine` object and detects that the instance ID no longer exists.
+2. It transitions the `AWSMachine` and `Machine` phase to `Failed`.
+3. The parent `MachineSet` controller sees that active replicas (9) is less than desired replicas (10) and automatically provisions a fresh replacement VM without human intervention.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know how to use `clusterctl describe cluster --show-conditions` for triage
+- [ ] Know the 3 common failures: Cloud Quotas/IAM, `cloud-init` scripts, Security Groups
+- [ ] Know that `/var/log/cloud-init-output.log` contains containerd/kubeadm boot logs
+- [ ] Know that KCPC verifies etcd quorum before terminating master nodes during upgrades
+- [ ] Know that deleting a failed `Machine` triggers automatic `MachineSet` replacement
+- [ ] Can view provider controller logs using `kubectl logs -n capa-system -l control-plane=capa-controller-manager`

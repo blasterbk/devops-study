@@ -1,0 +1,294 @@
+---
+title: "Chapter 4 — CronJob Controller & Concurrency"
+sidebar_position: 4
+module: "Module 3.5 — Jobs & CronJobs"
+description: "Master Kubernetes CronJobs — controller reconciliation loop, cron expression parsing, concurrencyPolicy (Allow, Forbid, Replace), startingDeadlineSeconds, and timezone scheduling."
+---
+
+# Chapter 4 — CronJob Controller Loop & Concurrency Policies
+
+> **Goal:** Master the scheduling and operational mechanics of Kubernetes CronJobs — understanding how the CronJob controller calculates execution intervals, configuring `concurrencyPolicy` to prevent overlapping data pipelines, preventing missed execution panics with `startingDeadlineSeconds`, pruning completed history, and configuring native timezones (`spec.timeZone`).
+>
+> By the end of this chapter, you will understand:
+> 1. The CronJob controller reconciliation loop inside `kube-controller-manager` (10s evaluation ticks)
+> 2. The 5-field cron syntax and Kubernetes-specific scheduling rules
+> 3. The exact behavior of `concurrencyPolicy: Allow`, `Forbid`, and `Replace`
+> 4. How `startingDeadlineSeconds` prevents cascading job storms after controller downtime
+> 5. The "100 missed schedules" deadlock rule and how to avoid it
+> 6. How to schedule CronJobs in specific timezones (`timeZone: "America/New_York"`) in Kubernetes 1.27+
+
+---
+
+## Real-Life Analogy
+
+Think of a CronJob as an **automated scheduled backup service for a company database**:
+
+- **The Schedule (`schedule: "0 2 * * *"`):** The contract states: *"Run a full database backup every night at 2:00 AM."*
+- **Concurrency Policies (What happens if last night's 2:00 AM backup is STILL running when tonight's 2:00 AM trigger fires?):**
+  - **`concurrencyPolicy: Allow` (Default):** Launch tonight's backup anyway. Now you have two heavy backup processes writing to the same disk at the same time, potentially exhausting I/O and crashing the database.
+  - **`concurrencyPolicy: Forbid` (Safe):** Notice that yesterday's backup is still running; **skip** tonight's run and let the existing job finish cleanly.
+  - **`concurrencyPolicy: Replace` (Aggressive):** Terminate yesterday's stuck backup immediately (`SIGTERM`/`SIGKILL`) and start a fresh backup from scratch.
+- **Missed Alarm Clock (`startingDeadlineSeconds`):** If a power outage knocks the server offline from 1:55 AM to 3:30 AM, when power returns, the system checks: *"Did I miss the 2:00 AM backup? If `startingDeadlineSeconds` is 600s (10m), it's too late; skip it and wait for tomorrow night."*
+
+---
+
+## Architecture Diagram
+
+```text
+               CronJob Controller Execution & Concurrency Flow
+
+ CronJob Spec: schedule: "*/15 * * * *", concurrencyPolicy: Forbid
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CronJob Controller Loop (Evaluates every 10 seconds)                   │
+ │                                                                        │
+ │   1. Reads current time vs Cron expression                             │
+ │   2. Trigger time reached: 02:15:00 UTC                                │
+ │   3. Evaluates active child Jobs: `status.active[]`                    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           ▼                                                 ▼
+ [No Active Child Job Running]                    [Previous Job STILL Running]
+           │                                                 │
+           ▼                                                 ▼
+ Spawns NEW Job object:                           Evaluate `concurrencyPolicy`:
+   `db-backup-28492015`                            - Allow:   Spawn parallel Job
+                                                   - Forbid:  SKIP this execution!
+                                                   - Replace: Cancel old Job & spawn new
+```
+
+---
+
+## The 5-Field Cron Syntax
+
+Kubernetes CronJobs use standard 5-field cron expressions:
+
+```text
+ ┌───────────── minute (0 - 59)
+ │ ┌───────────── hour (0 - 23)
+ │ │ ┌───────────── day of the month (1 - 31)
+ │ │ │ ┌───────────── month (1 - 12)
+ │ │ │ │ ┌───────────── day of the week (0 - 6) (Sunday to Saturday)
+ │ │ │ │ │
+ * * * * *
+```
+
+### Common Production Schedules:
+- **Every 5 minutes:** `*/5 * * * *`
+- **Every day at 2:30 AM:** `30 2 * * *`
+- **Every Monday at midnight:** `0 0 * * 1`
+- **First day of every month at 4:00 AM:** `0 4 1 * *`
+- **Predefined macros:** `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`
+
+---
+
+## Concurrency Policies: `Allow`, `Forbid`, `Replace`
+
+Configured under `.spec.concurrencyPolicy`:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Policy               │ Operational Behavior & Use Cases                                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Allow`** (Default)│ **Concurrent Execution.** Allows multiple Jobs to run simultaneously.       │
+ │                      │ *Best for:* Independent, idempotent data pull jobs where overlap is safe.   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Forbid`**         │ **Skip on Overlap.** If the previous Job has not finished, the controller    │
+ │                      │ skips the new scheduled execution completely.                               │
+ │                      │ *Best for:* Database backups, batch ETL pipelines, financial settlements.   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Replace`**        │ **Preempt on Overlap.** Cancels and deletes the currently running Job, then │
+ │                      │ immediately launches a new Job.                                             │
+ │                      │ *Best for:* Cache pre-warming, fresh data syncs where old data is obsolete. │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Handling Missed Schedules: `startingDeadlineSeconds`
+
+If the `kube-controller-manager` is down during a scheduled execution window (or if a cluster undergoes maintenance), the CronJob controller computes how many runs were missed when it comes back online.
+
+```yaml
+spec:
+  # If the scheduled time was missed by more than 200 seconds, DO NOT run it!
+  startingDeadlineSeconds: 200
+```
+
+### The "100 Missed Schedules" Critical Rule:
+If a CronJob misses more than **100 consecutive execution schedules** (and `startingDeadlineSeconds` is **not** set):
+1. The CronJob controller considers the schedule permanently broken.
+2. It logs an error: `Cannot determine if job needs to be started. Too many missed start time (> 100)`.
+3. The CronJob **stops creating jobs entirely** and requires manual deletion and recreation.
+4. **Fix:** Always specify `startingDeadlineSeconds` (e.g. `startingDeadlineSeconds: 300`) to cap the historical lookback window!
+
+---
+
+## Native TimeZone Support (Kubernetes 1.27+ GA)
+
+Historically, all CronJobs ran strictly in **UTC**. Operators had to manually calculate Daylight Saving Time (DST) offsets.
+
+In modern Kubernetes, use `.spec.timeZone` with standard IANA time zone database names:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: morning-reports
+spec:
+  timeZone: "America/New_York"       # Automatically adjusts for Daylight Saving Time!
+  schedule: "0 8 * * 1-5"            # 8:00 AM Mon-Fri in New York time
+  jobTemplate:
+    ...
+```
+
+---
+
+## History Limits & Pruning
+
+To keep `etcd` clean, CronJobs prune completed and failed Job objects:
+
+```yaml
+spec:
+  successfulJobsHistoryLimit: 3    # Retain last 3 successful Job records (Default: 3)
+  failedJobsHistoryLimit: 1        # Retain last 1 failed Job record (Default: 1)
+```
+
+---
+
+## Complete Production CronJob Manifest
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-db-backup
+  namespace: database
+  labels:
+    tier: storage-ops
+spec:
+  schedule: "0 3 * * *"             # 3:00 AM every night
+  timeZone: "America/Chicago"       # Central Time Zone
+  concurrencyPolicy: Forbid         # Never run parallel backups!
+  startingDeadlineSeconds: 600      # Skip if delayed > 10 minutes
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600   # 1 hour maximum execution time
+      template:
+        metadata:
+          labels:
+            app: db-backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: pg-dump
+            image: postgres:15-alpine
+            command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              echo "Starting PostgreSQL backup at $(date)..."
+              # Execute backup logic here
+              sleep 10
+              echo "Backup uploaded to S3 successfully."
+            resources:
+              requests:
+                cpu: "250m"
+                memory: "256Mi"
+              limits:
+                cpu: "1000m"
+                memory: "512Mi"
+```
+
+---
+
+## Hands-On Lab: Testing Concurrency Policies & Manual Triggers
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace cron-lab
+
+# Step 2: Deploy a CronJob running every minute with concurrencyPolicy: Forbid
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: overlap-demo
+  namespace: cron-lab
+spec:
+  schedule: "* * * * *"             # Every minute
+  concurrencyPolicy: Forbid         # Do NOT allow overlap!
+  successfulJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: slow-task
+            image: alpine:latest
+            command: ["sh", "-c", "echo 'Job started at '$(date); sleep 90; echo 'Job finished at '$(date)"]
+EOF
+
+# Step 3: Inspect CronJob schedule and active status
+kubectl get cronjobs -n cron-lab
+
+# Step 4: Watch execution over 2-3 minutes
+# Notice that because each job sleeps 90s, the next 1-minute trigger is SKIPPED!
+kubectl get jobs -n cron-lab -w
+
+# Step 5: Manually trigger a CronJob run out-of-schedule
+kubectl create job --from=cronjob/overlap-demo manual-test-run -n cron-lab
+
+# Step 6: Verify manual job execution
+kubectl get jobs -n cron-lab
+
+# Step 7: Clean up lab
+kubectl delete namespace cron-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the CronJob controller operate within Kubernetes?**
+
+The CronJob controller runs a continuous reconciliation loop within `kube-controller-manager`, evaluating all CronJob specifications roughly every 10 seconds. It calculates the time window between the last schedule and the current timestamp against the cron expression. When a trigger time matches, it checks the configured `concurrencyPolicy` against any currently active child Jobs (`status.active[]`). If permitted, it creates a standard Kubernetes `Job` resource whose template is derived from `.spec.jobTemplate`.
+
+**Q2: What is the difference between `concurrencyPolicy: Forbid` and `concurrencyPolicy: Replace`?**
+
+With `concurrencyPolicy: Forbid`, if a previously spawned Job is still active when the next scheduled execution interval arrives, the controller completely skips the new run and records a skip event, ensuring two jobs never run in parallel. With `concurrencyPolicy: Replace`, the controller immediately terminates and deletes the currently running Job (sending `SIGTERM`/`SIGKILL` to its Pods) and starts the new Job in its place.
+
+**Q3: What does `startingDeadlineSeconds` do, and what catastrophic issue does it prevent?**
+
+`startingDeadlineSeconds` specifies the maximum time (in seconds) that a Job can be started after its scheduled time has passed. If the controller is offline or paused during a trigger and restarts after the deadline, it skips that missed execution. This prevents the "100 missed schedules" deadlock: if a CronJob without a deadline misses over 100 execution windows during a prolonged outage, the controller logs an error and permanently disables the CronJob from future scheduling.
+
+**Q4: How do you manually trigger an ad-hoc run of a CronJob without waiting for the scheduled time?**
+
+You create an ad-hoc Job using the `--from` flag with `kubectl`:
+```bash
+kubectl create job --from=cronjob/<cronjob-name> <ad-hoc-job-name> -n <namespace>
+```
+This instructs the API server to clone the `.spec.jobTemplate` from the specified CronJob and immediately create a standalone Job without modifying the CronJob's regular schedule.
+
+**Q5: How does native timezone support work in Kubernetes 1.27+ CronJobs?**
+
+In Kubernetes 1.27+ (GA), you can declare `.spec.timeZone: "<IANA-Timezone>"` (e.g. `America/New_York`, `Europe/London`, `Asia/Tokyo`). The CronJob controller evaluates the cron schedule against the local wall-clock time of that specific timezone, automatically adjusting for Daylight Saving Time (DST) transitions. Prior to this feature, all CronJobs evaluated strictly against UTC.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that CronJobs create standard child `Job` resources on a schedule
+- [ ] Know the 5 cron fields: Minute, Hour, Day-of-Month, Month, Day-of-Week
+- [ ] Know the 3 concurrency policies: `Allow` (parallel), `Forbid` (skip), `Replace` (preempt)
+- [ ] Know why `startingDeadlineSeconds` prevents the 100-missed-schedules deadlock
+- [ ] Know how `spec.timeZone` enables timezone-aware scheduling in K8s 1.27+
+- [ ] Know that `successfulJobsHistoryLimit` prunes old completed Job records
+- [ ] Can manually trigger a CronJob using `kubectl create job --from=cronjob/<name>`

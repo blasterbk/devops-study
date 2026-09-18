@@ -1,0 +1,316 @@
+---
+title: "Chapter 1 — GatewayClass"
+sidebar_position: 1
+module: "Module 2.6 — Gateway API"
+description: "Deep dive into GatewayClass — the first tier of the Gateway API hierarchy that defines which controller implements gateways, the parametersRef for controller configuration, and how GatewayClass enables multi-controller clusters."
+---
+
+# Chapter 1 — GatewayClass
+
+> **Goal:** Understand GatewayClass as the cluster-level resource that maps a class name to an Ingress controller implementation, how it separates infrastructure concerns from application routing, and how it enables multiple gateway implementations in a single cluster.
+>
+> By the end of this chapter, you will understand:
+> 1. What Gateway API is and why it was created (Ingress limitations)
+> 2. The three-tier Gateway API hierarchy: GatewayClass → Gateway → Route
+> 3. GatewayClass as the cluster-scoped implementation pointer
+> 4. How `parametersRef` allows controller-specific configuration
+> 5. GatewayClass status and acceptance workflow
+> 6. Multi-controller clusters: different GatewayClasses for different workloads
+
+---
+
+## Real-Life Analogy
+
+The Gateway API's three-tier hierarchy is like a **franchise restaurant system**:
+
+**GatewayClass** is the **franchise brand** (McDonald's, Burger King) — it defines the implementation, the standard specifications, and who operates under this brand. The franchising body (controller vendor) registers its brand at the cluster level.
+
+**Gateway** is a **specific restaurant location** — provisioned by the franchise. It has a defined entrance (listener: port 443), a defined neighborhood (infrastructure policy), and operates under the brand rules.
+
+**HTTPRoute** is a **specific menu item routing rule** — "if the customer orders 'Big Mac' (host: api.example.com, path: /v1), send them to the kitchen (backend Service)." Each restaurant can have many menu routing rules.
+
+Teams operate at different levels: the infrastructure team manages the franchise brand and locations (GatewayClass + Gateway), while app teams manage their own menu items (HTTPRoute).
+
+---
+
+## Architecture Diagram
+
+```text
+            Gateway API — Three-Tier Hierarchy
+
+  Cluster Admin                 Namespace Team
+  ┌─────────────────────┐       ┌──────────────────────┐
+  │  GatewayClass       │       │  HTTPRoute           │
+  │  (cluster-scoped)   │       │  (namespace-scoped)  │
+  │  ─ controllerName   │       │  ─ parentRefs        │──┐
+  │  ─ parametersRef    │       │  ─ hostnames          │  │
+  └──────────┬──────────┘       │  ─ rules              │  │
+             │                 └──────────────────────┘  │
+  ┌──────────▼──────────┐                                 │
+  │  Gateway            │◀────────────────────────────────┘
+  │  (namespace-scoped) │  HTTPRoute attaches to Gateway
+  │  ─ gatewayClassName │
+  │  ─ listeners        │
+  │    ─ port: 443      │
+  │    ─ protocol: HTTPS│
+  │    ─ tls            │
+  └──────────┬──────────┘
+             │  Controller provisions
+             ▼
+  Cloud Load Balancer / NGINX Pod / Envoy Pod
+  (the actual infrastructure)
+```
+
+---
+
+## What Gateway API Is (and Why It Exists)
+
+Gateway API was developed by the SIG-Network community to solve Ingress's limitations:
+
+```text
+Ingress Problems:                    Gateway API Solution:
+─────────────────────────────────    ────────────────────────────────────────
+String annotations (unvalidated)  → Typed CRDs with OpenAPI schema
+No role separation                → 3-tier hierarchy (infra/platform/app)
+Controller-specific annotations   → Standard spec, controller-agnostic
+No native multi-namespace routing → Cross-namespace routing built-in
+Limited to HTTP/HTTPS             → HTTP, HTTPS, TCP, TLS, UDP, gRPC
+Single Ingress object             → Composable HTTPRoute + Gateway
+Canary needs 2 Ingress objects    → Native traffic splitting in HTTPRoute
+```
+
+Gateway API reached GA (v1.0) in October 2023. It's now the recommended approach for new clusters.
+
+---
+
+## GatewayClass: The Controller Registration
+
+GatewayClass is a **cluster-scoped** resource (like ClusterRole) that:
+- Registers a controller implementation under a name
+- Links to controller-specific configuration
+- Provides a stable reference for Gateways to use
+
+```yaml
+# GatewayClass created by the controller vendor (or cluster admin)
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: nginx
+spec:
+  # The controller that implements this GatewayClass
+  controllerName: k8s.io/ingress-nginx
+  
+  # Optional: Controller-specific global configuration
+  parametersRef:
+    group: k8s.io
+    kind: IngressClassParameters
+    name: nginx-global-config
+    namespace: ingress-nginx
+  
+  description: "NGINX Gateway Fabric implementation"
+```
+
+```yaml
+# Cilium GatewayClass
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: cilium
+spec:
+  controllerName: io.cilium/gateway-controller
+```
+
+```yaml
+# Traefik GatewayClass
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: traefik
+spec:
+  controllerName: traefik.io/gateway-controller
+```
+
+---
+
+## GatewayClass Status
+
+When a controller starts, it watches for GatewayClasses with its `controllerName`. When it finds one, it sets the `Accepted` condition:
+
+```bash
+kubectl get gatewayclass
+# NAME     CONTROLLER                 ACCEPTED   AGE
+# nginx    k8s.io/ingress-nginx       True       1h
+# cilium   io.cilium/gateway-controller True     2h
+# traefik  traefik.io/gateway-controller True    3h
+
+kubectl describe gatewayclass nginx
+# Status:
+#   Conditions:
+#     Message:  Accepted GatewayClass
+#     Reason:   Accepted
+#     Status:   True
+#     Type:     Accepted
+```
+
+If `Accepted: False`, the controller is not running or the `controllerName` doesn't match.
+
+---
+
+## parametersRef: Controller-Specific Configuration
+
+`parametersRef` points to a controller-specific CRD that configures global behavior for all Gateways using this class:
+
+```yaml
+# Example: NGINX Gateway Fabric NginxProxy config
+apiVersion: gateway.nginx.org/v1alpha1
+kind: NginxProxy
+metadata:
+  name: nginx-global-config
+  namespace: nginx-gateway
+spec:
+  telemetry:
+    serviceName: "nginx-gateway"
+    exporter:
+      endpoint: "otel-collector:4317"
+  rewriteClientIP:
+    mode: ProxyProtocol
+    trustedAddresses:
+    - type: CIDR
+      value: "10.0.0.0/8"
+```
+
+```yaml
+# GatewayClass referencing it:
+spec:
+  controllerName: gateway.nginx.org/nginx-gateway-controller
+  parametersRef:
+    group: gateway.nginx.org
+    kind: NginxProxy
+    name: nginx-global-config
+    namespace: nginx-gateway
+```
+
+---
+
+## Multi-Controller Clusters
+
+Multiple GatewayClasses can coexist in a cluster, each backed by a different controller:
+
+```text
+Use case: Enterprise cluster with different teams and requirements
+
+GatewayClass: "internal"   → Backed by Cilium (eBPF native, high performance)
+  Used by: Backend services, APIs
+  Listeners: Internal VPC only
+
+GatewayClass: "external"   → Backed by NGINX Gateway Fabric
+  Used by: Public-facing web apps
+  Listeners: External internet-facing LoadBalancer
+
+GatewayClass: "istio"      → Backed by Istio Gateway
+  Used by: Service mesh traffic (east-west + mTLS)
+  Listeners: Internal service-to-service
+
+Teams choose which GatewayClass their Gateway references.
+```
+
+---
+
+## Standard vs Experimental Channels
+
+Gateway API features are split into channels:
+
+| Channel | Stability | Example Features |
+|---------|-----------|-----------------|
+| **Standard** (v1) | GA | HTTPRoute, GatewayClass, Gateway, TLSRoute |
+| **Experimental** (v1alpha2) | Beta/Alpha | TCPRoute, UDPRoute, GRPCRoute, BackendTLSPolicy |
+
+```bash
+# Install Standard channel (recommended for production)
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
+
+# Install Experimental channel (includes TCPRoute, UDPRoute, GRPCRoute)
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/experimental-install.yaml
+
+# Verify CRDs installed
+kubectl get crd | grep gateway.networking.k8s.io
+# gatewayclasses.gateway.networking.k8s.io
+# gateways.gateway.networking.k8s.io
+# httproutes.gateway.networking.k8s.io
+# tcproutes.gateway.networking.k8s.io   ← experimental
+# grpcroutes.gateway.networking.k8s.io  ← experimental
+```
+
+---
+
+## Hands-On: GatewayClass Setup
+
+```bash
+# 1. Install NGINX Gateway Fabric (example)
+helm repo add nginx-gateway https://nginx.github.io/nginx-gateway-fabric
+helm install nginx-gateway nginx-gateway/nginx-gateway-fabric \
+  --namespace nginx-gateway \
+  --create-namespace \
+  --set service.type=LoadBalancer
+
+# 2. Check if GatewayClass was auto-created
+kubectl get gatewayclass
+# NAME    CONTROLLER                              ACCEPTED   AGE
+# nginx   gateway.nginx.org/nginx-gateway-controller  True  5m
+
+# 3. Create a custom GatewayClass (if not auto-created)
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: my-nginx
+spec:
+  controllerName: gateway.nginx.org/nginx-gateway-controller
+EOF
+
+# 4. Verify acceptance
+kubectl get gatewayclass my-nginx -o jsonpath='{.status.conditions[0].message}'
+
+# 5. Describe for full status
+kubectl describe gatewayclass my-nginx
+
+# 6. List all controllers registered via GatewayClass
+kubectl get gatewayclass -o custom-columns=\
+'NAME:.metadata.name,CONTROLLER:.spec.controllerName,ACCEPTED:.status.conditions[0].status'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the three-tier hierarchy of Gateway API and what is each tier's responsibility?**
+
+**GatewayClass** (cluster-scoped) — created by infrastructure engineers, identifies the controller implementation and its global configuration. **Gateway** (namespace-scoped) — created by platform engineers, defines the actual listener (port, protocol, TLS) and what Routes can attach to it. **HTTPRoute/TLSRoute/TCPRoute** (namespace-scoped) — created by application teams, defines routing rules (hosts, paths, headers, traffic splitting) and the backend Services. This separation lets infra teams control what's provisioned while app teams self-service their routing rules within allowed boundaries.
+
+**Q2: What is `controllerName` in GatewayClass and how does the controller use it?**
+
+`controllerName` is a unique identifier string (typically in reverse domain notation) that identifies which controller processes this GatewayClass. When a controller starts, it watches all GatewayClasses and filters for those with its specific `controllerName`. If found, it sets the GatewayClass's `status.conditions[0].status=True (Accepted)` and begins processing Gateways that reference this GatewayClass. Multiple controllers in the same cluster each only respond to their own `controllerName`.
+
+**Q3: How does GatewayClass solve the portability problem of Ingress annotations?**
+
+Ingress annotations are strings with no validation — they're controller-specific and silently fail on wrong controllers. GatewayClass + the Gateway API standard CRDs define a common vocabulary (`HTTPRoute.spec.rules`, `backendRefs`, `filters`) with OpenAPI schema validation. Controller-specific configuration is confined to `parametersRef` (a separate CRD per controller). Routing rules (HTTPRoute) are controller-agnostic and portable — the same HTTPRoute YAML works with NGINX, Cilium, or Istio Gateway implementations (modulo experimental features).
+
+**Q4: Can multiple GatewayClasses exist in the same cluster? Why would you want that?**
+
+Yes. Different GatewayClasses are backed by different controllers and serve different purposes. A common multi-GatewayClass setup: `external` (NGINX, internet-facing) for public web traffic, `internal` (Cilium, eBPF-native) for service-to-service APIs, and `istio` (Istio Gateway) for mTLS service mesh traffic. Teams select the appropriate GatewayClass for their workload's requirements (performance, security, protocol needs).
+
+**Q5: What is the `parametersRef` field in GatewayClass?**
+
+`parametersRef` is an optional reference to a controller-specific CRD that provides global configuration for all Gateways using this GatewayClass. For example, NGINX Gateway Fabric's `NginxProxy` CRD can configure OpenTelemetry tracing, client IP rewriting, and logging globally. This pattern separates the standard GatewayClass spec from controller-specific configuration, keeping the GatewayClass itself controller-agnostic while still allowing vendor customization.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the three-tier hierarchy: GatewayClass (cluster) → Gateway (namespace) → HTTPRoute (namespace)
+- [ ] Know GatewayClass is cluster-scoped and identifies the controller via `controllerName`
+- [ ] Understand role separation: infra=GatewayClass, platform=Gateway, app=HTTPRoute
+- [ ] Know `parametersRef` allows controller-specific global config
+- [ ] Know GatewayClass `Accepted` status — set by controller to confirm it's processing the class
+- [ ] Know that multiple GatewayClasses can coexist (different controllers for different purposes)
+- [ ] Know standard channel (GA) vs experimental channel (TCPRoute, UDPRoute, GRPCRoute)

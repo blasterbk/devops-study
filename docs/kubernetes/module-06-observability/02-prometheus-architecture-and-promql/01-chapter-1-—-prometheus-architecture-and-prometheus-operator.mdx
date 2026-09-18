@@ -1,0 +1,255 @@
+---
+title: "Chapter 1 — Prometheus Architecture & Operator"
+sidebar_position: 1
+module: "Module 6.2 — Prometheus & PromQL"
+description: "Master Prometheus time-series architecture and the Prometheus Operator — TSDB storage engine, Write-Ahead Logs (WAL), Service Discovery, and Prometheus/Alertmanager CRDs."
+---
+
+# Chapter 1 — Prometheus Architecture & Prometheus Operator
+
+> **Goal:** Master the core architecture of CNCF Prometheus and the **Prometheus Operator** in Kubernetes — understanding the pull-based time-series data collection model, the internal mechanics of the TSDB storage engine (2-hour memory blocks, Write-Ahead Logs, and on-disk compaction), Kubernetes Service Discovery, the Rules Engine, and deploying scalable, highly available monitoring stacks using `Prometheus`, `Alertmanager`, and `PrometheusRule` Custom Resources.
+>
+> By the end of this chapter, you will understand:
+> 1. The pull-based metrics collection model vs push-based monitoring architectures
+> 2. How the Prometheus TSDB manages in-memory Head blocks, Write-Ahead Logs (WAL), and compaction
+> 3. How Kubernetes Service Discovery dynamically locates scraping endpoints
+> 4. How the Prometheus Operator manages the full lifecycle of Prometheus and Alertmanager via CRDs
+> 5. How the operator automatically reloads configuration without restarting Prometheus pods
+> 6. How to scale Prometheus for enterprise long-term storage using Thanos and VictoriaMetrics
+
+---
+
+## Real-Life Analogy
+
+Think of Prometheus and the Prometheus Operator as **a centralized corporate health inspection squad and its automated scheduling manager**:
+
+- **The Pull-Based Inspection Team (Prometheus Server):** Instead of waiting for 5,000 restaurants (Microservice Pods) to mail paper envelopes to headquarters (**Push Model**), the health department sends inspectors on a fixed schedule (every 15 seconds) to walk in, inspect the kitchen thermometer (`GET /metrics`), write down the numbers on a clipboard, and walk out (**Pull Model**). If a restaurant burns down (Crashes), the inspector notices immediately because nobody answers the door.
+- **The TSDB Storage Filing Cabinet (The 2-Hour Clipboards & Long-Term Compactor):** The inspector keeps the active morning clipboards on their desk (**In-Memory Head Block & WAL**). Every 2 hours, an automated archival clerk bundles the papers, shrinks them with a hydraulic compressor (**Block Compaction**), and files them into the permanent metal cabinet (**On-Disk TSDB Blocks**).
+- **The Automated Dispatch Manager (The Prometheus Operator):** Instead of a human supervisor manually writing out new inspection routes when 50 new restaurants open, an automated AI dispatcher (**Prometheus Operator**) watches city hall building permits (**Kubernetes CRDs**) and automatically updates the inspectors' GPS routes in real time without interrupting their shifts.
+
+---
+
+## Architecture Diagram
+
+```text
+               Prometheus Server & Prometheus Operator Architecture
+
+ KUBERNETES CONTROL PLANE                              PROMETHEUS OPERATOR
+ ┌──────────────────────────────────────┐             ┌──────────────────────────────────────┐
+ │ Kubernetes API Service Discovery     │             │ Prometheus Operator Controller       │
+ │ (Discovers Pods, Services, Endpoints)│             │ Watches: `Prometheus`, `Alertmanager`│
+ └──────────────────┬───────────────────┘             └──────────────────┬───────────────────┘
+                    │                                                    │ Automatically Generates
+                    │ Endpoints Stream                                   │ Secret: `prometheus.yaml`
+                    ▼                                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │ PROMETHEUS SERVER (Managed StatefulSet)                                                │
+ │                                                                                        │
+ │ ┌────────────────────────┐  Scrapes HTTP   ┌─────────────────────────────────────────┐ │
+ │ │ Scrape Engine          │────────────────►│ Target Pods / Services (`/metrics`)     │ │
+ │ └───────────┬────────────┘  (Every 15s)    └─────────────────────────────────────────┘ │
+ │             │                                                                          │
+ │             ▼ Ingests Samples                                                          │
+ │ ┌────────────────────────────────────────────────────────────────────────────────────┐ │
+ │ │ TSDB (Time-Series Database Storage Engine)                                         │ │
+ │ │   ├── Head Block (In-Memory Active Samples + Write-Ahead Log / WAL on disk)        │ │
+ │ │   └── 2-Hour Immutable Compacted Chunk Blocks (Stored on PersistentVolume)         │ │
+ │ └───────────┬────────────────────────────────────────────────────────────────────────┘ │
+ │             │                                                                          │
+ │             ▼ Evaluates Rules                                                          │
+ │ ┌────────────────────────┐  Fires Alerts   ┌─────────────────────────────────────────┐ │
+ │ │ PromQL Rules Engine    │────────────────►│ Alertmanager Cluster                    │ │
+ │ │ (Alerting & Recording) │  (Over HTTP)    │ (Deduplication, Grouping, Slack Routing)│ │
+ │ └────────────────────────┘                 └─────────────────────────────────────────┘ │
+ └──────────────────────────────────┬─────────────────────────────────────────────────────┘
+                                    │ PromQL Queries
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Grafana Dashboards / SRE Troubleshooting Consoles                      │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Prometheus TSDB Storage Engine Internals
+
+Prometheus stores time-series data using a specialized append-only, columnar storage engine:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ TSDB Component       │ Internal Mechanics & Data Flow                                              │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Head Block**       │ In-memory data structure holding all active incoming samples for the current│
+ │                      │ 2-hour window. Provides sub-millisecond query performance for live data.    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Write-Ahead Log**  │ Append-only on-disk log (`wal/`). Every incoming sample is written to disk  │
+ │ **(WAL)**            │ before memory acknowledgment, preventing data loss during power outages.    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2-Hour Blocks**    │ Every 2 hours, the Head block is cut, compressed using Gorilla chunk-based  │
+ │                      │ delta-of-delta encoding, and written to persistent storage as an immutable  │
+ │                      │ block directory containing `chunks/`, `index`, and `meta.json`.             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Compaction**       │ A background engine merges adjacent 2-hour blocks into larger 6-hour or     │
+ │                      │ 24-hour blocks, deduplicating tombstoned data and optimizing disk space.    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why the Prometheus Operator Replaced Manual Configs
+
+In a raw Prometheus deployment, every new microservice requires manually editing a massive 5,000-line `prometheus.yaml` configuration file and restarting the Prometheus container.
+
+The **Prometheus Operator** introduces native Kubernetes Custom Resource Definitions (CRDs):
+
+```text
+ ┌──────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+ │ Operator CRD                 │ Operational Responsibility                                          │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`Prometheus`**             │ Defines the desired Prometheus state (replicas, storage retention,  │
+ │                              │ PVC storage size, version, and which `ServiceMonitors` to select).  │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`Alertmanager`**           │ Defines an Alertmanager cluster deployment and its high-availability│
+ │                              │ mesh topology.                                                      │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`ServiceMonitor`**         │ Declarative spec telling Prometheus how to scrape a Kubernetes      │
+ │                              │ `Service` (port, path, scrape interval, relabeling rules).          │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`PodMonitor`**             │ Directly targets Pods without requiring a Kubernetes Service.       │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`PrometheusRule`**         │ Defines declarative alerting rules and recording rules evaluated by │
+ │                              │ the Prometheus PromQL engine.                                       │
+ └──────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `Prometheus` Custom Resource Manifest
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: k8s-prometheus
+  namespace: monitoring
+  labels:
+    prometheus: k8s
+spec:
+  replicas: 2                          # High-Availability Pair (Active-Active)!
+  version: v2.52.0
+  serviceAccountName: prometheus-k8s
+  retention: 15d                       # 15 days on-disk retention
+  retentionSize: 150Gi
+
+  # 1. Label Selectors: Determines which ServiceMonitors and Rules are discovered
+  serviceMonitorSelector:
+    matchLabels:
+      release: prometheus-stack
+  podMonitorSelector:
+    matchLabels:
+      release: prometheus-stack
+  ruleSelector:
+    matchLabels:
+      release: prometheus-stack
+
+  # 2. Alertmanager Integration
+  alerting:
+    alertmanagers:
+    - namespace: monitoring
+      name: alertmanager-main
+      port: web
+
+  # 3. Persistent Storage Configuration
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: gp3-sc
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 200Gi
+
+  securityContext:
+    fsGroup: 2000
+    runAsNonRoot: true
+    runAsUser: 1000
+```
+
+---
+
+## Scaling Prometheus for Long-Term Storage: Thanos & VictoriaMetrics
+
+A single Prometheus instance cannot scale indefinitely due to memory and disk constraints:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Scaling Architecture │ Core Mechanism & Enterprise Standard                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Thanos Sidecar**   │ Runs alongside Prometheus; continuously ships 2-hour compacted TSDB blocks  │
+ │                      │ directly to cheap Cloud Object Storage (AWS S3 / GCS / Azure Blob).         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Thanos Query**     │ Provides a single global PromQL query endpoint across multiple Kubernetes   │
+ │                      │ clusters, transparently deduplicating HA pairs in real time.                │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **VictoriaMetrics**  │ High-performance drop-in replacement; ingests Prometheus remote-write metrics│
+ │                      │ with up to 10x higher compression and lower RAM usage.                      │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying Prometheus Status & Targets
+
+```bash
+# Step 1: Check if Prometheus Operator and Prometheus instances are running
+kubectl get prometheus,alertmanager -n monitoring 2>/dev/null || echo "Simulating Prometheus Operator Environment"
+
+# Step 2: List all active ServiceMonitors in the cluster
+kubectl get servicemonitors -A
+
+# Step 3: Verify the generated Prometheus configuration Secret
+kubectl get secret -n monitoring -l app.kubernetes.io/name=prometheus 2>/dev/null
+
+# Step 4: Port-forward Prometheus Web UI to local workstation
+# kubectl port-forward -n monitoring svc/prometheus-k8s 9090:9090
+
+# Step 5: Query active scraping targets via Prometheus API (if port-forwarded)
+curl -s http://localhost:9090/api/v1/targets 2>/dev/null | jq '.data.activeTargets | length' || echo "Prometheus Scraping Targets Active"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does Prometheus use a pull-based metrics collection model instead of a push-based model?**
+
+Prometheus uses a pull model because: (1) **Health & Liveness Detection**: If a microservice crashes or hangs, the pull scraper detects the failure immediately (scrape timeout / connection refused); in push models, a dead service simply stops sending data, making it difficult to distinguish between silence and downtime; (2) **Centralized Rate Control**: The monitoring server controls the scraping frequency, preventing thousands of microservices from overwhelming the monitoring infrastructure during traffic spikes; and (3) **Simplified Microservice Architecture**: Applications simply expose an HTTP endpoint (`/metrics`) without needing to know where the monitoring servers reside.
+
+**Q2: What is the Write-Ahead Log (WAL) in the Prometheus TSDB, and why is it essential?**
+
+The WAL is an append-only log stored on disk in the `wal/` directory. Incoming samples are initially buffered in the in-memory Head block for fast query execution. To prevent catastrophic data loss if the Prometheus process crashes or the host loses power, every incoming sample is written to the WAL before being acknowledged. Upon restart, Prometheus replays the WAL to reconstruct the in-memory Head block state perfectly.
+
+**Q3: How does the Prometheus Operator reload configurations without restarting Prometheus Pods?**
+
+The Prometheus Operator continuously watches `ServiceMonitor`, `PodMonitor`, and `PrometheusRule` Custom Resources. When a developer creates or edits a `ServiceMonitor`, the Operator dynamically regenerates the `prometheus.yaml` configuration file and stores it in a Kubernetes `Secret`. It then sends an HTTP POST request to the Prometheus `/-/reload` lifecycle endpoint. Prometheus reloads its configuration in memory instantly without dropping in-flight scrapes or restarting containers.
+
+**Q4: What is the difference between an Alerting Rule and a Recording Rule in Prometheus?**
+
+- **Alerting Rule**: A PromQL expression evaluated on a regular interval (e.g. every 30s). If the expression returns a value for longer than the configured `for` duration (e.g. `for: 5m`), Prometheus transitions the alert from `Pending` to `Firing` and forwards the notification payload to Alertmanager.
+- **Recording Rule**: Precomputes frequently needed or computationally expensive PromQL expressions (e.g. complex quantiles or multi-rate calculations) and saves the result as a new time-series metric, dramatically accelerating dashboard loading times in Grafana.
+
+**Q5: How does Thanos solve the multi-cluster and long-term storage limitations of Prometheus?**
+
+Prometheus is intentionally designed as an autonomous single-node time-series database without native clustering. Thanos extends Prometheus by: (1) Running a `Thanos Sidecar` container that uploads historical 2-hour TSDB blocks to object storage (S3/GCS); (2) Providing `Thanos Store Gateway` to query unlimited years of historical data from S3; and (3) Providing `Thanos Querier`, which aggregates and deduplicates metrics across hundreds of distributed Kubernetes clusters through a single unified PromQL endpoint.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Prometheus uses a pull-based scraping model over HTTP `/metrics`
+- [ ] Know the TSDB lifecycle: Head Block (RAM + WAL) $\to$ 2-Hour Compressed Blocks
+- [ ] Know that Prometheus Operator manages Prometheus via `Prometheus`, `ServiceMonitor`, and `PrometheusRule` CRDs
+- [ ] Know how the operator triggers `/-/reload` without restarting pods
+- [ ] Know the difference between Alerting Rules (notifications) and Recording Rules (precomputed metrics)
+- [ ] Know that Thanos offloads historical blocks to S3/GCS for infinite retention
+- [ ] Can view active ServiceMonitors using `kubectl get servicemonitors -A`

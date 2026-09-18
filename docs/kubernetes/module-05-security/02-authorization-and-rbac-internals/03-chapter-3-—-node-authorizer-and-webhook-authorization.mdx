@@ -1,0 +1,242 @@
+---
+title: "Chapter 3 — Node Authorizer & Webhook Authorization"
+sidebar_position: 3
+module: "Module 5.2 — Authorization & RBAC"
+description: "Master Kubernetes authorization chains — Node Authorizer blast radius containment, NodeRestriction admission plugins, and Webhook Authorization with SubjectAccessReview."
+---
+
+# Chapter 3 — Node Authorizer & Webhook Authorization
+
+> **Goal:** Master non-RBAC authorization mechanisms in Kubernetes — understanding the sequential authorization evaluation chain (`Node,RBAC,Webhook`), analyzing how the Node Authorizer and `NodeRestriction` admission plugin strictly confine Kubelet permissions to prevent cluster-wide secret exfiltration during worker node compromises, and integrating external authorization policy engines using Webhook Authorization and `SubjectAccessReview` APIs.
+>
+> By the end of this chapter, you will understand:
+> 1. How `kube-apiserver` evaluates multiple authorization modules in an ordered chain
+> 2. How the Node Authorizer identifies Kubelet requests (`system:node:<nodeName>` in `system:nodes`)
+> 3. How the Node Authorizer limits a node's access strictly to its own bound Pods and Secrets
+> 4. How the `NodeRestriction` admission plugin prevents worker nodes from hijacking node labels and taints
+> 5. How Webhook Authorization delegates access decisions to external services via `SubjectAccessReview`
+> 6. How to troubleshoot `403 Forbidden` errors across the authorizer chain
+
+---
+
+## Real-Life Analogy
+
+Think of the Node Authorizer and Webhook Authorization as **specialized security checkpoints in a high-security research hospital**:
+
+- **The General Hospital Access Desk (RBAC):** Manages human doctors, nurses, and researchers moving between patient rooms and operating theaters based on their badge permissions.
+- **The Dedicated Medical Cart Inspector (The Node Authorizer):** An automated robotic medication cart arrives from Floor 3 (`worker-03`). The cart claims: *"I need the painkiller prescription for Patient Alice."*
+  - The Node Authorizer checks the hospital room directory.
+  - If Patient Alice is physically admitted to a bed on **Floor 3**, the cart is handed the medicine.
+  - If Patient Alice is in the ICU on **Floor 7**, the Node Authorizer sounds an alarm and blocks the cart (**Blast Radius Containment**). Even if a malicious hacker hijacks the robotic cart on Floor 3, they cannot steal medications meant for patients on other floors!
+- **The Anti-Tamper Bumper Guard (`NodeRestriction`):** A physical metal lock that prevents the Floor 3 cart from repainting its own room number to say "Floor 7 VIP Suite".
+- **The External Ethics Board Consultation (Webhook Authorization):** When an unusual organ transplant request arrives, the hospital does not decide internally; it sends a secure digital dispatch (`SubjectAccessReview`) to an off-site legal ethics board (External Policy Webhook) and waits for an allow/deny verdict.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Authorization Chain & Node Isolation
+
+ Incoming API Request (From Kubelet, User, or CI/CD)
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: Sequential Authorization Pipeline                      │
+ │ Configured: `--authorization-mode=Node,RBAC,Webhook`                   │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+ ┌──────────────────────────────────▼─────────────────────────────────────┐
+ │ 1. NODE AUTHORIZER                                                     │
+ │    - Is caller in `system:nodes` with user `system:node:<nodeName>`?   │
+ │    - Is requested Secret/Pod bound to THAT specific worker node?       │
+ │    - If YES ──► GRANTED! (Evaluation halts)                            │
+ │    - If NO / Not a Node ──► Pass to next authorizer                    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+ ┌──────────────────────────────────▼─────────────────────────────────────┐
+ │ 2. RBAC AUTHORIZER                                                     │
+ │    - Evaluates Roles, ClusterRoles, RoleBindings                       │
+ │    - If MATCH FOUND ──► GRANTED! (Evaluation halts)                    │
+ │    - If NO MATCH ──► Pass to next authorizer                           │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+ ┌──────────────────────────────────▼─────────────────────────────────────┐
+ │ 3. WEBHOOK AUTHORIZER                                                  │
+ │    - Issues `SubjectAccessReview` HTTP POST to External Policy Engine  │
+ │    - External service returns `{ "allowed": true/false }`              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ If all authorizers deny:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ DECISION: HTTP 403 Forbidden!                                          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Sequential Authorization Chain
+
+Configured on `kube-apiserver` via `--authorization-mode`:
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ The Multi-Authorizer Evaluation Rule:                                                              │
+ ├────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1. The API server evaluates authorizers in the exact left-to-right order declared on CLI.          │
+ │ 2. If ANY authorizer grants access (Decision: ALLOW): Evaluation immediately HALTS and the         │
+ │    request is authorized!                                                                          │
+ │ 3. If an authorizer has NO OPINION: The request is passed to the next authorizer in the chain.    │
+ │ 4. If an authorizer explicitly DENIES: It passes to the next authorizer (unless configured as      │
+ │    hard deny).                                                                                     │
+ │ 5. If all authorizers in the chain fail to grant permission: The request is REJECTED with          │
+ │    HTTP `403 Forbidden`.                                                                           │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Node Authorizer & Blast Radius Containment
+
+Historically, all Kubelets shared broad read access to all cluster secrets. If an attacker escaped a container on a single worker node, they could use the Kubelet's client certificate to download database passwords and TLS certificates for every tenant in the cluster.
+
+### The Node Authorizer Fix:
+The Node Authorizer targets requests from the **`system:nodes` group** with username **`system:node:<nodeName>`**:
+
+```text
+ Strict Node Authorization Rules:
+ A Kubelet on node `worker-01` is permitted to read:
+ 1. Pods: ONLY Pods scheduled onto `worker-01`.
+ 2. Secrets & ConfigMaps: ONLY Secrets/ConfigMaps mounted by Pods running on `worker-01`.
+ 3. PersistentVolumes: ONLY PVs bound to Pods running on `worker-01`.
+ 4. Status Writes: Can update `.status` of node `worker-01` and its local pods.
+ 
+ ──► If worker-01 requests a Secret for a Pod running on worker-02: HTTP 403 FORBIDDEN!
+```
+
+---
+
+## The `NodeRestriction` Admission Plugin
+
+Complementing the Node Authorizer, the **`NodeRestriction`** admission plugin prevents compromised Kubelets from modifying cluster state:
+
+```text
+ What NodeRestriction Enforces:
+ 1. Label Protection: Kubelets can ONLY modify labels in the `*.node.kubernetes.io/` prefix 
+    and forbidden from modifying critical topology labels or nodeAffinity selectors.
+ 2. Taint Protection: Kubelets CANNOT remove control-plane taints or master taints.
+ 3. Self-Modification Only: A Kubelet can only modify its OWN Node API object, not other nodes.
+```
+
+---
+
+## Webhook Authorization & `SubjectAccessReview`
+
+Webhook Authorization delegates access control decisions to an external HTTP service:
+
+```yaml
+# /etc/kubernetes/webhook-auth-config.yaml
+apiVersion: v1
+kind: Config
+clusters:
+- name: external-authz-service
+  cluster:
+    server: https://authz.security.internal:8443/authorize
+    certificate-authority: /etc/kubernetes/pki/authz-ca.crt
+users:
+- name: apiserver-client
+  user:
+    client-certificate: /etc/kubernetes/pki/apiserver-authz.crt
+    client-key: /etc/kubernetes/pki/apiserver-authz.key
+current-context: webhook
+contexts:
+- context:
+    cluster: external-authz-service
+    user: apiserver-client
+  name: webhook
+```
+
+```text
+ The SubjectAccessReview API Flow:
+ 1. API Server receives request from `alice` to `delete pods` in namespace `prod`.
+ 2. API Server issues an HTTP POST containing a `SubjectAccessReview` JSON payload to the webhook.
+ 3. External engine evaluates corporate security policies and replies:
+    { "apiVersion": "authorization.k8s.io/v1", "status": { "allowed": true } }
+ 4. API server allows the pod deletion.
+```
+
+---
+
+## Complete API Server Master Flags
+
+```yaml
+# Inside /etc/kubernetes/manifests/kube-apiserver.yaml
+spec:
+  containers:
+  - name: kube-apiserver
+    command:
+    - kube-apiserver
+    # 1. Enable Node Authorizer before RBAC
+    - --authorization-mode=Node,RBAC,Webhook
+    - --authorization-webhook-config-file=/etc/kubernetes/webhook-auth-config.yaml
+    - --authorization-webhook-cache-authorized-ttl=5m0s
+    - --authorization-webhook-cache-unauthorized-ttl=30s
+    # 2. Enable NodeRestriction admission plugin
+    - --enable-admission-plugins=NodeRestriction,PodSecurity
+```
+
+---
+
+## Hands-On Lab: Querying Self-Subject & Subject Access Reviews
+
+```bash
+# Step 1: Query API permissions using SelfSubjectAccessReview via kubectl
+kubectl auth can-i create deployments -n default
+# Output: yes / no
+
+# Step 2: Test if another user can delete pods (Delegates to SubjectAccessReview API)
+kubectl auth can-i delete pods -n default --as=developer-bob
+# Output: 'no'
+
+# Step 3: Inspect active Authorization Mode on Control Plane
+kubectl describe pod -n kube-system -l component=kube-apiserver | grep -E "authorization-mode" 2>/dev/null || echo "Running on managed cluster (EKS/GKE)"
+
+# Step 4: Verify Node Authorizer isolation via simulated impersonation
+kubectl auth can-i get secret/database-secret --as=system:node:worker-01 --as-group=system:nodes -n default
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the Kubernetes authorization evaluation chain function when multiple modes are configured?**
+
+When configured with `--authorization-mode=Node,RBAC,Webhook`, the API server evaluates each authorizer sequentially. The request first checks the Node Authorizer; if approved, evaluation halts immediately. If not applicable, it passes to RBAC. If RBAC finds a matching RoleBinding, evaluation halts with approval. If RBAC denies, it passes to the Webhook authorizer. If all authorizers in the chain fail to grant permission, the API server returns HTTP `403 Forbidden`.
+
+**Q2: What is the Node Authorizer, and what security threat does it mitigate?**
+
+The Node Authorizer is a specialized authorization plugin dedicated exclusively to Kubelet daemons (authenticating as `system:node:<nodeName>` in `system:nodes`). It prevents **cluster-wide lateral movement during worker node compromises**. Prior to Node Authorizer, any compromised Kubelet could read any secret in `etcd`. The Node Authorizer strictly limits a Kubelet's access to only read Pods, Secrets, ConfigMaps, and PVs that are actively scheduled onto that specific physical node.
+
+**Q3: What is the role of the `NodeRestriction` admission plugin?**
+
+The `NodeRestriction` admission controller operates alongside the Node Authorizer to restrict what write modifications a Kubelet can make to the cluster API. It prevents a compromised worker node from: (1) Modifying node labels outside the allowed `*.node.kubernetes.io/` prefix; (2) Removing master taints to attract sensitive control-plane workloads; and (3) Modifying the status or properties of other worker nodes in the cluster.
+
+**Q4: How does Webhook Authorization work, and what API object is used for decisions?**
+
+Webhook Authorization delegates authorization decisions to an external HTTP webhook service. When an API call arrives, `kube-apiserver` serializes the request details (user, group, verb, resource, namespace) into an `authorization.k8s.io/v1` **`SubjectAccessReview`** JSON object and sends an HTTP POST to the webhook endpoint. The external service inspects custom corporate policies and returns `status.allowed: true` or `false`.
+
+**Q5: How does `kube-apiserver` optimize performance when using Webhook Authorization?**
+
+To avoid introducing network latency on every single API call, `kube-apiserver` implements in-memory caching of webhook decisions. Configured via `--authorization-webhook-cache-authorized-ttl` (e.g. 5 minutes) and `--authorization-webhook-cache-unauthorized-ttl` (e.g. 30 seconds), identical subsequent requests from the same user are authorized directly from cache without making repeated HTTP calls to the external webhook service.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that authorization modes evaluate sequentially (`Node,RBAC,Webhook`)
+- [ ] Know that ANY authorizer granting permission halts evaluation with SUCCESS
+- [ ] Know that Node Authorizer restricts Kubelets to their locally scheduled Pods/Secrets
+- [ ] Know that `NodeRestriction` admission plugin protects node labels and taints
+- [ ] Know how Webhook Authorization uses `SubjectAccessReview` JSON payloads
+- [ ] Know how authorization decision caching prevents API server latency bottlenecks
+- [ ] Can test authorization using `kubectl auth can-i <verb> <resource> --as=<user>`

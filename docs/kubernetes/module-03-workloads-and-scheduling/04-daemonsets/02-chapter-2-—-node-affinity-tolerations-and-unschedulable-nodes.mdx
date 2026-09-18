@@ -1,0 +1,313 @@
+---
+title: "Chapter 2 — Tolerations, Taints & Cordoned Nodes"
+sidebar_position: 2
+module: "Module 3.4 — DaemonSets"
+description: "Master DaemonSet scheduling interactions — control-plane taints and tolerations, default admission tolerations, behavior on cordoned (unschedulable) nodes, and dedicated infrastructure node patterns."
+---
+
+# Chapter 2 — Node Affinity, Tolerations & Unschedulable Nodes
+
+> **Goal:** Master the interaction between DaemonSets and Kubernetes node scheduling constraints — understanding why DaemonSets automatically tolerate cordoned (`unschedulable`) nodes, how the DaemonSet admission controller injects default system tolerations, how to schedule daemons onto control-plane nodes, and how to operate dedicated infrastructure pools using taints and tolerations.
+>
+> By the end of this chapter, you will understand:
+> 1. Why `kubectl cordon` stops Deployments from scheduling but allows DaemonSets to run
+> 2. The 6 built-in tolerations automatically injected into every DaemonSet Pod
+> 3. How to configure tolerations to schedule daemons on control-plane/master nodes
+> 4. How to combine `nodeAffinity` and taints to isolate dedicated infrastructure nodes
+> 5. The difference between `nodeSelector` and advanced `nodeAffinity` for hardware targeting
+> 6. How node conditions (`DiskPressure`, `MemoryPressure`, `PIDPressure`) affect DaemonSets
+
+---
+
+## Real-Life Analogy
+
+Think of a DaemonSet as a **certified elevator inspection and maintenance engineer**:
+
+- **Cordoned Building (Cordoned/Unschedulable Node):** The building manager places a yellow police tape across the entrance: *"Building Closed for Renovations (`kubectl cordon`). No new office tenants (Deployments) may move in."*
+  - Regular office workers (Deployment Pods) are turned away at the door.
+  - However, the elevator maintenance engineer (DaemonSet Pod) carries a **Master Safety Bypass Badge (Built-in Toleration)**. They walk right past the police tape onto the cordoned floor because maintaining ventilation and safety systems is required *even while the floor is closed to regular workers*.
+- **Executive Penthouse (Control-Plane Node):** The penthouse floor has a private security keycard reader (`control-plane:NoSchedule` taint). To service the air conditioning unit on the roof, the engineer must be explicitly granted an **Executive VIP Keycard (Custom Toleration)** in their work order.
+
+---
+
+## Architecture Diagram
+
+```text
+       DaemonSet Toleration Bypass & Node Condition Interaction
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Worker Node: worker-01                                                 │
+ │ State: Cordoned (kubectl cordon worker-01)                             │
+ │ Taint: node.kubernetes.io/unschedulable:NoSchedule                     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           ▼                                                 ▼
+ ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+ │ Deployment Pod (Web App)         │     │ DaemonSet Pod (Fluent Bit Logger)│
+ │ Tolerations: NONE                │     │ Injected Toleration:             │
+ │                                  │     │  node.kubernetes.io/unschedulable│
+ │ Result: BLOCKED BY SCHEDULER!    │     │                                  │
+ │ (Cannot schedule on this node)   │     │ Result: ALLOWED & SCHEDULED!     │
+ └──────────────────────────────────┘     └──────────────────────────────────┘
+```
+
+---
+
+## Why DaemonSets Run on Cordoned Nodes
+
+When an administrator runs `kubectl cordon <node-name>`, Kubernetes sets `.spec.unschedulable: true` on the Node object and applies the taint:
+```text
+node.kubernetes.io/unschedulable:NoSchedule
+```
+
+### The Architectural Rationale:
+Why do DaemonSets ignore this cordon?
+- When a node is being drained or repaired, standard applications are evicted, but **system-level services must remain active until the very last second**:
+  - The **CNI plugin (Cilium/Calico)** must stay running to maintain network routes for terminating Pods.
+  - The **Log Collector (Fluent Bit)** must stay running to capture the final shutdown logs of terminating applications.
+  - The **Storage Daemon (Ceph/CSI)** must stay running to unmount disks cleanly.
+
+To ensure this, the Kubernetes DaemonSet controller / mutating admission webhook automatically injects a toleration for `unschedulable` into every DaemonSet Pod!
+
+---
+
+## Built-In Default DaemonSet Tolerations
+
+Every Pod created by a DaemonSet automatically receives the following standard tolerations without requiring manual configuration:
+
+```text
+ ┌──────────────────────────────────────────────┬────────────┬────────────────────────────────────────────────────────┐
+ │ Taint Key                                    │ Effect     │ Purpose & Protection                                   │
+ │──────────────────────────────────────────────┼────────────┼────────────────────────────────────────────────────────┤
+ │ `node.kubernetes.io/unschedulable`           │ NoSchedule │ Allows daemons to run on cordoned maintenance nodes.   │
+ │ `node.kubernetes.io/disk-pressure`           │ NoSchedule │ Keeps daemons alive when node disk storage is full.    │
+ │ `node.kubernetes.io/memory-pressure`         │ NoSchedule │ Keeps daemons alive when node RAM is exhausted.        │
+ │ `node.kubernetes.io/pid-pressure`            │ NoSchedule │ Keeps daemons alive when OS process table is full.     │
+ │ `node.kubernetes.io/not-ready`               │ NoExecute  │ Prevents immediate eviction if Kubelet stops posting   │
+ │                                              │ (300s)     │ heartbeats briefly.                                    │
+ │ `node.kubernetes.io/unreachable`             │ NoExecute  │ Prevents immediate eviction during transient network   │
+ │                                              │ (300s)     │ split partitions.                                      │
+ └──────────────────────────────────────────────┴────────────┴────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Running DaemonSets on Control-Plane Nodes
+
+By default, control-plane (master) nodes are tainted to prevent regular workloads from consuming API server resources:
+```bash
+# Control-plane taint (Kubernetes 1.24+)
+node-role.kubernetes.io/control-plane:NoSchedule
+
+# Legacy master taint
+node-role.kubernetes.io/master:NoSchedule
+```
+
+To run networking, logging, or security daemons on control-plane nodes, explicitly add matching tolerations to your DaemonSet:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cilium-cni
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      tolerations:
+      # Tolerate standard control-plane taint
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      # Tolerate legacy master taint (for older clusters)
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      # Universal wildcard: tolerate ALL taints in cluster
+      - operator: Exists
+```
+
+> [!TIP]
+> Setting `- operator: Exists` (with no key or effect specified) creates a **universal wildcard toleration**, allowing the DaemonSet to schedule across every single node in the cluster, regardless of any custom taints applied by administrators.
+
+---
+
+## Dedicated Infrastructure Nodes Pattern
+
+In production architectures, teams often dedicate specialized nodes for specific roles (e.g., Ingress Gateways or GPU Deep Learning pools):
+
+```text
+ Dedicated Ingress Gateway Topology:
+
+ 1. Node Label:  role=ingress-gateway
+ 2. Node Taint:  dedicated=ingress:NoSchedule
+ 
+ Enforcement:
+ - Regular Deployments: Rejected (lack matching toleration).
+ - Ingress Controller DaemonSet:
+     nodeSelector: { role: ingress-gateway }
+     tolerations: [ { key: dedicated, value: ingress, effect: NoSchedule } ]
+   ──► Schedules exclusively on the dedicated gateway nodes!
+```
+
+### Complete Ingress Gateway DaemonSet Example:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ingress-nginx-edge
+  namespace: ingress-nginx
+spec:
+  selector:
+    matchLabels:
+      app: ingress-edge
+  template:
+    metadata:
+      labels:
+        app: ingress-edge
+    spec:
+      # 1. Bind directly to physical network interface on edge nodes
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # 2. Schedule ONLY on nodes labeled for ingress
+      nodeSelector:
+        role: ingress-gateway
+
+      # 3. Tolerate the dedicated taint
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: ingress
+        effect: NoSchedule
+
+      containers:
+      - name: nginx-ingress
+        image: registry.k8s.io/ingress-nginx/controller:v1.9.0
+        ports:
+        - name: http
+          containerPort: 80
+          hostPort: 80
+        - name: https
+          containerPort: 443
+          hostPort: 443
+```
+
+---
+
+## Hands-On Lab: Testing Cordoned Scheduling & Control-Plane Tolerations
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace ds-sched-lab
+
+# Step 2: Identify a worker node to test with
+TEST_NODE=$(kubectl get nodes --no-headers | grep -v "control-plane\|master" | head -n 1 | awk '{print $1}')
+echo "Selected worker node: $TEST_NODE"
+
+# Step 3: Deploy a standard Deployment (No tolerations)
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: regular-app
+  namespace: ds-sched-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: regular-app
+  template:
+    metadata:
+      labels:
+        app: regular-app
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.25-alpine
+EOF
+
+# Step 4: Deploy a DaemonSet
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cluster-daemon
+  namespace: ds-sched-lab
+spec:
+  selector:
+    matchLabels:
+      app: cluster-daemon
+  template:
+    metadata:
+      labels:
+        app: cluster-daemon
+    spec:
+      containers:
+      - name: agent
+        image: alpine:latest
+        command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 5: Cordon the test worker node
+kubectl cordon $TEST_NODE
+
+# Step 6: Verify DaemonSet Pod STILL runs on the cordoned node
+kubectl get pods -n ds-sched-lab -o wide | grep cluster-daemon | grep $TEST_NODE
+
+# Step 7: Scale up Deployment to prove it CANNOT schedule on cordoned node
+kubectl scale deployment regular-app -n ds-sched-lab --replicas=10
+kubectl get pods -n ds-sched-lab -o wide | grep regular-app | grep $TEST_NODE || echo "Regular app correctly blocked from cordoned node!"
+
+# Step 8: Apply a dedicated taint to the node
+kubectl taint nodes $TEST_NODE dedicated=security-scanner:NoSchedule
+
+# Step 9: Uncordon the node and clean up lab
+kubectl uncordon $TEST_NODE
+kubectl taint nodes $TEST_NODE dedicated=security-scanner:NoSchedule-
+kubectl delete namespace ds-sched-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why are DaemonSet Pods able to schedule on cordoned (`unschedulable`) nodes while Deployments cannot?**
+
+When a node is cordoned via `kubectl cordon`, Kubernetes applies the `node.kubernetes.io/unschedulable:NoSchedule` taint to prevent new workloads from landing on the node. The DaemonSet admission controller automatically injects a built-in toleration for `node.kubernetes.io/unschedulable` into every DaemonSet Pod. This is intentionally designed so that essential infrastructure daemons (such as CNI network routers, CSI storage plugins, and log forwarders) continue functioning on maintenance nodes to support remaining terminating workloads.
+
+**Q2: What built-in tolerations does Kubernetes automatically add to DaemonSet Pods?**
+
+Kubernetes automatically injects tolerations for standard node condition taints: (1) `node.kubernetes.io/unschedulable` (`NoSchedule`), (2) `node.kubernetes.io/disk-pressure` (`NoSchedule`), (3) `node.kubernetes.io/memory-pressure` (`NoSchedule`), (4) `node.kubernetes.io/pid-pressure` (`NoSchedule`), (5) `node.kubernetes.io/not-ready` (`NoExecute` with 300s grace), and (6) `node.kubernetes.io/unreachable` (`NoExecute` with 300s grace).
+
+**Q3: How do you configure a DaemonSet to run on control-plane/master nodes?**
+
+Control-plane nodes are configured with taints such as `node-role.kubernetes.io/control-plane:NoSchedule` or `node-role.kubernetes.io/master:NoSchedule`. To schedule a DaemonSet on these nodes, you must add matching tolerations to `.spec.template.spec.tolerations`:
+```yaml
+tolerations:
+- key: node-role.kubernetes.io/control-plane
+  operator: Exists
+  effect: NoSchedule
+```
+Alternatively, an empty `operator: Exists` toleration allows the daemon to run on all nodes across the cluster.
+
+**Q4: How do you build a dedicated node pool (e.g. for edge ingress) using taints and DaemonSets?**
+
+To dedicate a group of nodes exclusively to edge ingress: (1) Label the nodes with `role: ingress-gateway`. (2) Apply a custom taint to those nodes: `kubectl taint nodes <node> dedicated=ingress:NoSchedule`. This repels all standard application Deployments. (3) In the Ingress DaemonSet, configure `.spec.template.spec.nodeSelector: { role: ingress-gateway }` and add a matching toleration: `key: dedicated, value: ingress, effect: NoSchedule`.
+
+**Q5: What happens to a DaemonSet Pod if a node experiences severe `DiskPressure` or `MemoryPressure`?**
+
+When a node exceeds its resource thresholds, Kubelet applies `node.kubernetes.io/disk-pressure` or `node.kubernetes.io/memory-pressure` taints to the Node object. Because DaemonSet Pods carry automatic tolerations for these condition taints, the scheduler will not evict or reject DaemonSet Pods due to the taint. However, if the node runs completely out of memory (OOM), the Linux kernel OOM killer may still terminate container processes based on their QoS class and `oom_score_adj`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that DaemonSets automatically tolerate `node.kubernetes.io/unschedulable`
+- [ ] Know why CNI and logging agents must remain active on cordoned nodes
+- [ ] Know how to run DaemonSets on control-plane nodes using `control-plane:NoSchedule` tolerations
+- [ ] Know that `- operator: Exists` acts as a universal wildcard toleration
+- [ ] Know how to implement dedicated node pools using node labels + taints + tolerations
+- [ ] Know the 6 default condition tolerations injected by the DaemonSet admission controller

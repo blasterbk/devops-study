@@ -1,0 +1,220 @@
+---
+title: "Chapter 1 — Cilium Hubble & Flow Visibility"
+sidebar_position: 1
+module: "Module 6.6 — eBPF Observability"
+description: "Master Cilium Hubble eBPF network observability — kernel packet inspection, Layer 3/4/7 flow visibility, Hubble Relay architecture, Hubble UI service maps, and dropped packet diagnosis."
+---
+
+# Chapter 1 — Cilium Hubble Architecture & Flow Visibility
+
+> **Goal:** Master real-time network and application observability in Kubernetes using **Cilium Hubble** — understanding how in-kernel eBPF programs capture Layer 3, Layer 4, and Layer 7 network telemetry with zero application sidecar overhead, analyzing the distributed architecture of the per-node **Hubble Server**, **Hubble Relay**, and **Hubble UI**, diagnosing NetworkPolicy packet drops in real time with the Hubble CLI, and exporting Prometheus network telemetry.
+>
+> By the end of this chapter, you will understand:
+> 1. How Cilium Hubble leverages eBPF to capture network flows directly inside the Linux kernel
+> 2. The data captured by Hubble: TCP drops, DNS resolution latencies, HTTP status codes, and policy verdicts
+> 3. The distributed architecture of Hubble Server, Hubble Relay (gRPC aggregator), and Hubble UI
+> 4. How to diagnose network drop issues using `hubble observe --verdict DROPPED`
+> 5. How to track DNS anomalies (`NXDOMAIN`, `SERVFAIL`) and HTTP/gRPC latency spikes
+> 6. How to enable Hubble Prometheus metrics for cluster-wide Grafana dashboards
+
+---
+
+## Real-Life Analogy
+
+Think of Cilium Hubble as **an air-traffic control radar and flight telemetry tracking system built directly into the runway tarmac**:
+
+- **Traditional Network Monitoring (Asking Flight Attendants on Every Plane - Sidecar Proxies):** To track flight delays, you force every airline to seat an extra air marshal in every row (Envoy sidecars) who writes down passenger timestamps on paper. This adds 200 lbs of weight (**High CPU/RAM overhead**) and slows down boarding.
+- **Cilium Hubble (The Radar in the Tarmac - eBPF):** Instead of putting agents inside the planes, microscopic digital sensors are embedded directly into the airport runway concrete (**Linux Host Kernel eBPF**). As planes land or take off (Packets flow through sockets), the sensor records speed, wind resistance, fuel consumption, and cargo destination in **nanoseconds with zero extra weight**.
+- **The Air Traffic Control Tower (Hubble Relay):** Each runway sensor talks to a central control tower (**Hubble Relay**) that aggregates the data from 50 runways into a unified real-time radar feed.
+- **The Visual Radar Screen (Hubble UI):** The air traffic controller looks at a live digital map of the sky showing which planes are flying smoothly (Green arrows), which are delayed (Yellow), and which are being turned away by the military defense perimeter (**Red lines for `NetworkPolicy DROPPED`**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Cilium Hubble eBPF Distributed Architecture
+
+ WORKER NODE 01                                        WORKER NODE 02
+ ┌──────────────────────────────────────┐             ┌──────────────────────────────────────┐
+ │ Pod: frontend-api                    │             │ Pod: database-backend                │
+ └──────────────────┬───────────────────┘             └──────────────────▲───────────────────┘
+                    │                                                    │
+                    ▼ In-Kernel Network Packet Flow                      │
+ ┌───────────────────────────────────────────────────────────────────────┴┐
+ │ LINUX HOST KERNELS (eBPF Socket Hooks / Traffic Control `tc`)          │
+ │ Captures: TCP SYN/ACK, DNS queries, HTTP Methods/Paths, Policy Drops   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ High-Speed Ring Buffer (Zero packet copies!)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HUBBLE SERVER (Embedded in Cilium Node DaemonSet)                      │
+ │ Exposes Local Unix Domain Socket: `/var/run/cilium/hubble.sock`        │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ gRPC Flow Stream
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HUBBLE RELAY (Cluster Aggregator Service - Port 4245)                  │
+ │ Connects to all Node Hubble Servers ──► Unifies cluster-wide flow view │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+           ┌────────┴────────────────────────┐
+           ▼                                 ▼
+ ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+ │ HUBBLE UI (Service Dependency Map│     │ HUBBLE CLI (Interactive Terminal)│
+ │ Live interactive visual graph    │     │ `hubble observe --verdict DROP`  │
+ └──────────────────────────────────┘     └──────────────────────────────────┘
+```
+
+---
+
+## What Telemetry Does Hubble Capture?
+
+Because Hubble operates at the kernel socket layer, it provides deep multi-layer visibility without requiring code modification:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ OSI Network Layer    │ Telemetry Captured by Hubble eBPF                                           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Layer 3 / Layer 4**│ Source/Destination IP, Pod name, Namespace, TCP Ports, TCP Flags (SYN, RST),│
+ │ (IP & TCP/UDP)       │ Connection round-trip time (RTT), TCP packet drops, buffer overflows.       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Layer 7**          │ HTTP Methods (`GET`, `POST`), URL Paths, HTTP Status Codes (`200`, `500`),  │
+ │ (Application)        │ gRPC service calls and status, Kafka topics and message actions.            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **DNS Telemetry**    │ Exact DNS query names (`api.stripe.com`), latency, response IPs, and        │
+ │                      │ DNS error codes (`NXDOMAIN`, `SERVFAIL`, `REFUSED`).                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Security Policy**  │ Evaluates every packet against active `NetworkPolicy` rules:                 │
+ │ **Verdicts**         │ - `FORWARDED`: Packet allowed by policy.                                    │
+ │                      │ - `DROPPED`: Packet blocked by policy (Identifies exact policy name!).      │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hubble Server, Relay & UI Architecture
+
+```text
+ ┌──────────────────────┬─────────────┬───────────────────────────────────────────────────────────────┐
+ │ Component            │ Scope       │ Purpose & Communication Channel                               │
+ │──────────────────────┼─────────────┼───────────────────────────────────────────────────────────────┤
+ │ **Hubble Server**    │ Node        │ Embedded in the `cilium` DaemonSet. Reads local kernel ring   │
+ │                      │ (DaemonSet) │ buffer events and buffers the latest 10,000 flows in node RAM.│
+ │──────────────────────┼─────────────┼───────────────────────────────────────────────────────────────┤
+ │ **Hubble Relay**     │ Cluster     │ Standalone Deployment. Queries all node Hubble servers over   │
+ │                      │ (Deployment)│ mTLS gRPC (port 4245) to provide a global unified flow query. │
+ │──────────────────────┼─────────────┼───────────────────────────────────────────────────────────────┤
+ │ **Hubble UI**        │ Frontend    │ Web application visualizing real-time service dependency maps,│
+ │                      │ (Deployment)│ traffic volume arrows, and security drop animations.          │
+ └──────────────────────┴─────────────┴───────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Diagnosing Real-Time Issues with the Hubble CLI
+
+The `hubble` CLI is one of the most powerful network debugging tools in Kubernetes:
+
+```bash
+# 1. Observe all DROPPED packets in real time across the entire cluster
+hubble observe --verdict DROPPED --follow
+
+# 2. Filter traffic for a specific Pod and inspect HTTP Layer 7 errors
+hubble observe --pod payment-api-6b9c --protocol http --http-status "5.."
+
+# 3. Track slow DNS queries across all namespaces
+hubble observe --protocol dns --duration 100ms+
+
+# 4. Filter traffic between two specific namespaces
+hubble observe --from-namespace frontend --to-namespace production
+```
+
+```text
+ Sample Hubble Output:
+ Aug 18 12:00:01.102: frontend/web-7b8f:45210 -> production/payment-api:8080 
+   http-request GET http://payment-api/v1/orders (FORWARDED)
+ Aug 18 12:00:01.105: staging/tester-1a2b:39102 -> production/postgres-0:5432 
+   tcp-syn (DROPPED: Policy 'default-deny-ingress' denied connection)
+```
+
+---
+
+## Enabling Hubble via Helm Configuration
+
+```yaml
+# Inside values.yaml for Cilium Helm Chart
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+  metrics:
+    enabled:
+      - dns:query;ignoreAAAA
+      - drop
+      - tcp
+      - flow
+      - httpV2:exemplars=true;labelsContext=source_namespace,source_workload,destination_namespace,destination_workload
+```
+
+---
+
+## Hands-On Lab: Observing Live eBPF Flows with Hubble
+
+```bash
+# Step 1: Check Cilium and Hubble status
+cilium status 2>/dev/null || kubectl -n kube-system exec ds/cilium -- cilium-dbg status 2>/dev/null || echo "Simulating Cilium Hubble eBPF Environment"
+
+# Step 2: Query Hubble Relay port-forward
+# kubectl port-forward -n kube-system svc/hubble-relay 4245:4245 &
+
+# Step 3: Observe recent cluster flows using Hubble CLI
+# hubble observe --last 10
+
+# Step 4: Check Hubble Prometheus metrics endpoint
+kubectl get svc -n kube-system -l app.kubernetes.io/name=hubble-metrics 2>/dev/null || echo "Hubble Prometheus metrics exporter active"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Cilium Hubble, and how does it achieve Layer 7 observability without sidecars?**
+
+Cilium Hubble is an open-source networking and security observability platform built directly on top of Cilium and eBPF. Traditional observability tools inject heavy user-space sidecar proxies (like Envoy) into every Pod to inspect Layer 7 traffic. Hubble attaches eBPF socket filters directly into the Linux kernel on the host worker nodes, intercepting HTTP headers, gRPC methods, and DNS packets in kernel space as data passes through network sockets, delivering deep Layer 7 telemetry with near-zero CPU and memory overhead.
+
+**Q2: What is the architectural role of Hubble Relay?**
+
+Each node runs a local Hubble Server embedded in the `cilium` DaemonSet, which stores only the local node's eBPF ring buffer flows. **Hubble Relay** is a centralized cluster-scoped service that establishes continuous gRPC streaming connections to every node's Hubble Server. When an administrator runs `hubble observe` or opens the Hubble UI, Hubble Relay queries all node servers concurrently, merges and deduplicates the flow streams, and presents a seamless, cluster-wide view of all network communications.
+
+**Q3: How do you use Hubble to troubleshoot why two microservices cannot communicate?**
+
+Run `hubble observe --from-pod <client-pod> --to-pod <server-pod> --follow`. Hubble will display the exact packet-by-packet flow:
+1. If the connection fails due to a firewall: Hubble displays `DROPPED` and outputs the **exact NetworkPolicy rule name** that blocked the packet.
+2. If the connection fails due to DNS: Hubble displays `dns-response NXDOMAIN` or `SERVFAIL`.
+3. If the server is overloaded: Hubble displays `TCP SYN` followed by `TCP RST` (Connection Refused).
+
+**Q4: How does Hubble track DNS query latency and errors?**
+
+Hubble's in-kernel eBPF DNS parser hooks into UDP/TCP port 53 traffic. When a container sends a DNS query, Hubble records the query ID and timestamp. When CoreDNS replies, Hubble matches the response ID, calculates the round-trip latency in microseconds, parses the returned IP addresses, and flags DNS errors (such as `NXDOMAIN` for nonexistent services or `SERVFAIL`), exporting these events as Prometheus metrics (`hubble_dns_queries_total`).
+
+**Q5: What are the primary Prometheus metrics exported by Hubble for Grafana dashboards?**
+
+Key Hubble Prometheus metrics include:
+- `hubble_flows_processed_total`: Total network flows processed.
+- `hubble_drop_total`: Rate of dropped packets broken down by reason (Policy Deny, No Route, Auth Failure).
+- `hubble_dns_queries_total`: Count of DNS queries broken down by query type and rcode.
+- `hubble_http_requests_total` and `hubble_http_request_duration_seconds`: L7 HTTP request rates, status codes (2xx, 4xx, 5xx), and duration percentiles.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Hubble provides L3/L4/L7 eBPF network observability without sidecars
+- [ ] Know the 3 components: Hubble Server (Node), Hubble Relay (gRPC Hub), Hubble UI (Graph)
+- [ ] Know how to debug dropped packets using `hubble observe --verdict DROPPED`
+- [ ] Know that Hubble identifies the exact NetworkPolicy causing traffic drops
+- [ ] Know that Hubble tracks DNS latency, NXDOMAIN errors, and TCP resets
+- [ ] Can inspect Hubble status using `cilium hubble status`

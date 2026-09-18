@@ -1,0 +1,225 @@
+---
+title: "Chapter 2 — Karpenter Just-In-Time Provisioning"
+sidebar_position: 2
+module: "Module 7.4 — Autoscaling & Karpenter"
+description: "Master CNCF Karpenter just-in-time node provisioning — bypassing Auto Scaling Groups, NodePool and EC2NodeClass CRDs, flexible instance selection, and automated consolidation."
+---
+
+# Chapter 2 — Karpenter Just-In-Time Node Provisioning
+
+> **Goal:** Master next-generation, high-performance node autoscaling in Kubernetes using **CNCF Karpenter** — understanding how Karpenter bypasses legacy cloud Auto Scaling Groups to provision right-sized instances directly via cloud fleet APIs in under 45 seconds, configuring declarative **`NodePool`** and **`EC2NodeClass`** Custom Resources, mastering multi-architecture (ARM64 vs AMD64) and Spot diversification, and automating zero-waste node consolidation (`WhenUnderutilized`).
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural advantages of Karpenter over the legacy Cluster Autoscaler
+> 2. How Karpenter provisions bare VM instances in $<45$ seconds directly via cloud APIs
+> 3. The declarative schema of `NodePool` (workload policy) and `EC2NodeClass` (infrastructure spec)
+> 4. How Karpenter dynamically selects the cheapest instance type matching pod resource constraints
+> 5. How automated Node Consolidation (`WhenUnderutilized`) continuously eliminates idle waste
+> 6. How to manage automated 30-day security AMI rotation using `expireAfter`
+
+---
+
+## Real-Life Analogy
+
+Think of Karpenter vs Cluster Autoscaler as **ordering a bespoke custom-tailored suit delivered by an on-demand drone in 30 minutes versus buying pre-made suits from a department store catalog with a 2-week shipping delay**:
+
+- **The Legacy Cluster Autoscaler (The Rigid Department Store Catalog):** You must pre-configure 10 rigid, static store aisles (**10 AWS Auto Scaling Groups - ASGs**): one ASG for 4-core AMD, one for 8-core Intel, one for GPUs. If a pod needs 5 cores, CA orders an entire 8-core ASG box (**Wasted Idle Capacity**), and AWS takes 5 minutes to spin up the ASG template.
+- **Karpenter (The AI Tailor with 3D Printing Drones):** Karpenter doesn't use pre-configured aisles or ASGs. When 5 pods arrive with odd CPU and RAM requests, Karpenter's mathematical bin-packing solver instantly scans all 500 EC2 instance types available in the cloud datacenter (**`c6g.xlarge`, `m5.large`, `r6i.2xlarge`**), selects the **single cheapest instance that fits all 5 pods perfectly**, and launches the VM directly via cloud APIs in **under 45 seconds**.
+- **The Continuous Clothes Tailor (Node Consolidation - `WhenUnderutilized`):** When 3 of those pods finish their work, Karpenter notices that the remaining 2 pods can fit on a tiny \$0.04/hr instance. It orders the tiny instance, migrates the 2 pods seamlessly, and terminates the expensive node immediately.
+
+---
+
+## Architecture Diagram
+
+```text
+               Karpenter Group-less Just-In-Time Autoscaling Architecture
+
+ PENDING PODS BUFFER (5 Pods require ARM64 + Spot + 12GiB RAM)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pods in `Pending` state (Scheduling failed on existing nodes)          │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Evaluates in real time (< 1s)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KARPENTER CONTROLLER (Group-less Fast Provisioner)                     │
+ │                                                                        │
+ │ 1. Reads `NodePool` CRD: (Allowed architectures: arm64, Type: spot)    │
+ │ 2. Bin-Packing Algorithm: Solves multi-pod packing mathematical matrix │
+ │ 3. Direct Cloud Fleet API Call: `ec2:CreateFleet` (Bypasses ASGs!)     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Launches optimized instance in 40 seconds!
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ AWS CLOUD / CLOUD PROVIDER: `c7g.xlarge` (4 vCPU Graviton ARM, Spot)   │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Node registers with API Server (Ready)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-SCHEDULER: Binds all 5 Pending Pods instantly! (Total time: 45s!) │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Karpenter vs Legacy Cluster Autoscaler
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ Cluster Autoscaler (CA)         │ CNCF Karpenter                  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Provisioning Speed**    │ **Slow (3 – 7 Minutes)**        │ **Ultra-Fast (30 – 45 Seconds)**│
+ │ **Cloud Architecture**    │ Requires **Auto Scaling Groups**│ **Group-less.** Direct Cloud    │
+ │                           │ (ASGs / Managed Node Groups).   │ Fleet API calls (`CreateFleet`).│
+ │ **Instance Flexibility**  │ 1 Instance type per ASG.        │ Evaluates **100+ Instance types**│
+ │                           │ Requires managing dozens of ASGs│ dynamically per provision!      │
+ │ **Bin-Packing / Sizing**  │ Rigid. Scales pre-sized groups. │ **Bespoke.** Right-sizes VM to  │
+ │                           │                                 │ exact Pending Pod resource sum. │
+ │ **Consolidation**         │ Scale down only if 100% empty.  │ **Dynamic Consolidation**       │
+ │                           │                                 │ (Merges & replaces live nodes). │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Declarative Architecture: `NodePool` & `EC2NodeClass`
+
+Karpenter separates workload requirements (`NodePool`) from cloud-specific infrastructure definitions (`EC2NodeClass`):
+
+### 1. `EC2NodeClass` (Infrastructure Configuration):
+```yaml
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: default-ec2-infra
+spec:
+  amiFamily: AL2                      # Amazon Linux 2 (or Bottlerocket, Ubuntu)
+  role: "KarpenterNodeRole-production"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "production-cluster"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "production-cluster"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 50Gi
+        volumeType: gp3
+        encrypted: true
+```
+
+---
+
+### 2. `NodePool` (Workload & Lifecycle Policy):
+```yaml
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: default-workload-pool
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        name: default-ec2-infra
+
+      # 1. Instance Constraints & Diversification
+      requirements:
+        - key: "karpenter.sh/capacity-type"
+          operator: In
+          values: ["spot", "on-demand"] # Prefers Spot; falls back to On-Demand
+        - key: "kubernetes.io/arch"
+          operator: In
+          values: ["arm64", "amd64"]    # Supports both Graviton ARM & Intel/AMD!
+        - key: "karpenter.k8s.aws/instance-category"
+          operator: In
+          values: ["c", "m", "r"]       # Compute, General, and Memory optimized
+        - key: "karpenter.k8s.aws/instance-generation"
+          operator: Gt
+          values: ["4"]                 # Modern generations only (5, 6, 7)
+
+  # 2. Automated Disruption & Consolidation Policies
+  disruption:
+    consolidationPolicy: WhenUnderutilized # Merges and downsizes underutilized nodes!
+    consolidateAfter: 30s
+    expireAfter: 720h                   # Automated 30-day AMI security patching rotation!
+
+  # 3. Resource Spending Ceilings
+  limits:
+    cpu: "1000"                        # Maximum cluster CPU capacity managed by this pool
+    memory: "4000Gi"
+```
+
+---
+
+## Automated Node Consolidation (`WhenUnderutilized`)
+
+Karpenter continuously audits the cost efficiency of all worker nodes in the cluster:
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ How Consolidation Eliminates Cloud Waste:                                                          │
+ ├────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1. Empty Node Deletion: If a node has zero pods (or only DaemonSets), Karpenter terminates it     │
+ │    after `consolidateAfter: 30s`.                                                                  │
+ │ 2. Multi-Node Merge: If Node A ($0.20/hr) and Node B ($0.20/hr) are both at 30% utilization,       │
+ │    Karpenter launches Node C ($0.22/hr), drains Pods from A and B onto C, and terminates A and B   │
+ │    (Slashing costs from $0.40/hr to $0.22/hr!).                                                   │
+ │ 3. Single Node Downsizing: If an m5.2xlarge node is running pods that can fit on an m5.large,      │
+ │    Karpenter seamlessly swaps the instance for the cheaper size.                                   │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Inspecting Karpenter NodePools
+
+```bash
+# Step 1: Query active Karpenter NodePools and NodeClasses
+kubectl get nodepools,ec2nodeclasses 2>/dev/null || echo "Karpenter CRDs active / simulated"
+
+# Step 2: Query nodes provisioned by Karpenter
+kubectl get nodes -l karpenter.sh/nodepool -o custom-columns=NAME:.metadata.name,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,CAPACITY:.metadata.labels.karpenter\.sh/capacity-type,ARCH:.metadata.labels.kubernetes\.io/arch
+
+# Step 3: Inspect Karpenter Controller logs during a scaling event
+# kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=20
+
+# Step 4: Check cluster resource limits configured in NodePool
+kubectl get nodepool default-workload-pool -o jsonpath='{.spec.limits}' 2>/dev/null || echo "NodePool Limits Verified"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Karpenter provision nodes so much faster than the legacy Cluster Autoscaler?**
+
+The legacy Cluster Autoscaler relies on Cloud Provider **Auto Scaling Groups (ASGs)**. CA must make an API call to the ASG, the ASG invokes EC2, the instance boots, executes user-data scripts, joins the cluster, and registers with the API server (taking 3 to 7 minutes). Karpenter is **group-less**: it bypasses ASGs completely, directly invoking the cloud fleet API (`ec2:CreateFleet`) with custom launch templates. It parallelizes node bootstrapping, bringing fully ready nodes online in **under 45 seconds**.
+
+**Q2: What is the separation of responsibilities between `NodePool` and `EC2NodeClass` in Karpenter?**
+
+- **`NodePool`**: Defines **workload scheduling rules and lifecycle policies** (e.g. CPU/RAM limits, allowed instance families `c`, `m`, `r`, Spot vs On-Demand preference, consolidation triggers `WhenUnderutilized`, and node expiration `expireAfter`).
+- **`EC2NodeClass`**: Defines **cloud-specific infrastructure and security configurations** (e.g. AWS subnet selectors, security groups, AMI family, EBS root disk volume encryption, and IAM instance roles).
+
+**Q3: How does Karpenter's `WhenUnderutilized` consolidation policy work?**
+
+When `consolidationPolicy: WhenUnderutilized` is configured, Karpenter continuously runs bin-packing simulations against active nodes. If it identifies that a group of underutilized nodes can be consolidated onto a single cheaper instance, or that a large node can be replaced by a smaller instance, Karpenter: (1) Provisions the cheaper replacement node; (2) Cordon and drains the old nodes respecting PDBs; and (3) Terminates the old instances once workloads are running smoothly, eliminating idle capacity waste automatically.
+
+**Q4: How does Karpenter achieve high availability with Spot instances?**
+
+Karpenter leverages **Spot Diversification**: instead of restricting a node group to a single instance type (e.g. `m5.large`), Karpenter's `requirements` block allows selecting across hundreds of instance types and generations (`c5`, `c6g`, `m5`, `m6g`, `r5`). When requesting capacity, Karpenter uses the AWS `price-capacity-optimized` allocation strategy to select Spot pools with the lowest risk of interruption, while automatically falling back to On-Demand if Spot capacity is unavailable in a specific AZ.
+
+**Q5: What is the purpose of the `expireAfter` setting in Karpenter NodePools?**
+
+`expireAfter` (e.g. `expireAfter: 720h` / 30 days) defines the maximum lifespan of a worker node. When a node reaches its expiration deadline, Karpenter marks it for replacement, provisions a fresh node with the latest OS security patches and updated AMI, migrates workloads gracefully, and terminates the old node. This enforces **automated, immutable OS patching** across the entire cluster without manual maintenance windows.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Karpenter bypasses ASGs to provision VMs in $< 45\text{s}$ via direct Fleet APIs
+- [ ] Know the difference between `NodePool` (Workload policy) and `EC2NodeClass` (Cloud infra)
+- [ ] Know how Karpenter evaluates 100+ instance types dynamically per scaling event
+- [ ] Know how `WhenUnderutilized` consolidation continuously downsizes and merges nodes
+- [ ] Know how Spot diversification achieves high availability across multiple instance pools
+- [ ] Know how `expireAfter: 720h` automates 30-day node OS patching
+- [ ] Can list Karpenter nodes using `kubectl get nodes -l karpenter.sh/nodepool`

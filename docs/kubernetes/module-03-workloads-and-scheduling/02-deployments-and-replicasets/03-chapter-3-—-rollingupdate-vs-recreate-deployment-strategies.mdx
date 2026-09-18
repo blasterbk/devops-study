@@ -1,0 +1,402 @@
+---
+title: "Chapter 3 — RollingUpdate vs Recreate Strategies"
+sidebar_position: 3
+module: "Module 3.2 — Deployments & ReplicaSets"
+description: "Compare Kubernetes deployment strategies — RollingUpdate vs Recreate, database schema migration compatibility, native Blue/Green and Canary patterns using Service selectors, and progressive delivery."
+---
+
+# Chapter 3 — RollingUpdate vs Recreate Deployment Strategies
+
+> **Goal:** Master the fundamental trade-offs between Kubernetes deployment strategies — comparing `RollingUpdate` and `Recreate`, managing dual-version schema compatibility during rolling updates, implementing native Blue/Green and Canary rollouts using pure Kubernetes Service selectors, and integrating rollouts with CI/CD gates.
+>
+> By the end of this chapter, you will understand:
+> 1. The operational mechanics and downtime characteristics of `RollingUpdate` vs `Recreate`
+> 2. When `Recreate` is strictly required (breaking database migrations, ReadWriteOnce volume locks)
+> 3. The "Expand-Contract" (Parallel Run) database schema pattern for zero-downtime rolling updates
+> 4. How to implement Blue/Green deployments natively using two Deployments and one Service
+> 5. How to implement basic Canary deployments using replica count weighting
+> 6. How to gate CI/CD deployment pipelines using `kubectl rollout status`
+
+---
+
+## Real-Life Analogy
+
+Imagine **renovating a busy international airport runway**:
+
+- **`RollingUpdate` (Phased Construction):** The airport keeps half the runway open while resurfacing the other half. Flights continue landing without stopping service (zero downtime). However, both old propeller planes and new jets must be able to share the modified runway simultaneously (backward compatibility requirement).
+- **`Recreate` (Full Airport Shutdown):** The airport closes completely for 4 hours at night, replaces the entire electrical runway lighting system at once, and reopens. There is a period of total downtime (no planes land), but there is zero risk of conflicting electrical systems operating at the same time.
+- **`Blue/Green` (Building a Second Parallel Runway):** You build a brand new runway next door (Green). You test it thoroughly with empty test flights. When verified, the air traffic tower simply instructs all incoming flights to switch to the new runway instantly (instant traffic switch). If something goes wrong, they instantly divert flights back to the original runway (Blue).
+
+---
+
+## Architecture Diagram
+
+```text
+            RollingUpdate vs Recreate Deployment Timelines
+
+ 1. RollingUpdate Strategy (Zero Downtime, Dual-Version Window):
+ Time ─────────────────────────────────────────────────────────────────►
+ Version 1:  [Pod 1]  [Pod 2]  [Pod 3]  [Pod 4]  ──► Terminated
+                        ▲        ▲
+ Dual-Version State:    │ Both v1 AND v2 serve traffic simultaneously!
+                        ▼        ▼
+ Version 2:           [Pod 1]  [Pod 2]  [Pod 3]  [Pod 4]  ──► Active
+
+ ───────────────────────────────────────────────────────────────────────
+
+ 2. Recreate Strategy (Guaranteed Single Version, Downtime Window):
+ Time ─────────────────────────────────────────────────────────────────►
+ Version 1:  [Pod 1]  [Pod 2]  [Pod 3]  [Pod 4]  ──► ALL KILLED AT ONCE
+                                                      │
+ Downtime Gap (0 Pods Active / 503 Service Unavailable)│
+                                                      ▼
+ Version 2:                                     [Pod 1] [Pod 2] [Pod 3] [Pod 4]
+```
+
+---
+
+## Strategy Comparison Matrix
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ RollingUpdate                   │ Recreate                        │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Downtime**              │ 0 seconds (Zero downtime)       │ Several seconds to minutes      │
+ │ **Simultaneous Versions** │ YES (v1 and v2 coexist)         │ NO (Strictly one version active)│
+ │ **Resource Overhead**     │ Higher (Requires surge CPU/RAM) │ Minimal (Frees resources first) │
+ │ **Database Compatibility**│ Must be backward-compatible     │ Can tolerate breaking changes   │
+ │ **Storage (RWO PVCs)**    │ May fail volume multi-attach    │ Releases volume lock cleanly    │
+ │ **Default in K8s**        │ YES                             │ NO                              │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## When is `Recreate` Strictly Necessary?
+
+While `RollingUpdate` is the default for web applications, `Recreate` is essential in specific enterprise scenarios:
+
+### 1. Breaking Database Schema Migrations
+If Version 2 drops or renames a column in a shared SQL database, running Version 1 and Version 2 simultaneously will cause Version 1 Pods to crash immediately. If you cannot use the Expand-Contract pattern, `Recreate` ensures all V1 instances are terminated *before* V2 runs the migration.
+
+### 2. ReadWriteOnce (RWO) Storage Volume Locks
+Cloud block storage volumes (e.g., AWS EBS, Azure Disk, GCE Persistent Disk) with `accessModes: [ReadWriteOnce]` can only be attached to **a single worker node** at a time. During a `RollingUpdate`, if a V2 Pod schedules onto Node B while the V1 Pod is still running on Node A, the volume mount fails with `Multi-Attach error for volume`. `Recreate` terminates V1 on Node A first, allowing the disk to detach cleanly before Node B attaches it.
+
+### 3. Strict Singleton Workloads
+Applications that cannot run dual instances due to distributed state conflicts (e.g., non-clustered legacy software or message consumers without consumer group coordination).
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+```
+
+---
+
+## Zero-Downtime Database Pattern: Expand-Contract
+
+To safely use `RollingUpdate` with databases, teams use the **Expand-Contract (Parallel Run)** database migration pattern:
+
+```text
+ The 3-Phase Expand-Contract Migration:
+
+ Phase 1: Expand (Deploy DB Migration First)
+ - Add new column `phone_number_v2` (nullable). Keep old `phone_number`.
+ - Deploy DB schema change BEFORE application deployment.
+
+ Phase 2: Rolling Update (Dual-Version Safe)
+ - V1 code reads/writes `phone_number`.
+ - V2 code writes to BOTH `phone_number` and `phone_number_v2`, reads from `v2`.
+ - Rolling update completes safely with zero database errors.
+
+ Phase 3: Contract (Cleanup)
+ - Once V2 is 100% active, run a background script to backfill data.
+ - Deploy Phase 3 migration to drop the old `phone_number` column.
+```
+
+---
+
+## Native Blue/Green Deployments with Kubernetes Services
+
+You can achieve instant cutover and instant rollback using two Deployments and one Service:
+
+```text
+              Native Blue/Green Architecture
+
+ 1. Initial State: All traffic routed to Blue (v1)
+                    Service: web-service
+                    selector: app=web, version=blue
+                           │
+                           ▼
+                 ┌───────────────────┐
+                 │ Deployment: Blue  │
+                 │ (Version 1.0.0)   │
+                 └───────────────────┘
+
+ 2. Staging Phase: Deploy Green (v2). Run automated integration tests.
+                    Service: web-service (still pointing to Blue)
+                 ┌───────────────────┐     ┌───────────────────┐
+                 │ Deployment: Blue  │     │ Deployment: Green │
+                 │ (Version 1.0.0)   │     │ (Version 2.0.0)   │
+                 └───────────────────┘     └───────────────────┘
+
+ 3. Cutover Phase: Patch Service selector to version=green (Instant 100% switch!)
+                    Service: web-service
+                    selector: app=web, version=green
+                                           │
+                                           ▼
+                                   ┌───────────────────┐
+                                   │ Deployment: Green │
+                                   │ (Version 2.0.0)   │
+                                   └───────────────────┘
+```
+
+### Manifest Implementation:
+
+```yaml
+# 1. Blue Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: web
+        version: blue
+    spec:
+      containers:
+      - name: app
+        image: web-app:1.0.0
+---
+# 2. Green Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+      version: green
+  template:
+    metadata:
+      labels:
+        app: web
+        version: green
+    spec:
+      containers:
+      - name: app
+        image: web-app:2.0.0
+---
+# 3. Router Service (Points to Blue initially)
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  selector:
+    app: web
+    version: blue    # <--- Change to "green" to trigger instant cutover!
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+---
+
+## Native Canary Deployments via Replica Weighting
+
+Without a service mesh (like Istio), you can implement a basic Canary deployment by having one Service route across two Deployments sharing the same primary label (`app: api`):
+
+```text
+ Total Capacity = 10 Pods
+ - Stable Deployment (v1): 9 replicas (90% of traffic)
+ - Canary Deployment (v2): 1 replica  (10% of traffic)
+ 
+ Service selector: app=api  ──► Automatically load-balances 9:1 across all 10 Pods!
+```
+
+```yaml
+# Stable Deployment (90% Traffic)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-stable
+spec:
+  replicas: 9
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        track: stable
+    spec:
+      containers:
+      - name: api
+        image: api:1.0.0
+---
+# Canary Deployment (10% Traffic)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        track: canary
+    spec:
+      containers:
+      - name: api
+        image: api:2.0.0
+---
+# Shared Canary Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  selector:
+    app: api    # Matches both api-stable and api-canary!
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+---
+
+## Hands-On Lab: Blue/Green Cutover & Canary Weighting
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace strategy-lab
+
+# Step 2: Deploy Blue application (v1)
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-blue
+  namespace: strategy-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: web
+        version: blue
+    spec:
+      containers:
+      - name: nginx
+        image: nginxdemos/hello:plain-text
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+  namespace: strategy-lab
+spec:
+  selector:
+    app: web
+    version: blue
+  ports:
+  - port: 80
+    targetPort: 80
+EOF
+
+# Step 3: Verify Blue is serving traffic
+kubectl run test-client --image=curlimages/curl -n strategy-lab --rm -it --restart=Never -- \
+  curl -s http://web-service.strategy-lab | grep -i "Server address"
+
+# Step 4: Deploy Green application (v2) in parallel
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-green
+  namespace: strategy-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+      version: green
+  template:
+    metadata:
+      labels:
+        app: web
+        version: green
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25-alpine
+EOF
+
+# Step 5: Execute Instant Blue/Green Cutover
+kubectl patch service web-service -n strategy-lab -p '{"spec":{"selector":{"version":"green"}}}'
+
+# Step 6: Verify traffic immediately switches to Green
+kubectl run test-client --image=curlimages/curl -n strategy-lab --rm -it --restart=Never -- \
+  curl -s http://web-service.strategy-lab | grep -i "Welcome to nginx"
+
+# Step 7: Instant Rollback back to Blue
+kubectl patch service web-service -n strategy-lab -p '{"spec":{"selector":{"version":"blue"}}}'
+
+# Step 8: Clean up lab
+kubectl delete namespace strategy-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the primary trade-offs between `RollingUpdate` and `Recreate` deployment strategies?**
+
+`RollingUpdate` provides zero-downtime application upgrades by incrementally replacing old Pods with new ones, ensuring continuous request handling. However, it requires backward compatibility because old and new versions run concurrently, and it requires surplus cluster resources for surging. `Recreate` terminates all old Pods simultaneously before launching new Pods, resulting in a window of complete downtime. However, it eliminates version concurrency, simplifies breaking database migrations, and avoids storage volume multi-attach locks.
+
+**Q2: How do you achieve a Blue/Green deployment using native Kubernetes objects without third-party tools?**
+
+You create two distinct Deployments: one labeled `version: blue` (running the current production version) and another labeled `version: green` (running the new release). Both share common application labels (e.g. `app: web`). A single Kubernetes Service points its selector to `app: web, version: blue`. Once the Green deployment is healthy and verified, you update the Service's `.spec.selector.version` to `green`. The endpoint controller immediately updates routing tables, instantly switching 100% of traffic with zero dropped connections.
+
+**Q3: What is the "Expand-Contract" pattern, and why is it necessary for rolling deployments with relational databases?**
+
+The Expand-Contract (or Parallel Run) pattern allows breaking database changes to occur without disrupting rolling updates. During a rolling update, both old (V1) and new (V2) application instances run in parallel against the same database. In the Expand phase, the database schema is updated to add new columns or tables alongside old ones without deleting existing fields. V2 writes to both old and new structures. Once V2 is fully rolled out and V1 is terminated, the Contract phase runs a cleanup migration to drop the obsolete fields.
+
+**Q4: How can you implement a Canary deployment using basic Kubernetes Deployments, and what are its limitations?**
+
+You create two Deployments: `app-stable` (e.g. 9 replicas) and `app-canary` (e.g. 1 replica), both sharing the label `app: web`. A single Service selects `app: web`, exposing all 10 Pod endpoints. Kube-proxy round-robins traffic roughly 90% to stable and 10% to canary. The main limitation is that traffic splitting granularity is tied directly to replica counts (e.g. 10% requires 10 pods, 1% requires 100 pods), and you cannot route based on HTTP headers, cookies, or user IDs without a service mesh or advanced Ingress controller.
+
+**Q5: How does `kubectl rollout status` help automate CI/CD release pipelines?**
+
+`kubectl rollout status deployment/<name> --watch=true --timeout=300s` blocks the execution of a CI/CD script until all replicas in the new Deployment have successfully launched and passed their readiness probes. If the rollout stalls due to crash looping, image pull errors, or failed health checks, the command times out and exits with a non-zero exit code. This allows the CI/CD pipeline (e.g. GitHub Actions, GitLab CI, Argo CD) to automatically detect failures and trigger an automated rollback (`kubectl rollout undo`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `RollingUpdate` is zero-downtime but runs dual versions simultaneously
+- [ ] Know that `Recreate` causes downtime but guarantees strictly one version runs at a time
+- [ ] Know when `Recreate` is mandatory: breaking DB migrations and ReadWriteOnce PVC locks
+- [ ] Know how the Expand-Contract pattern enables zero-downtime database migrations
+- [ ] Know how to execute native Blue/Green cutover by patching a Service selector
+- [ ] Know how Canary weighting works with replica counts and its limitations
+- [ ] Can use `kubectl rollout status --timeout=60s` in CI/CD pipeline automation

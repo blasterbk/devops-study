@@ -1,0 +1,176 @@
+---
+title: "Chapter 2 — nftables Architecture: Unified Rule Evaluation, Sets, Maps & Bytecode Engine"
+sidebar_position: 1
+module: "Module 12.2 — nftables Architecture"
+description: "Master modern Linux packet classification with nftables — unified framework replacing iptables/ip6tables/arptables/ebtables, in-kernel bytecode VM, high-performance anonymous/named sets, maps, and atomic rule replacement."
+---
+
+# Chapter 2 — nftables Architecture: Unified Rule Evaluation, Sets, Maps & Bytecode Engine
+
+> **Goal:** Master `nftables` (RFC / Linux kernel default successor to iptables). Understand how `nftables` unifies IPv4, IPv6, ARP, and Ethernet bridging under a single high-performance syntax, its in-kernel bytecode Virtual Machine, atomic rule replacements, anonymous and named Sets ($O(1)$ and $O(\log N)$ lookup performance), Dictionaries/Maps for dynamic NAT, and migration from legacy iptables.
+>
+> By the end of this chapter, you will understand:
+> 1. Why `nftables` was built: eliminating iptables codebase fragmentation, kernel bloat, and $O(N)$ rule evaluation
+> 2. The `nftables` address families: `ip`, `ip6`, `inet` (dual-stack unified), `arp`, `bridge`, and `netdev` (ingress fast path)
+> 3. The in-kernel Bytecode Virtual Machine architecture
+> 4. High-performance Sets: Named sets, interval sets (CIDR ranges), and performance benchmarks vs `ipset`
+> 5. Dictionaries / Maps: 1-to-1 matching and dynamic port forwarding without linear chains
+> 6. CLI configuration and script automation using `nft`
+
+---
+
+## Real-Life Analogy
+
+Think of the difference between `iptables` and `nftables` as **upgrading from 4 separate paper ledgers to a modern compiled relational database**:
+
+- **Legacy iptables (4 Separate Paper Books):**
+  - If you wanted to filter IPv4, IPv6, MAC bridges, and ARP, you had to run 4 completely separate tools with different syntax (`iptables`, `ip6tables`, `arptables`, `ebtables`).
+  - To check an IP against 500 blocked addresses, iptables reads all 500 lines one-by-one from top to bottom (**$O(N)$ linear delay**).
+- **Modern nftables (Compiled SQL Database with Indexes):**
+  - A single tool (`nft`) handles IPv4 and IPv6 simultaneously inside a unified `inet` family.
+  - You store 100,000 blocked IPs in a hash index (**Named Set**). The kernel checks the incoming packet in **1 CPU instruction ($O(1)$)**, regardless of whether you have 10 or 1,000,000 rules.
+
+---
+
+## Architecture Diagram
+
+```text
+                  nftables Unified Architecture & Bytecode Engine
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ USER SPACE: `nft` Command-Line Tool / Configuration Scripts                 │
+ │                                                                             │
+ │   nft add rule inet filter input ip saddr @denylist_v4 drop                 │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ (libnftnl - Compiles to Bytecode)
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ LINUX KERNEL: Netfilter Subsystem                                           │
+ │                                                                             │
+ │   ┌───────────────────────────────────────────────────────────────────────┐ │
+ │   │ NFTABLES IN-KERNEL BYTECODE VIRTUAL MACHINE (VM)                      │ │
+ │   │                                                                       │ │
+ │   │ - Registers (Payload, Reg0, Reg1)                                     │ │
+ │   │ - Instructions (LOAD payload, CMP, JMP, VERDICT)                      │ │
+ │   └──────────────────────────────────┬────────────────────────────────────┘ │
+ │                                      │                                      │
+ │                                      ▼                                      │
+ │   ┌───────────────────────────────────────────────────────────────────────┐ │
+ │   │ HIGH-PERFORMANCE DATA STRUCTURES:                                     │ │
+ │   │ - Named Sets (Hash tables $O(1)$, rbtrees for CIDR ranges $O(\log N)$)│ │
+ │   │ - Dictionaries / Maps (IP -> Translated IP:Port in 1 step)            │ │
+ │   └───────────────────────────────────────────────────────────────────────┘ │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Unified Address Families in nftables
+
+```text
+ ┌──────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Family       │ Protocol & Scope                                                            │
+ │──────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`ip`**     │ Standard IPv4 packets only (replaces `iptables`)                            │
+ │ **`ip6`**    │ Standard IPv6 packets only (replaces `ip6tables`)                           │
+ │ **`inet`**   │ **Unified Dual-Stack:** Evaluates BOTH IPv4 and IPv6 rules in a single rule │
+ │ **`arp`**    │ Layer 2 ARP packet filtering (replaces `arptables`)                         │
+ │ **`bridge`** │ Layer 2 Ethernet bridging (replaces `ebtables`)                             │
+ │ **`netdev`** │ Ingress hook running directly after NIC driver (similar to XDP / TC)        │
+ └──────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Sets and Dictionaries (Maps)
+
+Instead of creating 100 separate iptables rules, `nftables` uses a single rule with a Set:
+
+```nft
+table inet my_filter {
+  # Named Set with CIDR Interval support
+  set allowlist_subnets {
+    type ipv4_addr
+    flags interval
+    elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.1.0/24 }
+  }
+
+  # Dictionary / Map (Port forwarding lookup table)
+  map port_forward_map {
+    type inet_service : ipv4_addr
+    elements = { 80 : 10.0.0.10, 443 : 10.0.0.11, 22 : 10.0.0.20 }
+  }
+
+  chain input {
+    type filter hook input priority 0; policy drop;
+    
+    # 1 rule checks entire set of 100k IPs in O(log N) time!
+    ip saddr @allowlist_subnets accept
+  }
+}
+```
+
+---
+
+## Hands-On Lab: Configuring nftables via CLI
+
+```bash
+# Step 1: List all active nftables rulesets, tables, and chains
+sudo nft list ruleset
+
+# Step 2: Create a unified dual-stack inet table and input chain
+sudo nft add table inet my_firewall
+sudo nft add chain inet my_firewall my_input { type filter hook input priority 0 \; policy drop \; }
+
+# Step 3: Allow loopback and established/related connections
+sudo nft add rule inet my_firewall my_input ct state established,related accept
+sudo nft add rule inet my_firewall my_input iifname "lo" accept
+
+# Step 4: Create a named set for allowed admin IPs and allow SSH
+sudo nft add set inet my_firewall admin_ips { type ipv4_addr \; }
+sudo nft add element inet my_firewall admin_ips { 192.168.1.50, 10.0.0.100 }
+sudo nft add rule inet my_firewall my_input ip saddr @admin_ips tcp dport 22 accept
+
+# Step 5: Clean up test table
+sudo nft delete table inet my_firewall
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the primary architectural improvements of `nftables` over legacy `iptables`?**
+
+1. **Unified Dual-Stack (`inet`):** Filters both IPv4 and IPv6 in a single rule, eliminating the duplication required by `iptables` and `ip6tables`.
+2. **In-Kernel Bytecode VM:** Evaluates compiled instructions rather than rigid hardcoded match extensions in kernel C code.
+3. **Native Sets and Maps:** Evaluates IP lookups in $O(1)$ (hash table) or $O(\log N)$ (rbtree) rather than $O(N)$ linear scans.
+4. **Atomic Rule Replacement:** Rulesets update in a single atomic transaction; no partial state or packet drops during firewall reloads.
+5. **Zero Built-In Tables:** Tables and chains are created only when needed, consuming zero memory when inactive.
+
+**Q2: What is the `netdev` address family in nftables and how does it optimize DDoS mitigation?**
+
+The `netdev` family hooks into the **Ingress pipeline directly after the NIC driver receives the packet**, before the packet enters the core IP stack or connection tracking. By dropping volumetric DDoS floods at the `netdev` ingress hook (`hook ingress priority -500`), the CPU avoids wasting memory allocations (`sk_buff`) and conntrack table lookups, surviving millions of attack packets per second.
+
+**Q3: How does atomic ruleset loading work in nftables?**
+
+When applying a configuration file (`nft -f /etc/nftables.conf`), `nftables` submits the entire ruleset to the kernel as a **single Netlink transaction**. The kernel validates the syntax, compiles the bytecode, and swaps the pointer to the active ruleset in a single atomic memory swap. If any syntax error exists, the entire transaction rolls back with zero disruption to active connections.
+
+**Q4: How do `nftables` Maps (Dictionaries) replace multiple DNAT port forwarding chains?**
+
+In iptables, forwarding ports 80, 443, and 22 to 3 different internal servers required 3 separate sequential DNAT rules in the `PREROUTING` chain. In `nftables`, a single Map binds incoming ports to destination IP addresses (`dnat to tcp dport map { 80 : 10.0.0.10, 443 : 10.0.0.11, 22 : 10.0.0.20 }`), executing the entire port-forwarding logic in a **single $O(1)$ dictionary lookup**.
+
+**Q5: What is `iptables-nft` and how does the compatibility layer operate?**
+
+`iptables-nft` is a translation wrapper provided by modern Linux distributions. It accepts standard legacy `iptables` CLI commands and translates them on-the-fly into `nftables` bytecode, writing to the underlying `nftables` kernel subsystem. This allows legacy tools (like Docker and older Kubernetes `kube-proxy`) to run without modification on `nftables`-only kernels.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the unified `inet` dual-stack family
+- [ ] Understand the in-kernel Bytecode VM architecture
+- [ ] Master Named Sets and $O(1)$ / $O(\log N)$ performance vs $O(N)$ iptables
+- [ ] Understand Dictionaries/Maps for single-rule dynamic NAT
+- [ ] Know how the `netdev` ingress hook mitigates high-rate DDoS attacks

@@ -1,0 +1,1593 @@
+---
+title: "Chapter 2 — iptables Mode Internals"
+sidebar_position: 2
+module: "Module 1.8 — kube-proxy Internals"
+description: "> **Goal:** Understand how Kubernetes implements Services using **iptables**. Learn how **Linux Netfilter**, **NAT tables**, **Kubernetes iptables chains**, **D..."
+---
+
+# Module 1.8 — kube-proxy Internals
+
+# Chapter 2 — iptables Mode Internals
+
+> **Goal:** Understand how Kubernetes implements Services using **iptables**. Learn how **Linux Netfilter**, **NAT tables**, **Kubernetes iptables chains**, **DNAT**, **SNAT**, and **Hairpin NAT** work together to transparently forward traffic from a Service Virtual IP to backend Pods.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Linux Netfilter architecture and netfilter packet traversal hooks
+> 2. How iptables organizes rules into tables (nat, filter, mangle) and chains
+> 3. Kubernetes custom iptables chains: KUBE-SERVICES, KUBE-SVC-*, KUBE-SEP-*
+> 4. Destination NAT (DNAT): translating ClusterIP to selected Pod IP
+> 5. Source NAT (SNAT / MASQUERADE): handling cross-node and external traffic
+> 6. Random load balancing across Pods using iptables statistic module
+> 7. Hairpin NAT: allowing a Pod to communicate with its own Service
+> 8. Performance bottlenecks: why O(n) rule evaluation degrades at scale
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of iptables mode like a customs officer with a rulebook.
+
+```text
+Customs Officer Analogy:
+
+Traveler (packet) arrives at checkpoint (Node network interface)
+Customs officer (Netfilter) flips through a massive rulebook line-by-line
+Rule 1: If going to VIP A -> reroute to Booth 101 with 33% chance
+Rule 2: If going to VIP A -> reroute to Booth 102 with 50% chance
+Rule 3: If going to VIP A -> reroute to Booth 103
+Officer stamps traveler and changes destination on ticket (DNAT)
+When the rulebook has 50,000 rules, checking every traveler becomes very slow
+```
+
+| Customs Officer | iptables Mode |
+| :--- | :--- |
+| Traveler | Network packet |
+| Checkpoint | Netfilter hooks (PREROUTING, OUTPUT, POSTROUTING) |
+| Rulebook | iptables NAT table chains |
+| Checking line-by-line | Sequential rule evaluation ($O(n)$ complexity) |
+| Changing destination ticket | DNAT (`KUBE-SEP` chain rewrites destination IP/port) |
+| Return stamp | conntrack state entry + SNAT/MASQUERADE |
+
+> **Important:** iptables rules are evaluated **linearly per packet**. In large clusters with thousands of Services and tens of thousands of Endpoints, the kernel must traverse sequential rules until a match is found. This $O(n)$ complexity causes significant CPU overhead and packet latency, which led to the creation of IPVS mode and modern eBPF replacements.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Linux Networking Basics
+- Kubernetes Services
+- kube-proxy Architecture
+- ClusterIP
+- EndpointSlices
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapter we learned:
+
+```text
+Client
+  |
+  v
+Service VIP
+  |
+  v
+kube-proxy
+  |
+  v
+Backend Pod
+```
+
+But we skipped one very important question:
+
+> **How does kube-proxy actually forward packets?**
+
+The answer is:
+
+```text
+iptables
+```
+
+---
+
+# The Problem
+
+Suppose a Service exists.
+
+```text
+Service
+
+10.96.0.15
+```
+
+Pods:
+
+```text
+Pod A
+
+10.244.1.5
+
+────────────
+
+Pod B
+
+10.244.2.8
+```
+
+No application is listening on:
+
+```text
+10.96.0.15
+```
+
+Yet traffic reaches the Pods.
+
+How?
+
+---
+
+# The Answer
+
+kube-proxy creates Linux **iptables rules**.
+
+Packets destined for:
+
+```text
+10.96.0.15
+```
+
+are rewritten to:
+
+```text
+10.244.1.5
+
+or
+
+10.244.2.8
+```
+
+This rewrite occurs entirely inside the Linux kernel.
+
+---
+
+# What is Netfilter?
+
+Before understanding iptables,
+
+we must understand:
+
+```text
+Netfilter
+```
+
+Netfilter is the packet processing framework built into the Linux kernel.
+
+Think of it as:
+
+```text
+Packet
+  |
+  v
+Kernel
+  |
+  v
+Decision
+  |
+  v
+Forward
+
+Modify
+
+Drop
+```
+
+Every packet entering or leaving Linux passes through Netfilter hooks.
+
+---
+
+# Netfilter Architecture
+
+```text
+Incoming Packet
+  |
+  v
+Netfilter Hooks
+  |
+  v
+iptables Rules
+  |
+  v
+Kernel Decision
+  |
+  v
+Outgoing Packet
+```
+
+Important:
+
+Netfilter is inside the Linux kernel.
+
+---
+
+# Netfilter Hooks
+
+Netfilter provides several hook points.
+
+```text
+Incoming Packet
+  |
+  v
+PREROUTING
+  |
+  v
+Routing Decision
+  |
+  v
+INPUT
+  |
+  v
+Application
+
+────────────
+
+Forwarded Packet
+  |
+  v
+FORWARD
+
+────────────
+
+Outgoing Packet
+  |
+  v
+OUTPUT
+  |
+  v
+POSTROUTING
+```
+
+Each hook allows packet inspection and modification.
+
+---
+
+# Netfilter Pipeline
+
+Complete flow:
+
+```text
+Incoming Packet
+  |
+  v
+PREROUTING
+  |
+  v
+Routing
+  |
+  v
+INPUT
+  |
+  v
+Local Process
+
+────────────
+
+OR
+
+────────────
+
+FORWARD
+  |
+  v
+POSTROUTING
+  |
+  v
+Outgoing Interface
+```
+
+---
+
+# What is iptables?
+
+iptables is a userspace tool used to configure Netfilter.
+
+Important distinction:
+
+```text
+iptables
+  |
+  v
+Configuration Tool
+
+────────────
+
+Netfilter
+  |
+  v
+Kernel Engine
+```
+
+iptables installs rules.
+
+Netfilter executes them.
+
+---
+
+# Analogy
+
+Imagine:
+
+```text
+iptables
+  |
+  v
+Writes Rules
+
+────────────
+
+Netfilter
+  |
+  v
+Police Officer
+  |
+  v
+Executes Rules
+```
+
+iptables does not process packets itself.
+
+---
+
+# Tables in iptables
+
+iptables organizes rules into tables.
+
+Common tables:
+
+```text
+filter
+  |
+  v
+Security
+
+────────────
+
+nat
+  |
+  v
+Address Translation
+
+────────────
+
+mangle
+  |
+  v
+Packet Modification
+
+────────────
+
+raw
+  |
+  v
+Special Processing
+```
+
+For Kubernetes Services,
+
+the most important table is:
+
+```text
+nat
+```
+
+---
+
+# Why NAT?
+
+Suppose:
+
+Client sends:
+
+```text
+Destination
+
+10.96.0.15
+```
+
+No Pod owns that IP.
+
+The kernel rewrites:
+
+```text
+Destination
+  |
+  v
+10.244.1.5
+```
+
+This process is called:
+
+```text
+DNAT
+
+Destination NAT
+```
+
+---
+
+# NAT Table
+
+The NAT table performs address translation.
+
+Typical flow:
+
+```text
+Original Packet
+  |
+  v
+NAT Table
+  |
+  v
+Modified Packet
+```
+
+Kubernetes Service networking depends heavily on this table.
+
+---
+
+# NAT Hooks
+
+The NAT table mainly operates at:
+
+```text
+PREROUTING
+
+OUTPUT
+
+POSTROUTING
+```
+
+These are the three hooks you must understand.
+
+---
+
+# PREROUTING
+
+Purpose:
+
+```text
+Packet Arrives
+  |
+  v
+Modify Destination
+  |
+  v
+Routing Decision
+```
+
+PREROUTING executes **before** Linux decides where to send the packet.
+
+---
+
+# Why PREROUTING?
+
+Suppose:
+
+```text
+Destination
+
+10.96.0.15
+```
+
+The kernel first changes it:
+
+```text
+v
+
+10.244.1.5
+```
+
+Only then does routing occur.
+
+---
+
+# PREROUTING Flow
+
+```text
+Incoming Packet
+  |
+  v
+PREROUTING
+  |
+  v
+DNAT
+  |
+  v
+Routing
+  |
+  v
+Pod
+```
+
+---
+
+# OUTPUT
+
+OUTPUT processes packets generated by the local Node.
+
+Example:
+
+```text
+kubelet
+  |
+  v
+Service VIP
+  |
+  v
+OUTPUT
+  |
+  v
+DNAT
+  |
+  v
+Pod
+```
+
+Without OUTPUT,
+
+Node-local processes could not access ClusterIP Services correctly.
+
+---
+
+# OUTPUT Flow
+
+```text
+Node Process
+  |
+  v
+OUTPUT
+  |
+  v
+DNAT
+  |
+  v
+Backend Pod
+```
+
+---
+
+# POSTROUTING
+
+POSTROUTING occurs after routing.
+
+Purpose:
+
+```text
+Packet Ready
+  |
+  v
+Modify Source Address
+  |
+  v
+Transmit
+```
+
+Most source NAT (SNAT) happens here.
+
+---
+
+# POSTROUTING Flow
+
+```text
+Pod Response
+  |
+  v
+POSTROUTING
+  |
+  v
+SNAT
+  |
+  v
+Client
+```
+
+---
+
+# Kubernetes iptables Chains
+
+Instead of placing all rules directly into PREROUTING,
+
+kube-proxy creates custom chains.
+
+Typical chain hierarchy:
+
+```text
+PREROUTING
+  |
+  v
+KUBE-SERVICES
+  |
+  v
+KUBE-SVC
+  |
+  v
+KUBE-SEP
+```
+
+This keeps rules organized.
+
+---
+
+# KUBE-SERVICES
+
+This is the entry point for Service traffic.
+
+Purpose:
+
+```text
+Service VIP
+  |
+  v
+Find Matching Service
+```
+
+Example:
+
+```text
+10.96.0.15
+  |
+  v
+KUBE-SVC-ABC123
+```
+
+---
+
+# Architecture
+
+```text
+Packet
+  |
+  v
+KUBE-SERVICES
+  |
+  v
+Correct Service Chain
+  |
+  v
+Backend
+```
+
+Every Service gets an entry.
+
+---
+
+# KUBE-SVC Chain
+
+Each Service has its own service chain.
+
+Example:
+
+```text
+Service
+  |
+  v
+KUBE-SVC-XYZ
+  |
+  v
+Select Backend
+```
+
+This chain decides which Pod should receive traffic.
+
+---
+
+# Example
+
+```text
+KUBE-SVC
+  |
+  v
+Random Selection
+  |
+  v
+Pod A
+
+────────────
+
+or
+  |
+  v
+Pod B
+```
+
+Load balancing occurs here.
+
+---
+
+# KUBE-SEP Chain
+
+SEP means:
+
+```text
+Service Endpoint
+```
+
+Each backend Pod receives its own endpoint chain.
+
+Example:
+
+```text
+KUBE-SEP-A
+  |
+  v
+Pod A
+
+────────────
+
+KUBE-SEP-B
+  |
+  v
+Pod B
+```
+
+---
+
+# Responsibility
+
+A KUBE-SEP chain performs the final destination rewrite.
+
+Example:
+
+```text
+Destination
+
+10.96.0.15
+  |
+  v
+10.244.1.5
+```
+
+---
+
+# KUBE-MARK-MASQ
+
+This chain marks packets that require source NAT.
+
+Purpose:
+
+```text
+Packet
+  |
+  v
+Needs SNAT?
+  |
+  v
+Mark Packet
+```
+
+The actual SNAT is applied later in POSTROUTING.
+
+---
+
+# Complete Chain Flow
+
+```text
+Incoming Packet
+  |
+  v
+PREROUTING
+  |
+  v
+KUBE-SERVICES
+  |
+  v
+KUBE-SVC
+  |
+  v
+KUBE-SEP
+  |
+  v
+DNAT
+  |
+  v
+Routing
+  |
+  v
+Pod
+```
+
+---
+
+# DNAT
+
+DNAT means:
+
+```text
+Destination Network Address Translation
+```
+
+Destination address changes.
+
+Example:
+
+Before:
+
+```text
+Destination
+
+10.96.0.15
+```
+
+After:
+
+```text
+Destination
+
+10.244.1.5
+```
+
+The client is unaware of this translation.
+
+---
+
+# DNAT Workflow
+
+```text
+Client
+  |
+  v
+Service VIP
+  |
+  v
+DNAT
+  |
+  v
+Backend Pod
+```
+
+---
+
+# SNAT
+
+SNAT means:
+
+```text
+Source Network Address Translation
+```
+
+Instead of changing destination,
+
+it changes:
+
+```text
+Source IP
+```
+
+---
+
+# Example
+
+Before:
+
+```text
+Source
+
+10.244.1.5
+```
+
+After:
+
+```text
+Node IP
+```
+
+This ensures return traffic follows a valid path in scenarios that require masquerading.
+
+---
+
+# Why SNAT?
+
+Some traffic paths require responses to return through the originating Node.
+
+SNAT ensures:
+
+```text
+Response
+  |
+  v
+Correct Route
+  |
+  v
+Client
+```
+
+---
+
+# Hairpin NAT
+
+Hairpin NAT is one of the most confusing Kubernetes networking topics.
+
+Suppose:
+
+```text
+Pod A
+```
+
+calls:
+
+```text
+Its Own Service
+```
+
+Flow:
+
+```text
+Pod A
+  |
+  v
+Service VIP
+  |
+  v
+Pod A
+```
+
+Without special handling,
+
+the packet can fail.
+
+---
+
+# Why?
+
+Initially:
+
+```text
+Source
+
+Pod A
+
+Destination
+
+Service VIP
+```
+
+After DNAT:
+
+```text
+Source
+
+Pod A
+
+Destination
+
+Pod A
+```
+
+The packet leaves and returns to the same Pod.
+
+Without Hairpin NAT,
+
+Linux networking may reject or mishandle this path.
+
+---
+
+# Hairpin NAT Solution
+
+The kernel performs additional NAT so the connection behaves correctly.
+
+Conceptually:
+
+```text
+Pod
+  |
+  v
+Service
+  |
+  v
+DNAT
+  |
+  v
+SNAT
+  |
+  v
+Same Pod
+```
+
+This allows Pods to access themselves through their own Service IP.
+
+---
+
+# Packet Walkthrough
+
+Let's trace a packet.
+
+Client:
+
+```text
+192.168.1.20
+```
+
+Destination:
+
+```text
+10.96.0.15
+```
+
+---
+
+# Step 1
+
+Packet arrives.
+
+```text
+Destination
+
+10.96.0.15
+```
+
+---
+
+# Step 2
+
+PREROUTING executes.
+
+---
+
+# Step 3
+
+Packet enters:
+
+```text
+KUBE-SERVICES
+```
+
+---
+
+# Step 4
+
+Correct service chain selected.
+
+```text
+KUBE-SVC
+```
+
+---
+
+# Step 5
+
+Backend selected.
+
+```text
+Pod B
+```
+
+---
+
+# Step 6
+
+Packet enters:
+
+```text
+KUBE-SEP
+```
+
+---
+
+# Step 7
+
+DNAT occurs.
+
+```text
+10.96.0.15
+  |
+  v
+10.244.2.8
+```
+
+---
+
+# Step 8
+
+Routing occurs.
+
+---
+
+# Step 9
+
+Packet reaches Pod.
+
+---
+
+# Complete Walkthrough
+
+```text
+Client
+  |
+  v
+Service VIP
+  |
+  v
+PREROUTING
+  |
+  v
+KUBE-SERVICES
+  |
+  v
+KUBE-SVC
+  |
+  v
+KUBE-SEP
+  |
+  v
+DNAT
+  |
+  v
+Routing
+  |
+  v
+Pod
+```
+
+---
+
+# Rule Generation
+
+How are these rules created?
+
+Workflow:
+
+```text
+API Server
+  |
+  v
+EndpointSlice Update
+  |
+  v
+kube-proxy
+  |
+  v
+Generate Rules
+  |
+  v
+iptables-restore
+  |
+  v
+Kernel
+```
+
+Important:
+
+kube-proxy generally updates rules in batches (commonly using `iptables-restore`) rather than invoking `iptables` once per rule, improving consistency and efficiency.
+
+---
+
+# Dynamic Updates
+
+Suppose:
+
+Deployment scales.
+
+Old:
+
+```text
+2 Pods
+```
+
+Later:
+
+```text
+5 Pods
+```
+
+Workflow:
+
+```text
+EndpointSlice
+  |
+  v
+Changed
+  |
+  v
+kube-proxy
+  |
+  v
+Regenerate Chains
+  |
+  v
+Traffic Updated
+```
+
+No application restart is required.
+
+---
+
+# Performance Characteristics
+
+iptables performs well for small and medium clusters.
+
+However,
+
+each packet may traverse rule chains until a match is found.
+
+As clusters grow:
+
+```text
+More Services
+  |
+  v
+More Rules
+  |
+  v
+Longer Rule Chains
+```
+
+Rule synchronization also becomes more expensive.
+
+---
+
+# Advantages
+
+✔ Mature Linux technology
+
+✔ Stable
+
+✔ Kernel-based forwarding
+
+✔ Widely supported
+
+✔ Easy to troubleshoot
+
+---
+
+# Limitations
+
+✖ Large rule sets
+
+✖ Rule updates can become expensive
+
+✖ Sequential rule traversal
+
+✖ Less scalable than modern eBPF dataplanes for very large environments
+
+---
+
+# Complete Internal Architecture
+
+```text
+               API Server
+
+                    |
+
+         Services / EndpointSlices
+
+                    |
+
+                    ▼
+
+              kube-proxy
+
+                    |
+
+          Generate Rules
+
+                    |
+
+             iptables-restore
+
+                    |
+
+                    ▼
+
+             Linux Netfilter
+
+                    |
+
+      PREROUTING / OUTPUT
+
+                    |
+
+             KUBE-SERVICES
+
+                    |
+
+               KUBE-SVC
+
+                    |
+
+               KUBE-SEP
+
+                    |
+
+                  DNAT
+
+                    |
+
+                  Routing
+
+                    |
+
+                 Backend Pod
+```
+
+---
+
+# Production Example 1
+
+Simple Cluster
+
+```text
+20 Services
+  |
+  v
+iptables
+  |
+  v
+Excellent Performance
+```
+
+---
+
+# Production Example 2
+
+Rolling Update
+
+```text
+Deployment
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+iptables Rules Updated
+  |
+  v
+Traffic Automatically Redirected
+```
+
+---
+
+# Production Example 3
+
+Pod Accesses Its Own Service
+
+```text
+Pod
+  |
+  v
+ClusterIP
+  |
+  v
+Hairpin NAT
+  |
+  v
+Same Pod
+```
+
+---
+
+# Production Example 4
+
+Backend Failure
+
+```text
+Pod Removed
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+iptables Regenerated
+  |
+  v
+Traffic Sent To Healthy Pods
+```
+
+---
+
+# Production Best Practices
+
+✔ Use EndpointSlices for backend discovery.
+
+✔ Monitor iptables rule count in large clusters.
+
+✔ Understand Hairpin NAT before debugging Service networking.
+
+✔ Monitor rule synchronization latency.
+
+✔ Prefer immutable infrastructure—let kube-proxy manage rules instead of modifying them manually.
+
+✔ Verify that Node firewall rules do not interfere with Kubernetes-managed chains.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+iptables forwards packets itself.
+
+**Correct:** iptables is a configuration tool. Netfilter inside the Linux kernel processes packets.
+
+---
+
+### ❌ Misconception 2
+
+The Service IP belongs to a network interface.
+
+**Correct:** A ClusterIP is a virtual IP implemented through packet translation.
+
+---
+
+### ❌ Misconception 3
+
+DNAT changes the source IP.
+
+**Correct:** DNAT changes the destination IP.
+
+---
+
+### ❌ Misconception 4
+
+SNAT changes the destination IP.
+
+**Correct:** SNAT changes the source IP.
+
+---
+
+### ❌ Misconception 5
+
+Hairpin NAT is required for every Service request.
+
+**Correct:** It is primarily required when a Pod accesses itself through its own Service.
+
+---
+
+### ❌ Misconception 6
+
+kube-proxy executes iptables rules.
+
+**Correct:** kube-proxy generates the rules. Netfilter executes them.
+
+---
+
+### ❌ Misconception 7
+
+Each Service has one iptables rule.
+
+**Correct:** A Service is typically represented by multiple chains and rules (for Service matching, endpoint selection, masquerading, and destination translation).
+
+---
+
+# Common Interview Questions
+
+### Q1. What is Netfilter?
+
+The Linux kernel framework responsible for packet filtering, NAT, and packet manipulation.
+
+---
+
+### Q2. What is iptables?
+
+A userspace tool used to configure Netfilter rules.
+
+---
+
+### Q3. What is the purpose of the NAT table?
+
+To perform address translation such as DNAT and SNAT.
+
+---
+
+### Q4. What happens in PREROUTING?
+
+Destination NAT can occur before the kernel makes its routing decision.
+
+---
+
+### Q5. What is the role of KUBE-SERVICES?
+
+It matches incoming traffic for Kubernetes Services and forwards it to the appropriate Service-specific chain.
+
+---
+
+### Q6. What is the role of KUBE-SVC?
+
+It selects one of the available backend endpoints for a Service.
+
+---
+
+### Q7. What is the role of KUBE-SEP?
+
+It performs endpoint-specific processing, including the destination translation to a Pod IP.
+
+---
+
+### Q8. What is Hairpin NAT?
+
+A mechanism that allows a Pod to successfully access itself through its own Service IP.
+
+---
+
+### Q9. Why does kube-proxy use `iptables-restore`?
+
+To update many rules atomically and more efficiently than issuing individual commands.
+
+---
+
+### Q10. Why does iptables become less efficient in very large clusters?
+
+Because large rule sets increase rule synchronization costs and packet matching may require traversing longer chains.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| ClusterIP unreachable | Missing or incorrect iptables rules, networking issue, or kube-proxy failure |
+| Pod cannot access its own Service | Hairpin NAT configuration issue |
+| Traffic reaches wrong backend | Stale EndpointSlice or outdated iptables rules |
+| New Pods receive no traffic | kube-proxy has not yet synchronized updated rules |
+| High packet latency | Very large iptables rule sets or underlying network bottlenecks |
+| Return traffic fails | SNAT/masquerading issue or routing problem |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is Netfilter?
+2. What is the relationship between Netfilter and iptables?
+3. Why does Kubernetes use the NAT table?
+4. What happens in PREROUTING, OUTPUT, and POSTROUTING?
+5. What are the purposes of KUBE-SERVICES, KUBE-SVC, KUBE-SEP, and KUBE-MARK-MASQ?
+6. What is the difference between DNAT and SNAT?
+7. Why is Hairpin NAT required?
+8. How does kube-proxy generate iptables rules?
+9. Why does iptables become less efficient as clusters grow?
+10. How does a packet travel from a Service VIP to a Pod?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes implements Service networking using Linux **iptables** and **Netfilter**.
+
+You learned:
+
+- The architecture of Linux Netfilter and how iptables configures it
+- Why Kubernetes relies on the NAT table for Service networking
+- The roles of the PREROUTING, OUTPUT, and POSTROUTING hooks
+- How kube-proxy creates Kubernetes-specific chains such as **KUBE-SERVICES**, **KUBE-SVC**, **KUBE-SEP**, and **KUBE-MARK-MASQ**
+- The differences between **DNAT** and **SNAT**
+- Why **Hairpin NAT** is necessary when a Pod accesses itself through its own Service
+- How kube-proxy generates and updates iptables rules based on EndpointSlice changes
+- The scalability characteristics, strengths, and limitations of the iptables dataplane
+
+iptables mode remains one of the foundational implementations of Kubernetes Service networking. Understanding how packets traverse Netfilter and Kubernetes-managed chains provides the foundation needed to understand the more advanced IPVS and eBPF dataplanes.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — IPVS Mode Internals**
+
+Topics include:
+
+- Why IPVS was Introduced
+- Linux IPVS Architecture
+- Virtual Servers
+- Real Servers
+- Scheduling Algorithms
+- IPVS Packet Flow
+- kube-proxy + IPVS
+- Connection Persistence
+- Performance Analysis
+- IPVS vs iptables
+```

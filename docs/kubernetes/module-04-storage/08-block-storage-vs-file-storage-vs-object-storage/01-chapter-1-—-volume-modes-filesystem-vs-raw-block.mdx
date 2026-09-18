@@ -1,0 +1,288 @@
+---
+title: "Chapter 1 — Volume Modes: Filesystem vs Raw Block"
+sidebar_position: 1
+module: "Module 4.8 — Block vs File vs Object Storage"
+description: "Master Kubernetes volume modes — volumeMode Filesystem vs Block, bypassing Linux VFS overhead for high-performance databases, KubeVirt VM storage, and volumeDevices configuration."
+---
+
+# Chapter 1 — Volume Modes: Filesystem vs Raw Block
+
+> **Goal:** Master Kubernetes volume modes — understanding the architectural differences between `volumeMode: Filesystem` (directory-mounted ext4/XFS) and `volumeMode: Block` (raw unformatted block devices mapped to `/dev/`), analyzing performance gains from bypassing host Linux Virtual File System (VFS) layers, configuring `volumeDevices` in Pod specs, and deploying raw storage for high-IOPS databases and KubeVirt virtual machines.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural difference between `volumeMode: Filesystem` and `volumeMode: Block`
+> 2. How `volumeMode: Block` exposes raw block devices directly via `volumeDevices`
+> 3. Why high-throughput databases (Oracle, ScyllaDB, Ceph OSDs) and KubeVirt require raw block devices
+> 4. How Kubelet bypasses `mkfs` filesystem formatting when staging raw block storage
+> 5. How raw block volumes eliminate double-caching and Linux page-cache overhead
+> 6. How to troubleshoot raw block device permissions and udev mapping
+
+---
+
+## Real-Life Analogy
+
+Think of volume modes as **different ways to receive raw timber at a construction site**:
+
+- **`volumeMode: Filesystem` (Pre-Built Wooden Cabinets):** The storage provider takes raw wood, cuts it into planks, sands it, builds a finished 4-drawer wooden cabinet (`mkfs.ext4`), and places it in your office (`mountPath: /var/data`). Your application simply opens the drawers and drops in documents (standard file I/O). This is convenient for 95% of applications.
+- **`volumeMode: Block` (Raw Uncut Oak Logs with Heavy Machinery):** You are a master specialized carpenter (Oracle DB, ScyllaDB, Ceph OSD, or KubeVirt). You do not want pre-built drawers because standard drawers waste space and restrict your tools. You request raw uncut timber delivered directly to your workshop (`volumeDevices: devicePath: /dev/sdb`). You run your own high-speed CNC laser cutters directly on the wood, carving custom high-density binary data blocks with zero intermediate cabinet overhead (**Zero VFS Latency**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Filesystem vs Raw Block Volume Modes
+
+ 1. volumeMode: Filesystem (Standard Directory Mount)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod Container                                                          │
+ │ Application writes file ──► VFS (ext4/XFS) ──► Linux Page Cache        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ mountPath: /var/data (Directory Mount)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Formatted Block Device (/dev/xvdf formatted with ext4)                 │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. volumeMode: Block (Direct Raw Device Access)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod Container (ScyllaDB / Ceph OSD / KubeVirt VM)                      │
+ │ Application writes raw binary blocks directly (O_DIRECT / io_uring)    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ devicePath: /dev/xvda (Raw Block Node)
+                                    │ (NO VFS layer! NO Linux Page Cache overhead!)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Unformatted Physical / Cloud Raw Block Storage Device                  │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `Filesystem` vs `Block` Volume Modes
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ `volumeMode: Filesystem` (Default│ `volumeMode: Block`             │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Presentation to App**   │ Standard directory mount path   │ Raw character/block device node │
+ │                           │ (e.g. `/var/data`)              │ (e.g. `/dev/xvda`, `/dev/block`)│
+ │ **Pod Declaration**       │ `spec.containers.volumeMounts`  │ `spec.containers.volumeDevices` │
+ │ **Formatting (`mkfs`)**   │ Formatted with ext4/XFS by CSI  │ **NEVER formatted by Kubelet.** │
+ │                           │ driver during NodeStage.        │ Passed as raw unpartitioned disk│
+ │ **Page Cache Caching**    │ Double-caching in OS page cache │ Direct I/O (`O_DIRECT`), zero OS│
+ │                           │ and application memory buffer.  │ cache overhead.                 │
+ │ **Primary Use Cases**     │ Web apps, microservices, logs,  │ KubeVirt (VM disks), Ceph OSDs, │
+ │                           │ standard PostgreSQL/MySQL.      │ ScyllaDB, Oracle, CockroachDB.  │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Eliminating Double-Caching & VFS Overhead
+
+For high-performance databases, standard filesystem mounts introduce significant performance penalties:
+
+```text
+ The Double-Caching Bottleneck:
+ 1. The database application allocates a 16GB in-memory buffer pool (SGA / InnoDB Buffer).
+ 2. When writing to a filesystem (`mountPath: /data`), the Linux kernel caches the same data blocks 
+    in the host OS Page Cache!
+ 3. Result: 32GB of RAM is consumed for 16GB of data, CPU cycles are wasted on filesystem journaling, 
+    and filesystem metadata locks throttle concurrent writes.
+```
+
+### The Raw Block Advantage:
+By declaring `volumeMode: Block`:
+- The container uses Linux direct asynchronous I/O (`O_DIRECT` or `io_uring`) directly against the device node `/dev/xvda`.
+- Host page caching and filesystem journaling are completely bypassed.
+- Latency drops to bare-metal hardware limits with maximum IOPS throughput.
+
+---
+
+## Complete Production Manifests: Raw Block Storage
+
+```yaml
+# 1. PersistentVolumeClaim Requesting Raw Block Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scylladb-raw-pvc
+  namespace: database
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # Explicitly declare Block mode!
+  volumeMode: Block
+  storageClassName: local-nvme-sc
+  resources:
+    requests:
+      storage: 500Gi
+---
+# 2. Database Pod Consuming Raw Block via volumeDevices
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scylladb-node-0
+  namespace: database
+spec:
+  volumes:
+  - name: raw-disk
+    persistentVolumeClaim:
+      claimName: scylladb-raw-pvc
+
+  containers:
+  - name: scylla
+    image: scylladb/scylla:5.2
+    # Notice: Uses volumeDevices instead of volumeMounts!
+    volumeDevices:
+    - name: raw-disk
+      devicePath: /dev/scylla-data    # Exposed directly as block device!
+    resources:
+      limits:
+        cpu: "8"
+        memory: "32Gi"
+```
+
+---
+
+## KubeVirt: Virtual Machines on Kubernetes
+
+The most prominent consumer of `volumeMode: Block` is **KubeVirt** (running full Linux/Windows KVM virtual machines inside Kubernetes Pods):
+
+```yaml
+apiVersion: kubevirt.io/v1
+kind: VirtualMachineInstance
+metadata:
+  name: windows-server-2022
+spec:
+  domain:
+    devices:
+      disks:
+      - name: os-disk
+        disk:
+          bus: virtio
+    resources:
+      requests:
+        memory: 16Gi
+  volumes:
+  - name: os-disk
+    persistentVolumeClaim:
+      claimName: windows-raw-block-pvc   # Raw block disk used as VM virtual drive!
+```
+
+---
+
+## Hands-On Lab: Deploying & Inspecting Raw Block Volumes
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace block-lab
+
+# Step 2: Create a raw block PersistentVolume (mock loop device or cloud)
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: lab-block-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Block    # Raw Block Mode!
+  storageClassName: manual-block
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /dev/null    # Simulating raw device node
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lab-block-pvc
+  namespace: block-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Block    # Must match PV volumeMode!
+  storageClassName: manual-block
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+
+# Step 3: Deploy a Pod consuming the raw block device via volumeDevices
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: raw-block-consumer
+  namespace: block-lab
+spec:
+  volumes:
+  - name: block-storage
+    persistentVolumeClaim:
+      claimName: lab-block-pvc
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    # volumeDevices binds the raw block device into container
+    volumeDevices:
+    - name: block-storage
+      devicePath: /dev/raw-disk
+EOF
+
+# Step 4: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/raw-block-consumer -n block-lab --timeout=30s
+
+# Step 5: Verify the block device inside the container namespace
+kubectl exec -n block-lab raw-block-consumer -- ls -la /dev/raw-disk
+
+# Step 6: Clean up lab
+kubectl delete namespace block-lab
+kubectl delete pv lab-block-pv
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between `volumeMode: Filesystem` and `volumeMode: Block` in Kubernetes?**
+
+- `volumeMode: Filesystem` (default): Kubelet formats the underlying block device with a filesystem (ext4/XFS) and mounts it into the container as a standard directory via `volumeMounts` at `mountPath`.
+- `volumeMode: Block`: Kubelet leaves the device completely unformatted and exposes the raw block storage device node directly into the container via `volumeDevices` at `devicePath` (e.g. `/dev/xvda`), bypassing all filesystem abstraction.
+
+**Q2: What are the primary production use cases for `volumeMode: Block`?**
+
+Key use cases include:
+1. **High-Performance Databases (Oracle, ScyllaDB, CockroachDB)**: Databases that implement their own proprietary block storage managers and direct I/O engines, eliminating Linux page-cache double-buffering.
+2. **Software-Defined Storage (Ceph Rook OSDs)**: Ceph BlueStore requires raw unformatted block devices to manage physical disk partitions directly.
+3. **Virtualization (KubeVirt)**: KVM/QEMU virtual machines running inside Pods require raw block devices to achieve near-native disk performance for VM disk images.
+
+**Q3: How does configuring `volumeDevices` differ from `volumeMounts` in a Pod specification?**
+
+- `volumeMounts` is used for `volumeMode: Filesystem` and specifies `mountPath: /dir/path` where a formatted directory tree is attached.
+- `volumeDevices` is used exclusively for `volumeMode: Block` and specifies `devicePath: /dev/block-name` where the raw Linux device node is exposed inside the container filesystem.
+
+**Q4: What happens if a PVC declares `volumeMode: Block` but the matched PersistentVolume has `volumeMode: Filesystem`?**
+
+The Kubernetes `pv-controller` requires an **exact match on `volumeMode`** during the binding evaluation. If a PVC requests `volumeMode: Block` and available PVs have `volumeMode: Filesystem`, the controller will refuse to bind them, and the PVC will remain stuck in the `Pending` state indefinitely.
+
+**Q5: Does Kubelet run `NodeStageVolume` for raw block volumes?**
+
+When `volumeMode: Block` is configured, Kubelet skips the filesystem formatting phase inside `NodeStageVolume`. Instead of executing `mkfs.ext4` and mounting to a global directory, the CSI node plugin maps the raw kernel device node directly to the global staging path via a symbolic or character device link, allowing raw block I/O.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `volumeMode: Filesystem` mounts a formatted directory via `volumeMounts`
+- [ ] Know that `volumeMode: Block` maps a raw device node via `volumeDevices`
+- [ ] Know that `volumeMode: Block` bypasses Linux VFS and OS page cache double-buffering
+- [ ] Know the primary use cases: KubeVirt VMs, Ceph OSDs, ScyllaDB, Oracle DB
+- [ ] Know that PV and PVC `volumeMode` must match exactly for binding to succeed
+- [ ] Know that Kubelet never runs `mkfs` on raw block storage volumes
+- [ ] Can view volume device nodes using `ls -la /dev/` inside containers

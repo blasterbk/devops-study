@@ -1,0 +1,221 @@
+---
+title: "Chapter 1 — OCI Image Spec: Manifest, Index & Layers"
+sidebar_position: 1
+module: "Module 2.2 — OCI Image Spec"
+description: "Master the OCI Image Specification — Image Manifest JSON, Multi-Arch Image Indexes (Fat Manifests), Layer Tarballs, Whiteout deletion markers, and Media Types."
+---
+
+# Chapter 1 — OCI Image Spec: Manifest, Index & Layers
+
+> **Goal:** Master the internal data structures, JSON schemas, and cryptographic hashing algorithms defined by the **OCI Image Specification (`image-spec`)** — dissecting the **Image Manifest JSON**, analyzing how **Multi-Architecture Image Indexes (Fat Manifests)** dynamically resolve `amd64` vs `arm64` CPU architectures, inspecting **Layer Tarballs** and OverlayFS whiteout deletion markers, and exploring standardized **OCI Media Types**.
+>
+> By the end of this chapter, you will understand:
+> 1. The hierarchical JSON structure of an OCI Image Manifest and Image Index
+> 2. How multi-arch images serve both Intel/AMD and Apple Silicon/ARM64 from a single tag
+> 3. How layer tarballs represent progressive filesystem diffs and handle file deletions (`.wh.`)
+> 4. The relationship between Compressed Layer Digests and Uncompressed `diff_ids`
+> 5. The official OCI Media Types used across container registries and runtimes
+> 6. How to inspect multi-arch manifest lists and raw image layers using CLI tooling
+
+---
+
+## Real-Life Analogy
+
+Think of the OCI Image Specification as **a multi-lingual architectural construction manual for building modular prefabricated houses**:
+
+- **1. The Multi-Lingual Catalog (`OCI Image Index / Fat Manifest`):**
+  - A customer orders a house kit labeled `model:v2.0` (**An image tag: `nginx:latest`**).
+  - The catalog lists 2 distinct blueprint editions: Edition A for flat desert terrain (**`linux/amd64`**), and Edition B for rocky mountain terrain (**`linux/arm64`**).
+  - The construction crane automatically detects the terrain and selects the matching blueprint without human intervention (**Client architecture auto-selection**).
+- **2. The Master Bill of Materials (`OCI Image Manifest JSON`):**
+  - The selected blueprint contains an exact checklist:
+    - *"Box #1: Concrete foundation (Digest: `sha256:4a...`)"*
+    - *"Box #2: Wooden wall frames (Digest: `sha256:7b...`)"*
+    - *"Box #3: Roof shingles (Digest: `sha256:9c...`)"*
+    - *"Instruction booklet: Ignition keys and room colors (The Config JSON)"*.
+- **3. The Stacked Layers & Erasers (`Layer Tarballs & Whiteouts`):**
+  - Box #2 adds a temporary wooden support beam. Box #3 removes the beam.
+  - To delete a file in a layered filesystem, Box #3 places a special red "ERASE" sticker over the beam (**A Whiteout File: `.wh.support_beam`**). When the layers are stacked, the beam vanishes from the finished house!
+
+---
+
+## Architecture Diagram
+
+```text
+               OCI Image Hierarchy: Image Index ──► Manifests ──► Layers
+
+ OCI IMAGE INDEX (Multi-Arch "Fat Manifest" - `application/vnd.oci.image.index.v1+json`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Manifest 01: `platform: { os: linux, architecture: amd64 }`           │
+ │ Manifest 02: `platform: { os: linux, architecture: arm64 }`           │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Client on Apple Silicon (M1/M2/M3) selects ARM64!
+                    ▼
+ OCI IMAGE MANIFEST (`application/vnd.oci.image.manifest.v1+json`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. CONFIG DESCRIPTOR (`application/vnd.oci.image.config.v1+json`)      │
+ │    - Points to SHA-256 Config Blob (Entrypoint, Env Vars, DiffIDs)     │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 2. LAYERS ARRAY (`application/vnd.oci.image.layer.v1.tar+gzip`)        │
+ │    ├── Layer 0: `sha256:1a2b...` (Base Alpine Linux Rootfs: 3.2MB)     │
+ │    ├── Layer 1: `sha256:3c4d...` (Installed Python Binaries: 45MB)     │
+ │    └── Layer 2: `sha256:5e6f...` (Application Code `app.py`: 12KB)     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Unpacks & Stacks via Storage Snapshotter (OverlayFS)
+                    ▼
+ [ MERGED RUNTIME ROOTFS: Complete unified container filesystem! ]
+```
+
+---
+
+## 1. The OCI Image Manifest JSON Schema
+
+```json
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:054a09e0236a9a79a6136e053f31f9b1c7c9134b22c76a5b6f",
+    "size": 1471
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:4abcf20661432fb2d719abb906d6545202c91ed57e6b558c4f",
+      "size": 3401201
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd1",
+      "size": 12894
+    }
+  ],
+  "annotations": {
+    "org.opencontainers.image.created": "2026-08-18T10:00:00Z",
+    "org.opencontainers.image.authors": "platform-engineering@enterprise.org"
+  }
+}
+```
+
+---
+
+## 2. Multi-Architecture Image Index (Fat Manifest)
+
+```json
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:amd64_manifest_hash_111...",
+      "size": 528,
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      }
+    },
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:arm64_manifest_hash_222...",
+      "size": 528,
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Layer Tarballs & Whiteout File Deletions
+
+In a union filesystem (OverlayFS), lower layers are **read-only and immutable**. When a Dockerfile command executes `RUN rm /etc/nginx/nginx.conf`:
+- The file is **not** deleted from lower layer tarballs.
+- Instead, the upper layer tarball creates a **Whiteout Marker File**: **`.wh.nginx.conf`**.
+- When the runtime mounts the layers, OverlayFS hides the file from user space.
+
+```text
+ Layer 0 (Read-Only): Contains `/etc/nginx/nginx.conf`
+ Layer 1 (Read-Only): Contains `/etc/nginx/.wh.nginx.conf` (Whiteout Marker)
+ ──────────────────────────────────────────────────────────────────────────
+ Merged Container View: `/etc/nginx/nginx.conf` is completely invisible!
+```
+
+---
+
+## Standard OCI Media Types Reference
+
+```text
+ ┌───────────────────────────────────────────────────────┬────────────────────────────────────────────┐
+ │ Standard OCI Media Type String                        │ Payload Purpose & Format                   │
+ │───────────────────────────────────────────────────────┼────────────────────────────────────────────┤
+ │ `application/vnd.oci.image.index.v1+json`             │ Multi-Architecture Image Index list.       │
+ │ `application/vnd.oci.image.manifest.v1+json`          │ Single-Architecture Image Manifest JSON.   │
+ │ `application/vnd.oci.image.config.v1+json`            │ Runtime configuration metadata (Env, Cmd). │
+ │ `application/vnd.oci.image.layer.v1.tar+gzip`         │ Standard Gzip-compressed layer tarball.    │
+ │ `application/vnd.oci.image.layer.v1.tar+zstd`         │ Ultra-fast Zstandard compressed layer.     │
+ │ `application/vnd.oci.image.layer.nondistributable...` │ Proprietary Windows foreign layer blob.    │
+ └───────────────────────────────────────────────────────┴────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying Multi-Arch Image Indexes
+
+```bash
+# Step 1: Inspect a multi-arch image index using docker buildx imagetools
+docker buildx imagetools inspect alpine:latest 2>/dev/null || echo "docker buildx ready"
+
+# Output will list all supported platform architectures:
+# Name:      docker.io/library/alpine:latest
+# MediaType: application/vnd.docker.distribution.manifest.list.v2+json
+# Manifests:
+#   Platform: linux/amd64
+#   Platform: linux/arm64
+#   Platform: linux/riscv64
+#   Platform: linux/s390x
+
+# Step 2: Download the raw JSON manifest directly using Docker
+# docker manifest inspect alpine:latest
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the structural difference between an OCI Image Manifest and an OCI Image Index?**
+
+- **Image Manifest (`application/vnd.oci.image.manifest.v1+json`)**: Represents a **concrete, single-architecture container image**. It points to exactly one Config JSON blob and an ordered array of layer tarball descriptors (`layers[]`) for a specific OS and CPU architecture (e.g. `linux/amd64`).
+- **Image Index (`application/vnd.oci.image.index.v1+json`)**: A higher-level routing descriptor (often called a **"Fat Manifest" or "Manifest List"**). It contains an array of pointers to multiple Image Manifests, each tagged with its target platform (`amd64`, `arm64`, `windows`). Container runtimes inspect the Index to download only the manifest matching the host CPU.
+
+**Q2: What is the difference between a Layer's `digest` and its `diff_id`?**
+
+- **`digest`**: The SHA-256 hash of the **compressed layer tarball as stored in the registry** (e.g. `.tar.gz`). Registries use this digest for network transfer integrity and content-addressable storage.
+- **`diff_id`**: The SHA-256 hash of the **uncompressed tar archive**. The Image Config JSON stores `diff_ids[]` so that the local runtime can verify the integrity of the unpacked filesystem layers on disk regardless of which compression algorithm was used.
+
+**Q3: How do OCI Layer Tarballs implement file deletion in an immutable layered filesystem?**
+
+Because lower layers cannot be modified, file deletions are implemented using **Whiteout Marker Files**. When a file named `sample.txt` is deleted in a new layer, the image builder inserts a 0-byte special file named **`.wh.sample.txt`** into that layer's tarball. For directory deletions, an **Opaque Whiteout Marker (`.wh..wh..opq`)** is created. When the storage driver (OverlayFS) merges the layers at runtime, it hides all underlying files matching whiteout markers.
+
+**Q4: Why is deleting large files in a later Dockerfile `RUN` step an anti-pattern for image size?**
+
+In an immutable layered filesystem, each `RUN` instruction creates a permanent, immutable layer tarball. If Layer 1 downloads a 1GB dataset (`RUN wget data.zip`), and Layer 2 deletes it (`RUN rm data.zip`), **the 1GB file remains permanently stored inside Layer 1's tarball**. The final image still downloads and consumes that 1GB of disk space. To avoid this, downloading, processing, and deleting files must be executed **inside a single `RUN` command** or via **Multi-Stage Builds**.
+
+**Q5: What are the performance advantages of Zstandard (`.tar+zstd`) over Gzip (`.tar+gzip`) layers in OCI?**
+
+**Zstandard (zstd)** provides significantly faster decompression speeds (up to **5x faster than gzip**) with comparable or superior compression ratios. In large enterprise clusters, uncompressing gigabytes of image layers during container cold starts creates CPU and I/O bottlenecks. Using OCI `layer.v1.tar+zstd` allows container runtimes like `containerd` to decompress and unpack images at near-disk saturation speeds, drastically reducing pod cold-start latency.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that an OCI Image Manifest points to 1 Config JSON and ordered Layer Tarballs
+- [ ] Know that an Image Index (Fat Manifest) routes clients to the correct CPU architecture
+- [ ] Know the difference: `digest` (Compressed hash) vs `diff_id` (Uncompressed hash)
+- [ ] Know that file deletions in layers use Whiteout markers (`.wh.<name>`)
+- [ ] Know why deleting files in later layers does NOT reduce total image download size
+- [ ] Can inspect multi-arch image platforms using `docker buildx imagetools inspect`

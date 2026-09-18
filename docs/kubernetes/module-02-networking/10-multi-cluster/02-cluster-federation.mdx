@@ -1,0 +1,350 @@
+---
+title: "Chapter 2 — Cluster Federation"
+sidebar_position: 2
+module: "Module 2.10 — Multi-Cluster"
+description: "Deep dive into Kubernetes cluster federation — KubeFed v2, OCM (Open Cluster Management), Liqo, and Admiralty. Covers federated workload scheduling, policy propagation across clusters, and how to manage dozens of clusters from a single control plane."
+---
+
+# Chapter 2 — Cluster Federation
+
+> **Goal:** Understand cluster federation as the management layer above multi-cluster networking — how to schedule workloads across clusters, propagate policies, and maintain a global view of all clusters from a single control plane.
+>
+> By the end of this chapter, you will understand:
+> 1. What cluster federation is and how it differs from multi-cluster networking
+> 2. KubeFed v2 — the original Kubernetes federation project and its status
+> 3. Open Cluster Management (OCM) — the CNCF-hosted multi-cluster management platform
+> 4. Liqo — virtual node federation enabling seamless workload offloading
+> 5. Admiralty — multi-cluster pod scheduling with virtual nodes
+> 6. The push vs pull model for policy propagation
+
+---
+
+## Real-Life Analogy
+
+Multi-cluster networking is like building **highways between cities** — it solves the physical connectivity problem.
+
+Cluster federation is like the **city government that decides which factories (workloads) go in which city**: it manages the higher-level decisions of where workloads run, propagates laws (policies) to all cities uniformly, and gives the mayor (ops team) a single dashboard instead of visiting each city individually.
+
+Without federation: you manage 20 clusters with 20 separate `kubectl` contexts, apply the same policy 20 times, and track which cluster runs which workload by hand.
+
+With federation: one control plane to rule them all — deploy once, the federation decides the best cluster, propagates configs, and reports status back centrally.
+
+---
+
+## Architecture Diagram
+
+```text
+              Cluster Federation Architecture
+
+  Federation Control Plane (Hub Cluster)
+  ┌──────────────────────────────────────────────────────────────┐
+  │  OCM Hub / KubeFed Controller                               │
+  │  - Stores FederatedDeployment, FederatedNamespace, etc.     │
+  │  - Schedules workloads to managed clusters                  │
+  │  - Propagates policies (RBAC, NetworkPolicy, ResourceQuota) │
+  └──────────┬───────────────┬───────────────┬───────────────────┘
+             │               │               │
+             ▼               ▼               ▼
+  Managed Cluster A   Managed Cluster B   Managed Cluster C
+  (region: us-east)  (region: eu-west)   (region: ap-south)
+  ┌────────────┐     ┌────────────┐     ┌────────────┐
+  │ OCM Agent  │     │ OCM Agent  │     │ OCM Agent  │
+  │ (pull)     │     │ (pull)     │     │ (pull)     │
+  │ Workloads  │     │ Workloads  │     │ Workloads  │
+  └────────────┘     └────────────┘     └────────────┘
+```
+
+---
+
+## KubeFed v2 (Historical Context)
+
+KubeFed was the original Kubernetes SIG-Multicluster project for federation:
+
+```text
+KubeFed v2 Status (2024):
+  - Archived / maintenance mode
+  - Superseded by more modern approaches (OCM, Liqo)
+  - Still widely referenced in literature and interviews
+
+Key KubeFed Concepts (still relevant for interviews):
+  - FederatedDeployment: wraps a Deployment with per-cluster overrides
+  - FederatedNamespace: creates namespace in all member clusters
+  - ReplicaSchedulingPreference: distributes replicas across clusters
+
+Example (conceptual):
+  FederatedDeployment:
+    template: (standard Deployment spec)
+    placement:
+      clusters:
+      - name: cluster-a
+      - name: cluster-b
+    overrides:
+    - clusterName: cluster-a
+      clusterOverrides:
+      - path: "/spec/replicas"
+        value: 3          # 3 replicas in cluster-a
+    - clusterName: cluster-b
+      clusterOverrides:
+      - path: "/spec/replicas"
+        value: 2          # 2 replicas in cluster-b
+```
+
+---
+
+## Open Cluster Management (OCM)
+
+OCM is the modern, CNCF-hosted multi-cluster management platform:
+
+```bash
+# Install OCM hub on the management cluster
+clusteradm init --wait
+# Outputs a join command with a token
+
+# Join managed clusters (run on each managed cluster)
+clusteradm join --hub-token <token> \
+  --hub-apiserver <hub-url> \
+  --cluster-name cluster-a
+
+# Approve the join request
+clusteradm accept --clusters cluster-a
+
+# List managed clusters
+kubectl get managedclusters
+# NAME        HUB ACCEPTED   MANAGED CLUSTER URLS   JOINED   AVAILABLE
+# cluster-a   true           https://...            True     True
+# cluster-b   true           https://...            True     True
+```
+
+### ManifestWork: Propagating Resources
+
+```yaml
+# Deploy to a specific cluster from the hub
+apiVersion: work.open-cluster-management.io/v1
+kind: ManifestWork
+metadata:
+  name: deploy-api
+  namespace: cluster-a    # Namespace = target cluster name
+spec:
+  workload:
+    manifests:
+    - apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: api-deployment
+        namespace: production
+      spec:
+        replicas: 3
+        # ... standard Deployment spec
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: api-service
+        namespace: production
+      # ...
+```
+
+### Placement: Multi-Cluster Scheduling
+
+```yaml
+# Select clusters matching criteria for workload placement
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: production-placement
+  namespace: default
+spec:
+  numberOfClusters: 2    # Select 2 clusters
+  clusterSets:
+  - production-clusters
+  predicates:
+  - requiredClusterSelector:
+      labelSelector:
+        matchLabels:
+          region: us-east
+  prioritizerPolicy:
+    mode: Additive
+    configurations:
+    - scoreCoordinate:
+        type: BuiltIn
+        builtIn: ResourceAllocatableCPU  # Prefer clusters with more free CPU
+      weight: 2
+    - scoreCoordinate:
+        type: BuiltIn
+        builtIn: Steady               # Prefer stable clusters (existing work)
+      weight: 1
+```
+
+---
+
+## Liqo: Virtual Node Federation
+
+Liqo takes a different approach — it makes remote clusters appear as virtual nodes in your cluster:
+
+```text
+Liqo Model:
+  Cluster A sees Cluster B's capacity as virtual node "liqo-cluster-b"
+  Regular Pod scheduling: scheduler places Pods on "liqo-cluster-b" node
+  Liqo tunnels the Pod to actually run in Cluster B
+  Pod appears in both clusters (mirrored)
+
+  Benefits:
+  - No new CRDs for workloads — use standard Deployments
+  - Standard kubectl scheduling labels work
+  - Horizontal scaling spills over to remote cluster automatically
+
+Architecture:
+  Cluster A                          Cluster B
+  ┌─────────────────────────┐       ┌───────────────────────┐
+  │ node: worker-1          │       │ (Real cluster B)      │
+  │ node: worker-2          │       │ Actual Pods run here  │
+  │ node: liqo-cluster-b    │──────▶│ (Reflected to A)      │
+  │   (virtual node)        │       └───────────────────────┘
+  │   Pods here → actual    │
+  │   run in Cluster B      │
+  └─────────────────────────┘
+```
+
+```bash
+# Install Liqo
+helm install liqo liqo/liqo \
+  --namespace liqo \
+  --create-namespace \
+  --set discovery.config.clusterName=cluster-a
+
+# Peer with another cluster
+liqoctl peer out-of-band cluster-b \
+  --auth-url https://cluster-b-auth:5000 \
+  --cluster-id cluster-b-id \
+  --auth-token <token>
+
+# Enable namespace offloading (workloads in this ns can run in Cluster B)
+liqoctl offload namespace production \
+  --namespace-mapping-strategy EnforceSameName
+```
+
+---
+
+## Admiralty: Multi-Cluster Pod Scheduling
+
+Admiralty implements the Kubernetes scheduler's multi-cluster extension:
+
+```yaml
+# Mark a namespace for multi-cluster scheduling
+kubectl label namespace production \
+  multicluster.admiralty.io/source-namespace=true
+
+# Target: allow cluster-a to schedule Pods in cluster-b
+apiVersion: multicluster.admiralty.io/v1alpha1
+kind: Target
+metadata:
+  name: cluster-b
+  namespace: production
+spec:
+  kubeconfigSecret:
+    name: cluster-b-kubeconfig
+
+# In the Deployment: annotate to allow cross-cluster scheduling
+spec:
+  template:
+    metadata:
+      annotations:
+        multicluster.admiralty.io/elect: ""  # Enable multi-cluster scheduling
+```
+
+Admiralty creates "proxy Pods" in the source cluster and runs actual Pods in target clusters transparently.
+
+---
+
+## Push vs Pull Model
+
+```text
+Push Model (KubeFed v2, manual ManifestWork):
+  Hub → pushes manifests → Managed Clusters
+  Hub needs API access to all managed clusters
+  If managed cluster is unreachable: push fails
+
+  Pros: Hub has full control, immediate propagation
+  Cons: Hub must have credentials for all clusters
+        Security concern: hub compromise = all clusters compromised
+
+Pull Model (OCM with klusterlet, Flux GitOps):
+  Managed cluster → polls hub → pulls its work
+  Hub does NOT need direct API access to managed clusters
+  Managed cluster behind firewall can reach out to hub
+
+  Pros: More secure (hub doesn't hold managed cluster credentials)
+        Works across network boundaries (firewall-friendly)
+  Cons: Propagation delay (poll interval)
+
+GitOps federation (Argo CD ApplicationSet):
+  Hub Argo CD → generates Applications per cluster
+  Each cluster's Argo CD agent → pulls from Git
+  Pure pull model, no direct cluster-to-cluster credentials
+```
+
+---
+
+## Hands-On: OCM Basic Federation
+
+```bash
+# 1. Check managed cluster status
+kubectl get managedclusters
+kubectl describe managedcluster cluster-a
+
+# 2. Check cluster labels (used for Placement)
+kubectl get managedcluster cluster-a -o jsonpath='{.metadata.labels}'
+
+# 3. Apply a Placement and check which clusters are selected
+kubectl apply -f placement.yaml
+kubectl get placementdecisions -n default
+
+# 4. Deploy a ManifestWork to selected clusters
+kubectl apply -f manifestwork.yaml -n cluster-a
+
+# 5. Check ManifestWork status (is it applied in managed cluster?)
+kubectl get manifestwork deploy-api -n cluster-a -o yaml | \
+  grep -A10 "conditions"
+
+# 6. Verify deployment on the managed cluster
+KUBECONFIG=cluster-a.yaml kubectl get deployment api-deployment -n production
+
+# 7. View all workloads across clusters
+# Use ocm-cli or a dashboard like Open Cluster Management console
+clusteradm get clusters
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between multi-cluster networking and cluster federation?**
+
+Multi-cluster networking solves the connectivity problem — making Pods and Services reachable across cluster boundaries (via tunnels, BGP, or service mesh gateways). Cluster federation solves the management problem — how to deploy, schedule, and manage workloads across many clusters from a single control plane. You need both: networking so clusters can communicate, and federation so you don't manually `kubectl apply` to each cluster individually. Submariner handles networking; OCM handles federation. They complement each other.
+
+**Q2: What is the push vs pull model in cluster federation and which is more secure?**
+
+Push model: the hub control plane holds credentials for all managed clusters and pushes manifests to them. Simpler to implement but the hub is a high-value attack target — compromise the hub and you have access to all clusters. Pull model: managed clusters hold the hub's address, connect outward, and pull their assigned work. The hub never holds managed cluster credentials. This is more secure (hub compromise doesn't give access to managed clusters) and works across network boundaries (managed clusters behind firewalls can initiate outbound connections to the hub). OCM's klusterlet and Flux/Argo CD use the pull model.
+
+**Q3: What is Liqo's virtual node approach and how does it differ from KubeFed?**
+
+Liqo makes remote clusters appear as virtual nodes in the local cluster. The standard Kubernetes scheduler places Pods on these virtual nodes using normal label selectors — no new CRDs required for workloads. Liqo transparently tunnels those Pods to run in the remote cluster and mirrors their status back. KubeFed (v2) required wrapping each resource in a `FederatedDeployment` CRD with explicit cluster placement — a separate, non-standard API. Liqo's model is more transparent to application developers (they use standard Deployments) but Liqo-specific labels/taints still need cluster-level management.
+
+**Q4: What is the Multi-Cluster Services (MCS) API and how does it standardize cross-cluster service discovery?**
+
+MCS (KEP-1645) is a Kubernetes SIG-Multicluster standard API for cross-cluster service discovery. It defines: `ServiceExport` (in exporting cluster, marks a Service as available to the cluster set) and `ServiceImport` (auto-created in importing clusters by the MCS controller). Exported services are accessible at `<svc>.<ns>.svc.clusterset.local` from any cluster in the set. This standardization means applications can use a single DNS name regardless of whether the service is local or cross-cluster, and switching between connectivity implementations (Submariner, GKE MCS, Cilium Cluster Mesh) requires no application changes.
+
+**Q5: What is Open Cluster Management (OCM) and what are its core primitives?**
+
+OCM is a CNCF-hosted project for multi-cluster management. Its core primitives: (1) **ManagedCluster** — represents a registered cluster in the hub; (2) **ManifestWork** — a bundle of Kubernetes resources to deploy to a specific cluster (namespace = cluster name in hub); (3) **Placement** — selects clusters based on labels and scoring (CPU availability, stability) for workload scheduling; (4) **PlacementDecision** — the result of Placement evaluation, listing selected clusters. OCM uses a pull model — each managed cluster runs a `klusterlet` agent that polls the hub and applies ManifestWork resources locally.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference: networking (connectivity) vs federation (management/scheduling)
+- [ ] Know KubeFed v2 is archived — superseded by OCM, Liqo, Admiralty
+- [ ] Know OCM primitives: ManagedCluster, ManifestWork, Placement, PlacementDecision
+- [ ] Know Liqo's virtual node model: remote clusters appear as nodes in local scheduler
+- [ ] Know push model (hub has managed cluster creds) vs pull model (agent polls hub)
+- [ ] Know MCS API: ServiceExport + ServiceImport → `*.svc.clusterset.local` DNS
+- [ ] Know Argo CD ApplicationSet as a GitOps-native federation approach

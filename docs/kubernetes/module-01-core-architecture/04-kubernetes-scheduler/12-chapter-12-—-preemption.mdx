@@ -1,0 +1,1592 @@
+---
+title: "Chapter 12 — Preemption"
+sidebar_position: 12
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand how Kubernetes schedules high-priority Pods when no Node has enough available resources. Learn why preemption exists, how Pod Priority in..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 12 — Preemption
+
+> **Goal:** Understand how Kubernetes schedules high-priority Pods when no Node has enough available resources. Learn why preemption exists, how Pod Priority influences scheduling, how victim Pods are selected, how Kubernetes respects PodDisruptionBudgets (PDBs), what a Nominated Node is, and how the complete preemption algorithm works in large production clusters.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why preemption exists: scheduling high-priority Pods when resources are full
+> 2. PriorityClass and Pod Priority values
+> 3. PostFilter phase: triggered when no Node passes Filter
+> 4. Candidate Node selection for preemption
+> 5. Victim Pod selection and PDB respect
+> 6. nominatedNodeName: how the preemptor signals its intent
+> 7. Grace period: victim Pods are not instantly deleted
+> 8. Why the preemptor may still not schedule after victims are evicted
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Preemption like airline overbooking and bumping standby passengers.
+
+```text
+Airline Overbooking Analogy:
+
+Flight (Node) is full (resources exhausted)
+High-priority passenger (VIP Pod) arrives with no seat
+Airline finds lowest-priority standby passengers to bump
+Bumped passengers (victim Pods) are moved to next flight
+VIP passenger gets their seat (Pod schedules on now-free Node)
+Bumped passengers may rebook (victim Pods reschedule elsewhere)
+```
+
+| Airline | Preemption |
+| :--- | :--- |
+| Full flight | Node with no allocatable capacity |
+| VIP passenger | High-priority Pod (`priorityClassName`) |
+| Standby passengers | Lower-priority running Pods |
+| Bumping standby passengers | Evicting victim Pods |
+| VIP boards | High-priority Pod schedules on freed Node |
+| Bumped passenger rebooks | Evicted Pod reschedules on another Node |
+
+> **Important:** Preemption **evicts victim Pods** but does **not guarantee** the preemptor will immediately schedule on that Node. Between eviction and reschedule, other Pods may claim the freed resources. The preemptor sets `nominatedNodeName` as a hint, but must still compete normally in the next scheduling cycle.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Scheduler Architecture
+- Scheduling Framework
+- Filter Plugins
+- Score Plugins
+- Reserve Phase
+- Bind Phase
+- Scheduler Cache
+- Pod Lifecycle
+
+---
+
+# Where Does Preemption Fit?
+
+Normally, scheduling follows this path:
+
+```text
+Scheduling Queue
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Bind
+```
+
+But what happens if **every Node fails filtering?**
+
+Instead of immediately giving up,
+
+the Scheduler may attempt:
+
+```text
+Preemption
+```
+
+---
+
+# Why Does Preemption Exist?
+
+Imagine a cluster with:
+
+```text
+10 Nodes
+```
+
+Every Node is fully utilized.
+
+A new Pod arrives:
+
+```text
+Priority
+
+1000
+```
+
+The Scheduler performs filtering.
+
+Result:
+
+```text
+Node-1
+
+Rejected
+
+Node-2
+
+Rejected
+
+...
+
+Node-10
+
+Rejected
+```
+
+Normally,
+
+the Pod would remain:
+
+```text
+Pending
+```
+
+But this Pod is extremely important.
+
+Should Kubernetes simply wait?
+
+No.
+
+Instead,
+
+Kubernetes can reclaim resources.
+
+---
+
+# Real-World Analogy
+
+Imagine a hospital.
+
+Current operating rooms:
+
+```text
+Routine Surgery
+
+Routine Surgery
+
+Routine Surgery
+```
+
+Suddenly,
+
+an emergency patient arrives.
+
+The hospital may postpone:
+
+```text
+Routine Surgery
+```
+
+to make room for:
+
+```text
+Emergency Surgery
+```
+
+That is exactly what Kubernetes preemption does.
+
+---
+
+# Simple Definition
+
+Preemption is:
+
+> **The process of evicting lower-priority Pods so that a higher-priority Pod can be scheduled.**
+
+It is a last-resort scheduling mechanism.
+
+---
+
+# High-Level Architecture
+
+```text
+High Priority Pod
+
+        |
+
+        ▼
+
+Normal Scheduling
+
+        |
+
+        ▼
+
+No Feasible Node
+
+        |
+
+        ▼
+
+Preemption
+
+        |
+
+        ▼
+
+Victim Selection
+
+        |
+
+        ▼
+
+Evict Lower Priority Pods
+
+        |
+
+        ▼
+
+Resources Become Free
+
+        |
+
+        ▼
+
+Schedule High Priority Pod
+```
+
+---
+
+# When Does Preemption Happen?
+
+Only after:
+
+```text
+Filter
+
+v
+
+No Candidate Nodes
+```
+
+If at least one feasible Node exists,
+
+preemption is **not** performed.
+
+---
+
+# Important Design Principle
+
+Preemption is expensive.
+
+It causes:
+
+- Pod eviction
+- Application restart
+- Temporary disruption
+- Controller reconciliation
+
+Therefore,
+
+Kubernetes avoids preemption whenever possible.
+
+---
+
+# Pod Priority
+
+Preemption depends entirely on:
+
+```text
+Priority
+```
+
+Every Pod may have an associated:
+
+```text
+PriorityClass
+```
+
+---
+
+# Example
+
+Cluster:
+
+```text
+Pod A
+
+Priority
+
+1000
+
+Pod B
+
+Priority
+
+500
+
+Pod C
+
+Priority
+
+100
+```
+
+Higher value means:
+
+```text
+More Important
+```
+
+---
+
+# PriorityClass
+
+Users define priorities using:
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+
+value: 100000
+```
+
+Pods reference it using:
+
+```yaml
+priorityClassName:
+```
+
+The Scheduler converts that into an integer priority value during scheduling.
+
+---
+
+# Example
+
+```text
+Critical System Pod
+
+Priority
+
+1,000,000
+
+v
+
+Production API
+
+Priority
+
+100,000
+
+v
+
+Batch Job
+
+Priority
+
+10
+
+v
+
+Testing Pod
+
+Priority
+
+1
+```
+
+---
+
+# Scheduling Without Priority
+
+Suppose:
+
+```text
+Node
+
+8 CPU
+```
+
+Running:
+
+```text
+Batch Job
+
+8 CPU
+```
+
+New Pod:
+
+```text
+Production API
+
+4 CPU
+```
+
+Without priorities:
+
+```text
+Pending Forever
+```
+
+---
+
+# Scheduling With Priority
+
+Scheduler sees:
+
+```text
+Production API
+
+Higher Priority
+```
+
+Result:
+
+```text
+Evict Batch Job
+
+v
+
+Free Resources
+
+v
+
+Schedule API
+```
+
+---
+
+# Candidate Nodes
+
+Preemption does **not** evaluate every Node equally.
+
+First,
+
+the Scheduler identifies Nodes where preemption **might** make scheduling possible.
+
+These become:
+
+```text
+Candidate Nodes
+```
+
+---
+
+# Example
+
+Cluster:
+
+```text
+Node A
+
+Needs
+
+2 CPU Freed
+
+v
+
+Possible
+
+Node B
+
+Needs
+
+20 CPU Freed
+
+v
+
+Impossible
+
+Node C
+
+Already Fits
+
+v
+
+No Preemption Needed
+```
+
+Only Nodes where evicting lower-priority Pods could realistically make enough room are considered as preemption candidates.
+
+---
+
+# Candidate Node Evaluation
+
+Conceptually:
+
+```text
+All Nodes
+
+v
+
+Could Preemption Help?
+
+v
+
+Yes
+
+v
+
+Candidate List
+```
+
+---
+
+# Victim Selection
+
+Once a candidate Node is found,
+
+the Scheduler chooses:
+
+```text
+Victim Pods
+```
+
+---
+
+# What Is a Victim?
+
+A victim is:
+
+> **A lower-priority Pod selected for eviction to free resources for a higher-priority Pod.**
+
+---
+
+# Example
+
+Node:
+
+```text
+CPU
+
+8
+```
+
+Running:
+
+```text
+Pod A
+
+Priority
+
+10
+
+CPU
+
+2
+
+Pod B
+
+Priority
+
+20
+
+CPU
+
+2
+
+Pod C
+
+Priority
+
+30
+
+CPU
+
+4
+```
+
+Incoming Pod:
+
+```text
+Priority
+
+100
+
+Needs
+
+4 CPU
+```
+
+Possible victim:
+
+```text
+Pod C
+```
+
+Resources become available.
+
+---
+
+# Goal of Victim Selection
+
+The Scheduler attempts to:
+
+- Evict as few Pods as possible
+- Minimize disruption
+- Preserve cluster stability
+- Free sufficient resources
+
+---
+
+# Another Example
+
+Need:
+
+```text
+2 CPU
+```
+
+Current Pods:
+
+```text
+Pod A
+
+1 CPU
+
+Priority 5
+
+Pod B
+
+1 CPU
+
+Priority 10
+
+Pod C
+
+6 CPU
+
+Priority 50
+```
+
+Instead of evicting:
+
+```text
+Pod C
+```
+
+Scheduler may evict:
+
+```text
+Pod A
+
++
+
+Pod B
+```
+
+depending on which combination satisfies scheduling while minimizing overall impact. The exact victim selection algorithm considers multiple factors, not just CPU totals.
+
+---
+
+# Victim Selection Strategy
+
+Conceptually:
+
+```text
+Candidate Node
+
+v
+
+Lower Priority Pods
+
+v
+
+Find Smallest Safe Set
+
+v
+
+Evict
+
+v
+
+Enough Resources?
+```
+
+---
+
+# What Cannot Be Preempted?
+
+Pods with:
+
+```text
+Equal Priority
+```
+
+or
+
+```text
+Higher Priority
+```
+
+cannot be preempted by a lower-priority Pod.
+
+Example:
+
+```text
+Incoming Pod
+
+Priority
+
+100
+
+Running Pod
+
+Priority
+
+100
+```
+
+No preemption occurs between them based solely on priority.
+
+---
+
+# PodDisruptionBudget (PDB)
+
+Preemption should minimize application disruption.
+
+Kubernetes considers:
+
+```text
+PodDisruptionBudget
+```
+
+during victim selection.
+
+---
+
+# What Is a PDB?
+
+A PodDisruptionBudget defines:
+
+> **How many Pods of an application should remain available during voluntary disruptions.**
+
+Example:
+
+```text
+Application
+
+5 Pods
+
+v
+
+Minimum Available
+
+4
+```
+
+Only one Pod should be disrupted at a time.
+
+---
+
+# Example
+
+Deployment:
+
+```text
+Web
+
+5 Pods
+```
+
+PDB:
+
+```yaml
+minAvailable: 4
+```
+
+Already unavailable:
+
+```text
+1 Pod
+```
+
+Scheduler avoids preempting another Pod from this workload if doing so would violate the PDB.
+
+---
+
+# Important Clarification
+
+PDBs are **best-effort** during preemption.
+
+If no alternative exists,
+
+Kubernetes may still preempt Pods in situations where scheduling a higher-priority workload is necessary.
+
+---
+
+# Why Respect PDB?
+
+Without PDB awareness:
+
+```text
+Preempt
+
+v
+
+Too Many Pods Removed
+
+v
+
+Application Down
+```
+
+PDB reduces unnecessary disruption.
+
+---
+
+# Nominated Node
+
+One of the most misunderstood concepts is:
+
+```text
+Nominated Node
+```
+
+---
+
+# What Is a Nominated Node?
+
+Suppose:
+
+```text
+Scheduler
+
+v
+
+Chooses Node-8
+
+v
+
+Victims Need Time
+
+v
+
+Termination Begins
+```
+
+Resources are **not** immediately available.
+
+The incoming Pod must wait.
+
+Instead of repeating the full search every moment,
+
+the Scheduler records:
+
+```text
+Nominated Node
+
+v
+
+Node-8
+```
+
+---
+
+# Why?
+
+This indicates:
+
+```text
+When Resources Become Free
+
+v
+
+Try This Node First
+```
+
+---
+
+# Nominated Node Workflow
+
+```text
+High Priority Pod
+
+v
+
+Node Selected
+
+v
+
+Victims Terminating
+
+v
+
+Nominated Node Recorded
+
+v
+
+Resources Released
+
+v
+
+Schedule Pod
+```
+
+---
+
+# Why Not Bind Immediately?
+
+Because victims must first:
+
+- Receive termination signal
+- Shut down gracefully
+- Release resources
+- Be removed from the Node
+
+Only then can the new Pod be scheduled.
+
+---
+
+# Preemption Algorithm
+
+High-level algorithm:
+
+```text
+Incoming Pod
+
+v
+
+Normal Scheduling
+
+v
+
+Candidate Found?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Bind
+
+|
+
++-- No
+
+      |
+
+      ▼
+
+Preemption
+
+      |
+
+      ▼
+
+Find Candidate Nodes
+
+      |
+
+      ▼
+
+Find Victims
+
+      |
+
+      ▼
+
+Respect PDB When Possible
+
+      |
+
+      ▼
+
+Choose Best Node
+
+      |
+
+      ▼
+
+Set Nominated Node
+
+      |
+
+      ▼
+
+Evict Victims
+
+      |
+
+      ▼
+
+Retry Scheduling
+
+      |
+
+      ▼
+
+Bind
+```
+
+---
+
+# Complete Lifecycle
+
+```text
+High Priority Pod
+
+v
+
+Pending
+
+v
+
+Filter Fails
+
+v
+
+Preemption Starts
+
+v
+
+Candidate Nodes
+
+v
+
+Victim Selection
+
+v
+
+Nominated Node
+
+v
+
+Victim Termination
+
+v
+
+Resources Freed
+
+v
+
+Schedule Again
+
+v
+
+Reserve
+
+v
+
+Bind
+
+v
+
+Running
+```
+
+---
+
+# Relationship with Scheduler Cache
+
+During preemption,
+
+the Scheduler uses:
+
+```text
+Scheduler Cache
+```
+
+to estimate:
+
+- Current resource usage
+- Running Pods
+- Priorities
+- Candidate Nodes
+
+Final decisions still depend on the latest cluster state when scheduling retries.
+
+---
+
+# Production Example 1
+
+Production Cluster
+
+Running:
+
+```text
+Analytics Job
+
+Priority
+
+10
+
+Uses
+
+16 CPU
+```
+
+Incoming:
+
+```text
+Payment Service
+
+Priority
+
+1000
+
+Needs
+
+8 CPU
+```
+
+Scheduler:
+
+```text
+Preempt Analytics
+
+v
+
+Schedule Payment Service
+```
+
+Business-critical traffic continues.
+
+---
+
+# Production Example 2
+
+Machine Learning Cluster
+
+Node:
+
+```text
+8 GPUs
+```
+
+Running:
+
+```text
+Research Job
+
+Priority
+
+100
+```
+
+Incoming:
+
+```text
+Emergency Fraud Detection
+
+Priority
+
+10000
+```
+
+Scheduler:
+
+```text
+Evict Research Job
+
+v
+
+Run Fraud Detection
+```
+
+Critical workloads receive priority.
+
+---
+
+# Production Example 3
+
+Batch Processing
+
+Current:
+
+```text
+Nightly Reports
+
+Priority
+
+50
+```
+
+Incoming:
+
+```text
+Customer API
+
+Priority
+
+1000
+```
+
+Scheduler:
+
+```text
+Preemption
+
+v
+
+API Starts
+
+v
+
+Reports Restart Later
+```
+
+---
+
+# Production Example 4
+
+PDB-Aware Service
+
+Application:
+
+```text
+10 Replicas
+```
+
+PDB:
+
+```text
+Minimum
+
+9 Available
+```
+
+Scheduler:
+
+```text
+Avoid Preempting
+
+v
+
+If Another Node Exists
+
+v
+
+Use Alternative
+```
+
+Reducing customer impact.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Scheduling Queue
+
+v
+
+Filter
+
+v
+
+No Feasible Node
+
+v
+
+Preemption
+
+v
+
+Candidate Nodes
+
+v
+
+Victims
+
+v
+
+Nominated Node
+
+v
+
+Retry Scheduling
+
+v
+
+Reserve
+
+v
+
+Bind
+```
+
+Preemption is an extension of the normal scheduling workflow—not a separate scheduler.
+
+---
+
+# Internal Scheduler Workflow
+
+```text
+Pending Pod
+
+v
+
+Filter Failure
+
+v
+
+Evaluate Priorities
+
+v
+
+Candidate Nodes
+
+v
+
+Victim Selection
+
+v
+
+Record Nominated Node
+
+v
+
+Evict Victims
+
+v
+
+Wait
+
+v
+
+Retry Scheduling
+
+v
+
+Bind
+```
+
+---
+
+# Performance Considerations
+
+Preemption is more expensive than normal scheduling because it requires:
+
+- Evaluating potential victims
+- Considering PDBs
+- Triggering Pod eviction
+- Waiting for graceful termination
+- Performing another scheduling attempt
+
+Therefore,
+
+it should remain an exceptional event rather than a routine scheduling strategy.
+
+---
+
+# Production Best Practices
+
+✔ Use PriorityClasses only for truly important workloads.
+
+✔ Avoid assigning very high priorities to every application.
+
+✔ Configure PodDisruptionBudgets for highly available services.
+
+✔ Monitor preemption events to identify resource shortages.
+
+✔ Reserve cluster capacity for critical workloads whenever possible.
+
+✔ Design applications to tolerate Pod restarts.
+
+✔ Keep graceful termination periods reasonable for high-priority environments.
+
+✔ Regularly review PriorityClass values to prevent priority inflation.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Preemption happens before filtering.
+
+Wrong.
+
+Preemption is considered only after normal scheduling fails.
+
+---
+
+### ❌ Misconception 2
+
+Higher-priority Pods always preempt immediately.
+
+Wrong.
+
+Victims must terminate and release resources before the new Pod can be scheduled.
+
+---
+
+### ❌ Misconception 3
+
+Any Pod can be selected as a victim.
+
+Wrong.
+
+Only lower-priority Pods are eligible for preemption based on priority.
+
+---
+
+### ❌ Misconception 4
+
+PodDisruptionBudgets completely prevent preemption.
+
+Wrong.
+
+The Scheduler tries to minimize PDB violations, but PDBs are best-effort during preemption.
+
+---
+
+### ❌ Misconception 5
+
+The Nominated Node already contains the new Pod.
+
+Wrong.
+
+It is only the Scheduler's preferred future target while waiting for resources.
+
+---
+
+### ❌ Misconception 6
+
+Preemption immediately frees resources.
+
+Wrong.
+
+Resources become available only after victim Pods terminate.
+
+---
+
+### ❌ Misconception 7
+
+Preemption is a sign that Kubernetes is malfunctioning.
+
+Wrong.
+
+It is an intentional scheduling mechanism designed to prioritize critical workloads under resource pressure.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does Kubernetes implement preemption?
+
+To allow higher-priority Pods to run by reclaiming resources from lower-priority Pods when no feasible Node exists.
+
+---
+
+### Q2. When does preemption occur?
+
+After the normal scheduling process fails to find any feasible Node.
+
+---
+
+### Q3. What determines whether one Pod can preempt another?
+
+Their relative priorities, as determined by `PriorityClass` values.
+
+---
+
+### Q4. What is a victim Pod?
+
+A lower-priority Pod selected for eviction to free resources for a higher-priority Pod.
+
+---
+
+### Q5. What is a Candidate Node during preemption?
+
+A Node where evicting lower-priority Pods could make scheduling the incoming Pod feasible.
+
+---
+
+### Q6. What is the purpose of a PodDisruptionBudget?
+
+To reduce application disruption by limiting voluntary Pod interruptions, which the Scheduler considers during preemption when possible.
+
+---
+
+### Q7. What is a Nominated Node?
+
+A Node identified as the preferred future placement for a high-priority Pod while waiting for victim Pods to terminate.
+
+---
+
+### Q8. Does preemption immediately schedule the incoming Pod?
+
+No. The Scheduler waits until victim Pods terminate and resources become available before retrying scheduling.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| High-priority Pod remains Pending | Victim Pods are still terminating or no suitable preemption candidate exists |
+| Frequent preemption events | Cluster resource pressure or overly aggressive PriorityClass usage |
+| Important applications unexpectedly restarted | Lower-priority workloads selected as preemption victims |
+| Scheduler ignores some Nodes for preemption | Evicting Pods on those Nodes cannot make the incoming Pod schedulable |
+| Preemption takes longer than expected | Long Pod termination grace periods delay resource release |
+| Unexpected service disruption | Missing or insufficient PodDisruptionBudget configuration |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does Kubernetes need preemption?
+2. When is preemption triggered?
+3. How does `PriorityClass` influence scheduling?
+4. What is a Candidate Node?
+5. What is a victim Pod?
+6. How does the Scheduler choose victims?
+7. Why are PodDisruptionBudgets considered during preemption?
+8. What is a Nominated Node?
+9. Why can't a preempting Pod be bound immediately?
+10. How does the preemption algorithm work from start to finish?
+11. Why is preemption considered a last-resort scheduling mechanism?
+12. What production practices reduce unnecessary preemption?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes ensures that **critical workloads continue running even when the cluster is fully utilized**.
+
+You learned:
+
+- Why the Scheduler implements preemption
+- How `PriorityClass` determines workload importance
+- How Candidate Nodes are identified
+- How victim Pods are selected to minimize disruption
+- How PodDisruptionBudgets influence victim selection
+- What a Nominated Node represents during the preemption process
+- How the complete preemption algorithm works from filter failure through successful scheduling
+- How production systems use preemption to protect business-critical services
+
+Preemption is Kubernetes' emergency scheduling mechanism. Rather than allowing high-priority workloads to remain pending indefinitely, the Scheduler intelligently reclaims resources from lower-priority Pods, balancing application availability, cluster stability, and resource utilization while minimizing disruption wherever possible.
+
+---
+
+# Next Chapter
+
+**Chapter 13 — Scheduler Profiles & Plugin Configuration**
+
+In the next chapter, we'll explore how Kubernetes customizes scheduling behavior without modifying Scheduler source code.
+
+Topics include:
+
+- Scheduler Profiles
+- Plugin Configuration
+- Enabling and Disabling Plugins
+- Extension Points
+- Multiple Scheduling Profiles
+- Custom Scheduler Configuration
+- Plugin Ordering
+- Production Configuration Examples
+
+You'll learn how platform engineers tailor Kubernetes scheduling policies for different workload types using Scheduler Profiles.
+```

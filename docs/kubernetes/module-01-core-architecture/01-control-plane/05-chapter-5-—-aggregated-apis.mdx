@@ -1,0 +1,426 @@
+---
+title: "Chapter 5 — Aggregated APIs"
+sidebar_position: 5
+module: "Module 1.1 — Kubernetes Control Plane"
+description: "> **Goal:** Understand what Aggregated APIs are, why Kubernetes needs them, how they work internally, and how they enable advanced features such as **kubectl top**, **Horizontal Pod Autoscaler (HPA)**, **KEDA**, and custom monitoring systems."
+---
+
+# Chapter 5 — Aggregated APIs
+
+> **Goal:** Understand what Aggregated APIs are, why Kubernetes needs them, how they work internally, and how they enable advanced features such as **kubectl top**, **Horizontal Pod Autoscaler (HPA)**, **KEDA**, and custom monitoring adapters.
+>
+> By the end of this chapter, you will understand how Kubernetes extends its API surface through extension API servers without modifying core Kubernetes code.
+
+---
+
+# Why Should You Learn This?
+
+A common interview question is:
+
+> **Where does `kubectl top` get its data?**
+
+Some engineers answer: *"From kubelet."* Others answer: *"From Metrics Server."* Both answers are incomplete on their own.
+
+The complete request and response flow is:
+
+```text
+kubectl top pod
+  |
+  v
+ kube-apiserver
+  |
+  v
+ API Aggregation Layer (kube-aggregator)
+  |
+  v
+  metrics.k8s.io
+  |
+  v
+ Metrics Server
+  |
+  v
+ kubelet / metrics source
+  |
+  v
+ Metrics Server (In-Memory Aggregation)
+  |
+  v
+ kube-apiserver
+  |
+  v
+    kubectl
+```
+
+Aggregated APIs allow Kubernetes API functionality to be implemented by separate extension API servers while being exposed through the main Kubernetes API endpoint.
+
+Without them, features like Metrics Server, custom autoscaling adapters, and external monitoring integrations could not present a unified API experience to clients.
+
+---
+
+# What is an Aggregated API?
+
+An Aggregated API is an **additional Kubernetes API group** served by an **extension API server** that is registered with `kube-apiserver` via an `APIService` object.
+
+For example:
+
+### Built-in APIs
+```text
+/api/v1
+/apis/apps/v1
+/apis/networking.k8s.io/v1
+```
+
+### Aggregated APIs (Extension APIs)
+```text
+/apis/metrics.k8s.io
+/apis/custom.metrics.k8s.io
+/apis/external.metrics.k8s.io
+```
+
+To Kubernetes users and clients (`kubectl`), there is no difference in interaction—all requests hit `kube-apiserver`.
+
+---
+
+# Core Architecture
+
+```text
+                        Kubernetes API
+  |
+  v
+                        kube-apiserver
+                              |
+                 +────────────+────────────+
+                 |                         |
+                 v                         v
+           Built-in APIs             API Aggregation Layer
+                 |                         |
+                 v                         v
+                etcd                Extension API Server
+                                           |
+                       +───────────────────+───────────────────+
+                       |                   |                   |
+                       v                   v                   v
+                 Metrics Server     Metrics Adapter     Other API Server
+                       |                   |
+                       v                   v
+                    kubelet           Prometheus /
+                                     External Systems
+```
+
+---
+
+# Real-Life Analogy
+
+Imagine a shopping mall:
+
+```text
+Customer
+  |
+  v
+Information Desk (kube-apiserver)
+   |
+   +── Department Store (Built-in APIs -> etcd)
+   |
+   +── Specialty Boutique (Extension API Server -> Metrics Server)
+```
+
+The customer interacts directly with the Information Desk. The Information Desk either fulfills the request directly or routes the customer to the specialized boutique store without forcing the customer to leave the building.
+
+---
+
+# Built-in APIs vs. Aggregated APIs
+
+## Built-in API
+Implemented inside `kube-apiserver` Go codebase (e.g., Pods, Deployments, Services).
+
+```text
+kubectl get pods
+  |
+  v
+ kube-apiserver
+  |
+  v
+      etcd
+```
+
+## Aggregated API
+Implemented by an external extension API server (e.g., Metrics Server).
+
+```text
+kubectl top pod
+  |
+  v
+ kube-apiserver
+  |
+  v
+ API Aggregation Layer
+  |
+  v
+ Metrics Server
+```
+
+> **etcd Storage Nuance:** The Resource Metrics API request (`metrics.k8s.io`) is served by Metrics Server from memory rather than being read from Kubernetes resource objects stored in etcd. However, an extension API server is free to use any storage backend, including its own separate etcd or database instance.
+
+---
+
+# Why Metrics Aren't Stored in etcd
+
+`etcd` is designed for Kubernetes control-plane state and coordination, not high-frequency time-series telemetry. Storing continuously changing metrics there would create unnecessary storage growth and write pressure on the control plane.
+
+Metrics Server itself keeps only short-term/in-memory metrics rather than acting as a long-term monitoring database.
+
+---
+
+# The Three Metrics APIs to Remember
+
+HPA does not interact directly with extension servers; **HPA obtains metrics through Kubernetes metrics APIs**.
+
+```text
+1. Resource Metrics API (metrics.k8s.io)
+   └── Metrics Server ──► kubectl top & HPA resource metrics (CPU/Memory)
+
+2. Custom Metrics API (custom.metrics.k8s.io)
+   └── Metrics Adapter (e.g., Prometheus Adapter) ──► Application metrics (Requests/sec) ──► HPA
+
+3. External Metrics API (external.metrics.k8s.io)
+   └── External Metrics Provider ──► External systems (AWS SQS, Kafka, PubSub) ──► HPA
+```
+
+---
+
+## 1. `metrics.k8s.io`
+
+- **Purpose:** Exposes basic container and node CPU/memory usage.
+- **Provider:** **Metrics Server**.
+- **Usage:** Powers `kubectl top` and HPA resource metric scaling (`targetCPUUtilizationPercentage`).
+
+```text
+kubectl top pod / HPA
+  |
+  v
+ kube-apiserver
+  |
+  v
+  metrics.k8s.io
+  |
+  v
+ Metrics Server
+  |
+  v
+   kubelet(s)
+```
+
+---
+
+## 2. `custom.metrics.k8s.io`
+
+- **Purpose:** Exposes in-cluster application-specific metrics (e.g., HTTP requests/sec, queue depth, active sessions).
+- **Provider:** **Prometheus Adapter** (or other custom metrics adapters).
+- **Usage:** Allows HPA to scale based on application telemetry.
+
+```text
+Application Pods
+  |
+  v
+ Prometheus
+  |
+  v
+ Prometheus Adapter
+  |
+  v
+ custom.metrics.k8s.io
+  |
+  v
+      HPA
+```
+
+---
+
+## 3. `external.metrics.k8s.io`
+
+- **Purpose:** Exposes metrics that originate outside the Kubernetes cluster.
+- **Provider:** `external.metrics.k8s.io` is an API exposed by an external metrics provider/adapter. **Prometheus Adapter** and **KEDA** are examples of systems that can provide external metrics to HPA.
+- **Examples:** AWS SQS queue length, Kafka consumer lag, GCP Pub/Sub unack count, RabbitMQ queue depth.
+
+```text
+External System (AWS SQS / Kafka)
+  |
+  v
+ External Metrics Provider / Adapter
+  |
+  v
+ external.metrics.k8s.io
+  |
+  v
+      HPA
+```
+
+---
+
+# KEDA (Kubernetes Event-Driven Autoscaler)
+
+KEDA is primarily an **event-driven autoscaling operator**. KEDA can integrate with HPA and can expose metrics through Kubernetes' external/custom metrics mechanisms depending on configuration and environment.
+
+```text
+Kafka / Event Source
+  |
+  v
+  KEDA Scaler
+  |
+  v
+ KEDA Operator
+  |
+  v
+      HPA
+  |
+  v
+   Deployment
+  |
+  v
+      Pods
+```
+
+KEDA uses custom controller logic to drive scaling (including scaling from 0 to 1) and integrates with HPA for active pod replica scaling.
+
+---
+
+# API Discovery
+
+When you run:
+
+```bash
+kubectl api-versions
+```
+
+`kube-apiserver` returns a merged list of active APIs:
+
+```text
+Built-in APIs
+       |
+       +── apps/v1
+       +── batch/v1
+       +── networking.k8s.io/v1
+
+Aggregated APIs (Cluster-Dependent)
+       |
+       +── metrics.k8s.io/v1beta1
+       +── custom.metrics.k8s.io/... (if adapter installed)
+       +── external.metrics.k8s.io/... (if provider installed)
+```
+
+Only APIs that are registered via a healthy `APIService` in the cluster appear in discovery.
+
+---
+
+# Aggregated API vs. CRD
+
+| Feature | CRD | Aggregated API |
+| :--- | :--- | :--- |
+| **Primary Purpose** | Define new declarative resource types | Define custom API endpoints & request handlers |
+| **Serving Layer** | `kube-apiserver` | Extension API Server |
+| **Default Storage** | `etcd` | Custom Storage / In-Memory / External DB |
+| **Logic Capability** | Schemas, CEL, Webhooks, Controllers | Full custom API server implementation |
+| **Example** | `RedisCluster`, `Certificate` | `metrics.k8s.io`, `custom.metrics.k8s.io` |
+
+---
+
+# Production Architecture Summary
+
+```text
+                               Kubernetes Cluster
+                                       |
+                                     Client
+  |
+  v
+                                 kube-apiserver
+                                       |
+                   +───────────────────+───────────────────+
+                   |                   |                   |
+                   v                   v                   v
+            metrics.k8s.io      custom.metrics      external.metrics
+                   |                   |                   |
+                   v                   v                   v
+            Metrics Server     Prometheus Adapter   External Provider
+                   |                   |                   |
+                   v                   v                   v
+                kubelets           Prometheus       External Systems
+                                                       (SQS / Kafka)
+```
+
+---
+
+# What Happens if Metrics Server Fails?
+
+Suppose Metrics Server crashes:
+
+```bash
+kubectl top pod
+```
+
+Returns:
+```text
+Error from server (ServiceUnavailable): metrics API not available
+```
+
+However:
+```bash
+kubectl get pods
+```
+
+Continues working normally because built-in APIs and `etcd` persistence are completely isolated from extension server failures.
+
+---
+
+# Common Interview Questions
+
+### Q1. Where does `kubectl top` get its data?
+`kubectl` requests `metrics.k8s.io` from `kube-apiserver`. `kube-aggregator` routes the request to Metrics Server, which aggregates CPU/memory metrics collected from node `kubelets` and returns the formatted response.
+
+### Q2. Why aren't metrics stored in etcd?
+`etcd` is optimized for cluster state coordination. Storing high-frequency telemetry in `etcd` would cause excessive storage growth and control-plane write latency. Metrics Server stores short-term metrics in memory.
+
+### Q3. How does HPA use Aggregated APIs?
+HPA queries metrics APIs (`metrics.k8s.io`, `custom.metrics.k8s.io`, or `external.metrics.k8s.io`) via `kube-apiserver` to calculate target vs actual metric values and adjust workload replica counts.
+
+### Q4. Is KEDA just an Aggregated API?
+No. KEDA is an event-driven autoscaling operator. It uses scalers to monitor event sources, creates/manages HPAs, and can expose metrics through metrics adapters to enable fine-grained autoscaling.
+
+### Q5. Can an Aggregated API use its own storage?
+Yes. Aggregated APIs are not forced to use `etcd`. They can use in-memory storage (Metrics Server), time-series databases (Prometheus Adapter), or external relational/document databases.
+
+---
+
+# Troubleshooting Guide
+
+| Issue | Cause | Fix |
+| :--- | :--- | :--- |
+| `kubectl top` fails | Metrics Server down or APIService unhealthy | Run `kubectl get apiservice v1beta1.metrics.k8s.io` |
+| HPA CPU scaling stagnant | Metrics Server unable to scrape kubelet | Verify kubelet TLS/port configuration in Metrics Server args |
+| Custom metric HPA not scaling | Prometheus Adapter query misconfigured | Check `adapter-config` ConfigMap in Prometheus Adapter |
+| External metric missing | External provider credentials or adapter network error | Inspect metrics adapter pod logs |
+
+---
+
+# Knowledge Check
+
+Before finishing Module 1.1, verify that you can:
+1. Explain the complete request path for `kubectl top pod`.
+2. Differentiate `metrics.k8s.io`, `custom.metrics.k8s.io`, and `external.metrics.k8s.io`.
+3. Explain why `etcd` is not used for telemetry metrics.
+4. Describe how KEDA interacts with HPA and event sources.
+5. Contrast CRDs and Aggregated APIs across serving, storage, and logic dimensions.
+
+---
+
+# Module 1.1 Complete 🎉
+
+Congratulations! You have completed **Module 1.1 – Kubernetes Control Plane**.
+
+You now understand:
+- Control Plane Component Architecture
+- API Server Request Lifecycle (Steps 1–20)
+- Authentication, Authorization, Admission, and Storage
+- API Aggregation Layer (`kube-aggregator`)
+- Aggregated APIs (`metrics.k8s.io`, `custom.metrics.k8s.io`, `external.metrics.k8s.io`)
+
+This deep architectural foundation equips you for advanced topics in workload controllers, custom operators, networking, storage, and platform engineering.

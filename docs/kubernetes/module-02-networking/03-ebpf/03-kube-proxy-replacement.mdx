@@ -1,0 +1,310 @@
+---
+title: "Chapter 3 — kube-proxy Replacement"
+sidebar_position: 3
+module: "Module 2.3 — eBPF"
+description: "Deep dive into replacing kube-proxy with Cilium's eBPF dataplane — comparing iptables vs IPVS vs eBPF Service handling, DSR (Direct Server Return), NAT-less load balancing, and the operational steps to migrate from kube-proxy to Cilium."
+---
+
+# Chapter 3 — kube-proxy Replacement with eBPF
+
+> **Goal:** Understand why kube-proxy has scaling limits, how Cilium's eBPF Service handling eliminates these limits, and how to migrate a cluster from kube-proxy to full eBPF-native Service processing.
+>
+> By the end of this chapter, you will understand:
+> 1. How kube-proxy works in iptables mode and its O(N) scaling problem
+> 2. How IPVS mode improves over iptables but still falls short
+> 3. How Cilium's eBPF completely replaces kube-proxy at O(1)
+> 4. What DSR (Direct Server Return) is and how it halves network hops
+> 5. How to enable kube-proxy replacement in Cilium
+> 6. How to verify that kube-proxy is fully replaced and not running
+
+---
+
+## Real-Life Analogy
+
+Imagine a **call center routing system**:
+
+**kube-proxy iptables mode** is like a **paper rulebook** at reception: every call goes through a receptionist who scans the entire rulebook from page 1 to find the right extension. At 100 services it takes 1 second. At 10,000 services it takes 100 seconds — linear degradation.
+
+**IPVS** is like a **digital phone directory** (hash table): any extension found instantly, but the receptionist still needs to pick up every call and transfer it.
+
+**Cilium eBPF** is like a **smart PBX system at the door**: before the call even enters the building, the system reads the caller ID, looks up the right extension in a microsecond (hash map), and connects the call directly — bypassing reception entirely. For NodePort calls from outside, the call goes straight to the right desk without bouncing through the lobby (DSR).
+
+---
+
+## Architecture Diagram
+
+```text
+              kube-proxy vs eBPF Service Handling
+
+kube-proxy iptables mode:
+  Client → NIC → iptables PREROUTING
+                   → DNAT (rule N of N) → backend Pod
+                 (O(N) rule scan for N services)
+
+kube-proxy IPVS mode:
+  Client → NIC → iptables (small) → IPVS hash → backend Pod
+                 (O(1) but still netfilter overhead)
+
+Cilium eBPF mode:
+  Client → NIC → TC hook → eBPF hash map lookup → backend Pod
+                 (O(1), no iptables, no conntrack for known flows)
+
+DSR (Direct Server Return) mode:
+  External → NodePort:30080 → Node A → eBPF → Pod B (on Node B)
+  Pod B returns directly to client (skips Node A on return path)
+
+  Normal (without DSR):
+  External → Node A → Pod B → Node A → External  (2 extra hops)
+
+  With DSR:
+  External → Node A → Pod B → External  (1 fewer hop)
+```
+
+---
+
+## The kube-proxy Problem at Scale
+
+### iptables Mode (Default)
+
+kube-proxy in iptables mode creates a chain of iptables DNAT rules for each Service endpoint:
+
+```bash
+# kube-proxy iptables rules example (simplified)
+iptables -t nat -L KUBE-SERVICES -n | head -20
+# Target                Prot   Destination
+# KUBE-SVC-XXXYYY       tcp    10.96.0.10:80      ← ClusterIP
+# KUBE-SVC-AAABBB       tcp    10.96.0.20:443
+# ...
+
+iptables -t nat -L KUBE-SVC-XXXYYY -n
+# KUBE-SEP-111   all   → statistic 0.33333 (1/3 probability)
+# KUBE-SEP-222   all   → statistic 0.50000 (1/2 of remaining)
+# KUBE-SEP-333   all   → (final 1/3)
+
+iptables -t nat -L KUBE-SEP-111 -n
+# DNAT  tcp  → 10.244.1.5:8080
+```
+
+**Scaling problems:**
+- Adding a new Service: kube-proxy rewrites the **entire** iptables ruleset (not incremental)
+- 10,000 Services = ~40,000 iptables rules = **rule reload takes 10-30 seconds**
+- During reload: brief iptables lock causes packet drops
+- Conntrack table: each flow creates a conntrack entry → table exhaustion at high QPS
+
+```bash
+# Observe the problem: count iptables rules
+iptables -t nat -L | wc -l
+# 1 Service ≈ 6-10 rules → 5000 Services ≈ 30,000-50,000 rules
+
+# Reload time grows linearly
+time iptables-restore < /tmp/rules  # Seconds at scale
+```
+
+### IPVS Mode
+
+IPVS (IP Virtual Server) uses Linux kernel hash tables:
+- **O(1)** backend selection (vs iptables O(N))
+- No rule rewriting on Service add/delete
+- Better connection rate at high Service count
+
+But IPVS still has limitations:
+- Still uses iptables/netfilter for NodePort and firewall rules
+- Conntrack table still used for NAT state
+- kube-proxy process still runs — adds management overhead
+- Can't do L7 policies or HTTP-level load balancing
+
+---
+
+## Cilium's eBPF Solution: O(1) at All Scales
+
+Cilium implements Service load balancing entirely in eBPF maps:
+
+```text
+Service registration (when kube-proxy would write iptables rules):
+  → Cilium writes to cilium_lb_services map:
+    Key: VIP=10.96.0.10:80
+    Value: [backend_id_1, backend_id_2, backend_id_3]
+
+  → Writes to cilium_lb_backends map:
+    Key: backend_id_1 → Value: 10.244.1.5:8080
+    Key: backend_id_2 → Value: 10.244.1.8:8080
+    Key: backend_id_3 → Value: 10.244.2.3:8080
+
+Packet forwarding time:
+  1. Packet hits TC hook (or socket-level hook)
+  2. Lookup VIP in cilium_lb_services → O(1) hash map
+  3. Select backend with Maglev hashing → O(1)
+  4. Rewrite dst → backend IP:port → O(1)
+  
+Adding 1000 more Services: zero impact on forwarding speed
+```
+
+### Maglev Consistent Hashing
+
+Cilium uses Maglev hashing (from Google's Maglev load balancer) for backend selection:
+- Consistent: same src IP/port → always same backend (session affinity)
+- Stable: when a backend is removed, only that backend's traffic is redistributed (minimal disruption)
+- Near-uniform: traffic distributed evenly across all backends
+
+---
+
+## DSR: Direct Server Return
+
+In standard NodePort mode:
+```text
+Client → Node A port 30080 → DNAT → Pod B (on Node B)
+Pod B response → Node A (SNAT back to client IP) → Client
+Node A is in the return path — doubles latency and wastes bandwidth
+```
+
+With **DSR enabled in Cilium**:
+```text
+Client → Node A port 30080
+Node A: eBPF rewrites dst to Pod B IP (on Node B), preserves client src IP
+Node B: Pod B processes request, responds directly to Client IP
+Client ← Pod B (return goes directly, Node A is bypassed)
+```
+
+Benefits:
+- **Removes Node A from return path** → lower latency, less bandwidth
+- **Real client IP preserved** at the Pod (no SNAT hiding)
+- **Node A has no state** for return traffic → more scalable
+
+Requirements:
+- Cilium must be in Native Routing mode (no VXLAN encapsulation for NodePort)
+- Network must support routing Pod IPs (underlay BGP or host-routing)
+
+```bash
+# Enable DSR in Cilium Helm values
+helm upgrade cilium cilium/cilium \
+  --set loadBalancer.mode=dsr \
+  --set routingMode=native
+
+# Verify DSR is enabled
+kubectl exec -n kube-system cilium-<id> -- cilium status | grep DSR
+```
+
+---
+
+## Enabling kube-proxy Replacement
+
+### On a New Cluster
+
+```bash
+# Install Cilium with full kube-proxy replacement
+helm install cilium cilium/cilium \
+  --namespace kube-system \
+  --set kubeProxyReplacement=true \
+  --set k8sServiceHost=192.168.1.100 \   # API server IP
+  --set k8sServicePort=6443 \
+  --set hostServices.enabled=true \
+  --set nodePort.enabled=true \
+  --set externalIPs.enabled=true
+```
+
+### Migrating an Existing Cluster (from kube-proxy)
+
+```bash
+# Step 1: Deploy Cilium with kube-proxy replacement enabled
+helm upgrade cilium cilium/cilium \
+  --set kubeProxyReplacement=true \
+  --set k8sServiceHost=$(kubectl get endpoints kubernetes \
+    -o jsonpath='{.subsets[0].addresses[0].ip}') \
+  --set k8sServicePort=6443
+
+# Step 2: Delete kube-proxy DaemonSet
+kubectl delete daemonset kube-proxy -n kube-system
+
+# Step 3: Clean up kube-proxy iptables rules (optional — Cilium will ignore them)
+# Run on each node:
+iptables-save | grep -v KUBE | iptables-restore
+ip6tables-save | grep -v KUBE | ip6tables-restore
+
+# Step 4: Verify replacement is complete
+kubectl exec -n kube-system cilium-<id> -- cilium status | grep KubeProxyReplacement
+# Output: KubeProxyReplacement:    True [eth0 192.168.1.10/32 (Direct Routing)]
+```
+
+---
+
+## Verification and Testing
+
+```bash
+# 1. Confirm no kube-proxy pods are running
+kubectl get pods -n kube-system | grep kube-proxy
+# (should be empty)
+
+# 2. Verify Cilium handles all Services
+kubectl exec -n kube-system cilium-<id> -- cilium service list
+# Shows all ClusterIP, NodePort, and ExternalIP services
+
+# 3. Check that no KUBE-* iptables chains exist
+iptables -t nat -L | grep KUBE
+# (should be empty if Cilium cleaned them up)
+
+# 4. Verify a Service is reachable
+kubectl run test --image=nginx --restart=Never
+kubectl expose pod test --port=80 --type=ClusterIP
+CLUSTER_IP=$(kubectl get svc test -o jsonpath='{.spec.clusterIP}')
+kubectl run curl-test --image=curlimages/curl --restart=Never -- curl $CLUSTER_IP
+kubectl logs curl-test  # Should show nginx response
+
+# 5. Check eBPF load balancer map for the Service
+kubectl exec -n kube-system cilium-<id> -- \
+  cilium bpf lb list | grep $CLUSTER_IP
+
+# 6. Performance test (compare before/after)
+# Use wrk or hey for HTTP benchmarking to compare RPS
+hey -n 100000 -c 100 http://$CLUSTER_IP/
+```
+
+---
+
+## Comparison Summary
+
+| Feature | iptables | IPVS | Cilium eBPF |
+|---------|----------|------|------------|
+| **Backend selection** | O(N) sequential | O(1) hash | O(1) hash |
+| **Rule reload on change** | Full reload (slow) | Incremental | Incremental |
+| **Conntrack needed** | Yes | Yes | No (for known flows) |
+| **kube-proxy process** | Required | Required | Not needed |
+| **NodePort DSR** | No | No | Yes |
+| **Client IP preservation** | No (SNAT) | No (SNAT) | Yes (with DSR) |
+| **L7 load balancing** | No | No | Yes (via envoy) |
+| **10K+ services** | Degraded | OK | Excellent |
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does kube-proxy iptables mode have scaling problems?**
+
+kube-proxy in iptables mode creates 6-10 iptables rules per Service endpoint. At 5,000 Services with 3 endpoints each, that's ~90,000 iptables rules. Two problems emerge: (1) Rule matching is O(N) — every packet must traverse rules sequentially until a match is found; (2) Any change requires rewriting the entire iptables ruleset via `iptables-restore`, which takes 10-30+ seconds at large scale and holds an iptables lock during this time, causing packet drops.
+
+**Q2: How does Cilium's eBPF replace kube-proxy's Service handling?**
+
+Cilium stores Service VIPs and their backends in eBPF hash maps (`cilium_lb_services`, `cilium_lb_backends`). When a packet arrives at a TC hook targeting a ClusterIP, an eBPF program performs an O(1) hash map lookup to find the Service, selects a backend using Maglev consistent hashing (also O(1)), and rewrites the destination IP in-place. This happens without any iptables rules, conntrack entries (for known flows), or kube-proxy process. Adding 1000 more Services has zero impact on forwarding latency.
+
+**Q3: What is DSR (Direct Server Return) and when would you use it?**
+
+DSR is a mode where return traffic from backend Pods goes directly to the client, bypassing the node that received the original NodePort request. In standard mode, all traffic flows through the ingress node (SNAT and de-SNAT). With DSR, Cilium rewrites the NodePort packet to the backend Pod's IP while preserving the client source IP, and the backend Pod responds directly. DSR halves the network hops for external traffic, reduces latency, preserves real client IPs, and reduces load on ingress nodes. Requires native routing mode (no VXLAN).
+
+**Q4: What is Maglev consistent hashing and why does Cilium use it?**
+
+Maglev is Google's consistent hashing algorithm designed for load balancers. It produces a lookup table where each entry maps to a backend. Properties: (1) Near-uniform distribution of traffic across backends; (2) Consistency — the same (src_ip, src_port) always maps to the same backend (session affinity without explicit state); (3) Minimal disruption — when a backend is added or removed, only 1/N of traffic is remapped. Cilium uses Maglev to ensure persistent connections survive backend changes without breaking existing flows.
+
+**Q5: What happens to existing connections during a kube-proxy to Cilium migration?**
+
+During migration, there's a brief overlap where both kube-proxy iptables rules and Cilium eBPF maps are active. Existing connections that have conntrack state from kube-proxy will continue to work via the conntrack table. New connections will be handled by Cilium's eBPF. After kube-proxy DaemonSet is deleted and iptables rules are cleaned, all new connections go through Cilium exclusively. Zero-downtime migration is achievable by rolling out Cilium before removing kube-proxy.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know kube-proxy iptables scaling problems: O(N) rule scan + full reload on every change
+- [ ] Understand IPVS improves to O(1) but still uses netfilter and requires kube-proxy process
+- [ ] Know how Cilium eBPF handles Services: O(1) hash map lookup + Maglev consistent hashing
+- [ ] Understand DSR (Direct Server Return) — backend Pod responds directly to client, skipping ingress node
+- [ ] Know the Helm flags to enable kube-proxy replacement: `kubeProxyReplacement=true`
+- [ ] Know the migration steps: deploy Cilium → delete kube-proxy DaemonSet → verify with `cilium service list`
+- [ ] Can verify kube-proxy replacement with `cilium status` and `cilium bpf lb list`

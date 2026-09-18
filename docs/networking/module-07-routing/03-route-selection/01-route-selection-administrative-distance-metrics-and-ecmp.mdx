@@ -1,0 +1,154 @@
+---
+title: "Chapter 3 — Route Selection: Administrative Distance, Metrics & ECMP Multipathing"
+sidebar_position: 1
+module: "Module 7.3 — Route Selection"
+description: "Master the route selection pipeline — Administrative Distance (AD), Protocol Metrics, Equal-Cost Multi-Path (ECMP) load balancing, and Linux multipath hashing."
+---
+
+# Chapter 3 — Route Selection: Administrative Distance, Metrics & ECMP Multipathing
+
+> **Goal:** Master how the operating system kernel and enterprise router control planes choose the single best path when multiple routes exist for the same destination prefix. Understand the hierarchy of Longest Prefix Match vs Administrative Distance (AD) vs Metrics, and how Equal-Cost Multi-Path (ECMP) balances traffic across parallel links.
+>
+> By the end of this chapter, you will understand:
+> 1. The 3-tier Route Selection Hierarchy: 1) Longest Prefix Match, 2) Administrative Distance, 3) Metric
+> 2. Standard Administrative Distance rankings across Cisco, Juniper, and Linux
+> 3. Equal-Cost Multi-Path (ECMP): 5-tuple hashing, packet reordering mitigation, and flow preservation
+> 4. Unequal-Cost Load Balancing (EIGRP Variance)
+> 5. Linux kernel multipath routing (`ip route add default nexthop ...`)
+> 6. CLI tools to debug and trace multipath routing behaviors
+
+---
+
+## Real-Life Analogy
+
+Think of route selection as **hiring a transport contractor for a corporate shipment**:
+
+- **Step 1 — Exact Location (Longest Prefix Match):**
+  - If Contractor A bids on *"State of California"* (`/8`) and Contractor B bids on *"San Francisco Downtown Office"* (`/24`), you always pick Contractor B because their bid is **specifically tailored to your exact street address**.
+- **Step 2 — Contractor Trustworthiness (Administrative Distance):**
+  - If two contractors bid on the exact same address, you look at their reputation score. You trust your direct company truck (**Connected = AD 0**) more than an external courier (**OSPF = AD 110**).
+- **Step 3 — Shipping Cost (Metric):**
+  - If two trucks from the same reputable company offer identical delivery, you choose the one with the lowest toll cost (**Metric**).
+- **ECMP (Splitting Fleet across Dual Bridges):**
+  - If two identical bridges have the exact same toll ($0), the dispatcher sends Odd trucks across Bridge 1 and Even trucks across Bridge 2 (**ECMP 5-tuple hash**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  The 3-Step Route Selection Pipeline
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ STEP 1: LONGEST PREFIX MATCH (LPM)                                          │
+ │ Compare all matching routes in RIB. Route with highest prefix (/24 > /16)   │
+ │ is selected. If multiple routes match the EXACT SAME prefix -> proceed to:  │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ STEP 2: ADMINISTRATIVE DISTANCE (AD / Preference)                           │
+ │ Compare trustworthiness of routing sources. Route with lowest AD is selected:│
+ │   - Connected: 0                                                            │
+ │   - Static: 1                                                               │
+ │   - eBGP: 20                                                                │
+ │   - OSPF: 110                                                               │
+ │   - iBGP: 200                                                               │
+ │ If learned from the SAME protocol with equal AD -> proceed to:              │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ STEP 3: METRIC / COST COMPARISON                                            │
+ │ Compare internal protocol metric (OSPF Cost, RIP Hops). Lowest metric wins. │
+ │ If Metrics are EQUAL -> Install ALL paths into FIB using ECMP Multi-path!   │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Administrative Distance (AD) Reference Table
+
+```text
+ ┌──────────────────────────────────┬─────────────────┬──────────────────┐
+ │ Routing Protocol / Source        │ Cisco / Standard│ Linux Kernel     │
+ │──────────────────────────────────┼─────────────────┼──────────────────┤
+ │ **Directly Connected Interface** │ 0               │ 0                │
+ │ **Static Route**                 │ 1               │ 1                │
+ │ **eBGP (External BGP)**          │ 20              │ 20               │
+ │ **EIGRP (Internal)**             │ 90              │ N/A              │
+ │ **OSPF**                         │ 110             │ 110              │
+ │ **IS-IS**                        │ 115             │ 115              │
+ │ **RIP**                          │ 120             │ 120              │
+ │ **iBGP (Internal BGP)**          │ 200             │ 200              │
+ └──────────────────────────────────┴─────────────────┴──────────────────┘
+```
+
+---
+
+### 2. Equal-Cost Multi-Path (ECMP) & 5-Tuple Hashing
+
+When a router learns multiple routes to the same destination with identical prefix length, AD, and Metric:
+1. It installs up to $N$ next-hops (e.g. 8, 16, 64) into the FIB.
+2. For every outgoing packet, the hardware switch ASIC computes a **5-tuple hash**:
+
+$$\text{Hash} = \text{CRC32}(\text{Src IP}, \text{Dst IP}, \text{Src Port}, \text{Dst Port}, \text{Protocol}) \pmod N$$
+
+3. **Flow Preservation:** Because all packets within a single TCP connection share the same 5-tuple, they are guaranteed to take the **exact same physical link**, completely preventing TCP packet reordering and jitter while load-balancing aggregate traffic across parallel backbones.
+
+---
+
+## Hands-On Lab: Configuring ECMP Multipath in Linux
+
+```bash
+# Step 1: Add a default multipath ECMP route across two gateway uplinks
+sudo ip route add default scope global \
+  nexthop via 192.168.1.1 dev eth0 weight 1 \
+  nexthop via 192.168.1.2 dev eth0 weight 1
+
+# Step 2: Inspect multipath route configuration
+ip route show default
+
+# Step 3: Verify the kernel's Layer 4 multipath hashing policy (5-tuple)
+sysctl net.ipv4.fib_multipath_hash_policy
+
+# Step 4: Set multipath hash policy to Layer 4 (IP + L4 Ports) for fine-grained flow balancing
+sudo sysctl -w net.ipv4.fib_multipath_hash_policy=1
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What takes precedence: a `/28` route learned via RIP (AD 120) or a `/24` route learned via Static configuration (AD 1)?**
+
+The **`/28` RIP route wins**. **Longest Prefix Match (LPM) is evaluated before Administrative Distance**. The router only compares Administrative Distance when two or more routes advertise the **exact same destination prefix length** (e.g. comparing a `/24` static route against a `/24` OSPF route).
+
+**Q2: Why does ECMP hash on the 5-tuple instead of doing simple round-robin packet distribution?**
+
+If a router distributed packets of a single TCP stream round-robin across two paths with slightly different latencies (e.g. Path A = 2ms, Path B = 10ms), packets would arrive at the receiver out of order. Out-of-order packets trigger duplicate TCP ACKs, leading to unnecessary Fast Retransmits and slashing TCP throughput by 90%. 5-tuple hashing ensures all packets of a given flow traverse the same path, eliminating packet reordering.
+
+**Q3: What is the difference between Equal-Cost Multi-Path (ECMP) and Unequal-Cost Multi-Path (UCMP)?**
+
+- **ECMP:** Distributes traffic only across paths with **strictly identical metrics** (supported by OSPF, BGP, IS-IS).
+- **UCMP:** Distributes traffic proportionally across paths with **different metrics** (e.g., sending 75% traffic across a 10Gbps link and 25% across a 1Gbps link). Supported natively by EIGRP (via `variance`) and BGP (via BGP Link Bandwidth Extended Community).
+
+**Q4: What is BFD (Bidirectional Forwarding Detection) and how does it accelerate ECMP failover?**
+
+Dynamic routing protocols like OSPF and BGP use slow Hello timers (e.g., 10s OSPF, 60s BGP). If a link silently degrades, traffic is black-holed for seconds before the route is withdrawn. **BFD (RFC 5880)** runs microsecond-level hardware heartbeats (e.g., 50ms) between routers. If BFD drops 3 heartbeats (150ms), it instantly notifies the routing table to purge the failed ECMP next-hop in sub-second time.
+
+**Q5: What happens if an interface goes down in an ECMP bundle with Resilient Hashing?**
+
+In standard modulo hashing ($\text{Hash} \pmod N$), removing 1 failed link shifts the modulo calculation for **all** existing flows, disrupting active connections across healthy links. **Resilient Hashing (Consistent Hashing)** ensures that when Link 1 of 4 fails, only the 25% of flows mapped to Link 1 are reassigned, while the other 75% of connections on healthy links remain completely undisturbed.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 3-step route selection pipeline: 1) LPM $\to$ 2) AD $\to$ 3) Metric
+- [ ] Memorize AD values: Connected (0), Static (1), eBGP (20), OSPF (110), iBGP (200)
+- [ ] Understand ECMP 5-tuple flow hashing and packet reordering prevention
+- [ ] Master BFD sub-second link failure detection for ECMP
+- [ ] Know how to configure Linux multipath routing via `ip route`

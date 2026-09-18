@@ -1,0 +1,357 @@
+---
+title: "Chapter 1 — CNI Specification"
+sidebar_position: 1
+module: "Module 2.2 — CNI Plugins"
+description: "Deep dive into the Container Network Interface (CNI) specification — the ADD/DEL/CHECK verbs, plugin chain execution, IPAM plugins, and how Kubernetes invokes CNI at Pod creation and deletion."
+---
+
+# Chapter 1 — The CNI Specification
+
+> **Goal:** Understand what CNI is, how the specification works, and exactly how Kubernetes calls CNI plugins at Pod creation and deletion — including plugin chaining, IPAM delegation, and the JSON configuration format.
+>
+> By the end of this chapter, you will understand:
+> 1. What CNI is and why it exists as an interface specification
+> 2. The three CNI operations: ADD, DEL, CHECK
+> 3. The CNI configuration file format and plugin chain
+> 4. How IPAM plugins work and why they're separate from network plugins
+> 5. The exact sequence when Kubernetes creates a new Pod
+> 6. How to inspect and debug CNI configuration on a live cluster
+
+---
+
+## Real-Life Analogy
+
+CNI is like a **power outlet standard**:
+
+The building (Kubernetes) doesn't care what device you plug in — TV, laptop, or lamp. It just provides a standardized outlet (the CNI interface). Any device (CNI plugin) built to the outlet standard will work. You can swap out Flannel for Calico without changing the building — just plug in a different device.
+
+The building has three operations it can perform: **connect a device** (ADD), **disconnect a device** (DEL), and **verify a device is properly connected** (CHECK). It passes information (JSON config) to the device and expects a result back.
+
+---
+
+## Architecture Diagram
+
+```text
+Pod Creation → CNI Invocation Flow
+
+  kubelet
+    │
+    ▼
+  containerd (CRI)
+    │
+    │  1. Create pause container → new netns at /proc/<pid>/ns/net
+    │
+    ▼
+  CNI plugin binary        ← /opt/cni/bin/calico, /opt/cni/bin/flannel
+    │
+    │  Called with:
+    │  - CNI_COMMAND=ADD
+    │  - CNI_NETNS=/proc/12345/ns/net
+    │  - CNI_IFNAME=eth0
+    │  - CNI_CONTAINERID=abc123
+    │  - stdin: JSON config from /etc/cni/net.d/
+    │
+    ▼
+  Plugin executes:
+    ├── Calls IPAM plugin → get Pod IP
+    ├── Creates veth pair
+    ├── Moves veth into Pod netns as eth0
+    ├── Assigns IP to eth0
+    ├── Configures routes
+    └── Returns JSON result with IP/gateway to kubelet
+```
+
+---
+
+## What CNI Is
+
+**CNI (Container Network Interface)** is a CNCF specification (originally from CoreOS) that defines:
+1. A **configuration format** (JSON files in `/etc/cni/net.d/`)
+2. An **execution protocol** (environment variables + stdin)
+3. A **result format** (JSON returned to the runtime)
+
+CNI is **not a daemon** — it's a set of binaries that are executed on-demand by the container runtime. Each plugin binary lives in `/opt/cni/bin/` and is called once per Pod lifecycle event.
+
+```bash
+# CNI binaries on a typical node
+ls /opt/cni/bin/
+# bandwidth  bridge  calico  calico-ipam  dhcp  flannel
+# host-local  ipvlan  loopback  macvlan  portmap  ptp
+# sbr  static  tuning  vlan  vrf
+```
+
+---
+
+## The Three CNI Operations
+
+### ADD — Create Pod Network
+
+Called when a new container (Pod) needs networking:
+
+```bash
+# Environment variables set by the runtime before calling the plugin:
+CNI_COMMAND=ADD
+CNI_CONTAINERID=abc123def456  # Unique container ID
+CNI_NETNS=/proc/12345/ns/net  # Path to the Pod's network namespace
+CNI_IFNAME=eth0               # Interface name to create inside the Pod
+CNI_PATH=/opt/cni/bin         # Where plugin binaries live
+CNI_ARGS=K8S_POD_NAME=nginx;K8S_POD_NAMESPACE=default;K8S_POD_INFRA_CONTAINER_ID=abc123
+```
+
+The plugin reads a **JSON config from stdin** (from `/etc/cni/net.d/`), sets up the network, and returns a JSON result:
+
+```json
+{
+  "cniVersion": "0.4.0",
+  "interfaces": [
+    {
+      "name": "eth0",
+      "mac": "aa:bb:cc:dd:ee:01",
+      "sandbox": "/proc/12345/ns/net"
+    }
+  ],
+  "ips": [
+    {
+      "version": "4",
+      "interface": 0,
+      "address": "10.244.1.5/24",
+      "gateway": "10.244.1.1"
+    }
+  ],
+  "routes": [
+    { "dst": "0.0.0.0/0" }
+  ]
+}
+```
+
+### DEL — Remove Pod Network
+
+Called when a Pod is deleted:
+
+```bash
+CNI_COMMAND=DEL
+CNI_CONTAINERID=abc123def456
+CNI_NETNS=/proc/12345/ns/net
+CNI_IFNAME=eth0
+```
+
+The plugin:
+1. Removes the veth pair
+2. Returns the Pod's IP to IPAM
+3. Cleans up any routes or iptables rules
+
+### CHECK — Verify Network State
+
+Called to verify that a previously created network is still correctly configured (CNI spec v0.4.0+):
+
+```bash
+CNI_COMMAND=CHECK
+CNI_CONTAINERID=abc123def456
+CNI_NETNS=/proc/12345/ns/net
+CNI_IFNAME=eth0
+```
+
+Returns an error if the network is not in the expected state. Used for healthchecks.
+
+---
+
+## CNI Configuration Files
+
+CNI plugins are configured via JSON files in `/etc/cni/net.d/`. The runtime reads the **lexicographically first** file (alphabetically lowest filename):
+
+```bash
+ls /etc/cni/net.d/
+# 10-calico.conflist    ← Used first (lowest number)
+# 99-loopback.conf
+```
+
+### Single Plugin Config (`.conf`)
+
+```json
+{
+  "cniVersion": "0.4.0",
+  "name": "mynet",
+  "type": "bridge",
+  "bridge": "cni0",
+  "isGateway": true,
+  "ipMasq": true,
+  "ipam": {
+    "type": "host-local",
+    "subnet": "10.244.1.0/24",
+    "routes": [
+      { "dst": "0.0.0.0/0" }
+    ]
+  }
+}
+```
+
+### Plugin Chain (`.conflist`) — Multiple Plugins in Sequence
+
+```json
+{
+  "cniVersion": "0.4.0",
+  "name": "k8s-pod-network",
+  "plugins": [
+    {
+      "type": "calico",
+      "log_level": "info",
+      "datastore_type": "kubernetes",
+      "ipam": {
+        "type": "calico-ipam"
+      },
+      "policy": {
+        "type": "k8s"
+      }
+    },
+    {
+      "type": "bandwidth",
+      "ingressRate": 100000000,
+      "egressRate": 100000000
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true}
+    }
+  ]
+}
+```
+
+In a conflist, plugins execute **sequentially**. The result of each plugin is passed to the next. This is how bandwidth limiting and port mapping are layered on top of a base network plugin.
+
+---
+
+## IPAM: IP Address Management
+
+IPAM (IP Address Management) is separated into its own plugin type in the CNI spec. This allows the same IPAM logic to be reused with different network plugins.
+
+### `host-local` IPAM
+
+Stores allocated IPs in files on the local host. Simple and requires no external dependencies:
+
+```bash
+# host-local stores state here:
+ls /var/lib/cni/networks/mynet/
+# 10.244.1.5   10.244.1.8   10.244.1.12  last_reserved_ip.0
+cat /var/lib/cni/networks/mynet/10.244.1.5
+# abc123def456  ← Container ID that owns this IP
+```
+
+### `calico-ipam` IPAM
+
+Calico's IPAM plugin allocates IPs from the cluster-wide IPAM pool stored in the Calico datastore. Supports:
+- IP pools with blockSize configuration
+- Per-namespace or per-node IP restrictions
+- Affinity-based block allocation
+
+### `dhcp` IPAM
+
+Requests IPs from an external DHCP server. Used in specialized network environments.
+
+---
+
+## Hands-On: Inspecting CNI on a Live Cluster
+
+```bash
+# 1. View CNI config
+cat /etc/cni/net.d/10-calico.conflist | python3 -m json.tool
+
+# 2. List available CNI binaries
+ls -la /opt/cni/bin/
+
+# 3. Check which Pod is using which IP (host-local IPAM)
+ls /var/lib/cni/networks/
+cat /var/lib/cni/networks/cbr0/10.244.1.5
+
+# 4. Manually invoke CNI ADD (for debugging - dangerous in production)
+# This is what the runtime does internally:
+cat > /tmp/cni-test.json << 'EOF'
+{
+  "cniVersion": "0.4.0",
+  "name": "test",
+  "type": "bridge",
+  "bridge": "testbr0",
+  "ipam": {
+    "type": "host-local",
+    "subnet": "10.99.0.0/24"
+  }
+}
+EOF
+
+# Create a test netns
+ip netns add testns
+
+CNI_COMMAND=ADD \
+CNI_CONTAINERID=test123 \
+CNI_NETNS=/var/run/netns/testns \
+CNI_IFNAME=eth0 \
+CNI_PATH=/opt/cni/bin \
+/opt/cni/bin/bridge < /tmp/cni-test.json
+
+# Verify
+ip netns exec testns ip addr
+
+# Cleanup
+CNI_COMMAND=DEL \
+CNI_CONTAINERID=test123 \
+CNI_NETNS=/var/run/netns/testns \
+CNI_IFNAME=eth0 \
+CNI_PATH=/opt/cni/bin \
+/opt/cni/bin/bridge < /tmp/cni-test.json
+
+ip netns del testns
+
+# 5. Debug CNI issues by checking kubelet logs
+journalctl -u kubelet | grep -i cni | tail -20
+
+# 6. Common error: Pod stuck in ContainerCreating
+kubectl describe pod <pod-name>
+# Look for: "network: failed to set bridge addr"
+# or: "Error adding network: failed to delegate"
+```
+
+---
+
+## Common CNI Failures
+
+| Error Message | Root Cause | Fix |
+|---------------|-----------|-----|
+| `failed to find plugin "calico" in path` | CNI binary not in `/opt/cni/bin/` | Reinstall CNI plugin DaemonSet |
+| `failed to set bridge addr` | IP conflict on the bridge | Check IPAM state, clean up stale IPs |
+| `network not ready: network plugin returns not ready` | CNI config missing or malformed | Check `/etc/cni/net.d/` |
+| `IPAM resources exhausted` | All IPs in the node's subnet are allocated | Check for Pod leaks, or increase subnet size |
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNI and how does Kubernetes use it?**
+
+CNI (Container Network Interface) is a CNCF specification defining how container runtimes (containerd, CRI-O) invoke network plugins to configure Pod networking. Kubernetes itself has no networking implementation — it delegates to CNI plugins. When the runtime creates a Pod's pause container (and its network namespace), it reads the CNI config from `/etc/cni/net.d/` and executes the plugin binary with ADD/DEL/CHECK commands via environment variables and stdin/stdout.
+
+**Q2: What is the difference between a `.conf` and `.conflist` CNI file?**
+
+A `.conf` file configures a single CNI plugin. A `.conflist` configures a **plugin chain** — multiple plugins run sequentially on each ADD/DEL/CHECK operation. Chaining allows layering: the main plugin sets up routing, a `bandwidth` plugin adds traffic shaping, and a `portmap` plugin configures host port mapping. The runtime reads the lexicographically first filename in `/etc/cni/net.d/`.
+
+**Q3: What does an IPAM plugin do and why is it separate from the network plugin?**
+
+IPAM (IP Address Management) plugins handle only IP allocation and route specification — they don't touch interfaces or kernel routing. Separation allows reuse: `host-local` IPAM works with both `bridge` and `ptp` network plugins. `calico-ipam` can be used with Calico's networking or even standalone. The network plugin calls the IPAM plugin internally and uses the returned IP/gateway info to configure interfaces.
+
+**Q4: What happens if the CNI plugin binary crashes or is not installed?**
+
+Pods on that node will be stuck in `ContainerCreating` state. The kubelet logs will show a CNI error. The runtime calls the CNI binary synchronously during Pod setup — if it fails or returns an error, the Pod's network setup fails and the Pod cannot start. Existing Pods are unaffected (their networks were already configured).
+
+**Q5: In what order do plugins in a CNI conflist chain execute, and can they share data?**
+
+Plugins execute in the order listed in the `plugins` array, sequentially for ADD and in reverse order for DEL. Each plugin receives the full config and the result from the previous plugin (for ADD). This allows downstream plugins to see the IP/interface allocated by the primary plugin. For example, a `portmap` plugin can read the Pod's IP from the primary plugin's result to configure iptables DNAT rules.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know what CNI is — a specification (not a daemon) defining a plugin protocol for container networking
+- [ ] Understand the three operations: ADD (create), DEL (delete), CHECK (verify)
+- [ ] Know the environment variables passed to CNI plugins (CNI_COMMAND, CNI_NETNS, CNI_CONTAINERID)
+- [ ] Understand the difference between `.conf` (single plugin) and `.conflist` (plugin chain)
+- [ ] Know what IPAM plugins do and why they're separate (`host-local`, `calico-ipam`, `dhcp`)
+- [ ] Can inspect CNI config in `/etc/cni/net.d/` and binaries in `/opt/cni/bin/`
+- [ ] Know how to diagnose Pods stuck in ContainerCreating due to CNI failures

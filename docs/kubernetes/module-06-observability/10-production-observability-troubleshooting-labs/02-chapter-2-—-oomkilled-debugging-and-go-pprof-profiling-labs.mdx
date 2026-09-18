@@ -1,0 +1,280 @@
+---
+title: "Chapter 2 — OOMKilled Debugging & Go pprof"
+sidebar_position: 2
+module: "Module 6.10 — Troubleshooting Labs"
+description: "Master debugging Kubernetes OOMKilled (Exit Code 137) and memory profiling with Go pprof — cgroup limit breaches vs node evictions, heap in-use analysis, and goroutine leak detection."
+---
+
+# Chapter 2 — OOMKilled Debugging & Go pprof Profiling Labs
+
+> **Goal:** Master the deep technical diagnosis and root-cause resolution of **OOMKilled (Exit Code 137)** container terminations in Kubernetes — differentiating between container cgroup limit breaches, host kernel OOM panics, and Kubelet node memory pressure evictions, analyzing `dmesg` kernel logs and `working_set_bytes` telemetry, and capturing live production heap profiles and goroutine leak traces using **Go `pprof`**.
+>
+> By the end of this chapter, you will understand:
+> 1. The anatomical origin of Exit Code 137 ($128 + \text{SIGKILL } 9$)
+> 2. The 3 distinct OOMKill triggers: Container cgroup limit, Host Kernel OOM, and Kubelet Eviction
+> 3. How to inspect `dmesg` and cgroup memory controllers for OOM invocation events
+> 4. How to instrument Go microservices with `net/http/pprof` endpoints
+> 5. How to capture and analyze live heap profiles (`inuse_space` vs `alloc_space`)
+> 6. How to diagnose and eliminate Goroutine leaks in production Kubernetes pods
+
+---
+
+## Real-Life Analogy
+
+Think of OOMKilled terminations and Go pprof profiling as **a building code enforcement inspector and an forensic architectural auditor investigating a collapsing building**:
+
+- **The Exit Code 137 Executioner (The Linux Kernel OOM Killer):** When an unruly tenant packs so much heavy furniture into their apartment that the ceiling begins cracking (**`working_set_bytes` exceeds `limits.memory`**), the building code officer does not send a polite warning letter. The SWAT team kicks the door down and evicts the tenant with an immediate shotgun blast (**`SIGKILL (Signal 9)` $\to$ Exit Code $128 + 9 = 137$**).
+- **The 3 Types of Collapses:**
+  - **1. Apartment Limit Breach (cgroup OOM):** Only Apartment 4B exceeded its individual lease limit; the rest of the building is completely fine.
+  - **2. Building Foundation Collapse (Host Kernel OOM):** The entire physical skyscraper ran out of physical concrete (**Host RAM exhausted**). The kernel shoots the highest `oom_score_adj` tenant to save the building.
+  - **3. Preemptive City Eviction (Kubelet Pressure Eviction):** The building manager notices that emergency stairs are getting congested (**`memory.available < 100Mi`**) and politely asks non-critical tenants to leave (**Pod Eviction**).
+- **The Forensic X-Ray Auditor (Go `pprof`):** Instead of guessing which room has heavy furniture, the auditor brings an X-ray scanner (**`go tool pprof`**). The scanner instantly points to a single closet: *"80% of all building weight is coming from an unclosed database cache array in `handlers/order.go:line 42`!"*
+
+---
+
+## Architecture Diagram
+
+```text
+               Anatomy of a Container OOMKill & pprof Profiling Flow
+
+ 1. MEMORY LEAK ESCALATION:
+ Application allocates memory dynamically without releasing pointers
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Memory Working Set (`container_memory_working_set_bytes`)    │
+ │ [ 500MB ... 800MB ... 990MB ... 1024MB (LIMIT HIT!) ]                  │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Linux Kernel cgroup threshold tripped!
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX KERNEL OOM-KILLER ENGINE                                         │
+ │ 1. Identifies container PID as culprit                                 │
+ │ 2. Sends uncatchable `SIGKILL (Signal 9)` to process                   │
+ │ 3. Writes event to kernel buffer: `dmesg: oom_reaper invoked`          │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Process Exits with Code 137 (128 + 9)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBELET CONTROLLER: Records Status `Reason: OOMKilled`                 │
+ │ Pod enters `CrashLoopBackOff`!                                         │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+ 2. SRE DIAGNOSTIC INVESTIGATION (Go pprof):
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LIVE HEAP PROFILING: `go tool pprof http://localhost:6060/debug/pprof/heap`
+ │                                                                        │
+ │ TOP MEMORY CONSUMERS (inuse_space):                                    │
+ │ 1. `github.com/company/api/cache.(*OrderCache).Add` ──► 820MB (80.1%)  │
+ │ 2. `net/http.(*conn).serve`                         ──►  90MB ( 8.8%)  │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 Types of Memory Terminations Compared
+
+```text
+ ┌───────────────────────────┬───────────────────┬───────────────────┬───────────────────┐
+ │ Dimension                 │ Container cgroup  │ Host Kernel OOM   │ Kubelet Node      │
+ │                           │ Memory OOMKill    │ (Node Exhaustion) │ Pressure Eviction │
+ │───────────────────────────┼───────────────────┼───────────────────┼───────────────────┤
+ │ **Trigger Condition**     │ `working_set`     │ Host physical RAM │ `memory.available`│
+ │                           │ exceeds `limits`  │ 100% full.        │ below threshold.  │
+ │ **Termination Signal**    │ `SIGKILL (9)`     │ `SIGKILL (9)`     │ `SIGTERM` then    │
+ │                           │                   │                   │ `SIGKILL`         │
+ │ **Exit Code**             │ **137**           │ **137**           │ 137 (or 0)        │
+ │ **`kubectl describe`**    │ `Reason:          │ `Reason:          │ `Reason: Evicted` │
+ │ **Pod Status**            │ `OOMKilled`       │ `OOMKilled`       │ `(Preempted)`     │
+ │ **Target Selection**      │ The violating Pod │ Highest OOM score │ BestEffort pods   │
+ │                           │ container only.   │ victim process.   │ evicted first.    │
+ └───────────────────────────┴───────────────────┴───────────────────┴───────────────────┘
+```
+
+---
+
+## How to Instrument Go Microservices with `pprof`
+
+Expose the standard Go `pprof` diagnostic endpoints by importing `net/http/pprof`:
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+	_ "net/http/pprof" // Standard pprof HTTP handler registration!
+)
+
+func main() {
+	// Start pprof debugging server on dedicated internal port (e.g. 6060)
+	go func() {
+		log.Println("Starting pprof profiling server on :6060")
+		log.Println(http.ListenAndServe("0.0.0.0:6060", nil))
+	}()
+
+	// Main application logic...
+	startApplicationServer()
+}
+```
+
+```text
+ Available pprof Endpoints:
+ - `GET /debug/pprof/heap`: Heap memory allocation profile (Detects memory leaks).
+ - `GET /debug/pprof/goroutine`: Stack traces of all current goroutines (Detects goroutine leaks).
+ - `GET /debug/pprof/profile?seconds=30`: 30-second CPU profiling sample.
+ - `GET /debug/pprof/block`: Goroutine blocking on synchronization primitives.
+```
+
+---
+
+## Capturing and Analyzing Production Heap Profiles
+
+```bash
+# 1. Establish secure port-forward to the running Pod's pprof port
+kubectl port-forward -n production pod/payment-api-7b8f 6060:6060 &
+
+# 2. Capture a live 30-second Heap Profile into an interactive shell
+go tool pprof http://localhost:6060/debug/pprof/heap
+
+# Inside the pprof interactive console:
+(pprof) top20 -inuse_space
+(pprof) list OrderCache.Add
+(pprof) png > heap_profile.png
+```
+
+```text
+ Understanding inuse_space vs alloc_space:
+ - `inuse_space`: Active memory currently held in RAM (Used for finding active MEMORY LEAKS).
+ - `alloc_space`: Cumulative total memory allocated over the lifetime (Used for finding Garbage Collection churn).
+```
+
+---
+
+## Diagnosing Goroutine Leaks
+
+A **Goroutine Leak** occurs when a Go microservice spawns goroutines that block indefinitely on an unbuffered channel or a dead network socket, quietly consuming memory until the container is OOMKilled:
+
+```bash
+# Inspect active goroutine count in pprof
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+
+(pprof) top10
+# If you observe: 50,000 goroutines blocked on `chan receive`, you have a critical channel leak!
+```
+
+---
+
+## Complete Production Manifest: Workload with Diagnostic Profiling
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: profiled-payment-api
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment-api
+  template:
+    metadata:
+      labels:
+        app: payment-api
+    spec:
+      containers:
+      - name: api
+        image: payment-api:v1.5
+        ports:
+        - name: http-app
+          containerPort: 8080
+        - name: http-pprof            # Dedicated diagnostic port
+          containerPort: 6060
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            memory: 1Gi                # Strict ceiling triggers cgroup OOMKill if breached
+```
+
+---
+
+## Hands-On Lab: Simulating OOMKill & Capturing Memory Diagnostics
+
+```bash
+# Step 1: Create a lab namespace
+kubectl create namespace oom-lab
+
+# Step 2: Launch a Pod that deliberately exceeds its memory limit
+cat <<EOF | kubectl apply -f - -n oom-lab
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-victim-pod
+spec:
+  restartPolicy: Never
+  containers:
+  - name: memory-eater
+    image: alpine:latest
+    command: ["sh", "-c", "apk add --no-cache python3 && python3 -c 'a = [1] * (50 * 1024 * 1024)'"] # Allocates ~400MB RAM!
+    resources:
+      limits:
+        memory: 64Mi                   # Limit is only 64MiB!
+EOF
+
+# Step 3: Wait 10 seconds and observe the Pod termination
+sleep 10
+kubectl get pod oom-victim-pod -n oom-lab
+
+# Step 4: Inspect the Exit Code and Termination Reason
+kubectl describe pod oom-victim-pod -n oom-lab | grep -E "Exit Code|Reason"
+# Observe: Reason: OOMKilled, Exit Code: 137!
+
+# Step 5: Clean up lab
+kubectl delete namespace oom-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What does Exit Code 137 mean in Kubernetes container crashes?**
+
+In Unix-like operating systems, an exit code greater than 128 indicates that the process was terminated by an unhandled POSIX signal. The formula is:
+$$\text{Exit Code} = 128 + \text{Signal Number}$$
+Signal 9 is **`SIGKILL`**. Therefore, Exit Code 137 ($128 + 9 = 137$) means the container process was forcibly killed by `SIGKILL`. In Kubernetes, this most commonly occurs when the Linux kernel's Out-Of-Memory (OOM) killer terminates a container because its `container_memory_working_set_bytes` exceeded `resources.limits.memory`.
+
+**Q2: What is the difference between a Container cgroup OOMKill and a Kubelet Node Pressure Eviction?**
+
+- **Container cgroup OOMKill**: The container process exceeded its configured `resources.limits.memory`. The Linux kernel sends an instantaneous `SIGKILL` directly to the process. The Pod remains scheduled on the node and enters a `CrashLoopBackOff` restart cycle (`Reason: OOMKilled`).
+- **Kubelet Node Pressure Eviction**: The entire physical worker node's available memory dropped below the eviction threshold (e.g. `memory.available < 100Mi`). Kubelet gracefully terminates the Pod via `SIGTERM`, removes it from the node, and marks the Pod phase as `Failed` (`Reason: Evicted`), prompting the scheduler to restart it on a different node.
+
+**Q3: How do you differentiate between `inuse_space` and `alloc_space` when analyzing a Go heap profile?**
+
+- **`inuse_space`**: Measures the total bytes of memory currently live in RAM that have not yet been freed by the garbage collector. This is the primary view used to detect **live memory leaks**.
+- **`alloc_space`**: Measures the cumulative total memory allocated since the program started, including memory that has already been garbage collected. This view is used to identify high-allocation churn functions that trigger heavy GC CPU pauses.
+
+**Q4: What is a Goroutine Leak, and how does it lead to an OOMKilled failure?**
+
+A Goroutine leak occurs when an application continuously launches Go concurrency routines (goroutines) that never terminate (for example, waiting forever on an unbuffered channel that never receives data, or blocking on a network socket without a read timeout). Each goroutine allocates a minimum 2KB stack. Over days, tens of thousands of leaked goroutines accumulate, slowly consuming all container RAM until the working set breaches `limits.memory` and triggers an OOMKill.
+
+**Q5: How can you confirm that a Pod was killed by the kernel OOM Killer by inspecting the host worker node?**
+
+Access the host worker node and run `dmesg -T | grep -i oom` or inspect `/var/log/messages`. The Linux kernel outputs an explicit diagnostic block whenever `oom_reaper` is invoked:
+`[Tue Aug 18 12:00:00 2026] Memory cgroup out of memory: Kill process 14201 (payment-api) score 950 or sacrifice child`
+This confirms that the cgroup memory limit was breached.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Exit Code 137 represents $128 + \text{SIGKILL } 9$
+- [ ] Know the 3 memory terminations: Container cgroup OOM, Host Kernel OOM, Kubelet Eviction
+- [ ] Know how to inspect OOMKills in `kubectl describe pod` and `dmesg`
+- [ ] Know how to instrument Go microservices using `net/http/pprof`
+- [ ] Know the difference between `inuse_space` (active leaks) and `alloc_space` (GC churn)
+- [ ] Know how to capture live heap profiles using `go tool pprof`
+- [ ] Can diagnose Goroutine leaks using the `/debug/pprof/goroutine` endpoint

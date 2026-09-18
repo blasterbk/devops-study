@@ -1,0 +1,1474 @@
+---
+title: "Chapter 5 — Service Load Balancing"
+sidebar_position: 5
+module: "Module 1.8 — kube-proxy Internals"
+description: "> **Goal:** Understand how Kubernetes Services distribute traffic across Pods. Learn how kube-proxy performs endpoint selection, how EndpointSlices work, how tr..."
+---
+
+# Module 1.8 — kube-proxy Internals
+
+# Chapter 5 — Service Load Balancing
+
+> **Goal:** Understand how Kubernetes Services distribute traffic across Pods. Learn how kube-proxy performs endpoint selection, how EndpointSlices work, how traffic policies affect routing, how rolling updates occur without downtime, and how Kubernetes maintains reliable load balancing in production clusters.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Service load balancing mechanics across iptables, IPVS, and eBPF
+> 2. Endpoint vs EndpointSlice: scaling beyond 1,000 backend Pods
+> 3. Random distribution (iptables probability) vs scheduling algorithms (IPVS)
+> 4. Session affinity: ClientIP configuration and timeout enforcement
+> 5. internalTrafficPolicy: Cluster (all nodes) vs Local (node-local pods only)
+> 6. externalTrafficPolicy: Cluster (extra hop, SNAT) vs Local (preserves client IP)
+> 7. Zero-downtime rolling updates: readiness probe transitions and endpoint removal
+> 8. Topology-aware routing and Traffic Distribution hints
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Service Load Balancing like a customer support call routing system.
+
+```text
+Call Center Routing Analogy:
+
+Customer dials main support hotline (Service ClusterIP)
+Automated switchboard (kube-proxy programmed kernel) picks a free agent (Pod)
+Normal mode: routes to any agent randomly across all call centers
+Sticky mode (sessionAffinity): routes returning caller to same agent if within timeout
+Local office mode (trafficPolicy: Local): route only to agents in caller's local branch
+When an agent clocks out (Pod terminating): switchboard stops routing new calls immediately
+```
+
+| Call Center | Service Load Balancing |
+| :--- | :--- |
+| Support hotline number | Service Virtual IP (ClusterIP) |
+| Active agents list | EndpointSlice object |
+| Random agent assignment | iptables probability rule / IPVS round-robin |
+| Return caller to same agent | `sessionAffinity: ClientIP` with `timeoutSeconds` |
+| Local branch preference | `internalTrafficPolicy: Local` / `externalTrafficPolicy: Local` |
+| Agent clocking out gracefully | Readiness probe fail -> EndpointSlice removal -> conntrack drain |
+
+> **Important:** By default, Kubernetes Service load balancing is **connection-level, not request-level (L4, not L7)**. For persistent TCP protocols like HTTP/2 or gRPC, all requests in a single TCP connection go to the exact same backend Pod! To achieve true per-request load balancing for gRPC/HTTP2, you must use an L7 proxy (such as Ingress-NGINX, Envoy, or a Service Mesh) rather than standard kube-proxy Service routing.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes Services
+- kube-proxy
+- iptables
+- IPVS
+- conntrack
+- EndpointSlices (basic concept)
+
+---
+
+# Where This Chapter Fits
+
+So far we have learned:
+
+```text
+Client
+  |
+  v
+ClusterIP
+  |
+  v
+kube-proxy
+  |
+  v
+iptables/IPVS
+  |
+  v
+Pod
+```
+
+But we still haven't answered one important question:
+
+> **How does Kubernetes decide which Pod should receive the request?**
+
+Suppose we have:
+
+```text
+Pod A
+
+────────────
+
+Pod B
+
+────────────
+
+Pod C
+```
+
+Who receives the next request?
+
+This chapter answers that question.
+
+---
+
+# The Problem
+
+Suppose a Deployment has:
+
+```text
+10 Pods
+```
+
+Every Pod exposes:
+
+```text
+Port 8080
+```
+
+Clients connect to:
+
+```text
+ClusterIP
+
+10.96.0.15
+```
+
+The challenge is:
+
+```text
+One Service
+  |
+  v
+Many Pods
+```
+
+Traffic must be distributed correctly.
+
+---
+
+# Kubernetes Solution
+
+Instead of exposing Pods directly,
+
+Kubernetes creates a Service.
+
+```text
+Client
+  |
+  v
+Service
+  |
+  v
+Backend Pods
+```
+
+The Service becomes the stable entry point.
+
+---
+
+# High-Level Service Architecture
+
+```text
+                 Client
+
+                    |
+
+                    ▼
+
+              ClusterIP Service
+
+                    |
+
+                    ▼
+
+               kube-proxy
+
+                    |
+
+          Select Backend Pod
+
+                    |
+
+      ┌────────┼────────┐
+
+      ▼        ▼        ▼
+
+    Pod A    Pod B    Pod C
+```
+
+---
+
+# Important Principle
+
+A Kubernetes Service does **not** contain Pods.
+
+Instead,
+
+it contains:
+
+```text
+Label Selector
+```
+
+The selector determines which Pods belong to the Service.
+
+---
+
+# Example
+
+Service:
+
+```yaml
+selector:
+  app: payment
+```
+
+Matching Pods:
+
+```text
+payment-1
+
+payment-2
+
+payment-3
+```
+
+The Service automatically includes matching Pods.
+
+---
+
+# Backend Discovery
+
+How does Kubernetes discover Pods?
+
+Workflow:
+
+```text
+Service Selector
+  |
+  v
+EndpointSlice Controller
+  |
+  v
+EndpointSlices
+  |
+  v
+kube-proxy
+```
+
+Notice:
+
+The Service never directly stores Pod IPs.
+
+---
+
+# Service Load Balancing Architecture
+
+Complete architecture:
+
+```text
+            Deployment
+
+                  |
+
+              Creates Pods
+
+                  |
+
+                  ▼
+
+              EndpointSlice
+
+                  |
+
+                  ▼
+
+               kube-proxy
+
+                  |
+
+        iptables / IPVS / eBPF
+
+                  |
+
+                  ▼
+
+             Backend Pod
+```
+
+---
+
+# ClusterIP Load Balancing
+
+ClusterIP is the default Service type.
+
+Example:
+
+```text
+Service
+
+10.96.0.15
+```
+
+Clients always connect to:
+
+```text
+10.96.0.15
+```
+
+Never directly to Pods.
+
+---
+
+# ClusterIP Workflow
+
+```text
+Client
+  |
+  v
+ClusterIP
+  |
+  v
+Backend Selection
+  |
+  v
+Pod
+```
+
+The client never knows which Pod handled the request.
+
+---
+
+# Multiple Requests
+
+Suppose:
+
+```text
+Client
+  |
+  v
+Request 1
+  |
+  v
+Pod A
+
+────────────
+
+Request 2
+  |
+  v
+Pod C
+
+────────────
+
+Request 3
+  |
+  v
+Pod B
+```
+
+Traffic is distributed according to the dataplane's load-balancing behavior and connection state.
+
+---
+
+# Endpoint Selection
+
+A Service may have many endpoints.
+
+Example:
+
+```text
+Pod A
+
+10.244.1.5
+
+────────────
+
+Pod B
+
+10.244.2.8
+
+────────────
+
+Pod C
+
+10.244.3.9
+```
+
+The dataplane selects one backend for a new connection.
+
+---
+
+# Selection Workflow
+
+```text
+ClusterIP
+  |
+  v
+Endpoint List
+  |
+  v
+Choose Backend
+  |
+  v
+Forward Request
+```
+
+The exact selection algorithm depends on the dataplane (iptables, IPVS, or eBPF).
+
+---
+
+# Where Do Endpoints Come From?
+
+Not from kube-proxy.
+
+Instead:
+
+```text
+Pods
+  |
+  v
+EndpointSlice Controller
+  |
+  v
+EndpointSlices
+  |
+  v
+kube-proxy
+```
+
+---
+
+# EndpointSlices
+
+Earlier Kubernetes versions used:
+
+```text
+Endpoints
+```
+
+Modern Kubernetes uses:
+
+```text
+EndpointSlices
+```
+
+EndpointSlices improve scalability.
+
+---
+
+# Why EndpointSlices?
+
+Suppose:
+
+```text
+1,000 Pods
+```
+
+Putting all endpoints into one object becomes inefficient.
+
+Instead:
+
+```text
+EndpointSlice 1
+
+100 Endpoints
+
+────────────
+
+EndpointSlice 2
+
+100 Endpoints
+
+────────────
+
+EndpointSlice 3
+
+100 Endpoints
+```
+
+Each EndpointSlice typically contains up to around 100 endpoints by default, though this limit is configurable.
+
+---
+
+# EndpointSlice Architecture
+
+```text
+Deployment
+  |
+  v
+Pods
+  |
+  v
+EndpointSlice Controller
+  |
+  v
+EndpointSlices
+  |
+  v
+kube-proxy
+```
+
+---
+
+# EndpointSlice Contents
+
+Each endpoint includes information such as:
+
+- Pod IP
+- Port
+- Protocol
+- Conditions (Ready, Serving, Terminating)
+- Node name
+- Zone (when available)
+
+This allows intelligent routing decisions.
+
+---
+
+# Ready Endpoints
+
+Not every Pod receives traffic.
+
+Suppose:
+
+```text
+Pod A
+
+Ready
+
+────────────
+
+Pod B
+
+Ready
+
+────────────
+
+Pod C
+
+Not Ready
+```
+
+Only Ready endpoints are normally included for Service traffic.
+
+---
+
+# Why?
+
+Traffic should never reach a Pod that cannot serve requests.
+
+Readiness determines whether a Pod participates in load balancing.
+
+---
+
+# Session Affinity
+
+Normally,
+
+every new connection may reach a different backend.
+
+Sometimes,
+
+this is undesirable.
+
+Example:
+
+```text
+Shopping Cart
+  |
+  v
+Client
+  |
+  v
+Same Backend
+```
+
+---
+
+# What is Session Affinity?
+
+Session Affinity attempts to send requests from the same client to the same backend.
+
+Conceptually:
+
+```text
+Client A
+  |
+  v
+Pod B
+
+────────────
+
+Client A
+  |
+  v
+Pod B
+
+Again
+```
+
+---
+
+# Why Use Session Affinity?
+
+Useful for:
+
+- Legacy applications
+- In-memory sessions
+- Stateful applications
+- Cache locality
+
+---
+
+# ClientIP Affinity
+
+Kubernetes currently supports:
+
+```text
+ClientIP
+```
+
+Requests from the same client IP are directed to the same backend for the configured affinity timeout period, provided that backend remains eligible.
+
+---
+
+# ClientIP Workflow
+
+```text
+Client
+  |
+  v
+Remember Backend
+  |
+  v
+Future Requests
+  |
+  v
+Same Pod
+```
+
+---
+
+# Important Note
+
+Session Affinity is **not** the same as TCP connection tracking.
+
+Connection tracking ensures packets in a connection stay together.
+
+Session Affinity attempts to keep **multiple connections** from the same client directed to the same backend.
+
+---
+
+# conntrack vs Session Affinity
+
+| conntrack | Session Affinity |
+|------------|------------------|
+| Same TCP connection | Multiple connections |
+| Kernel feature | Kubernetes Service feature |
+| Always required | Optional |
+| Packet consistency | Client stickiness |
+
+---
+
+# InternalTrafficPolicy
+
+Sometimes traffic should remain:
+
+```text
+Inside Same Node
+```
+
+This is controlled by:
+
+```text
+InternalTrafficPolicy
+```
+
+Possible values:
+
+```text
+Cluster
+
+Local
+```
+
+---
+
+# Cluster Policy
+
+```text
+Node A
+  |
+  v
+Pod Anywhere
+```
+
+Traffic may be forwarded to Pods on any Node.
+
+---
+
+# Local Policy
+
+```text
+Node A
+  |
+  v
+Only Local Pods
+```
+
+If no local endpoints exist,
+
+the Service has no eligible backend for traffic originating from that Node.
+
+---
+
+# Why Use Local?
+
+Advantages:
+
+- Lower latency
+- Reduced cross-node traffic
+- Better network locality
+
+Trade-off:
+
+Potentially uneven traffic distribution if endpoint placement is imbalanced.
+
+---
+
+# ExternalTrafficPolicy
+
+This policy applies to traffic entering the cluster through:
+
+- NodePort
+- LoadBalancer Services
+
+Possible values:
+
+```text
+Cluster
+
+Local
+```
+
+---
+
+# ExternalTrafficPolicy = Cluster
+
+Traffic may arrive at:
+
+```text
+Node A
+```
+
+and be forwarded to:
+
+```text
+Pod on Node B
+```
+
+This maximizes backend availability.
+
+---
+
+# ExternalTrafficPolicy = Local
+
+Traffic entering:
+
+```text
+Node A
+```
+
+can only be forwarded to Pods on:
+
+```text
+Node A
+```
+
+If no local endpoints exist,
+
+that Node does not serve external traffic for the Service.
+
+---
+
+# Why Use Local?
+
+One major advantage:
+
+```text
+Preserve Client IP
+```
+
+Because unnecessary cross-node forwarding and SNAT can often be avoided.
+
+Trade-offs include reduced load distribution flexibility if some Nodes have no local endpoints.
+
+---
+
+# Health Checking
+
+Kubernetes should not send traffic to unhealthy Pods.
+
+How does it know?
+
+Through:
+
+```text
+Readiness Probe
+```
+
+---
+
+# Workflow
+
+```text
+Readiness Probe
+  |
+  v
+Ready?
+  |
+  v
+Yes
+  |
+  v
+EndpointSlice
+  |
+  v
+Traffic
+
+────────────
+
+No
+  |
+  v
+Remove Endpoint
+```
+
+---
+
+# Health Check Example
+
+```text
+Pod A
+
+Ready
+
+────────────
+
+Pod B
+
+Ready
+
+────────────
+
+Pod C
+
+Failed Readiness
+```
+
+Traffic only reaches:
+
+```text
+Pod A
+
+Pod B
+```
+
+---
+
+# Rolling Updates
+
+Suppose:
+
+Version 1
+
+```text
+Pod A
+
+Pod B
+
+Pod C
+```
+
+New deployment begins.
+
+---
+
+# Update Process
+
+```text
+New Pod
+  |
+  v
+Ready
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+Traffic Starts
+  |
+  v
+Old Pod Removed
+  |
+  v
+Traffic Stops
+```
+
+No downtime occurs when the rollout is configured correctly.
+
+---
+
+# Rolling Update Timeline
+
+```text
+Old Pod
+  |
+  v
+Running
+
+────────────
+
+New Pod
+  |
+  v
+Created
+  |
+  v
+Ready
+  |
+  v
+Traffic Enabled
+  |
+  v
+Old Pod Deleted
+```
+
+Traffic shifts only after readiness is confirmed.
+
+---
+
+# Scaling Events
+
+Suppose:
+
+```text
+3 Pods
+```
+
+Autoscaler increases to:
+
+```text
+10 Pods
+```
+
+Workflow:
+
+```text
+New Pods
+  |
+  v
+Ready
+  |
+  v
+EndpointSlices Updated
+  |
+  v
+kube-proxy
+  |
+  v
+Traffic Distributed
+```
+
+No Service restart occurs.
+
+---
+
+# Scale Down
+
+Suppose:
+
+```text
+10 Pods
+  |
+  v
+3 Pods
+```
+
+Workflow:
+
+```text
+Old Pods
+  |
+  v
+Termination
+  |
+  v
+Endpoint Removed
+  |
+  v
+Traffic Stops
+```
+
+The endpoint is removed before the Pod is terminated to minimize request failures.
+
+---
+
+# Failure Handling
+
+Suppose:
+
+```text
+Pod B
+  |
+  v
+Crash
+```
+
+Workflow:
+
+```text
+Readiness Fails
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+Remove Endpoint
+  |
+  v
+Traffic
+  |
+  v
+Healthy Pods
+```
+
+No manual intervention is required.
+
+---
+
+# Node Failure
+
+Suppose:
+
+```text
+Entire Node
+  |
+  v
+Offline
+```
+
+Workflow:
+
+```text
+Node Controller
+  |
+  v
+Pods Lost
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+Traffic Redirected
+```
+
+Clients continue using the same Service IP.
+
+---
+
+# Complete Traffic Flow
+
+```text
+Client
+  |
+  v
+ClusterIP
+  |
+  v
+kube-proxy
+  |
+  v
+iptables/IPVS/eBPF
+  |
+  v
+Endpoint Selection
+  |
+  v
+Selected Pod
+  |
+  v
+Application
+  |
+  v
+Response
+  |
+  v
+Client
+```
+
+---
+
+# Complete Internal Architecture
+
+```text
+                 Deployment
+
+                      |
+
+                   ReplicaSet
+
+                      |
+
+                     Pods
+
+                      |
+
+                      ▼
+
+          EndpointSlice Controller
+
+                      |
+
+               EndpointSlices
+
+                      |
+
+                      ▼
+
+                 kube-proxy
+
+                      |
+
+       iptables / IPVS / eBPF
+
+                      |
+
+          Session Affinity
+
+                      |
+
+        Internal/External Policy
+
+                      |
+
+                      ▼
+
+               Selected Backend
+```
+
+---
+
+# Production Example 1
+
+E-Commerce Platform
+
+```text
+Checkout Service
+  |
+  v
+100 Pods
+  |
+  v
+ClusterIP
+  |
+  v
+Load Balanced
+```
+
+Customers connect to one Service while requests are distributed across healthy Pods.
+
+---
+
+# Production Example 2
+
+Rolling Deployment
+
+```text
+Old Version
+  |
+  v
+New Version Ready
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+Traffic Moves
+```
+
+Users experience no interruption.
+
+---
+
+# Production Example 3
+
+Node Failure
+
+```text
+Node Offline
+  |
+  v
+Endpoints Removed
+  |
+  v
+Healthy Nodes Continue
+```
+
+The Service remains available.
+
+---
+
+# Production Example 4
+
+Autoscaling
+
+```text
+CPU High
+  |
+  v
+HPA
+  |
+  v
+New Pods
+  |
+  v
+EndpointSlices Updated
+  |
+  v
+Traffic Distributed
+```
+
+Capacity increases automatically.
+
+---
+
+# Production Best Practices
+
+✔ Always configure Readiness Probes.
+
+✔ Use EndpointSlices (default in modern Kubernetes).
+
+✔ Use Session Affinity only when required.
+
+✔ Prefer stateless applications whenever possible.
+
+✔ Use InternalTrafficPolicy=Local only when the locality benefits outweigh reduced flexibility.
+
+✔ Use ExternalTrafficPolicy=Local when preserving client IP is required.
+
+✔ Monitor endpoint counts during large rollouts.
+
+✔ Verify endpoint readiness before investigating networking issues.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Services store Pod IPs.
+
+**Correct:** EndpointSlices store backend endpoint information.
+
+---
+
+### ❌ Misconception 2
+
+Every request is randomly distributed.
+
+**Correct:** Distribution depends on the dataplane implementation, connection state, and optional affinity settings.
+
+---
+
+### ❌ Misconception 3
+
+Session Affinity and conntrack are the same.
+
+**Correct:** conntrack tracks packets within a connection; Session Affinity influences backend selection across multiple connections.
+
+---
+
+### ❌ Misconception 4
+
+A Pod receives traffic immediately after creation.
+
+**Correct:** Traffic is normally sent only after the Pod becomes Ready.
+
+---
+
+### ❌ Misconception 5
+
+Rolling updates require downtime.
+
+**Correct:** Proper readiness handling allows traffic to shift gradually without interruption.
+
+---
+
+### ❌ Misconception 6
+
+InternalTrafficPolicy affects external clients.
+
+**Correct:** It applies only to traffic originating from inside the cluster.
+
+---
+
+### ❌ Misconception 7
+
+ExternalTrafficPolicy=Local guarantees better performance.
+
+**Correct:** It preserves client IP and can reduce cross-node hops, but it may also reduce load distribution flexibility and depends on local endpoint availability.
+
+---
+
+# Common Interview Questions
+
+### Q1. How does a Service discover backend Pods?
+
+Through label selectors, the EndpointSlice controller, and EndpointSlices.
+
+---
+
+### Q2. What is an EndpointSlice?
+
+A scalable Kubernetes resource that stores backend endpoint information for Services.
+
+---
+
+### Q3. Why were EndpointSlices introduced?
+
+To improve scalability compared to the older Endpoints resource.
+
+---
+
+### Q4. What is Session Affinity?
+
+A Service feature that attempts to route multiple connections from the same client to the same backend.
+
+---
+
+### Q5. What is ClientIP affinity?
+
+A session affinity mode that uses the client IP address to maintain backend stickiness for a configurable period.
+
+---
+
+### Q6. What is InternalTrafficPolicy?
+
+A Service setting that controls whether internal traffic can use cluster-wide endpoints or only local Node endpoints.
+
+---
+
+### Q7. What is ExternalTrafficPolicy?
+
+A Service setting for NodePort and LoadBalancer Services that controls whether external traffic can be forwarded to remote Nodes or only local endpoints.
+
+---
+
+### Q8. Why are Readiness Probes important?
+
+Only Ready endpoints normally receive Service traffic.
+
+---
+
+### Q9. What happens during a rolling update?
+
+New Ready Pods are added to EndpointSlices before old Pods are removed, allowing seamless traffic transition.
+
+---
+
+### Q10. What happens when a Pod crashes?
+
+Its readiness fails (or it is removed), EndpointSlices are updated, and traffic is redirected to remaining healthy endpoints.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Service has no endpoints | Label selector mismatch or no Ready Pods |
+| New Pods receive no traffic | Readiness Probe failing |
+| Traffic still reaches terminating Pod | Endpoint update or termination still in progress |
+| Client IP not preserved | ExternalTrafficPolicy set to Cluster or SNAT behavior |
+| Uneven traffic distribution | Session Affinity, long-lived connections, or endpoint imbalance |
+| Traffic never stays on local Node | InternalTrafficPolicy configured as Cluster |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. How does a Service discover Pods?
+2. What role do EndpointSlices play?
+3. How is a backend selected?
+4. What is Session Affinity?
+5. How does ClientIP affinity work?
+6. What is the difference between InternalTrafficPolicy and ExternalTrafficPolicy?
+7. Why are Readiness Probes critical for Services?
+8. How do rolling updates avoid downtime?
+9. What happens during a scaling event?
+10. How does Kubernetes recover from Pod or Node failures?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes performs **Service Load Balancing** across healthy Pods.
+
+You learned:
+
+- The complete Service load-balancing architecture
+- How ClusterIP provides a stable virtual endpoint
+- How backend Pods are discovered through EndpointSlices
+- How kube-proxy selects endpoints using the underlying dataplane
+- The purpose of Session Affinity and ClientIP affinity
+- The differences between InternalTrafficPolicy and ExternalTrafficPolicy
+- How Readiness Probes determine whether a Pod receives traffic
+- How rolling updates and scaling events automatically update Service backends
+- How Kubernetes redirects traffic during Pod and Node failures
+
+Service load balancing is one of Kubernetes' most important abstractions. It decouples clients from individual Pods, allowing applications to scale, recover from failures, and perform zero-downtime deployments while maintaining a single stable Service endpoint.
+
+---
+
+# Module 1.8 Summary — kube-proxy Internals
+
+You have now completed **Module 1.8 — kube-proxy Internals**.
+
+Across these five chapters, you learned:
+
+- **Chapter 1:** kube-proxy Architecture
+- **Chapter 2:** iptables Mode Internals
+- **Chapter 3:** IPVS Mode Internals
+- **Chapter 4:** conntrack Internals
+- **Chapter 5:** Service Load Balancing
+
+Together, these chapters explain how Kubernetes transforms a virtual Service IP into reliable communication with backend Pods using Linux networking primitives, endpoint discovery, stateful connection tracking, and scalable load-balancing mechanisms.
+
+---
+
+# Next Module
+
+## Module 1.9 — CRDs & Operators
+
+Topics include:
+
+- Custom Resource Definitions (CRDs)
+- Kubernetes API Extension
+- Custom Resources
+- API Registration
+- CRD Validation
+- Versioning & Conversion
+- Controllers
+- Operators
+- Kubebuilder
+- Operator SDK
+- Finalizers
+- OwnerReferences
+- Production Patterns
+
+In the next module, you'll learn how Kubernetes itself becomes an extensible platform by allowing you to define entirely new API resources and build controllers that automate complex operational workflows.
+```

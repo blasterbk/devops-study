@@ -1,0 +1,183 @@
+---
+title: "Chapter 1 — BuildKit Architecture & LLB Graphs"
+sidebar_position: 1
+module: "Module 10.1 — BuildKit Architecture"
+description: "Master BuildKit internals — buildkitd daemon, Low-Level Builder (LLB) directed acyclic graphs, concurrent multi-stage execution, and flexible exporters."
+---
+
+# Chapter 1 — BuildKit Architecture & LLB Graphs
+
+> **Goal:** Master the compiler architecture, dependency graphs, and concurrent execution pipelines of **BuildKit** — the next-generation container image build engine powering `docker buildx` and Kubernetes CI/CD. Dissect the **`buildkitd` daemon architecture**, master **Low-Level Builder (LLB)** intermediate representation graphs, analyze **concurrent multi-stage build optimization**, and evaluate **pluggable output exporters** (`image`, `local`, `tar`).
+>
+> By the end of this chapter, you will understand:
+> 1. The structural flaws of the legacy Docker builder and why BuildKit replaced it
+> 2. How `buildctl` communicates with `buildkitd` over gRPC
+> 3. How LLB serves as the LLVM-like intermediate representation for container builds
+> 4. How BuildKit automatically executes independent Dockerfile stages in parallel
+> 5. How BuildKit exporters push images directly to remote registries without local caching
+> 6. How to enable, inspect, and benchmark BuildKit pipelines
+
+---
+
+## Real-Life Analogy
+
+Think of BuildKit and LLB as **an ultra-modern robotic automobile factory versus an old 1920s single-lane assembly line**:
+
+- **The Legacy Docker Builder (The 1920s One-Man Assembly Line):**
+  - A single mechanic builds a car from scratch, one step at a time (**Strictly sequential Dockerfile execution**).
+  - Even if the car's wheels and the car's radio are completely unrelated, the mechanic builds the radio, waits 10 minutes, and only then starts the wheels (**Zero parallelization**).
+  - If you never install the radio in the final car (**Unused build stage**), the mechanic still wastes 10 minutes building it anyway!
+- **BuildKit & LLB (The Modern Robotic Smart Factory):**
+  - A central AI computer converts the car blueprint into a **Directed Acyclic Graph (DAG)** of discrete tasks (**Low-Level Builder - LLB**).
+  - 10 robotic arms work simultaneously: Arm A builds the chassis, Arm B compiles the engine software, Arm C sews the leather seats (**Concurrent Multi-Stage Execution**).
+  - If a stage is not connected to the final vehicle, the AI compiler **prunes it from the build graph in 0.0 milliseconds**, saving massive time and electricity!
+
+---
+
+## Architecture Diagram
+
+```text
+               BuildKit Architecture: Frontend ──► LLB Graph ──► Exporters
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT FRONTEND: `docker buildx build` / `buildctl` (Dockerfile / Moby)│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Compiles Dockerfile into LLB Protocol Buffers
+                    ▼ (gRPC API: `/run/buildkit/buildkitd.sock`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `buildkitd` CORE ENGINE (LLB Graph Execution Planner)                  │
+ │                                                                        │
+ │ [ PARALLEL LLB DEPENDENCY GRAPH ]                                      │
+ │   ┌────────────────────────┐      ┌────────────────────────┐           │
+ │   │ Stage 1: Build Backend │      │ Stage 2: Build Frontend│           │
+ │   │ (Compiles Go Binary)   │      │ (Compiles React Assets)│           │
+ │   └───────────┬────────────┘      └───────────┬────────────┘           │
+ │               └─────────────┬─────────────────┘                        │
+ │                             ▼                                          │
+ │               ┌───────────────────────────┐                            │
+ │               │ Stage 3: Final Minimal OCI│ (Unused stages pruned!)    │
+ │               └─────────────┬─────────────┘                            │
+ └─────────────────────────────┼──────────────────────────────────────────┘
+                               │ Pluggable Exporter Output
+                               ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ BUILDKIT EXPORTERS:                                                    │
+ │ ├── `type=image`: Pushes directly to AWS ECR / Harbor (No local copy!) │
+ │ ├── `type=docker`: Loads image into local Docker Engine daemon         │
+ │ └── `type=local`: Extracts compiled binary directly to host directory! │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Legacy Docker Builder vs BuildKit
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────────┐
+ │ Technical Feature         │ Legacy Docker Builder           │ BuildKit Engine (`buildx`)          │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **Execution Model**       │ Strictly **Sequential** (1-by-1)│ **Parallel DAG Graph Execution**.   │
+ │ **Unused Stages**         │ Builds every stage blindly.     │ **Prunes unreferenced stages** (0s).│
+ │ **Context Transfer**      │ Sends 100% of directory upfront.│ **Incremental lazy file transfer**. │
+ │ **Secret Handling**       │ Bakes secrets into image layers.│ **`--mount=type=secret`** in RAM.   │
+ │ **Remote Cache Backends** │ None (Local image cache only).  │ **S3, GitHub Actions, Registry**.   │
+ │ **Multi-Arch Builds**     │ Complex manual manifest scripts.│ Native QEMU / remote cross-compile. │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## Low-Level Builder (LLB): The Intermediate Representation
+
+Just as modern compilers (like Clang/Rust) compile high-level code into **LLVM IR**, BuildKit compiles Dockerfiles into **Low-Level Builder (LLB)**:
+- LLB is a binary **Protocol Buffer format** representing a Directed Acyclic Graph (DAG) of filesystem transformations.
+- Each node in the graph represents an atomic operation: `SourceOp` (pulling base image or copying files), `ExecOp` (running a command), or `FileOp` (creating directories/symlinks).
+- LLB is completely decoupled from Dockerfiles: languages like Python, Lua, or specialized DSLs can compile directly to LLB to generate container images!
+
+---
+
+## Flexible Output Exporters
+
+BuildKit can export build results to various destinations without requiring a local Docker daemon:
+
+```bash
+# 1. Push directly to remote registry without saving to local Docker daemon (Saves disk!)
+docker buildx build --output type=image,name=harbor.io/my-app:v1,push=true .
+
+# 2. Extract compiled binaries directly to host directory (Great for Go/Rust compilers!)
+docker buildx build --output type=local,dest=./bin/ .
+
+# 3. Export as a standalone tar archive
+docker buildx build --output type=tar,dest=output.tar .
+```
+
+---
+
+## Hands-On Lab: Verifying BuildKit Parallel Execution
+
+```bash
+# Step 1: Ensure BuildKit is enabled in your environment
+export DOCKER_BUILDKIT=1
+
+# Step 2: Create a multi-stage Dockerfile with independent parallel stages
+cat << 'EOF' > Dockerfile.test
+# Stage 1: Simulates Backend Build
+FROM alpine AS backend-builder
+RUN echo "Building Backend..." && sleep 3 && echo "Backend Done" > /backend.bin
+
+# Stage 2: Simulates Frontend Build (Runs simultaneously with Stage 1!)
+FROM alpine AS frontend-builder
+RUN echo "Building Frontend..." && sleep 3 && echo "Frontend Done" > /frontend.bin
+
+# Stage 3: Final Production Image
+FROM alpine
+COPY --from=backend-builder /backend.bin /app/backend.bin
+COPY --from=frontend-builder /frontend.bin /app/frontend.bin
+CMD ["cat", "/app/backend.bin"]
+EOF
+
+# Step 3: Build the image and watch BuildKit execute Stages 1 and 2 in PARALLEL!
+docker build -t buildkit-demo -f Dockerfile.test .
+
+# Notice total elapsed time is ~3 seconds rather than 6 seconds!
+
+# Cleanup
+rm -f Dockerfile.test
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is BuildKit, and why is it superior to the legacy Docker build engine?**
+
+BuildKit is the next-generation container image build engine created by Docker and the Moby project. It replaced the legacy builder because: (1) **Parallel Stage Execution**: It converts build steps into an acyclic dependency graph (LLB) and executes independent stages concurrently; (2) **Automatic Stage Pruning**: It detects unreferenced stages and skips them entirely; (3) **Efficient Context Transfer**: Only files actually referenced by `COPY` statements are transferred over gRPC rather than uploading the entire project directory; (4) **Advanced Mounts**: Native support for cache mounts (`--mount=type=cache`) and secure in-memory secrets (`--mount=type=secret`).
+
+**Q2: What is Low-Level Builder (LLB), and what role does it play in BuildKit?**
+
+Low-Level Builder (LLB) is the **Intermediate Representation (IR)** of BuildKit, analogous to LLVM IR in compiler architecture. It defines build definitions as a **Directed Acyclic Graph (DAG)** of content-addressable filesystem operations serialized in Protocol Buffers. By compiling Dockerfiles into LLB first, BuildKit can perform advanced compiler optimization passes (such as dead-code elimination, parallel branch detection, and content-hash caching) before executing a single container step.
+
+**Q3: How does BuildKit handle unused stages in a multi-stage Dockerfile?**
+
+In the legacy builder, every stage in a Dockerfile was executed sequentially from top to bottom regardless of whether its output was used. In BuildKit, the LLB compiler starts from the final target stage and **traverses backwards along the dependency graph**. Any stage whose outputs are not referenced by a `COPY --from=<stage>` directive is identified as dead code and **completely pruned from the build plan**, consuming **0 CPU cycles and 0 seconds**.
+
+**Q4: How do BuildKit Output Exporters improve CI/CD pipeline efficiency?**
+
+Traditional Docker builds always unpack the finished image into the local Docker daemon's storage pool before pushing. BuildKit **Exporters (`--output`)** decouple the build process from the local daemon:
+- **`type=image,push=true`**: Streams image layers directly to the remote container registry over the network without writing anything to the local host disk, saving disk space in ephemeral CI runners.
+- **`type=local`**: Discards the container OS and extracts only the compiled binary artifacts directly to a local host directory, turning Docker into a universal, sandboxed build tool for Go, Rust, or C++.
+
+**Q5: How does `buildctl` interact with `buildkitd` in a Kubernetes cluster?**
+
+In Kubernetes CI/CD platforms (like Tekton or Argo Workflows), **`buildkitd` runs as a standalone daemon in a dedicated Pod**. CI worker pods use the **`buildctl` CLI** to send build requests to `buildkitd` over a gRPC TCP/UNIX connection. `buildkitd` manages its own cache and container execution natively without requiring root privileges on the Kubernetes host node or mounting `/var/run/docker.sock`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that BuildKit converts Dockerfiles into parallel LLB dependency graphs
+- [ ] Know that `buildkitd` is the core daemon communicating via gRPC
+- [ ] Know that LLB is the LLVM-like intermediate representation for container builds
+- [ ] Know that BuildKit automatically executes independent stages in parallel
+- [ ] Know that unreferenced stages are pruned from the build plan in 0s
+- [ ] Know how exporters (`type=image,push=true`) push directly without local caching

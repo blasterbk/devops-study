@@ -1,0 +1,159 @@
+---
+title: "Chapter 1 — BGP Fundamentals: Autonomous Systems, eBGP, iBGP & Route Reflectors"
+sidebar_position: 1
+module: "Module 8.1 — BGP Fundamentals"
+description: "Master Border Gateway Protocol (BGP-4, RFC 4271) — Autonomous System Numbers (ASN), eBGP vs iBGP peering, Finite State Machine (FSM), split-horizon rule, and Route Reflectors."
+---
+
+# Chapter 1 — BGP Fundamentals: Autonomous Systems, eBGP, iBGP & Route Reflectors
+
+> **Goal:** Master the core architecture of Border Gateway Protocol (BGP-4, RFC 4271), the routing protocol that powers the global Internet. Understand 16-bit and 32-bit Autonomous System Numbers (ASNs), eBGP vs iBGP peering rules, the 6-stage BGP Finite State Machine (FSM), iBGP full-mesh scaling limitations, and Route Reflector topologies.
+>
+> By the end of this chapter, you will understand:
+> 1. Autonomous Systems (AS) and 2-byte vs 4-byte ASN allocations (Public vs Private ranges)
+> 2. TCP Port 179 transport, neighbor adjacencies, and BGP message types (OPEN, UPDATE, KEEPALIVE, NOTIFICATION)
+> 3. The 6-state BGP Finite State Machine (`Idle`, `Connect`, `Active`, `OpenSent`, `OpenConfirm`, `Established`)
+> 4. External BGP (eBGP: TTL=1 default) vs Internal BGP (iBGP: TTL=255, Next-Hop-Self requirement)
+> 5. The iBGP Split-Horizon rule and Route Reflector (RR) clusters (Cluster ID, Originator ID)
+> 6. CLI exploration with Linux BGP daemons (FRRouting / BIRD)
+
+---
+
+## Real-Life Analogy
+
+Think of BGP as **the international treaty and customs network connecting sovereign countries**:
+
+- **Autonomous System (A Sovereign Country):**
+  - Country A (Google, ASN 15169) and Country B (Cloudflare, ASN 13335) each have their own internal laws (**OSPF / IS-IS**).
+- **External BGP (eBGP — International Border Ambassadors):**
+  - Diplomats meet at international border crossings (**IXPs / Tier-1 Transit**). They exchange formal treaties: *"Country A will accept trade packets destined for `8.8.8.0/24`"*.
+- **Internal BGP (iBGP — Federal Courier Service):**
+  - Once the treaty enters Country A, internal couriers distribute the route to all domestic city halls.
+- **Route Reflectors (Central Dispatch Hub):**
+  - Instead of forcing all 1,000 city halls to maintain a direct telephone line to every other city hall ($N(N-1)/2$ full mesh), all city halls connect to 2 Central Dispatch Towers (**Route Reflectors**) that broadcast updates to everyone.
+
+---
+
+## Architecture Diagram
+
+```text
+                     eBGP Peering, iBGP Full-Mesh & Route Reflectors
+                     
+ ┌──────────────────────────────────────┐     ┌──────────────────────────────────────┐
+ │ AUTONOMOUS SYSTEM 64512 (Company A)  │     │ AUTONOMOUS SYSTEM 64513 (Company B)  │
+ │                                      │     │                                      │
+ │   ┌──────────────┐                   │     │                   ┌──────────────┐   │
+ │   │ Route Refl.  │ (iBGP Cluster)    │     │                   │ Route Refl.  │   │
+ │   │  [RR-1]      │                   │     │                   │  [RR-2]      │   │
+ │   └──────┬───────┘                   │     │                   └──────┬───────┘   │
+ │      iBGP│                           │     │                       iBGP│          │
+ │   ┌──────▼───────┐                   │     │                   ┌──────▼───────┐   │
+ │   │ Edge Router 1├──────── eBGP Peering Session (TCP 179) ─────┤ Edge Router 2│   │
+ │   └──────────────┘                   │     │                   └──────────────┘   │
+ └──────────────────────────────────────┘     └──────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Autonomous System Numbers (ASN)
+
+An AS is a collection of IP routing prefixes under a single administrative entity.
+- **Public ASNs (Global Internet):** `1 – 64,495` (16-bit) and `131072 – 419999` (32-bit).
+- **Private ASNs (Enterprise / Datacenter):** `64,512 – 65,534` (16-bit) and `4200000000 – 4294967294` (32-bit).
+
+---
+
+### 2. The 6-Stage BGP Finite State Machine (FSM)
+
+```text
+ ┌───────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ State         │ Description & Operation                                                     │
+ │───────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Idle**   │ Router initializes resources and listens for TCP connection.                │
+ │ **2. Connect**│ Initiates TCP 3-way handshake on port 179 with neighbor.                    │
+ │ **3. Active** │ TCP handshake failed; router actively attempts to re-establish TCP socket.  │
+ │ **4. OpenSent**│ TCP connected! Router transmits `BGP OPEN` message (ASN, BGP ID, Hold Time).│
+ │ **5. OpenConfirm**│ Receives matching OPEN message from peer and transmits `KEEPALIVE`.     │
+ │ **6. Established**│ Session fully active! Peers continuously exchange `UPDATE` routing msgs. │
+ └───────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 3. eBGP vs iBGP Mechanics
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Feature              │ eBGP (External BGP)                      │ iBGP (Internal BGP)                      │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **Peering Location** │ Between different ASNs                   │ Within the same ASN                      │
+ │ **Default IP TTL**   │ `TTL = 1` (Direct physical link required)│ `TTL = 255` (Multi-hop IGP routed)       │
+ │ **AS-Path Action**   │ Prepends its own ASN to AS-Path          │ Does NOT modify AS-Path                  │
+ │ **Next-Hop Action**  │ Changes Next-Hop to its own peering IP   │ Preserves external Next-Hop (needs self) │
+ │ **Split-Horizon**    │ None                                     │ Never forward iBGP route to other iBGP   │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 4. Route Reflectors (RR) & Loop Prevention
+
+To eliminate the $N(N-1)/2$ full-mesh requirement in large iBGP networks, **Route Reflectors** are permitted to forward iBGP routes to client peers. Loop prevention uses two mandatory non-transitive attributes:
+1. **`ORIGINATOR_ID`:** The BGP Router-ID of the router that originally created the route. If an update returns with a router's own Originator ID, it is discarded.
+2. **`CLUSTER_LIST`:** Sequence of Route Reflector Cluster IDs the route has traversed.
+
+---
+
+## Hands-On Lab: Inspecting BGP Sessions via Linux CLI
+
+```bash
+# Step 1: Query global BGP looking glasses to trace public ASNs (using whois)
+whois -h whois.radb.net 1.1.1.1 | grep -i "origin"
+
+# Step 2: If FRR (Free Range Routing) or BIRD is installed, check BGP summary
+# vtysh -c "show ip bgp summary"
+# vtysh -c "show ip bgp neighbors"
+
+# Step 3: Monitor BGP TCP port 179 packets with tcpdump
+sudo tcpdump -n -i any "tcp port 179" -c 4
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does iBGP require an iBGP Split-Horizon rule, and why does that force a full-mesh or Route Reflector topology?**
+
+In eBGP, loops are prevented because routers discard any update containing their own ASN in the AS-Path. However, within an AS, **iBGP does not append its own ASN** to the AS-Path. To prevent internal loops, iBGP enforces **Split Horizon: an iBGP router must never forward a route learned from an iBGP peer to any other iBGP peer**. This rule means routes can only travel 1 hop internally, forcing all iBGP routers to peer with every other iBGP router (Full Mesh: $N(N-1)/2$ sessions) or deploy **Route Reflectors**.
+
+**Q2: What is the purpose of the `next-hop-self` configuration command in iBGP?**
+
+When an edge router learns a route via eBGP from a transit provider, the route's Next-Hop IP is set to the external ISP IP (e.g. `203.0.113.1`). When the edge router reflects this route into iBGP, standard iBGP rules **preserve the external Next-Hop**. Internal routers cannot reach `203.0.113.1` (because external IPs are not in the internal IGP), causing the route to be marked unusable. `neighbor <peer> next-hop-self` forces the edge router to rewrite the Next-Hop to its own internal Loopback IP.
+
+**Q3: What causes a BGP session to get stuck in the `Active` state?**
+
+The `Active` state indicates the router is actively trying to initiate a TCP connection on port 179, but the TCP handshake is failing. Common causes:
+1. An intermediate firewall or security group is blocking **TCP Port 179**.
+2. An IP mismatch in the `neighbor <ip>` configuration (peering IP does not match the source interface).
+3. The peer has no valid Layer 3 route back to the source IP.
+4. eBGP Multihop is missing when peering across Loopback interfaces (`ebgp-multihop 2`).
+
+**Q4: What is the difference between BGP Multihop and standard eBGP peering?**
+
+By default, eBGP packets have an IP `TTL = 1`, enforcing that eBGP peers must be directly connected by a physical cable. If two eBGP routers peer using their **Loopback interfaces** for redundancy across dual physical cables, packets require 2 hops ($\text{TTL}=2$). Enabling `ebgp-multihop 2` allows eBGP packets to survive the extra hop without being dropped.
+
+**Q5: What are BGP 4-Byte ASNs and how does BGP maintain backward compatibility with legacy 2-Byte peers?**
+
+Standard ASNs were 16-bit integers ($1\dots 65535$). When ASNs neared exhaustion, RFC 4893 introduced 32-bit (4-byte) ASNs ($1\dots 4,294,967,295$). For backward compatibility with legacy 2-byte routers that cannot parse 32-bit ASNs, BGP uses a reserved placeholder ASN **`23456` (`AS_TRANS`)** in the legacy AS-Path while encoding the true 4-byte ASN in a new BGP attribute (`NEW_AS_PATH`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Master ASN allocations (Public vs Private `64512-65534`)
+- [ ] Understand the 6-state BGP FSM (`Idle` $\to$ `Connect` $\to$ `Active` $\to$ `OpenSent` $\to$ `OpenConfirm` $\to$ `Established`)
+- [ ] Differentiate eBGP (`TTL=1`, ASN prepending) vs iBGP (`TTL=255`, `next-hop-self`)
+- [ ] Understand the iBGP Split-Horizon rule and Route Reflector clusters
+- [ ] Know how `ORIGINATOR_ID` and `CLUSTER_LIST` prevent iBGP loops

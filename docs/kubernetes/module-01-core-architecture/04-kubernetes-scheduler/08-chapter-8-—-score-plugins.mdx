@@ -1,0 +1,1680 @@
+---
+title: "Chapter 8 — Score Plugins"
+sidebar_position: 8
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand how Kubernetes selects the **best** Node after filtering. Learn why scoring exists, how Score Plugins work, how different scoring strateg..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 8 — Score Plugins
+
+> **Goal:** Understand how Kubernetes selects the **best** Node after filtering. Learn why scoring exists, how Score Plugins work, how different scoring strategies evaluate Nodes, how scores are normalized and weighted, and how the Scheduler finally selects the winning Node in a production cluster.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why scoring is needed (multiple feasible nodes after filtering)
+> 2. NodeResourcesBalancedAllocation — spreading load evenly
+> 3. NodeResourcesFit scoring strategies: LeastAllocated vs MostAllocated
+> 4. ImageLocality — preferring nodes that already have the image
+> 5. PodTopologySpread — spreading Pods across zones and nodes
+> 6. InterPodAffinity scoring — co-location and anti-affinity preferences
+> 7. Score normalization: per-plugin 0-100 scale
+> 8. Plugin weights and final node selection
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Score Plugins like a company's interview scoring panel.
+
+```text
+Interview Panel Analogy:
+
+Multiple candidates (Nodes) passed initial screening (Filter)
+Each interviewer (Score plugin) scores each candidate independently
+Interviewers have different expertise weights (plugin weights)
+Scores are normalized to a common scale (0-100 per plugin)
+Weighted scores are combined for a final ranking
+Highest-scoring candidate (Node) gets the offer (Pod)
+```
+
+| Interview Panel | Score Plugins |
+| :--- | :--- |
+| Candidate | Feasible Node (passed Filter) |
+| Interviewer | Score plugin |
+| Interviewer's specialty weight | Plugin weight in scheduler config |
+| Normalized interview score | Plugin score (0–100) |
+| Combined weighted total | Final Node score |
+| Candidate with highest total | Selected Node for binding |
+
+> **Important:** Each Score plugin produces a score in its own range, then Kubernetes **normalizes** all plugin scores to 0–100 before applying weights. The final Node score is the **weighted sum** of all normalized plugin scores. If multiple Nodes share the highest score, the Scheduler selects one at **random** among the tied Nodes.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Scheduler Architecture
+- Scheduling Framework
+- Scheduling Cycle
+- Scheduler Cache
+- Filter Plugins
+- Node Resources
+- Affinity
+- Topology Spread Constraints
+
+---
+
+# Where Does Scoring Fit?
+
+The Scheduling Framework executes:
+
+```text
+Scheduling Queue
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+Filtering determines:
+
+```text
+Can the Pod run here?
+```
+
+Scoring determines:
+
+```text
+Where should it run?
+```
+
+---
+
+# Why Does Scoring Exist?
+
+Imagine filtering produced:
+
+```text
+Node-1
+
+Pass
+
+Node-2
+
+Pass
+
+Node-3
+
+Pass
+
+Node-4
+
+Pass
+```
+
+Every Node is valid.
+
+Which one should Kubernetes choose?
+
+Without scoring:
+
+```text
+Pick Random Node
+```
+
+That would produce:
+
+- Poor utilization
+- Hotspots
+- Uneven workloads
+- Slower application startup
+- Increased infrastructure cost
+
+Scoring solves this problem.
+
+---
+
+# Simple Definition
+
+Scoring is:
+
+> **The process of ranking all feasible Nodes and selecting the one that best satisfies Kubernetes scheduling policies.**
+
+Filtering removes impossible Nodes.
+
+Scoring ranks the remaining candidates.
+
+---
+
+# High-Level Architecture
+
+```text
+              Candidate Nodes
+
+                     |
+
+                     ▼
+
+             Score Plugins
+
+       ┌────────────┼────────────┐
+
+       ▼            ▼            ▼
+
+ Resources     Image Cache   Topology
+
+       ▼            ▼            ▼
+
+   Numeric Scores Per Node
+
+                |
+
+                ▼
+
+      Score Normalization
+
+                |
+
+                ▼
+
+       Weighted Aggregation
+
+                |
+
+                ▼
+
+        Highest Score Wins
+```
+
+---
+
+# Filter vs Score
+
+| Filter Plugins | Score Plugins |
+|----------------|---------------|
+| Pass / Reject | Numeric score |
+| Eliminate Nodes | Rank Nodes |
+| Binary decision | Relative comparison |
+| Stops invalid Nodes | Chooses the best valid Node |
+
+---
+
+# Example
+
+After filtering:
+
+```text
+Node-1
+
+Pass
+
+Node-2
+
+Pass
+
+Node-3
+
+Pass
+```
+
+Scoring:
+
+```text
+Node-1
+
+72
+
+Node-2
+
+95
+
+Node-3
+
+81
+```
+
+Winner:
+
+```text
+Node-2
+```
+
+---
+
+# How Score Plugins Work
+
+Every Score Plugin independently evaluates each candidate Node.
+
+Example:
+
+```text
+Candidate Nodes
+
+v
+
+Plugin A
+
+v
+
+Plugin B
+
+v
+
+Plugin C
+
+v
+
+Combined Score
+```
+
+Each plugin measures a different aspect of Node quality.
+
+---
+
+# Built-in Score Plugins
+
+Some commonly used built-in Score Plugins include:
+
+```text
+NodeResourcesBalancedAllocation
+
+NodeResourcesFit
+
+ImageLocality
+
+PodTopologySpread
+
+InterPodAffinity
+
+TaintToleration
+
+NodeAffinity
+```
+
+Several plugins exist in both Filter and Score phases, but with different responsibilities.
+
+---
+
+# Score Range
+
+Conceptually, each plugin produces:
+
+```text
+0
+
+v
+
+100
+```
+
+Where:
+
+```text
+100
+
+=
+
+Excellent Candidate
+```
+
+```text
+0
+
+=
+
+Poor Candidate
+```
+
+**Note:** Internally, Kubernetes uses a defined scoring range (currently `framework.MinNodeScore` to `framework.MaxNodeScore`, typically 0–100), allowing plugins to produce comparable scores.
+
+---
+
+# NodeResourcesBalancedAllocation
+
+Purpose:
+
+> **Prefer Nodes whose CPU and Memory utilization remain balanced after scheduling the Pod.**
+
+Balanced resource consumption helps prevent resource fragmentation.
+
+---
+
+# Why Balance Matters
+
+Node:
+
+```text
+16 CPU
+
+64 GB RAM
+```
+
+Suppose:
+
+CPU Usage:
+
+```text
+95%
+```
+
+Memory Usage:
+
+```text
+15%
+```
+
+Another workload may require:
+
+```text
+CPU + Memory
+```
+
+Although memory exists,
+
+CPU is exhausted.
+
+The Node becomes fragmented.
+
+---
+
+# Example
+
+Node A after scheduling:
+
+```text
+CPU
+
+50%
+
+Memory
+
+52%
+```
+
+Node B:
+
+```text
+CPU
+
+95%
+
+Memory
+
+20%
+```
+
+BalancedAllocation prefers:
+
+```text
+Node A
+```
+
+---
+
+# Visual Comparison
+
+```text
+Node A
+
+CPU
+
+█████░░░░░
+
+Memory
+
+█████░░░░░
+```
+
+Balanced.
+
+---
+
+```text
+Node B
+
+CPU
+
+█████████░
+
+Memory
+
+██░░░░░░░░
+```
+
+Unbalanced.
+
+---
+
+# Why Fragmentation is Bad
+
+Suppose later:
+
+Pod requires:
+
+```text
+4 CPU
+
+8 GB
+```
+
+Node B:
+
+```text
+CPU Full
+
+v
+
+Rejected
+```
+
+Even though plenty of memory exists.
+
+BalancedAllocation reduces this problem.
+
+---
+
+# NodeResourcesFit Scoring
+
+The `NodeResourcesFit` plugin is used not only for filtering,
+
+but also for scoring.
+
+It supports multiple scoring strategies.
+
+The two most common are:
+
+```text
+LeastAllocated
+
+MostAllocated
+```
+
+---
+
+# LeastAllocated Strategy
+
+Purpose:
+
+> **Prefer Nodes with the most remaining free resources.**
+
+---
+
+# Example
+
+Cluster:
+
+```text
+Node A
+
+20% Used
+
+Node B
+
+80% Used
+
+Node C
+
+60% Used
+```
+
+LeastAllocated scores:
+
+```text
+Node A
+
+100
+
+Node C
+
+55
+
+Node B
+
+15
+```
+
+Winner:
+
+```text
+Node A
+```
+
+---
+
+# Why Use LeastAllocated?
+
+Advantages:
+
+- Leaves room for future workloads
+- Reduces immediate resource pressure
+- Handles bursty traffic well
+- Suitable for general-purpose clusters
+
+---
+
+# Visual Example
+
+```text
+Node A
+
+CPU
+
+██░░░░░░░░
+
+Memory
+
+██░░░░░░░░
+```
+
+Lots of free resources.
+
+---
+
+# MostAllocated Strategy
+
+Purpose:
+
+> **Prefer Nodes that are already heavily utilized.**
+
+This may sound surprising.
+
+---
+
+# Why?
+
+Suppose:
+
+10 Nodes
+
+Each:
+
+```text
+10% Used
+```
+
+LeastAllocated spreads workloads.
+
+Result:
+
+```text
+10 Nodes Active
+```
+
+Power consumption:
+
+High.
+
+Instead:
+
+MostAllocated packs workloads together.
+
+---
+
+# Example
+
+Cluster:
+
+```text
+Node A
+
+80% Used
+
+Node B
+
+25% Used
+
+Node C
+
+40% Used
+```
+
+MostAllocated prefers:
+
+```text
+Node A
+```
+
+---
+
+# Benefits
+
+MostAllocated helps:
+
+- Consolidate workloads
+- Reduce infrastructure cost
+- Free completely unused Nodes
+- Improve cluster autoscaling opportunities
+
+---
+
+# Packing Example
+
+Without packing:
+
+```text
+Node1
+
+20%
+
+Node2
+
+20%
+
+Node3
+
+20%
+
+Node4
+
+20%
+```
+
+After MostAllocated:
+
+```text
+Node1
+
+85%
+
+Node2
+
+80%
+
+Node3
+
+0%
+
+Node4
+
+0%
+```
+
+The autoscaler can potentially remove idle Nodes.
+
+---
+
+# LeastAllocated vs MostAllocated
+
+| LeastAllocated | MostAllocated |
+|----------------|---------------|
+| Spreads workloads | Packs workloads |
+| Leaves spare capacity | Maximizes utilization |
+| Good for unpredictable workloads | Good for cost optimization |
+| Reduces immediate pressure | Helps Cluster Autoscaler scale down |
+
+---
+
+# ImageLocality Plugin
+
+Purpose:
+
+> **Prefer Nodes that already contain the container images required by the Pod.**
+
+---
+
+# Example
+
+Pod:
+
+```text
+nginx
+
+redis
+
+python
+```
+
+Node A:
+
+```text
+All Images Present
+```
+
+Node B:
+
+```text
+Must Download All Images
+```
+
+ImageLocality prefers:
+
+```text
+Node A
+```
+
+---
+
+# Why?
+
+Benefits:
+
+- Faster startup
+- Less network traffic
+- Reduced registry load
+- Better cold-start performance
+
+---
+
+# Example
+
+Node A:
+
+```text
+Pull Time
+
+0 Seconds
+```
+
+Node B:
+
+```text
+Pull Time
+
+45 Seconds
+```
+
+Node A receives a higher score.
+
+---
+
+# PodTopologySpread Plugin
+
+Purpose:
+
+> **Spread Pods evenly across topology domains such as zones, regions, or Nodes.**
+
+---
+
+# Example
+
+Three Zones:
+
+```text
+Zone A
+
+8 Pods
+
+Zone B
+
+2 Pods
+
+Zone C
+
+3 Pods
+```
+
+New Pod arrives.
+
+Best placement:
+
+```text
+Zone B
+```
+
+This improves balance.
+
+---
+
+# Why?
+
+Benefits:
+
+- High Availability
+- Fault Tolerance
+- Disaster Recovery
+- Even traffic distribution
+
+---
+
+# InterPodAffinity Plugin
+
+Purpose:
+
+> **Prefer Nodes based on relationships with other Pods.**
+
+Unlike filtering,
+
+the scoring phase expresses **preferences**, not strict requirements.
+
+---
+
+# Example
+
+Web Pod prefers:
+
+```text
+Near
+
+Redis
+```
+
+Node A:
+
+```text
+Redis Running
+```
+
+Node B:
+
+```text
+No Redis
+```
+
+Scoring:
+
+```text
+Node A
+
+95
+
+Node B
+
+40
+```
+
+---
+
+# Another Example
+
+Analytics Pods prefer:
+
+```text
+Same Zone
+```
+
+Scheduler gives higher scores to Nodes satisfying that preference.
+
+---
+
+# Multiple Score Plugins
+
+Each plugin generates an independent score.
+
+Example:
+
+```text
+Node A
+
+BalancedAllocation
+
+80
+
+LeastAllocated
+
+70
+
+ImageLocality
+
+100
+
+TopologySpread
+
+60
+```
+
+These scores must be combined.
+
+---
+
+# Score Normalization
+
+Different plugins may naturally produce different score distributions.
+
+Suppose:
+
+Plugin A:
+
+```text
+20
+
+40
+
+60
+```
+
+Plugin B:
+
+```text
+500
+
+800
+
+1000
+```
+
+Direct comparison would be unfair.
+
+Normalization converts plugin scores into a common range.
+
+---
+
+# Conceptual Example
+
+Before normalization:
+
+```text
+Plugin A
+
+10
+
+40
+
+90
+```
+
+Plugin B:
+
+```text
+400
+
+700
+
+1000
+```
+
+After normalization:
+
+```text
+Plugin A
+
+10
+
+40
+
+90
+```
+
+Plugin B:
+
+```text
+40
+
+70
+
+100
+```
+
+Now both contribute fairly.
+
+---
+
+# Why Normalize?
+
+Normalization ensures:
+
+- Consistent scoring scale
+- Fair plugin comparison
+- Predictable weighting
+- Stable scheduling decisions
+
+---
+
+# Weighted Scores
+
+Not every plugin is equally important.
+
+Example:
+
+```text
+NodeResourcesFit
+
+Weight
+
+3
+
+ImageLocality
+
+Weight
+
+1
+
+TopologySpread
+
+Weight
+
+2
+```
+
+Higher weight means greater influence.
+
+---
+
+# Example Calculation
+
+Node A:
+
+```text
+Resources
+
+90
+
+×
+
+3
+
+=
+
+270
+
+Image
+
+100
+
+×
+
+1
+
+=
+
+100
+
+Topology
+
+80
+
+×
+
+2
+
+=
+
+160
+
+Total
+
+530
+```
+
+---
+
+# Node B
+
+```text
+Resources
+
+75
+
+×
+
+3
+
+=
+
+225
+
+Image
+
+95
+
+×
+
+1
+
+=
+
+95
+
+Topology
+
+100
+
+×
+
+2
+
+=
+
+200
+
+Total
+
+520
+```
+
+Winner:
+
+```text
+Node A
+```
+
+---
+
+# Final Node Selection
+
+After all plugins complete:
+
+```text
+Node A
+
+530
+
+Node B
+
+520
+
+Node C
+
+480
+```
+
+Scheduler selects:
+
+```text
+Node A
+```
+
+This Node enters:
+
+```text
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+---
+
+# Tie Handling
+
+What if two Nodes have identical scores?
+
+Conceptually:
+
+```text
+Node A
+
+500
+
+Node B
+
+500
+```
+
+The Scheduler breaks ties using its internal selection logic, ensuring one Node is chosen. The exact implementation may vary across Kubernetes releases and aims to avoid introducing bias over time.
+
+---
+
+# Complete Scoring Workflow
+
+```text
+Candidate Nodes
+
+v
+
+Score Plugins
+
+v
+
+Normalization
+
+v
+
+Apply Plugin Weights
+
+v
+
+Aggregate Scores
+
+v
+
+Highest Score
+
+v
+
+Selected Node
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+---
+
+# Production Example 1
+
+Cluster:
+
+```text
+500 Nodes
+```
+
+Filtering leaves:
+
+```text
+40 Nodes
+```
+
+Scoring:
+
+```text
+BalancedAllocation
+
+v
+
+ImageLocality
+
+v
+
+TopologySpread
+
+v
+
+InterPodAffinity
+
+v
+
+Weighted Total
+
+v
+
+Best Node
+```
+
+---
+
+# Production Example 2
+
+Global Application
+
+Zones:
+
+```text
+US-East
+
+US-West
+
+Europe
+```
+
+Current Pods:
+
+```text
+US-East
+
+15
+
+US-West
+
+15
+
+Europe
+
+3
+```
+
+PodTopologySpread prefers:
+
+```text
+Europe
+```
+
+Improving resilience.
+
+---
+
+# Production Example 3
+
+AI Cluster
+
+GPU Nodes:
+
+```text
+Node A
+
+Already Has
+
+CUDA Images
+```
+
+Node B:
+
+```text
+Needs
+
+10 GB Download
+```
+
+ImageLocality gives:
+
+```text
+Node A
+
+Higher Score
+```
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Scheduling Queue
+
+v
+
+Scheduler Cache Snapshot
+
+v
+
+PreFilter
+
+v
+
+Filter Plugins
+
+v
+
+Candidate Nodes
+
+v
+
+Score Plugins
+
+v
+
+Weighted Scores
+
+v
+
+Best Node
+
+v
+
+Binding Cycle
+```
+
+Scoring is the optimization stage of scheduling.
+
+---
+
+# Performance Considerations
+
+Large Cluster:
+
+```text
+8,000 Nodes
+```
+
+Filtering:
+
+```text
+v
+
+150 Nodes
+```
+
+Scoring:
+
+```text
+150 Nodes
+
+v
+
+Multiple Parallel Score Plugins
+
+v
+
+Winner
+```
+
+Scoring is significantly cheaper because filtering has already reduced the candidate set.
+
+---
+
+# Production Best Practices
+
+✔ Choose resource scoring strategies that match workload patterns.
+
+✔ Use `LeastAllocated` for burst-heavy, general-purpose clusters.
+
+✔ Use `MostAllocated` to improve infrastructure utilization and autoscaler efficiency.
+
+✔ Enable topology spread for highly available applications.
+
+✔ Avoid excessive affinity preferences that complicate placement.
+
+✔ Keep image registries healthy to maximize ImageLocality benefits.
+
+✔ Tune plugin weights carefully—small changes can significantly alter scheduling behavior.
+
+✔ Monitor scheduler metrics to understand scoring decisions in production.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Scoring decides whether a Node is valid.
+
+Wrong.
+
+Filtering determines validity.
+
+Scoring ranks already valid Nodes.
+
+---
+
+### ❌ Misconception 2
+
+The highest CPU Node always wins.
+
+Wrong.
+
+Multiple plugins contribute to the final score.
+
+---
+
+### ❌ Misconception 3
+
+LeastAllocated is always better.
+
+Wrong.
+
+Its suitability depends on workload characteristics and operational goals.
+
+---
+
+### ❌ Misconception 4
+
+MostAllocated wastes resources.
+
+Wrong.
+
+It intentionally consolidates workloads to improve utilization and enable cluster scale-down.
+
+---
+
+### ❌ Misconception 5
+
+ImageLocality guarantees the Node will be selected.
+
+Wrong.
+
+It is only one contributor to the overall weighted score.
+
+---
+
+### ❌ Misconception 6
+
+Topology spread only works across availability zones.
+
+Wrong.
+
+It can operate across any supported topology domain, including Nodes, racks (via labels), or zones.
+
+---
+
+### ❌ Misconception 7
+
+Plugin weights affect filtering.
+
+Wrong.
+
+Weights influence only the scoring phase.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does Kubernetes need scoring?
+
+To rank feasible Nodes and choose the most suitable placement after filtering.
+
+---
+
+### Q2. What is the difference between filtering and scoring?
+
+Filtering removes invalid Nodes, while scoring ranks the remaining valid Nodes.
+
+---
+
+### Q3. What does `NodeResourcesBalancedAllocation` optimize?
+
+It prefers Nodes with balanced CPU and memory utilization to reduce resource fragmentation.
+
+---
+
+### Q4. What is the difference between `LeastAllocated` and `MostAllocated`?
+
+`LeastAllocated` spreads workloads by preferring Nodes with more free resources. `MostAllocated` packs workloads onto already utilized Nodes to improve infrastructure efficiency.
+
+---
+
+### Q5. Why does Kubernetes track image locality?
+
+To reduce image pull time, network usage, and Pod startup latency.
+
+---
+
+### Q6. What is the purpose of `PodTopologySpread`?
+
+To distribute Pods evenly across topology domains for better availability and resilience.
+
+---
+
+### Q7. Why are scores normalized?
+
+To convert plugin outputs into a comparable range before weighting and aggregation.
+
+---
+
+### Q8. How does Kubernetes select the final Node?
+
+It aggregates normalized, weighted scores from all enabled Score Plugins and selects the highest-ranked Node.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod consistently lands on unexpected Nodes | Plugin weights or scoring strategies favor those Nodes |
+| Uneven cluster utilization | `LeastAllocated`/`MostAllocated` strategy not aligned with workload goals |
+| Slow Pod startup despite available resources | ImageLocality scores are low because required images are absent |
+| Pods concentrated in one zone | Missing or misconfigured `PodTopologySpread` constraints |
+| Autoscaler rarely scales down | Workloads are spread too evenly, preventing Node consolidation |
+| Scheduling decisions seem inconsistent | Multiple Score Plugins interact; review Scheduler Profile configuration and plugin weights |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does Kubernetes perform scoring after filtering?
+2. What is the role of a Score Plugin?
+3. How does `NodeResourcesBalancedAllocation` reduce resource fragmentation?
+4. What is the difference between `LeastAllocated` and `MostAllocated`?
+5. Why can `MostAllocated` improve Cluster Autoscaler efficiency?
+6. How does `ImageLocality` influence scheduling?
+7. What problem does `PodTopologySpread` solve?
+8. How does `InterPodAffinity` influence Node ranking?
+9. Why is score normalization necessary?
+10. How do plugin weights affect scheduling?
+11. How is the final Node selected?
+12. Why does scoring become more efficient after filtering?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes selects the **best** Node after filtering has identified all feasible candidates.
+
+You learned:
+
+- Why the scoring phase exists
+- How Score Plugins independently evaluate candidate Nodes
+- How `NodeResourcesBalancedAllocation` minimizes resource fragmentation
+- The differences between `LeastAllocated` and `MostAllocated` resource strategies
+- How `ImageLocality` reduces image pull latency
+- How `PodTopologySpread` improves availability by distributing workloads
+- How `InterPodAffinity` expresses placement preferences
+- Why Kubernetes normalizes plugin scores before combining them
+- How weighted scoring determines the final Node selection
+
+The scoring phase transforms a list of feasible Nodes into a single optimal placement decision by combining multiple scheduling objectives. This flexible, plugin-based approach allows Kubernetes to balance performance, availability, utilization, and operational policies while scaling to large production clusters.
+
+---
+
+# Next Chapter
+
+**Chapter 9 — Reserve Phase**
+
+In the next chapter, we'll examine what happens immediately after the Scheduler selects the winning Node.
+
+Topics include:
+
+- Why the Reserve Phase Exists
+- What Resource Reservation Means
+- Reserve Plugins
+- Assumed Pods
+- Optimistic Scheduling
+- Unreserve Plugins
+- Failure Recovery
+- Race Condition Prevention
+- Production Reservation Workflow
+
+You'll learn how Kubernetes temporarily reserves resources, prevents competing scheduling decisions, and safely transitions from scheduling to binding.
+```

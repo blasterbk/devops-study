@@ -1,0 +1,173 @@
+---
+title: "Chapter 1 — eBPF Fundamentals: In-Kernel VM, Verifier, Maps & Program Types"
+sidebar_position: 1
+module: "Module 13.1 — eBPF Fundamentals"
+description: "Master extended Berkeley Packet Filter (eBPF) — in-kernel virtual machine, JIT compiler, the eBPF static safety verifier, BPF Maps (Hash, Array, RingBuffer), helper functions, and CO-RE (Compile Once, Run Everywhere)."
+---
+
+# Chapter 1 — eBPF Fundamentals: In-Kernel VM, Verifier, Maps & Program Types
+
+> **Goal:** Master extended Berkeley Packet Filter (eBPF), the revolutionary technology that makes the Linux kernel programmable at runtime. Understand how eBPF programs execute sandboxed bytecode directly inside the kernel without modifying kernel source or loading unstable kernel modules (`kmods`), the in-kernel Static Verifier mathematical safety checks, BPF Maps for stateful storage, and BPF Type Format (BTF) / CO-RE.
+>
+> By the end of this chapter, you will understand:
+> 1. The evolution from cBPF (classic packet filter) to 64-bit eBPF in-kernel Virtual Machine
+> 2. The eBPF Verifier: preventing kernel panics, infinite loops, null pointer dereferences, and memory leaks
+> 3. JIT (Just-In-Time) compilation converting bytecode to native host machine instructions (x86_64 / ARM64)
+> 4. BPF Maps: bidirectional kernel-to-user-space shared memory (Hash Tables, Arrays, Ring Buffers, LRU, SockMaps)
+> 5. Program Types: `BPF_PROG_TYPE_XDP`, `SCHED_CLS` (TC), `SOCKET_FILTER`, `KPROBE`, `TRACEPOINT`
+> 6. CLI exploration and debugging using `bpftool`
+
+---
+
+## Real-Life Analogy
+
+Think of eBPF as **bringing JavaScript and WebAssembly capabilities directly into the Linux OS kernel**:
+
+- **Traditional Kernel Development (Writing C Code for Hardware Engine):**
+  - If you wanted to add a new network filter, you had to write a kernel driver in C. If you made a single typo or pointer error, the entire machine suffered a Blue Screen / Kernel Panic (**Total System Crash**).
+- **eBPF (Sandboxed JavaScript Engine inside the Kernel):**
+  - You write small, elegant C/Rust programs.
+  - Before running, an ultra-strict security guard (**The eBPF Verifier**) inspects every line of code to mathematically prove it **cannot crash, cannot leak memory, and cannot run forever**.
+  - Once verified, the code runs at blistering line rate directly on the CPU (**JIT compiled**), modifying packet flows and capturing metrics with **zero performance penalty**.
+
+---
+
+## Architecture Diagram
+
+```text
+                     eBPF Compilation, Verification & Execution Pipeline
+                     
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ USER SPACE (C / Rust / Go Program)                                          │
+ │                                                                             │
+ │    [eBPF Source Code: my_filter.c] ──► [Clang / LLVM Compiler]              │
+ │                                                │                            │
+ │                                                ▼                            │
+ │                                      [eBPF Bytecode: .o]                    │
+ │                                                │                            │
+ │                                                ▼                            │
+ │    `bpf(BPF_PROG_LOAD)` Syscall ───────────────┼────────────────────────────┘
+ │                                                │
+ └────────────────────────────────────────────────┼────────────────────────────┘
+                                                  ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ LINUX KERNEL                                                                │
+ │                                                                             │
+ │    ┌───────────────────────────────────────────────────────────────────┐    │
+ │    │ 1. eBPF VERIFIER (Static Safety Analysis)                         │    │
+ │    │    - Proves program terminates (DAG execution, no unbounded loops)│    │
+ │    │    - Verifies all memory accesses are within bounded safety ranges│    │
+ │    │    - Checks helper function permissions and type safety           │    │
+ │    └─────────────────────────────────┬─────────────────────────────────┘    │
+ │                                      │ (Passes Verification)                │
+ │                                      ▼                                      │
+ │    ┌───────────────────────────────────────────────────────────────────┐    │
+ │    │ 2. JIT COMPILER (Bytecode -> Native x86_64 / ARM64 Machine Code)   │    │
+ │    └─────────────────────────────────┬─────────────────────────────────┘    │
+ │                                      │                                      │
+ │                                      ▼ (Attached to Kernel Hook)            │
+ │    ┌───────────────────────────────────────────────────────────────────┐    │
+ │    │ 3. EXECUTION HOOKS: [ XDP / TC / Sockets / Tracepoints / Kprobes ]│    │
+ │    └─────────────────────────────────┬─────────────────────────────────┘    │
+ │                                      │ Reads / Writes                       │
+ │                                      ▼                                      │
+ │    ┌───────────────────────────────────────────────────────────────────┐    │
+ │    │ 4. BPF MAPS (Shared Key-Value Memory: Hash, Array, RingBuffer)    │    │
+ │    └───────────────────────────────────────────────────────────────────┘    │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The In-Kernel eBPF Virtual Machine
+
+- **Registers:** 11 64-bit registers (`R0` to `R10`):
+  - `R0`: Return value from helper function or exit verdict.
+  - `R1 – R5`: Arguments passed into helper functions.
+  - `R6 – R9`: Callee-saved general-purpose registers.
+  - `R10`: Read-only stack frame pointer (512-byte stack per program).
+
+---
+
+### 2. Common BPF Map Types
+
+```text
+ ┌───────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ BPF Map Type              │ Purpose & Performance Characteristic                                   │
+ │──────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`BPF_MAP_TYPE_HASH`**   │ Generic key-value store; $O(1)$ average lookup (e.g. IP -> Metrics)   │
+ │ **`BPF_MAP_TYPE_ARRAY`**  │ Fast fixed-size index lookup; direct array offset dereferencing        │
+ │ **`BPF_MAP_TYPE_LRU_HASH`**│ Automatically evicts least-recently-used items when full (Conntrack)   │
+ │ **`BPF_MAP_TYPE_RINGBUF`**│ High-throughput, lockless memory ring buffer to stream events to user  │
+ │ **`BPF_MAP_TYPE_SOCKMAP`**│ Stores socket file descriptors; enables zero-copy socket redirection   │
+ └───────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 3. CO-RE (Compile Once, Run Everywhere) & BTF
+
+Traditionally, compiling an eBPF program required installing full kernel header packages on every target machine. **CO-RE (Compile Once, Run Everywhere)** uses **BPF Type Format (BTF)** metadata embedded in modern Linux kernels. The eBPF loader automatically relocates struct field offsets at runtime, allowing a single compiled eBPF binary to run across different Linux kernel versions seamlessly.
+
+---
+
+## Hands-On Lab: Inspecting eBPF Programs & Maps via `bpftool`
+
+```bash
+# Step 1: Verify Linux kernel eBPF JIT compiler status
+sysctl net.core.bpf_jit_enable
+
+# Step 2: List all active eBPF programs loaded in the kernel using bpftool
+sudo bpftool prog show
+
+# Step 3: List all active BPF Maps and their memory utilization
+sudo bpftool map show
+
+# Step 4: Dump the disassembled JIT machine instructions of a loaded eBPF program
+# sudo bpftool prog dump jited id <PROG_ID>
+
+# Step 5: Inspect BPF Type Format (BTF) support in the running kernel
+ls -la /sys/kernel/btf/vmlinux
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What does the eBPF Verifier do, and why is it essential for kernel stability?**
+
+The eBPF Verifier performs static analysis on raw eBPF bytecode before it is permitted to run in kernel space. It constructs a Directed Acyclic Graph (DAG) of all possible code execution paths to mathematically prove:
+1. The program is guaranteed to **terminate** (no infinite loops or unbounded loops).
+2. It does not perform **uninitialized register reads** or **out-of-bounds memory accesses**.
+3. It does not dereference **null pointers**.
+4. It only calls approved, safe kernel **BPF Helper Functions**.
+If any safety check fails, the program is rejected with a verification error, preventing kernel crashes.
+
+**Q2: What is the difference between eBPF and traditional Linux Kernel Modules (LKM / `.ko`)?**
+
+- **Kernel Module (LKM):** Written in C, compiled for a specific kernel version, runs with unrestricted ring-0 privileges. A bug or null pointer dereference crashes the entire system with a kernel panic.
+- **eBPF:** Sandboxed bytecode statically proven safe by the Verifier. Loaded dynamically at runtime without rebooting the kernel, cannot crash the operating system, and is automatically unloaded when references close.
+
+**Q3: What are BPF Helper Functions and why can't eBPF programs call arbitrary kernel C functions directly?**
+
+eBPF programs run in a restricted execution environment and are forbidden from calling arbitrary kernel C functions to prevent security vulnerabilities and kernel corruption. Instead, the Linux kernel exposes a stable, audited API of **BPF Helper Functions** (e.g. `bpf_ktime_get_ns()`, `bpf_map_lookup_elem()`, `bpf_xdp_adjust_head()`) that eBPF programs can invoke safely.
+
+**Q4: What is the advantage of `BPF_MAP_TYPE_RINGBUF` over the legacy `BPF_MAP_TYPE_PERF_EVENT_ARRAY`?**
+
+The legacy Perf Ring Buffer allocated a separate memory buffer per CPU core. If CPU 0 generated 90% of events, its buffer overflowed (dropping packets) while other CPU buffers sat empty (wasting memory). The modern **eBPF Ring Buffer (RingBuf)** provides a **single shared memory buffer across all CPU cores**, supporting lockless variable-length writes, guaranteed in-order event delivery, and up to $3\times$ higher throughput.
+
+**Q5: How does BPF Type Format (BTF) make eBPF programs portable across Linux kernel versions?**
+
+Different kernel builds may add or reorder fields inside internal kernel structs (e.g. `struct task_struct` or `struct sk_buff`), shifting memory byte offsets. BTF embeds rich type metadata directly into the kernel image. During program load, the user-space eBPF loader (e.g., `libbpf`) reads `/sys/kernel/btf/vmlinux`, compares target struct offsets with compile-time offsets, and **rewrites bytecode instructions on-the-fly** to match the exact memory layout of the running kernel.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the eBPF compilation pipeline: C/Rust $\to$ LLVM Bytecode $\to$ Verifier $\to$ JIT
+- [ ] Understand the 4 safety guarantees enforced by the in-kernel Verifier
+- [ ] Memorize BPF Map types: Hash, Array, LRU, RingBuf, SockMap
+- [ ] Understand BPF Type Format (BTF) and CO-RE portability
+- [ ] Master `bpftool prog show` and `bpftool map show` CLI commands

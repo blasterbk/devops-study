@@ -1,0 +1,316 @@
+---
+title: "Chapter 1 — ClusterIP Services"
+sidebar_position: 1
+module: "Module 2.4 — Services"
+description: "Deep dive into ClusterIP — Kubernetes' default Service type. Covers how virtual IPs work, the kube-proxy iptables/IPVS implementation, session affinity, DNS resolution, and the complete packet path for a ClusterIP request."
+---
+
+# Chapter 1 — ClusterIP Services
+
+> **Goal:** Understand how ClusterIP Services create stable virtual IPs for Pod groups, how kube-proxy programs iptables/IPVS rules to implement them, and how to trace a complete request from client Pod to backend Pod.
+>
+> By the end of this chapter, you will understand:
+> 1. What a ClusterIP Service is and why it's needed (Pod IP instability)
+> 2. How the virtual IP is implemented — iptables vs IPVS
+> 3. What EndpointSlices are and how kube-proxy reads them
+> 4. The complete packet path: client → ClusterIP → iptables DNAT → backend Pod
+> 5. Session affinity — what it is and how to configure it
+> 6. How DNS resolves a Service name to a ClusterIP
+
+---
+
+## Real-Life Analogy
+
+Imagine a **restaurant chain** where individual locations (Pods) open and close, but the **main phone number** (ClusterIP) stays the same forever:
+
+When you call the main number (send to ClusterIP), the call center (kube-proxy/iptables) routes you to the nearest available location (backend Pod). If a location closes (Pod terminates), it's removed from the routing list. New locations are added automatically. You never need to know the specific location's direct number — you always call the same main number.
+
+The ClusterIP is the restaurant chain's permanent identity — even when every individual location has changed.
+
+---
+
+## Architecture Diagram
+
+```text
+                ClusterIP Service — Data Path
+
+  Pod A (client)
+  10.244.1.5
+     │
+     │  send to ClusterIP 10.96.0.10:80
+     ▼
+  Pod A's eth0 → veth → cbr0 bridge
+     │
+     ▼
+  Node kernel iptables (PREROUTING DNAT):
+  ┌────────────────────────────────────────────────┐
+  │ KUBE-SERVICES chain:                           │
+  │   dst 10.96.0.10:80 → KUBE-SVC-XXX            │
+  │                                                │
+  │ KUBE-SVC-XXX chain (3 backends, round-robin):  │
+  │   33% probability → KUBE-SEP-1 → DNAT 10.244.1.8:8080 │
+  │   50% probability → KUBE-SEP-2 → DNAT 10.244.2.3:8080 │
+  │   100% remaining  → KUBE-SEP-3 → DNAT 10.244.2.7:8080 │
+  └────────────────────────────────────────────────┘
+     │
+     │  Packet now has dst: 10.244.2.3:8080
+     ▼
+  Routing → cross-node → Pod B (10.244.2.3)
+  Pod B sees: src=10.244.1.5 (Pod A's real IP), dst=10.244.2.3:8080
+```
+
+---
+
+## Why ClusterIP Exists: The Pod IP Problem
+
+Pods are ephemeral — they are created and destroyed constantly:
+- Deployment rolling updates replace all Pods
+- Node failures terminate Pods and reschedule them elsewhere
+- HPA (Horizontal Pod Autoscaler) scales replicas up and down
+
+Each new Pod gets a **new IP address**. If Service A hard-codes Service B's Pod IP, it breaks every time B restarts.
+
+**ClusterIP solves this**: a stable virtual IP that never changes, backed by the current set of healthy Pod endpoints. You configure once — point to the ClusterIP — and it always routes to the currently available Pods.
+
+---
+
+## Creating a ClusterIP Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-svc
+  namespace: production
+spec:
+  type: ClusterIP          # Default — no need to specify explicitly
+  selector:
+    app: backend
+    tier: api
+  ports:
+  - name: http
+    protocol: TCP
+    port: 80               # Port the Service listens on (ClusterIP:80)
+    targetPort: 8080       # Port the backend Pods listen on
+  - name: grpc
+    protocol: TCP
+    port: 9090
+    targetPort: 9090
+```
+
+```bash
+# Create Service and verify
+kubectl apply -f backend-svc.yaml
+kubectl get svc backend-svc -n production
+
+# Output:
+# NAME          TYPE        CLUSTER-IP    EXTERNAL-IP  PORT(S)          AGE
+# backend-svc   ClusterIP   10.96.45.23   <none>       80/TCP,9090/TCP  5s
+
+# Check endpoints (which Pods the Service routes to)
+kubectl get endpoints backend-svc -n production
+# NAME          ENDPOINTS                                      AGE
+# backend-svc   10.244.1.5:8080,10.244.2.3:8080,10.244.2.7:8080  5s
+
+# Or use the newer EndpointSlice
+kubectl get endpointslices -n production -l kubernetes.io/service-name=backend-svc
+```
+
+---
+
+## How kube-proxy Implements ClusterIP
+
+### iptables Mode
+
+kube-proxy watches Services and EndpointSlices and translates them into iptables rules:
+
+```bash
+# View the full Service chain
+iptables -t nat -L KUBE-SERVICES -n | grep 10.96.45.23
+# KUBE-SVC-XXXYYY tcp -- 0.0.0.0/0 10.96.45.23 tcp dpt:80
+
+iptables -t nat -L KUBE-SVC-XXXYYY -n
+# KUBE-SEP-AAA all -- statistic mode random probability 0.33333333
+# KUBE-SEP-BBB all -- statistic mode random probability 0.50000000
+# KUBE-SEP-CCC all
+
+iptables -t nat -L KUBE-SEP-AAA -n
+# DNAT tcp -- to:10.244.1.5:8080
+
+# Return path (POSTROUTING):
+# If the client and backend are on the same node:
+# MASQUERADE applied so the reply comes back through the same path
+```
+
+### IPVS Mode
+
+```bash
+# Enable IPVS mode (in kube-proxy ConfigMap)
+kubectl edit configmap kube-proxy -n kube-system
+# Change: mode: "" → mode: "ipvs"
+
+# View IPVS virtual services
+ipvsadm -Ln
+# TCP  10.96.45.23:80 rr          ← Round-robin scheduler
+#   -> 10.244.1.5:8080     Masq  1  0  0
+#   -> 10.244.2.3:8080     Masq  1  0  0
+#   -> 10.244.2.7:8080     Masq  1  0  0
+```
+
+IPVS supports multiple scheduling algorithms:
+- `rr` — round-robin
+- `lc` — least connections
+- `sh` — source hashing (consistent session affinity)
+- `wrr` — weighted round-robin
+- `nq` — never queue (always pick shortest queue)
+
+---
+
+## Session Affinity
+
+By default, each request is load-balanced independently. For stateful applications (shopping carts, WebSockets), you want the same client to always hit the same backend:
+
+```yaml
+spec:
+  selector:
+    app: backend
+  sessionAffinity: ClientIP          # Sticky sessions by client IP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800          # 3 hours
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+With `sessionAffinity: ClientIP`:
+- iptables mode: uses `recent` match to track client IPs
+- IPVS mode: uses `sh` (source hash) algorithm
+- Cilium eBPF: uses Maglev hashing (consistent, no state table needed)
+
+---
+
+## DNS Resolution of Services
+
+CoreDNS (Kubernetes' built-in DNS server) automatically creates DNS records for every Service:
+
+```text
+Service: backend-svc, Namespace: production, ClusterIP: 10.96.45.23
+
+DNS records created:
+  backend-svc.production.svc.cluster.local.  → A  10.96.45.23
+  _http._tcp.backend-svc.production.svc.cluster.local. → SRV (port 80)
+
+Short forms (resolved within a Pod):
+  backend-svc              (same namespace only)
+  backend-svc.production   (cross-namespace)
+  backend-svc.production.svc.cluster.local  (fully qualified)
+```
+
+```bash
+# Test DNS resolution from inside a Pod
+kubectl exec -it test-pod -- nslookup backend-svc.production
+# Server:    10.96.0.10   ← CoreDNS ClusterIP
+# Address:   10.96.0.10#53
+# Name:      backend-svc.production.svc.cluster.local
+# Address:   10.96.45.23
+
+kubectl exec -it test-pod -- curl http://backend-svc.production:80/
+```
+
+---
+
+## Hands-On: Tracing a Complete ClusterIP Request
+
+```bash
+# 1. Deploy a backend Service
+kubectl create deployment backend --image=nginx --replicas=3
+kubectl expose deployment backend --port=80 --target-port=80
+
+# 2. Get ClusterIP
+CLUSTER_IP=$(kubectl get svc backend -o jsonpath='{.spec.clusterIP}')
+echo "ClusterIP: $CLUSTER_IP"
+
+# 3. Watch endpoint changes (keep in one terminal)
+kubectl get endpoints backend --watch
+
+# 4. Test from a client Pod
+kubectl run curl-client --image=curlimages/curl --restart=Never \
+  -- sh -c "while true; do curl -s $CLUSTER_IP/; sleep 1; done"
+
+# 5. Observe iptables rules on the node
+# SSH to a node:
+iptables -t nat -L KUBE-SERVICES -n | grep $CLUSTER_IP
+iptables -t nat -L KUBE-SVC-* -n 2>/dev/null | head -20
+
+# 6. Scale down backends — watch endpoints update
+kubectl scale deployment backend --replicas=1
+kubectl get endpoints backend  # Only 1 endpoint now
+
+# 7. Observe iptables update (new rules with no probability, single backend)
+iptables -t nat -L KUBE-SVC-* -n 2>/dev/null | head -10
+
+# 8. Test Service when no backends are ready
+kubectl scale deployment backend --replicas=0
+curl $CLUSTER_IP  # Connection refused — no endpoints
+kubectl get endpoints backend  # Shows: <none>
+```
+
+---
+
+## Common Pitfalls
+
+```bash
+# Issue 1: Service selector doesn't match Pod labels
+kubectl get svc myapp -o jsonpath='{.spec.selector}'    # Check selector
+kubectl get pods --show-labels | grep app=myapp          # Check Pod labels
+# Fix: ensure labels match exactly (case-sensitive)
+
+# Issue 2: targetPort wrong
+kubectl describe svc myapp | grep TargetPort             # What port is configured
+kubectl exec -it pod-name -- ss -tlnp                    # What port is actually listening
+
+# Issue 3: Service in wrong namespace
+# Service must be in the same namespace OR use FQDN:
+# backend-svc.other-namespace.svc.cluster.local
+
+# Issue 4: Port name mismatch (for named ports)
+# Service targetPort: "http" must match container port name: "http"
+kubectl get pods -o json | jq '.items[].spec.containers[].ports'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What problem does ClusterIP solve that Pods' own IPs don't?**
+
+Pod IPs are ephemeral — they change every time a Pod is restarted, rescheduled, or a Deployment is updated. If Service A connects to Service B using a Pod IP, the connection breaks the next time a Pod restarts. ClusterIP provides a **stable virtual IP** that never changes throughout the Service's lifetime. kube-proxy/iptables maps this stable VIP to the currently healthy Pod endpoints, which can change freely without breaking clients.
+
+**Q2: Is a ClusterIP a real network interface? Can you ping it?**
+
+No. A ClusterIP is a **virtual IP with no corresponding network interface** anywhere in the cluster. It exists only in iptables DNAT rules (or IPVS virtual services or eBPF maps). You cannot `ping` a ClusterIP because ICMP (ping) packets don't match the TCP/UDP port rules that implement the virtual IP — they pass through iptables without matching any DNAT rule and are dropped. Only TCP/UDP to the configured Service port is intercepted.
+
+**Q3: How does kube-proxy implement load balancing across multiple backends?**
+
+In iptables mode: kube-proxy creates a chain of DNAT rules with `statistic` module probability matching — the first rule has a 1/N probability, the second 1/(N-1), etc. This achieves near-uniform distribution. In IPVS mode: kube-proxy creates a virtual service with the specified scheduler (default: round-robin). With Cilium eBPF: Maglev consistent hashing selects the backend deterministically based on (src_ip, src_port).
+
+**Q4: What is session affinity in a Service and how is it implemented?**
+
+Session affinity (`sessionAffinity: ClientIP`) ensures all requests from the same client IP go to the same backend Pod. In iptables mode: the `recent` module tracks client IPs and routes matching IPs to the same endpoint. In IPVS mode: source-hash (`sh`) scheduler maps client IP to a consistent backend. The affinity timeout (`timeoutSeconds`, default 3 hours) controls how long the mapping is held.
+
+**Q5: What happens to in-flight connections when a backend Pod is removed?**
+
+kube-proxy removes the iptables DNAT rule (or IPVS entry) for the deleted Pod. Existing connections that already have conntrack entries will continue until the connection closes (the conntrack entry remains even after the iptables rule is deleted). New connections no longer route to the deleted Pod. This is why Pods need termination grace periods — to finish handling in-flight requests before disappearing from the endpoint list (handled by `preStop` hooks and `terminationGracePeriodSeconds`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why ClusterIP exists: stable VIP for ephemeral Pod endpoints
+- [ ] Understand ClusterIP is a virtual IP — no real network interface, ICMP ping won't work
+- [ ] Know how kube-proxy implements load balancing: iptables probability rules / IPVS schedulers
+- [ ] Understand session affinity (`ClientIP`) and how to configure it
+- [ ] Know how DNS works for Services (CoreDNS A records: `svc.namespace.svc.cluster.local`)
+- [ ] Can trace the full packet path: client → iptables DNAT → real Pod IP → response
+- [ ] Know common failure modes: selector mismatch, wrong targetPort, wrong namespace

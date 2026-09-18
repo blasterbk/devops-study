@@ -1,0 +1,154 @@
+---
+title: "Chapter 2 — GRE & IPIP Tunneling: Encapsulation, Multipoint GRE & WAN Overlays"
+sidebar_position: 1
+module: "Module 10.2 — GRE & IPIP"
+description: "Master Generic Routing Encapsulation (GRE, RFC 2784) and IP-in-IP (IPIP, RFC 2003) — header formats, multipoint GRE (mGRE), dynamic routing over tunnels, and MTU considerations."
+---
+
+# Chapter 2 — GRE & IPIP Tunneling: Encapsulation, Multipoint GRE & WAN Overlays
+
+> **Goal:** Master point-to-point and multipoint IP tunneling protocols: Generic Routing Encapsulation (GRE, RFC 2784 & RFC 2890) and IP-in-IP (IPIP, RFC 2003). Understand how GRE encapsulates arbitrary Layer 3 protocols (IPv4, IPv6, multicast, OSPF/EIGRP) across transit IP networks, how IPIP provides minimal 20-byte encapsulation in Linux and Calico CNI, and how to configure and debug Linux kernel tunnel interfaces.
+>
+> By the end of this chapter, you will understand:
+> 1. GRE header structure (IP Protocol `47`), protocol type flags, optional sequence numbers, and keys
+> 2. IPIP header structure (IP Protocol `4`) and why it is preferred for lightweight container networking
+> 3. Transporting non-IP and multicast traffic (OSPF/EIGRP Hello packets) across public IP backbones
+> 4. Dynamic Multipoint VPN (DMVPN) foundations using Multipoint GRE (mGRE) and NHRP
+> 5. GRE/IPIP MTU overhead, MSS clamping (`TCPMSS`), and fragmentation hazards
+> 6. Linux CLI commands to create and troubleshoot `gre` and `ipip` interfaces
+
+---
+
+## Real-Life Analogy
+
+Think of GRE and IPIP as **two different types of diplomatic transport containers**:
+
+- **IPIP Encapsulation (Standard Double-Envelope):**
+  - You put an IPv4 letter inside a second, larger IPv4 mailing envelope (**20-byte IP header added**). Only IPv4 letters fit inside; you cannot send anything else.
+- **GRE Encapsulation (Universal Shipping Crate):**
+  - A flexible container that can carry **any cargo**: IPv4, IPv6, AppleTalk, or broadcast/multicast audio streams (**IP Protocol 47**).
+  - GRE adds a 4-byte to 16-byte protocol tag specifying the contents, allowing a company to run internal OSPF dynamic routing directly through public commercial internet pipes.
+
+---
+
+## Architecture Diagram
+
+```text
+                  GRE vs IPIP Packet Encapsulation Formats
+                  
+ 1. IP-in-IP (IPIP) ENCAPSULATION (IP Protocol 4, 20-Byte Overhead):
+ ┌────────────────────────────────┬───────────────────────────────┐
+ │ Outer IPv4 Header (20 Bytes)   │ Original Inner IP Packet Data │
+ │ Src: VTEP 1, Dst: VTEP 2       │ Src: 10.244.1.5, Dst: 10.244.2.8│
+ └────────────────────────────────┴───────────────────────────────┘
+ 
+ 2. GRE ENCAPSULATION (IP Protocol 47, 24 to 36-Byte Overhead):
+ ┌────────────────────────┬─────────────────────┬─────────────────────────┐
+ │ Outer IP Header (20B)  │ GRE Header (4-16B)  │ Original Inner Payload  │
+ │ Protocol = 47          │ Flags + EtherType   │ (IPv4 / IPv6 / Multicast)│
+ └────────────────────────┴─────────────────────┴─────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Architectural Comparison: GRE vs IPIP vs VXLAN
+
+```text
+ ┌──────────────────────┬──────────────────────────┬──────────────────────────┬──────────────────────────┐
+ │ Feature              │ IPIP (RFC 2003)          │ GRE (RFC 2784)           │ VXLAN (RFC 7348)         │
+ │──────────────────────┼──────────────────────────┼──────────────────────────┼──────────────────────────┤
+ │ **IP Protocol Number**│ Protocol **4**          │ Protocol **47**          │ UDP Port **4789**        │
+ │ **Encapsulation Layer**│ Layer 3 in Layer 3      │ Layer 3 (Any) in Layer 3 │ Layer 2 Ethernet in L4   │
+ │ **Header Overhead**  │ **20 Bytes** (Minimal)   │ **24 – 36 Bytes**        │ **50 Bytes**             │
+ │ **Multicast Support**│ NO                       │ YES (Runs OSPF/EIGRP)    │ YES (Multicast / BGP)    │
+ │ **ECMP Support**     │ Poor (No UDP port hash)  │ Poor                     │ Excellent (UDP hash)     │
+ │ **Common Cloud Use** │ Calico CNI cross-subnet  │ Site-to-Site Enterprise  │ AWS, VMware, Cilium, K8s │
+ └──────────────────────┴──────────────────────────┴──────────────────────────┴──────────────────────────┘
+```
+
+---
+
+### 2. GRE Header Format (RFC 2784)
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|C| |K|S|    Reserved0    | Ver |         Protocol Type         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|      Checksum (optional)      |       Reserved1 (optional)    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Key (optional)                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Sequence Number (optional)                 |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **Protocol Type (16 bits):** Standard Ethernet EtherType (e.g. `0x0800` for IPv4, `0x86DD` for IPv6).
+
+---
+
+## Hands-On Lab: Building a Linux GRE & IPIP Tunnel
+
+```bash
+# Step 1: Create a Point-to-Point GRE tunnel interface
+sudo ip tunnel add tun-gre mode gre \
+  remote 198.51.100.2 \
+  local 198.51.100.1 \
+  ttl 255
+
+# Step 2: Assign an internal private IP to the GRE tunnel
+sudo ip addr add 10.10.10.1/30 dev tun-gre
+sudo ip link set tun-gre up
+
+# Step 3: Create an IPIP tunnel interface (Calico CNI style)
+sudo ip tunnel add tun-ipip mode ipip \
+  remote 198.51.100.2 \
+  local 198.51.100.1
+
+sudo ip addr add 10.20.20.1/30 dev tun-ipip
+sudo ip link set tun-ipip up
+
+# Step 4: Inspect active tunnel interfaces
+ip -d tunnel show
+
+# Step 5: Clean up tunnel interfaces
+sudo ip link del tun-gre
+sudo ip link del tun-ipip
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is GRE required when deploying dynamic routing protocols (like OSPF) across the public Internet?**
+
+Dynamic routing protocols (OSPF, EIGRP) use **multicast packets** (`224.0.0.5`, `224.0.0.10`) for neighbor discovery. Standard public Internet routers do not route multicast packets. Because **GRE encapsulates multicast packets inside standard unicast IP headers (IP Protocol 47)**, OSPF Hello packets traverse the public Internet transparently, allowing routers across different cities to form direct OSPF adjacencies.
+
+**Q2: Does standard GRE provide encryption or confidentiality?**
+
+No. **GRE provides zero encryption or authentication**. All encapsulated data traverses the network in plain text. To secure a GRE tunnel, network engineers combine it with **IPsec (GRE over IPsec)**: GRE encapsulates the multicast/routing traffic, and IPsec ESP encapsulates the GRE packet with AES-GCM encryption.
+
+**Q3: What is TCP MSS Clamping (`TCPMSS`) and why is it essential on GRE/IPIP tunnels?**
+
+When packets traverse a GRE tunnel, the 24-byte GRE header plus 20-byte IP header reduces the usable path MTU from 1500 to **1476** (or 1420 with IPsec). If clients send 1460-byte TCP segments with `DF=1`, packets will be dropped if ICMP PMTUD is blocked. **TCP MSS Clamping** (configured via `iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`) automatically rewrites the MSS option during the 3-way handshake to 1436 bytes, completely preventing packet drops.
+
+**Q4: Why does Calico CNI use IPIP instead of VXLAN by default in certain bare-metal setups?**
+
+IPIP has a header overhead of only **20 bytes**, compared to VXLAN's **50 bytes**. In pure Linux-to-Linux container environments where only IPv4 pod-to-pod routing is needed (no Layer 2 MAC stretching or multi-tenant VNIs required), IPIP reduces CPU packet overhead and provides higher packet-per-second (PPS) throughput.
+
+**Q5: What is Multipoint GRE (mGRE) in Cisco DMVPN?**
+
+In standard GRE, each tunnel is strictly point-to-point, requiring $N(N-1)/2$ separate tunnel interfaces on a hub router. **Multipoint GRE (mGRE)** allows a single tunnel interface on a central Hub router to dynamically terminate connections from hundreds of Spoke routers using **Next Hop Resolution Protocol (NHRP)** to dynamically map private tunnel IPs to public WAN IPs.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master GRE (Protocol 47, 24B overhead) vs IPIP (Protocol 4, 20B overhead)
+- [ ] Understand why GRE supports multicast and OSPF while IPIP is unicast IPv4 only
+- [ ] Know why GRE over IPsec is required for cryptographic confidentiality
+- [ ] Master TCP MSS Clamping (`TCPMSS`) to prevent MTU tunnel drops
+- [ ] Know how to create Linux kernel tunnels via `ip tunnel add`

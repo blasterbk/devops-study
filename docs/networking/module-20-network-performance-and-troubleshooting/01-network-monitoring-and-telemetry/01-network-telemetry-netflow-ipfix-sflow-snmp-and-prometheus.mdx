@@ -1,0 +1,144 @@
+---
+title: "Chapter 1 — Network Telemetry: NetFlow, IPFIX, sFlow, SNMP v3 & Prometheus Metrics"
+sidebar_position: 1
+module: "Module 20.1 — Network Telemetry"
+description: "Master enterprise network monitoring and telemetry — Flow protocols (NetFlow v9, IPFIX, sFlow sampling), SNMP v3 polling/traps, Linux node_exporter Prometheus network metrics, and Grafana dashboarding."
+---
+
+# Chapter 1 — Network Telemetry: NetFlow, IPFIX, sFlow, SNMP v3 & Prometheus Metrics
+
+> **Goal:** Master network observability, flow telemetry, and metric instrumentation across hybrid enterprise and cloud networks. Understand flow protocols (**Cisco NetFlow v9, IPFIX / RFC 7011, sFlow sampling**), Simple Network Management Protocol (**SNMP v3** with USM authentication/privacy), Prometheus `node_exporter` Linux kernel network metrics (`node_network_receive_bytes_total`, `node_network_receive_drop_total`), and Grafana dashboarding.
+>
+> By the end of this chapter, you will understand:
+> 1. The 3 Types of Network Telemetry: **Metrics** (Prometheus counters/gauges), **Flow Logs** (NetFlow / IPFIX / VPC Flow Logs), and **Full Packet Captures** (PCAP)
+> 2. NetFlow v9 vs IPFIX (RFC 7011) vs sFlow (1:N Statistical packet sampling at ASIC line rate)
+> 3. SNMP architecture: Managers, Agents, Management Information Bases (MIBs), OIDs, Polling, and Traps/Informs
+> 4. SNMP v1/v2c (insecure community strings) vs SNMP v3 (HMAC-SHA auth + AES-256 encryption)
+> 5. Prometheus network metric scraping: Linux `/proc/net/dev`, `/proc/net/snmp`, and calculating saturation/bandwidth
+> 6. CLI diagnostic workflows and telemetry queries
+
+---
+
+## Real-Life Analogy
+
+Think of Network Telemetry as **the monitoring, traffic camera, and diagnostic system of a national highway system**:
+
+- **Prometheus Metrics (The Automated Toll Booth Counters):**
+  - Instantaneous dashboard counters measuring totals: *"10,000 cars passed per minute, 50 cars broke down (**Packet Drops**), average speed is 65 MPH"*. Ultra-fast, lightweight, aggregated.
+- **Flow Logs / NetFlow / IPFIX (The Highway License Plate Scanner):**
+  - Records the metadata of every single vehicle trip without filming the passengers inside: *"Car with License Plate A (Src IP) drove from Exit 4 to Exit 12 at 3:15 PM and transported 400 lbs of cargo (**Byte Volume**)"*.
+- **SNMP v3 (The Engine Diagnostic Sensors on Roadwork Trucks):**
+  - An encrypted query sent to the internal maintenance engine: *"What is the CPU temperature, optical fiber laser signal strength (dBm), and power supply status of Router Switch #42?"*
+
+---
+
+## Architecture Diagram
+
+```text
+                  Network Telemetry & Flow Ingestion Architecture
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ PHYSICAL / CLOUD NETWORK INFRASTRUCTURE (Routers, Switches, Linux Nodes)    │
+ └──────────────────────┬──────────────────────┬──────────────────────┬────────┘
+                        │                      │                      │
+                        │ 1. FLOW TELEMETRY    │ 2. SNMP v3 POLLING   │ 3. PULL SCRAPE
+                        │ (IPFIX / NetFlow v9) │ (UDP Port 161)       │ (Prometheus)
+                        ▼                      ▼                      ▼
+ ┌─────────────────────────────┐  ┌──────────────────────────┐  ┌──────────────┐
+ │ FLOW COLLECTOR / ANALYZER   │  │ NMS / SNMP COLLECTOR     │  │ PROMETHEUS   │
+ │ (ElastiFlow, Kentik, Splunk)│  │ (Zabbix, LibreNMS)       │  │ TSDB         │
+ │ - Top Talkers & Bandwidth   │  │ - Switch Port Up/Down    │  │ - Rate/Errors│
+ │ - DDoS Traffic Anomaly      │  │ - Optical dBm Transceivers│ │ - Saturation │
+ └─────────────────────────────┘  └──────────────────────────┘  └──────┬───────┘
+                                                                       │
+                                                                       ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ UNIFIED GRAFANA OBSERVABILITY DASHBOARD (Network SRE Team)                  │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Telemetry Comparison: NetFlow vs IPFIX vs sFlow
+
+```text
+ ┌──────────────────────┬──────────────────────────┬──────────────────────────┬──────────────────────────┐
+ │ Feature              │ NetFlow v9 (Cisco)       │ IPFIX (IETF / RFC 7011)  │ sFlow (RFC 3176)         │
+ │──────────────────────┼──────────────────────────┼──────────────────────────┼──────────────────────────┤
+ │ **Mechanism**        │ Stateful Flow Cache      │ Stateful Flow Cache      │ **Stateless Sampling**   │
+ │                      │ (Aggregates packets in RAM│ (Standardized NetFlow v10│ (Picks 1 out of $N$ pkts)│
+ │ **Standardization**  │ Cisco Proprietary        │ IETF Open Standard       │ InMon Open Consortium    │
+ │ **Export Format**    │ Template-based binary UDP│ Extensible Enterprise IDs│ Sampled packet header + cnt│
+ │ **Switch CPU Load**  │ Moderate (Flow tracking) │ Moderate                 │ **Near-Zero (Hardware)** │
+ └──────────────────────┴──────────────────────────┴──────────────────────────┴──────────────────────────┘
+```
+
+---
+
+### 2. Prometheus Linux Kernel Network Metrics
+
+Prometheus `node_exporter` reads directly from `/proc/net/dev`:
+
+```promql
+# 1. Calculate incoming bandwidth in Megabits per second (Mbps)
+rate(node_network_receive_bytes_total{device="eth0"}[5m]) * 8 / 1000000
+
+# 2. Calculate network packet drop rate per second
+rate(node_network_receive_drop_total[5m]) + rate(node_network_transmit_drop_total[5m])
+
+# 3. Calculate TCP retransmission percentage (Indicates network packet loss / congestion)
+rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m]) * 100
+```
+
+---
+
+## Hands-On Lab: Querying Linux Network Metrics & SNMP
+
+```bash
+# Step 1: Inspect raw Linux kernel network interface byte and drop counters
+cat /proc/net/dev
+
+# Step 2: Inspect raw TCP socket and retransmission statistics
+cat /proc/net/snmp | grep -i "Tcp:"
+
+# Step 3: Query local SNMP daemon using snmpwalk (if snmpd installed)
+snmpwalk -v 3 -u admin -l authPriv -a SHA -A "authPass123" -x AES -X "privPass123" localhost 1.3.6.1.2.1.1 2>/dev/null || echo "snmpwalk available"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between sFlow (Sampling) and NetFlow/IPFIX (Flow Caching)?**
+
+- **NetFlow / IPFIX:** **Stateful flow aggregation**. The switch maintains a memory cache of all active 5-tuple flows. It aggregates packet counts and durations, exporting a summary record when the flow terminates or times out. Provides 100% accurate billing and volume stats, but consumes switch RAM.
+- **sFlow:** **Stateless packet sampling**. The switch ASIC samples 1 out of every $N$ packets (e.g. 1 in 1,000) and immediately exports the first 128 bytes of the packet header to the collector. It consumes virtually zero switch CPU/RAM and scales to 400 Gbps core optical backbones.
+
+**Q2: Why is SNMP v3 mandatory over legacy SNMP v1 and SNMP v2c in production environments?**
+
+SNMP v1 and v2c transmit all authentication credentials (**Community Strings**, e.g. `public` or `private`) and management telemetry in **unencrypted plain text** over UDP port 161. Anyone listening on the network can steal administrative credentials and reconfigure switch ports. **SNMP v3 introduces the User-based Security Model (USM)**, providing HMAC authentication (SHA-256) and AES encryption (AES-256) for all polling and trap messages.
+
+**Q3: How do you detect Linux Network Saturation and Dropped Packets using Prometheus metrics?**
+
+By monitoring `node_network_receive_drop_total` and `node_network_transmit_drop_total`. An increase in receive drops indicates that the Linux kernel network receive ring buffer (**`rx-ring`**) or socket backlog (`net.core.netdev_max_backlog`) is full, meaning the CPU is unable to process incoming packets fast enough.
+
+**Q4: What is an SNMP OID (Object Identifier) and MIB (Management Information Base)?**
+
+- **OID (Object Identifier):** A dot-delimited hierarchical numeric string uniquely identifying a specific hardware metric (e.g. `1.3.6.1.2.1.2.2.1.10.1` represents `ifInOctets` for interface 1).
+- **MIB (Management Information Base):** A human-readable text translation database that maps cryptic numeric OIDs into readable names and units (e.g. mapping `1.3.6.1.2.1.1.1.0` to `sysDescr`).
+
+**Q5: What are AWS / Cloud VPC Flow Logs and how are they used for security incident investigations?**
+
+VPC Flow Logs capture IP traffic metadata traversing network interfaces (ENIs) in your cloud VPC. Each record logs: `version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status`. Security teams query flow logs in Athena/Splunk to detect compromised instances communicating with known malicious C2 (Command & Control) IP addresses or scanning internal VPC subnets.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 3 telemetry types: Metrics, Flow Logs, and PCAP
+- [ ] Differentiate NetFlow v9 / IPFIX (stateful) from sFlow (stateless sampling)
+- [ ] Understand SNMP v3 USM authentication (SHA) and privacy (AES)
+- [ ] Know key Prometheus network PromQL queries (bandwidth, drops, retransmissions)
+- [ ] Understand VPC Flow Logs for cloud security incident investigations

@@ -1,0 +1,346 @@
+---
+title: "Chapter 2 — QoS Classes: Guaranteed, Burstable & BestEffort"
+sidebar_position: 2
+module: "Module 3.7 — Priority, Preemption & QoS"
+description: "Master Kubernetes Quality of Service (QoS) classes — Guaranteed, Burstable, BestEffort classification rules, CPU throttling via Linux CFS vs Memory OOMKilling, and resource requests vs limits."
+---
+
+# Chapter 2 — QoS Classes: Guaranteed, Burstable & BestEffort
+
+> **Goal:** Master Kubernetes Quality of Service (QoS) classes — understanding how the control plane infers `Guaranteed`, `Burstable`, and `BestEffort` tiers from container resource specifications, how Linux Completely Fair Scheduler (CFS) enforces CPU throttling versus kernel Out-Of-Memory (OOM) killing, and how resource requests dictate scheduling while limits enforce runtime containment.
+>
+> By the end of this chapter, you will understand:
+> 1. The exact mathematical rules defining `Guaranteed`, `Burstable`, and `BestEffort` QoS classes
+> 2. Why QoS class is an inferred status field (`.status.qosClass`) rather than a configurable spec field
+> 3. The fundamental difference between Compressible resources (CPU) and Incompressible resources (Memory)
+> 4. How Linux kernel CFS quota throttling degrades CPU performance without killing processes
+> 5. How cgroup memory limits trigger Linux OOM-killer invocations (`Exit Code 137`)
+> 6. How to enforce cluster-wide QoS standards using `LimitRange` policies
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes QoS classes as **ticket classes on a commercial passenger airline flight**:
+
+- **First Class (`Guaranteed` QoS):** You paid top dollar for a reserved seat, dedicated overhead bin, and gourmet meal (`requests == limits`). The airline guarantees your seat cannot be reassigned. If the plane is overweight, the captain will never throw First Class luggage overboard.
+- **Business Standby (`Burstable` QoS):** You paid for a base ticket (`requests`), but you are hoping for an upgrade to an empty window seat (`limits > requests`). If the flight is half-empty, you get the extra legroom. But if turbulence hits and weight must be shed, you might be asked to give up your overhead space.
+- **Free Standby Pass (`BestEffort` QoS):** You paid $0 (`requests: none, limits: none`). The airline lets you sit in any empty seat. But the moment a paying passenger shows up or the plane needs to shed weight, you are the **very first person escorted off the aircraft**!
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes QoS Classification Decision Tree
+
+                   ┌────────────────────────────────────────┐
+                   │ Container Resource Evaluation in Pod   │
+                   └───────────────────┬────────────────────┘
+                                       │
+                ┌──────────────────────┴──────────────────────┐
+                │ Do ALL containers have CPU & Memory         │
+                │ requests AND limits set, with REQ == LIM?   │
+                └──────────────────────┬──────────────────────┘
+                                       │
+                      ┌────────────────┴────────────────┐
+                      │ YES                             │ NO
+                      ▼                                 ▼
+             ┌─────────────────┐       ┌─────────────────────────────────┐
+             │   Guaranteed    │       │ Does at least ONE container     │
+             │   QoS Class     │       │ have a CPU or Memory request    │
+             └─────────────────┘       │ or limit set?                   │
+                                       └────────────────┬────────────────┘
+                                                        │
+                                       ┌────────────────┴────────────────┐
+                                       │ YES                             │ NO
+                                       ▼                                 ▼
+                              ┌─────────────────┐               ┌─────────────────┐
+                              │    Burstable    │               │   BestEffort    │
+                              │    QoS Class    │               │    QoS Class    │
+                              └─────────────────┘               └─────────────────┘
+```
+
+---
+
+## QoS Classification Rules
+
+Unlike other Kubernetes primitives, there is **no `.spec.qosClass` field**. The Kubelet inspects `.spec.containers[].resources` and computes `.status.qosClass` dynamically at admission time.
+
+```text
+ ┌───────────────────┬─────────────────────────────────────────────────────────────┬──────────────────────────┐
+ │ QoS Class         │ Required Spec Configuration                                 │ OOM Kill Priority        │
+ │───────────────────┼─────────────────────────────────────────────────────────────┼──────────────────────────┤
+ │ **`Guaranteed`**  │ - Every container (including init containers) must set:     │ **LOWEST** (Killed last) │
+ │                   │   `requests.cpu == limits.cpu` AND                          │ Protected by kernel      │
+ │                   │   `requests.memory == limits.memory`                        │ `oom_score_adj: -997`    │
+ │───────────────────┼─────────────────────────────────────────────────────────────┼──────────────────────────┤
+ │ **`Burstable`**   │ - Does not meet Guaranteed criteria.                        │ **MEDIUM**               │
+ │                   │ - At least one container sets a CPU/Memory request or limit.│ Scored dynamically:      │
+ │                   │   (e.g., `requests.memory: 256Mi`, `limits.memory: 1Gi`).   │ `oom_score_adj: 2 - 999` │
+ │───────────────────┼─────────────────────────────────────────────────────────────┼──────────────────────────┤
+ │ **`BestEffort`**  │ - NO container in the Pod specifies ANY CPU or Memory       │ **HIGHEST** (Killed first│
+ │                   │   requests or limits.                                       │ Forced to max score:     │
+ │                   │                                                             │ `oom_score_adj: 1000`    │
+ └───────────────────┴─────────────────────────────────────────────────────────────┴──────────────────────────┘
+```
+
+---
+
+## Requests (Scheduling) vs Limits (Runtime)
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Resource Field       │ Target Mechanism & Cluster Effect                                           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`requests`**       │ **Scheduling & Bin-Packing Phase.**                                         │
+ │                      │ Used exclusively by `kube-scheduler`. A node must have allocatable capacity │
+ │                      │ $\ge$ Pod requests to accept placement. Does NOT enforce runtime ceilings.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`limits`**         │ **Runtime Kernel Enforcement.**                                             │
+ │                      │ Configured on Linux cgroups (`cpu.cfs_quota_us` and `memory.max`).          │
+ │                      │ Hard ceiling on what the container process is permitted to consume.         │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Compressible (CPU) vs Incompressible (Memory) Resources
+
+```text
+ ┌──────────────────────────────────────────┬─────────────────────────────────────────────────────────┐
+ │ CPU (Compressible Resource)              │ Memory (Incompressible Resource)                        │
+ │──────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ - Exceeding CPU limit causes **Linux CFS │ - Exceeding Memory limit causes **Immediate Termination│
+ │   Quota Throttling**.                    │   via Linux OOM-Killer (`SIGKILL / Exit Code 137`)**.   │
+ │ - The process is paused for milliseconds;│ - Memory cannot be compressed; the kernel kills the     │
+ │   latency increases, but it does NOT die!│   process immediately to protect the host OS.           │
+ └──────────────────────────────────────────┴─────────────────────────────────────────────────────────┘
+```
+
+```text
+ Linux CFS CPU Quota Mechanics:
+ 1 CPU Core = 1000m (millicores) = 100,000 microseconds (us) per 100ms CFS period (`cpu.cfs_period_us`).
+ If `limits.cpu: "500m"`:
+ ──► The process is allocated 50,000us of CPU runtime per 100ms period.
+ ──► If the process consumes 50,000us in the first 20ms of the window, it is THROTTLED (frozen)
+     for the remaining 80ms!
+```
+
+---
+
+## Enforcing QoS with `LimitRange`
+
+To prevent developers from accidentally creating `BestEffort` Pods that destabilize nodes, apply a namespace `LimitRange` to automatically inject default requests and limits:
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-qos-limits
+  namespace: production
+spec:
+  limits:
+  - default:                 # Default LIMIT if omitted by user
+      cpu: "500m"
+      memory: "512Mi"
+    defaultRequest:          # Default REQUEST if omitted by user
+      cpu: "250m"
+      memory: "256Mi"
+    max:                     # Maximum ceiling permitted per container
+      cpu: "2000m"
+      memory: "2Gi"
+    min:                     # Minimum floor required per container
+      cpu: "50m"
+      memory: "64Mi"
+    type: Container
+```
+
+---
+
+## Complete Production Manifests for All 3 QoS Classes
+
+```yaml
+# 1. GUARANTEED QoS Pod (Requests == Limits)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-guaranteed
+  namespace: default
+spec:
+  containers:
+  - name: db
+    image: postgres:15-alpine
+    resources:
+      requests:
+        cpu: "1000m"
+        memory: "1Gi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+---
+# 2. BURSTABLE QoS Pod (Limits > Requests)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-burstable
+  namespace: default
+spec:
+  containers:
+  - name: web
+    image: nginx:1.25-alpine
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+---
+# 3. BESTEFFORT QoS Pod (No requests or limits)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-besteffort
+  namespace: default
+spec:
+  containers:
+  - name: scavenger
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+```
+
+---
+
+## Hands-On Lab: Verifying QoS Classification & CPU Throttling
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace qos-lab
+
+# Step 2: Deploy Guaranteed, Burstable, and BestEffort Pods
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo-guaranteed
+  namespace: qos-lab
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "100Mi"
+      limits:
+        cpu: "100m"
+        memory: "100Mi"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo-burstable
+  namespace: qos-lab
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "50Mi"
+      limits:
+        cpu: "200m"
+        memory: "200Mi"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo-besteffort
+  namespace: qos-lab
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Inspect the computed .status.qosClass on all 3 Pods
+kubectl get pods -n qos-lab -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+
+# Expected Output:
+# demo-guaranteed    Guaranteed
+# demo-burstable     Burstable
+# demo-besteffort    BestEffort
+
+# Step 4: Verify OOMKill on a Burstable Pod exceeding limits
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-victim
+  namespace: qos-lab
+spec:
+  restartPolicy: Never
+  containers:
+  - name: mem-consumer
+    image: python:3.11-slim
+    command: ["python", "-c", "x = 'a' * 150 * 1024 * 1024"] # Allocate 150MB
+    resources:
+      limits:
+        memory: "30Mi"
+EOF
+
+# Wait a moment and check status
+sleep 3
+kubectl get pod oom-victim -n qos-lab
+kubectl describe pod oom-victim -n qos-lab | grep -E "(OOMKilled|Exit Code)"
+
+# Step 5: Clean up lab
+kubectl delete namespace qos-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the three Kubernetes QoS classes, and how are they assigned?**
+
+The three Quality of Service (QoS) classes are `Guaranteed`, `Burstable`, and `BestEffort`. They are not declared explicitly in the Pod specification; instead, the Kubelet dynamically infers and assigns `.status.qosClass` at admission time based on container resource definitions:
+1. `Guaranteed`: All containers (including init containers) have both CPU and Memory requests and limits set, and `requests == limits`.
+2. `Burstable`: At least one container specifies a CPU or Memory request or limit, but the Pod does not satisfy the Guaranteed criteria.
+3. `BestEffort`: No container in the Pod specifies any CPU or Memory requests or limits.
+
+**Q2: What happens when a container exceeds its CPU limit vs its Memory limit?**
+
+CPU is a **compressible resource**. When a container attempts to consume more CPU than its `.limits.cpu`, the Linux kernel Completely Fair Scheduler (CFS) enforces quota throttling (`cpu.cfs_quota_us`), temporarily pausing the process execution for milliseconds; the process experiences latency degradation, but it is **not terminated**. Memory is an **incompressible resource**. When a container exceeds its `.limits.memory`, the Linux kernel Out-Of-Memory (OOM) killer immediately terminates the process with `SIGKILL` (`Exit Code 137`).
+
+**Q3: In what order does the Linux OOM-killer terminate Pods during node memory exhaustion?**
+
+When a node experiences severe memory pressure, the kernel evaluates process `oom_score_adj` values and terminates processes in the following order:
+1. `BestEffort` Pods are killed first (`oom_score_adj: 1000`).
+2. `Burstable` Pods are killed second (scored between `2` and `999` proportionally based on how much memory they consume relative to their request).
+3. `Guaranteed` Pods are killed last (`oom_score_adj: -997`), protected just above critical system daemons.
+
+**Q4: What is the operational purpose of `resources.requests` vs `resources.limits`?**
+
+`resources.requests` is used exclusively by the `kube-scheduler` during placement to bin-pack Pods onto nodes that have sufficient allocatable capacity; it represents the minimum resource guarantee reserved for the container. `resources.limits` is enforced at runtime by the container runtime via Linux cgroups (`cfs_quota` for CPU and `memory.max` for RAM), setting the absolute maximum ceiling a container can consume.
+
+**Q5: How does a `LimitRange` help maintain cluster stability regarding QoS?**
+
+A `LimitRange` allows administrators to enforce default resource requests and limits for all Pods created within a namespace. If a developer deploys a Pod without specifying resource parameters, the `LimitRange` mutating admission webhook automatically injects default requests and limits, preventing accidental `BestEffort` workloads from running unchecked, consuming unlimited node resources, or causing noisy-neighbor starvation.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 3 QoS classes: `Guaranteed`, `Burstable`, and `BestEffort`
+- [ ] Know that QoS is computed dynamically from `requests` and `limits`
+- [ ] Know that `Guaranteed` requires `requests == limits` for both CPU and Memory
+- [ ] Know that CPU limits trigger CFS throttling (slowdown, no crash)
+- [ ] Know that Memory limits trigger kernel OOMKill (`SIGKILL / Exit Code 137`)
+- [ ] Know that `BestEffort` Pods are OOMKilled first under memory pressure
+- [ ] Can inspect a Pod's QoS class with `kubectl get pod <name> -o jsonpath='{.status.qosClass}'`

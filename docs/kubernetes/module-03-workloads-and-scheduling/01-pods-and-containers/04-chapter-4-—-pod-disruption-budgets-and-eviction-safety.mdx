@@ -1,0 +1,329 @@
+---
+title: "Chapter 4 — Pod Disruption Budgets & Eviction Safety"
+sidebar_position: 4
+module: "Module 3.1 — Pods & Containers"
+description: "Master Pod Disruption Budgets (PDB) — voluntary vs involuntary disruptions, minAvailable vs maxUnavailable calculations, the Eviction API, cluster node drains, and production high-availability safety."
+---
+
+# Chapter 4 — Pod Disruption Budgets & Eviction Safety
+
+> **Goal:** Master high-availability protections using Pod Disruption Budgets (PDB) — understanding the distinction between voluntary and involuntary disruptions, configuring `minAvailable` versus `maxUnavailable`, tracing the Kubernetes Eviction API during `kubectl drain`, and preventing outages during automated cluster upgrades.
+>
+> By the end of this chapter, you will understand:
+> 1. The fundamental difference between voluntary disruptions (drains, autoscaling) and involuntary disruptions (hardware panics, OOMs)
+> 2. How to configure `minAvailable` and `maxUnavailable` with absolute counts and percentages
+> 3. The mechanics of the Kubernetes `Eviction` API (`/api/v1/namespaces/{ns}/pods/{name}/eviction`)
+> 4. How `kubectl drain` interacts with PDBs to safely vacate nodes
+> 5. Modern PDB features: `unhealthyPodEvictionPolicy` (Kubernetes 1.27+ stable)
+> 6. How to diagnose and unblock stuck cluster upgrades caused by misconfigured PDBs
+
+---
+
+## Real-Life Analogy
+
+Think of a **fleet of commercial airplanes**:
+
+- **Involuntary Disruption (No PDB Protection):** A sudden lightning strike, bird strike, or engine failure in mid-air. You cannot prevent this with policy; the plane must land immediately. In Kubernetes, this is a physical node power loss, kernel panic, or an out-of-memory kernel kill.
+- **Voluntary Disruption (Protected by PDB):** Scheduled routine maintenance, cabin cleaning, or pilot shift rotation. The airline has a strict policy: *"At least 80% of our planes on this route must remain flying at all times (`minAvailable: 80%`)"*. If taking plane #3 into the maintenance hangar violates that rule, the ground controller (Eviction API) refuses to ground the plane until plane #4 has completed its flight and is ready to take over.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Node Drain & PDB Eviction Flow
+
+ Admin / Cluster Autoscaler runs: kubectl drain node-01
+  │
+  ▼
+ For each Pod on node-01:
+ Call Kubernetes Eviction API (/api/v1/namespaces/prod/pods/app-1/eviction)
+  │
+  ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ PodDisruptionBudget Controller (API Server Admission)            │
+ │                                                                  │
+ │ PDB Spec: minAvailable: 2 (Total Replicas: 3, Currently Ready: 3)│
+ │                                                                  │
+ │ Calculation:                                                     │
+ │ Current Ready (3) - Eviction Target (1) = 2                      │
+ │ 2 >= minAvailable (2)  ──► ALLOWED DISRUPTIONS: 1                │
+ └────────────────────────────────┬─────────────────────────────────┘
+                                  │
+                 ┌────────────────┴────────────────┐
+                 │                                 │
+                 ▼                                 ▼
+         [If Allowed: OK 200]             [If Denied: 429 Too Many Requests]
+                 │                                 │
+                 ▼                                 ▼
+   Pod deleted gracefully via Kubelet     Drain process blocks & retries
+   Deployment controller spawns           (Waits for new replacement Pod
+   replacement Pod on node-02             on another node to become Ready)
+```
+
+---
+
+## Voluntary vs Involuntary Disruptions
+
+Understanding what a PDB can and cannot protect against is vital for cluster operations:
+
+```text
+ ┌──────────────────────────────────────────────────┬──────────────────────────────────────────────────┐
+ │ Voluntary Disruptions (PDB ENFORCED)             │ Involuntary Disruptions (PDB CANNOT PREVENT)     │
+ │──────────────────────────────────────────────────┼──────────────────────────────────────────────────┤
+ │ - Node maintenance (`kubectl drain <node>`)      │ - Physical node hardware failure / power outage  │
+ │ - Cluster Autoscaler downscaling empty nodes     │ - Kernel panic / Linux OS crash                  │
+ │ - Kubernetes node OS / kernel rolling upgrade    │ - Cloud VM termination (e.g., hypervisor crash)  │
+ │ - Rebalancing workloads across nodes             │ - Out-Of-Memory (OOM) killer terminating process │
+ │ - Manual eviction via Eviction API               │ - Physical network cable disconnect / switch failure │
+ └──────────────────────────────────────────────────┴──────────────────────────────────────────────────┘
+```
+
+> [!IMPORTANT]
+> A PDB **only** guards against voluntary evictions initiated through the Kubernetes Eviction API. It does **not** prevent a Pod from being deleted if you run `kubectl delete pod <name>`, nor does it protect against sudden node crashes.
+
+---
+
+## PDB Specification: `minAvailable` vs `maxUnavailable`
+
+A `PodDisruptionBudget` is declared under the `policy/v1` API group. You must specify **either** `minAvailable` or `maxUnavailable`, but never both in the same manifest.
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Parameter            │ Description                              │ Example Calculation (Total Replicas: 5)  │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **`minAvailable`**   │ The minimum number of Pods that MUST be  │ `minAvailable: 4` ──► Max 1 Pod evicted. │
+ │                      │ `Ready` simultaneously.                  │ `minAvailable: 80%` ──► Max 1 Pod evicted.│
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **`maxUnavailable`** │ The maximum number of Pods that may be   │ `maxUnavailable: 1` ──► Max 1 Pod evicted.│
+ │                      │ unavailable (not `Ready` or missing).    │ `maxUnavailable: 20%` ──► Max 1 evicted. │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+### 1. `minAvailable` Example (Critical Database / Payment API)
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-api-pdb
+  namespace: production
+spec:
+  # Guarantee at least 2 replicas are running and healthy at all times
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: payment-api
+```
+
+### 2. `maxUnavailable` Example (Stateless Web Frontend)
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-frontend-pdb
+  namespace: production
+spec:
+  # Allow at most 1 Pod to be offline during node drains
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: web-frontend
+```
+
+---
+
+## The Eviction API vs Direct Deletion
+
+When an operator runs `kubectl delete pod <pod-name>`, the client issues an HTTP `DELETE` directly to `/api/v1/namespaces/{ns}/pods/{name}`. **This completely bypasses the PDB!**
+
+In contrast, administrative tools like `kubectl drain`, Cluster Autoscaler, and Descheduler use the **Eviction API**:
+```http
+POST /api/v1/namespaces/production/pods/payment-api-7b8f-x49zl/eviction
+Content-Type: application/json
+
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "payment-api-7b8f-x49zl",
+    "namespace": "production"
+  }
+}
+```
+
+If evicting the Pod would violate the active `PodDisruptionBudget`, the API server rejects the request with **HTTP Status 429 (Too Many Requests)**:
+```json
+{
+  "kind": "Status",
+  "apiVersion": "v1",
+  "status": "Failure",
+  "message": "Cannot evict pod as it would violate the pod's disruption budget.",
+  "reason": "TooManyRequests",
+  "code": 429
+}
+```
+
+---
+
+## Unhealthy Pod Eviction Policy (Kubernetes 1.27+)
+
+Prior to Kubernetes 1.27, if a Pod was stuck in `CrashLoopBackOff` or failed its readiness probe, it was still counted as "unavailable". If a PDB had `maxUnavailable: 1` and one Pod was crashing, `kubectl drain` would hang forever because no more disruptions were permitted.
+
+The `unhealthyPodEvictionPolicy` solves this deadlock:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: resilient-pdb
+  namespace: production
+spec:
+  minAvailable: 1
+  # Options: IfHealthyBudget (Default) | AlwaysAllow
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app: resilient-api
+```
+
+- **`IfHealthyBudget` (Default):** Running unhealthy Pods can only be evicted if the disruption budget is not currently exceeded.
+- **`AlwaysAllow`:** Pods that are already not `Ready` (e.g. crashing) can **always** be evicted immediately, preventing deadlocked node upgrades.
+
+---
+
+## Common PDB Anti-Patterns & Deadlocks
+
+### Anti-Pattern 1: `minAvailable: 100%` on a 1-Replica Deployment
+If `replicas: 1` and `minAvailable: 1` (or `100%`), `ALLOWED-DISRUPTIONS` will be `0`. Running `kubectl drain` on that node will **hang indefinitely** until manually cancelled or forced.
+
+### Anti-Pattern 2: PDB Matching Multiple Workloads
+If a label selector is too broad (e.g., `matchLabels: tier: backend`), the PDB will calculate budgets across unrelated Deployments and StatefulSets, causing unexpected eviction blockages.
+
+---
+
+## Hands-On Lab: Testing Eviction & PDB Blocking
+
+```bash
+# Step 1: Create a dedicated lab namespace
+kubectl create namespace pdb-lab
+
+# Step 2: Deploy a 2-replica application
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: protected-app
+  namespace: pdb-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: protected-app
+  template:
+    metadata:
+      labels:
+        app: protected-app
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 2
+          periodSeconds: 3
+EOF
+
+# Step 3: Wait for both Pods to become Ready
+kubectl wait --for=condition=Ready deployment/protected-app -n pdb-lab --timeout=30s
+
+# Step 4: Apply a strict PDB requiring BOTH Pods to remain available
+cat <<EOF | kubectl apply -f -
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: strict-pdb
+  namespace: pdb-lab
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: protected-app
+EOF
+
+# Step 5: Inspect the PDB status
+kubectl get pdb -n pdb-lab
+# Notice: MIN AVAILABLE = 2, ALLOWED DISRUPTIONS = 0 !
+
+# Step 6: Identify which node hosts one of the Pods
+POD_NAME=$(kubectl get pods -n pdb-lab -l app=protected-app -o jsonpath='{.items[0].metadata.name}')
+NODE_NAME=$(kubectl get pods -n pdb-lab -l app=protected-app -o jsonpath='{.items[0].spec.nodeName}')
+echo "Attempting to drain node: $NODE_NAME containing pod: $POD_NAME"
+
+# Step 7: Attempt to drain the node (dry-run to observe PDB rejection)
+kubectl drain $NODE_NAME --ignore-daemonsets --delete-emptydir-data --dry-run=server
+
+# Notice output states: "error when evicting pod ... Cannot evict pod as it would violate the pod's disruption budget."
+
+# Step 8: Fix the PDB by adjusting to maxUnavailable: 1
+cat <<EOF | kubectl apply -f -
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: strict-pdb
+  namespace: pdb-lab
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: protected-app
+EOF
+
+# Step 9: Re-check PDB status
+kubectl get pdb -n pdb-lab
+# Notice: ALLOWED DISRUPTIONS = 1 !
+
+# Step 10: Clean up lab
+kubectl delete namespace pdb-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the primary purpose of a PodDisruptionBudget (PDB), and when does it apply?**
+
+A PodDisruptionBudget (PDB) limits the number of Pods of a replicated application that can be down simultaneously due to voluntary disruptions. It enforces high availability by ensuring a minimum number or percentage of healthy Pods remain `Ready`. PDBs are evaluated strictly when an automated controller or human operator initiates a voluntary eviction via the Kubernetes Eviction API (e.g., during `kubectl drain`, automated cluster upgrades, or Cluster Autoscaler node downscaling).
+
+**Q2: What is the difference between voluntary and involuntary disruptions?**
+
+Voluntary disruptions are deliberate actions initiated by cluster administrators or automated management controllers (e.g., node draining for OS patching, cluster autoscaler removing underutilized nodes, or moving pods to rebalance capacity). PDBs actively protect against voluntary disruptions. Involuntary disruptions are uncontrollable, catastrophic failures (e.g., hardware crashes, power loss, kernel panics, or application OOM kills). PDBs cannot prevent or mitigate involuntary disruptions.
+
+**Q3: Can a PDB prevent a pod from being deleted by `kubectl delete pod`?**
+
+No. `kubectl delete pod` sends an HTTP `DELETE` command directly to the Pod resource on the API server, which bypasses the PDB validation mechanism. PDBs only intercept and gate calls made to the `/eviction` subresource of a Pod (the Eviction API), which is specifically used by `kubectl drain` and eviction controllers.
+
+**Q4: What causes `kubectl drain` to hang forever on a node, and how do you resolve it?**
+
+`kubectl drain` will hang indefinitely if evicting a Pod would reduce the number of available replicas below the PDB's `minAvailable` (or exceed `maxUnavailable`), resulting in `ALLOWED DISRUPTIONS = 0`. This frequently happens when: (1) an application has 1 replica with `minAvailable: 1`; (2) existing Pods are in `CrashLoopBackOff` and fail their readiness probes; or (3) cluster capacity is exhausted and replacement Pods cannot schedule. To unblock the drain, you can scale up the Deployment, relax the PDB constraints, or use `kubectl drain --disable-eviction` (which uses standard deletion).
+
+**Q5: What is `unhealthyPodEvictionPolicy` in Kubernetes 1.27+, and why is it useful?**
+
+`unhealthyPodEvictionPolicy` defines how the PDB controller handles Pods that are currently not `Ready` (e.g. crashing or failing health checks). By setting it to `AlwaysAllow`, Kubelet and the API server allow unhealthy Pods to be evicted immediately during a node drain without counting against the disruption budget. This prevents unhealthy or misbehaving applications from permanently locking up cluster-wide node upgrades and automated scaling operations.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between voluntary disruptions (PDB protected) and involuntary disruptions (hardware/OOM)
+- [ ] Know that `minAvailable` and `maxUnavailable` can be specified as integers or percentages
+- [ ] Know that a single PDB cannot declare both `minAvailable` and `maxUnavailable`
+- [ ] Know that PDBs protect the `/eviction` API (used by `kubectl drain`), NOT direct `kubectl delete`
+- [ ] Know that a PDB with `minAvailable: 1` on a 1-replica deployment blocks `kubectl drain`
+- [ ] Know how `unhealthyPodEvictionPolicy: AlwaysAllow` prevents stuck drains from crashing pods
+- [ ] Can verify allowed disruptions using `kubectl get pdb -A`

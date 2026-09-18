@@ -1,0 +1,194 @@
+---
+title: "Chapter 1 — IPv4 Addressing, CIDR, Subnetting & NAT Mechanics"
+sidebar_position: 1
+module: "Module 3.1 — IPv4 Addressing"
+description: "Master IPv4 address structure, legacy classes, CIDR notation, VLSM subnetting calculation, RFC 1918 private spaces, NAT/PAT mechanics, and Carrier-Grade NAT."
+---
+
+# Chapter 1 — IPv4 Addressing, CIDR, Subnetting & NAT Mechanics
+
+> **Goal:** Master the mathematical, structural, and operational mechanics of IPv4 addressing. Learn how to calculate subnets using Classless Inter-Domain Routing (CIDR), apply Variable Length Subnet Masking (VLSM), understand Network Address Translation (NAT/PAT) at the kernel level, and diagnose IP exhaustion strategies like CGNAT.
+>
+> By the end of this chapter, you will understand:
+> 1. The 32-bit IPv4 binary structure, octet conversion, and legacy address classes (Class A, B, C, D, E)
+> 2. CIDR prefix notation, bitwise subnet masking, and broadcast/network address derivation
+> 3. Variable Length Subnet Masking (VLSM) for optimized hierarchical address planning
+> 4. RFC 1918 private ranges, RFC 6598 CGNAT (`100.64.0.0/10`), and APIPA link-local (`169.254.0.0/16`)
+> 5. SNAT, DNAT, Port Address Translation (PAT/NAPT), and Linux conntrack table mechanics
+> 6. Linux network tooling (`ip`, `calc`, `iptables`, `conntrack`) for subnetting verification and NAT debugging
+
+---
+
+## Real-Life Analogy
+
+Think of IPv4 addressing and NAT as a **global enterprise campus with a central mail distribution office**:
+
+- **Public IPv4 Address (Building Street Address):**
+  - A globally unique street address (e.g., `100 Enterprise Way, San Francisco, CA`). Anyone in the world can send a delivery truck directly to this destination.
+- **Private Subnets (Office Rooms & Desks):**
+  - Inside the corporate building, rooms are numbered `Room 101`, `Desk 4B` (RFC 1918 `10.0.0.0/8`). These room numbers only make sense inside this specific building; another company across town has their own `Room 101`.
+- **NAT / PAT Gateway (Campus Mailroom Receptionist):**
+  - When employee at `Desk 4B` orders a package from external vendor, the receptionist rewrites the return address to `100 Enterprise Way, Box #4021` (**SNAT / Port mapping**). When the delivery arrives, the receptionist checks their logbook (**conntrack table**), sees Box #4021 belongs to Desk 4B, and delivers it to the internal desk (**Reverse translation**).
+
+---
+
+## Architecture Diagram
+
+```text
+               IPv4 Subnetting and Network Address Translation (NAT/PAT)
+               
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ PRIVATE LOCAL NETWORK (RFC 1918: 192.168.1.0/24)                            │
+ │                                                                             │
+ │   [Host A]  IP: 192.168.1.10:45200 ──┐                                      │
+ │   [Host B]  IP: 192.168.1.11:45200 ──┼──► [Default Gateway / NAT Router]    │
+ │                                      │    Internal IP: 192.168.1.1          │
+ └──────────────────────────────────────┼──────────────────────────────────────┘
+                                        │
+                                        ▼ (Kernel conntrack table entry created)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ NAT ROUTER TRANSLATION TABLE (Linux netfilter / conntrack)                  │
+ │ ┌──────────────────┬────────────────────┬──────────────────┬──────────────┐ │
+ │ │ Internal IP:Port │ Translated IP:Port │ Destination IP   │ Protocol     │ │
+ │ ├──────────────────┼────────────────────┼──────────────────┼──────────────┤ │
+ │ │ 192.168.1.10:45200│ 203.0.113.5:50001 │ 93.184.216.34:80 │ TCP          │ │
+ │ │ 192.168.1.11:45200│ 203.0.113.5:50002 │ 93.184.216.34:80 │ TCP          │ │
+ │ └──────────────────┴────────────────────┴──────────────────┴──────────────┘ │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ Public Interface: 203.0.113.5
+                                        ▼ (Egress to Internet)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ PUBLIC INTERNET                                                             │
+ │                                                                             │
+ │   Source: 203.0.113.5:50001 ────────► [Web Server: 93.184.216.34:80]        │
+ │   Source: 203.0.113.5:50002 ────────► [Web Server: 93.184.216.34:80]        │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. IPv4 Binary Structure & Legacy Classful Addressing
+
+An IPv4 address consists of 32 binary bits divided into four 8-bit octets:
+
+$$\text{Address: } 192.168.1.1 \iff \underbrace{11000000}_{\text{1st Octet (192)}} . \underbrace{10101000}_{\text{2nd Octet (168)}} . \underbrace{00000001}_{\text{3rd Octet (1)}} . \underbrace{00000001}_{\text{4th Octet (1)}}$$
+
+```text
+ ┌───────┬──────────────┬──────────────────┬─────────────────┬───────────────────────────┐
+ │ Class │ Leading Bits │ Network Range    │ Default Subnet  │ Usable Hosts / Network    │
+ │───────┼──────────────┼──────────────────┼─────────────────┼───────────────────────────┤
+ │ **A** │ `0...`       │ 1.0.0.0 – 126.0.0.0 | 255.0.0.0 (/8)  │ $2^{24}-2 = 16,777,214$   │
+ │ **B** │ `10...`      │ 128.0.0.0 – 191.255.0.0 | 255.255.0.0 (/16)| $2^{16}-2 = 65,534$    │
+ │ **C** │ `110...`     │ 192.0.0.0 – 223.255.255.0 | 255.255.255.0 (/24)| $2^8-2 = 254$     │
+ │ **D** │ `1110...`    │ 224.0.0.0 – 239.255.255.255 | N/A (Multicast) | No host addressing        │
+ │ **E** │ `1111...`    │ 240.0.0.0 – 255.255.255.255 | N/A (Experimental)| Reserved                 │
+ └───────┴──────────────┴──────────────────┴─────────────────┴───────────────────────────┘
+```
+
+---
+
+### 2. Classless Inter-Domain Routing (CIDR) & Subnet Calculation
+
+CIDR (RFC 1519) eliminated rigid class boundaries by appending a prefix length `/$n$` representing the number of contiguous binary 1s in the subnet mask:
+
+$$\text{Usable Host Count} = 2^{(32 - n)} - 2$$
+
+*(Subtract 2 for the Network ID and Subnet Broadcast ID).*
+
+```text
+ ┌────────┬─────────────────────┬───────────────────┬──────────────┬───────────────────────┐
+ │ Prefix │ Subnet Mask         │ Total Addresses   │ Usable Hosts │ Common Use Case       │
+ │────────┼─────────────────────┼───────────────────┼──────────────┼───────────────────────┤
+ │ `/32`  │ 255.255.255.255     │ 1                 │ 1 (Host Route) Loopback / VIP / Pod   │
+ │ `/31`  │ 255.255.255.254     │ 2                 │ 2 (RFC 3021) │ Point-to-Point Links  │
+ │ `/30`  │ 255.255.255.252     │ 4                 │ 2            │ Legacy P2P Router Link│
+ │ `/28`  │ 255.255.255.240     │ 16                │ 14           │ Small Database Subnet │
+ │ `/24`  │ 255.255.255.0       │ 256               │ 254          │ Standard Office / VLAN│
+ │ `/20`  │ 255.255.240.0       │ 4,096             │ 4,094        │ K8s Node Pool VPC     │
+ │ `/16`  │ 255.255.0.0         │ 65,536            │ 65,534       │ Cloud VPC CIDR Block  │
+ └────────┴─────────────────────┴───────────────────┴──────────────┴───────────────────────┘
+```
+
+---
+
+### 3. Special IPv4 Address Ranges
+
+```text
+ ┌──────────────────────┬──────────────────────┬──────────────────────────────────────────────┐
+ │ Range                │ Standard / RFC       │ Purpose & Description                        │
+ │──────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+ │ `10.0.0.0/8`         │ RFC 1918             │ Enterprise Private Cloud & Datacenter Subnets│
+ │ `172.16.0.0/12`      │ RFC 1918             │ Docker / K8s Cluster Pod CIDR Defaults       │
+ │ `192.168.0.0/16`     │ RFC 1918             │ Small Office & Home Network Subnets          │
+ │ `100.64.0.0/10`      │ RFC 6598 (CGNAT)     │ ISP Carrier-Grade NAT Shared Address Space   │
+ │ `127.0.0.0/8`        │ RFC 1122             │ Loopback (Host inter-process communication)  │
+ │ `169.254.0.0/16`     │ RFC 3927 (APIPA)     │ Link-Local self-assigned (No DHCP available) │
+ │ `169.254.169.254/32` │ Cloud Metadata (IMDS)│ AWS/GCP/Azure Instance Metadata Service      │
+ └──────────────────────┴──────────────────────┴──────────────────────────────────────────────┘
+```
+
+---
+
+### 4. NAT Flavors: SNAT, DNAT, and Masquerading
+
+- **SNAT (Source NAT):** Rewrites the source IP of egress packets. Used when private internal hosts initiate connections to external public servers.
+- **MASQUERADE:** A specialized form of SNAT designed for dynamic public IP interfaces (e.g., PPPoE, DHCP WAN). The kernel automatically checks the current interface IP dynamically.
+- **DNAT (Destination NAT / Port Forwarding):** Rewrites the destination IP of incoming packets. Used to expose internal private services (e.g., exposing a private web server on `192.168.1.50:80` to public internet requests hitting `203.0.113.5:80`).
+
+---
+
+## Hands-On Lab: Subnetting & Kernel NAT Inspection
+
+```bash
+# Step 1: Display IP address and CIDR prefix of all active interfaces
+ip -4 addr show
+
+# Step 2: Calculate network address and broadcast for a subnet using ipcalc
+# (Install if needed: apt-get install ipcalc / yum install ipcalc)
+ipcalc 192.168.10.45/27
+
+# Step 3: Inspect active kernel NAT connection tracking entries
+sudo conntrack -L -p tcp 2>/dev/null || cat /proc/net/nf_conntrack | grep tcp | head -n 10
+
+# Step 4: Add an iptables Source NAT (MASQUERADE) rule for an egress interface
+sudo iptables -t nat -A POSTROUTING -o eth0 -s 10.244.0.0/16 -j MASQUERADE
+
+# Step 5: Verify NAT table rules
+sudo iptables -t nat -L -n -v --line-numbers
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between Classful Addressing and CIDR?**
+
+Classful addressing allocated IP addresses in rigid 8, 16, or 24-bit blocks (Class A, B, C), leading to catastrophic address waste (e.g., a company needing 300 IPs had to receive a Class B with 65,534 addresses). CIDR (Classless Inter-Domain Routing) introduced variable-length prefix masks (`/n`), allowing networks to be sized exactly to requirements and enabling route aggregation (supernetting) in global BGP routing tables.
+
+**Q2: What happens when an RFC 1918 private IP reaches a public Internet router?**
+
+Internet backbone routers (Tier-1 and Tier-2 ISPs) maintain explicit filter policies that discard any packet with an RFC 1918 source or destination address. Because private addresses are not globally routable or unique, sending packets with private IPs onto the public Internet leads to silent drops.
+
+**Q3: How does Port Address Translation (PAT / NAPT) allow thousands of hosts to share a single public IP?**
+
+PAT multiplexes thousands of private IP sessions over a single public IP by modifying the Layer 4 source port number. When internal host `192.168.1.10:45000` sends traffic, the router translates the source to `203.0.113.5:51234` and logs the mapping in its conntrack table. Return packets targeting port `51234` are un-translated back to `192.168.1.10:45000`.
+
+**Q4: What is RFC 6598 Carrier-Grade NAT (`100.64.0.0/10`) and why was it created?**
+
+CGNAT is a dedicated IP range assigned to ISPs to deploy large-scale NAT between residential customer CPE routers (which themselves assign RFC 1918 IPs) and the ISP's public IPv4 pool. This prevents IP address collisions that would occur if both the ISP core and the home network used the standard `10.0.0.0/8` or `192.168.0.0/16` address space.
+
+**Q5: Why is `/31` subnetting permitted on point-to-point links under RFC 3021?**
+
+Standard subnets reserve 2 addresses for Network ID (all host bits 0) and Broadcast ID (all host bits 1). On point-to-point router links with only two endpoints, broadcast and network addresses are unnecessary. RFC 3021 permits using a `/31` mask (2 total addresses), saving billions of IP addresses across carrier backbones.
+
+---
+
+## Summary Checksheet
+
+- [ ] Can convert IPv4 binary to dotted decimal and calculate usable host counts ($2^{32-n} - 2$)
+- [ ] Memorized RFC 1918 private spaces: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+- [ ] Understand CGNAT `100.64.0.0/10` and Link-Local `169.254.0.0/16` (APIPA & IMDS)
+- [ ] Know the mechanical difference between SNAT, DNAT, and MASQUERADE
+- [ ] Can inspect and debug Linux conntrack table entries and iptables NAT chains

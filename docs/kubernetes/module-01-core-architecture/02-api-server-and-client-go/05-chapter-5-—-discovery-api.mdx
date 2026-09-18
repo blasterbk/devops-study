@@ -1,0 +1,342 @@
+---
+title: "Chapter 5 — Discovery API"
+sidebar_position: 5
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand how Kubernetes clients automatically discover available APIs, Resources, Groups, and Versions without any hardcoded knowledge."
+---
+
+# Chapter 5 — Discovery API
+
+> **Goal:** Understand how Kubernetes clients automatically discover available APIs, Resources, Groups, and Versions without any hardcoded knowledge.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. What the Discovery API is
+> 2. /api and /apis discovery endpoints
+> 3. How kubectl api-resources works internally
+> 4. How kubectl api-versions works internally
+> 5. Aggregated Discovery (Kubernetes 1.27+)
+> 6. How dynamic clients use Discovery
+> 7. How CRDs and Aggregated APIs appear in discovery
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Imagine a new Kubernetes feature is released tomorrow introducing a new resource:
+
+```text
+AIModel   (ai.k8s.io/v1)
+```
+
+How does `kubectl` immediately know about it — without a new `kubectl` release?
+
+The answer is **Discovery API**. `kubectl` asks the cluster: *"What APIs do you support?"* — and the API Server replies with a complete, up-to-date list.
+
+Without the Discovery API:
+- `kubectl` would need hardcoded resource lists (impossible for CRDs)
+- Dynamic clients (`client-go` dynamic client) couldn't resolve resources
+- Operators couldn't discover custom resources at runtime
+- Third-party tools like ArgoCD and Flux couldn't enumerate resources generically
+
+---
+
+# Real-Life Analogy
+
+Think of the Discovery API as a shopping mall directory.
+
+```text
+Mall Directory (Discovery API)
+        |
+        +-- Floor 1: Food Court (Core API: Pods, Services)
+        |
+        +-- Floor 2: Electronics (apps: Deployments, ReplicaSets)
+        |
+        +-- Floor 3: Fashion (batch: Jobs, CronJobs)
+        |
+        +-- Floor 4: Custom Boutiques (CRDs, Aggregated APIs)
+```
+
+| Mall | Kubernetes |
+| :--- | :--- |
+| Mall directory | Discovery API endpoints |
+| Store name | API Group |
+| Store location | API Group URL path |
+| New store added | CRD or Aggregated API registered |
+| Directory update | `kubectl api-resources` re-fetches |
+
+When a new store opens (CRD installed), the directory updates automatically and clients find it on the next discovery query.
+
+---
+
+# Discovery Endpoints
+
+The API Server exposes a hierarchy of discovery endpoints:
+
+```text
+GET /          -> Root discovery (links to /api and /apis)
+
+GET /api       -> Lists available Core API versions (v1)
+GET /api/v1    -> Lists all Core resources (Pods, Services, etc.)
+
+GET /apis      -> Lists all named API Groups
+GET /apis/apps -> Lists versions for the 'apps' group (v1)
+GET /apis/apps/v1  -> Lists all resources in apps/v1
+```
+
+---
+
+# Step-by-Step Discovery Walk
+
+```text
+Client starts
+  |
+  v
+GET /api  ->  { "versions": ["v1"] }
+  |
+  v
+GET /api/v1  ->  {
+  "resources": [
+    { "name": "pods",       "namespaced": true,  "kind": "Pod" },
+    { "name": "services",   "namespaced": true,  "kind": "Service" },
+    { "name": "nodes",      "namespaced": false, "kind": "Node" }
+  ]
+}
+  |
+  v
+GET /apis  ->  {
+  "groups": [
+    { "name": "apps",              "preferredVersion": "v1" },
+    { "name": "batch",             "preferredVersion": "v1" },
+    { "name": "networking.k8s.io", "preferredVersion": "v1" }
+  ]
+}
+  |
+  v
+GET /apis/apps/v1  ->  {
+  "resources": [
+    { "name": "deployments", "namespaced": true, "kind": "Deployment" },
+    { "name": "replicasets", "namespaced": true, "kind": "ReplicaSet" }
+  ]
+}
+```
+
+---
+
+# kubectl api-resources
+
+`kubectl api-resources` is a convenience command that runs the full discovery walk and displays a formatted table.
+
+```bash
+kubectl api-resources
+```
+
+Output (subset):
+```text
+NAME                  SHORTNAMES  APIVERSION           NAMESPACED  KIND
+pods                  po          v1                   true        Pod
+services              svc         v1                   true        Service
+nodes                 no          v1                   false       Node
+deployments           deploy      apps/v1              true        Deployment
+replicasets           rs          apps/v1              true        ReplicaSet
+daemonsets            ds          apps/v1              true        DaemonSet
+statefulsets          sts         apps/v1              true        StatefulSet
+jobs                              batch/v1             true        Job
+cronjobs              cj          batch/v1             true        CronJob
+ingresses             ing         networking.k8s.io/v1 true        Ingress
+```
+
+Filter by API group:
+```bash
+kubectl api-resources --api-group=apps
+kubectl api-resources --namespaced=false
+kubectl api-resources --verbs=list,watch
+```
+
+---
+
+# kubectl api-versions
+
+Lists only the available Group+Version strings:
+
+```bash
+kubectl api-versions
+```
+
+Output (subset):
+```text
+apps/v1
+batch/v1
+networking.k8s.io/v1
+storage.k8s.io/v1
+autoscaling/v2
+coordination.k8s.io/v1
+metrics.k8s.io/v1beta1
+```
+
+> **Important:** Only API groups and versions with a healthy registered `APIService` appear in this list. If Metrics Server is not installed, `metrics.k8s.io` will be absent.
+
+---
+
+# How CRDs Appear in Discovery
+
+When a CRD is installed, the API Server dynamically registers a new group and resource:
+
+```text
+kubectl apply -f rediscluster-crd.yaml
+  |
+  v
+API Server registers:
+  Group:    database.example.com
+  Version:  v1
+  Resource: redisclusters
+  |
+  v
+Immediately available in discovery:
+  GET /apis/database.example.com/v1/redisclusters
+  |
+  v
+kubectl api-resources now shows:
+  redisclusters    database.example.com/v1    true    RedisCluster
+```
+
+---
+
+# How Aggregated APIs Appear in Discovery
+
+When an Aggregated API is registered via an `APIService` object, it also appears in discovery:
+
+```yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.k8s.io
+spec:
+  group: metrics.k8s.io
+  version: v1beta1
+  service:
+    name: metrics-server
+    namespace: kube-system
+```
+
+Once registered and healthy:
+```text
+GET /apis -> includes "metrics.k8s.io"
+GET /apis/metrics.k8s.io/v1beta1 -> resource list served by Metrics Server
+```
+
+---
+
+# Aggregated Discovery (Kubernetes 1.27+)
+
+Traditional discovery required one HTTP request per API group — expensive in clusters with many CRDs.
+
+Kubernetes 1.27+ introduced **Aggregated Discovery** via a single endpoint:
+
+```http
+GET /api?aggregated=true
+GET /apis?aggregated=true
+```
+
+This returns the complete API group and resource list in a single response, dramatically reducing the number of round-trips for clients that need the full picture.
+
+---
+
+# How Dynamic Clients Use Discovery
+
+`client-go`'s dynamic client and discovery client work together:
+
+```text
+program starts
+  |
+  v
+discovery.NewDiscoveryClientForConfig(config)
+  |
+  v
+Fetch all API groups and resources from Discovery API
+  |
+  v
+Build GVR map: "deployments" -> apps/v1/deployments
+  |
+  v
+dynamicClient.Resource(gvr).Namespace("default").List(...)
+  |
+  v
+GET /apis/apps/v1/namespaces/default/deployments
+```
+
+This allows a single program to work with any resource — including CRDs — without compile-time knowledge of their types.
+
+---
+
+# Discovery Caching
+
+Discovery results are **cached** by `kubectl` to avoid re-querying the API Server on every command:
+
+```text
+Cache location: ~/.kube/cache/discovery/<cluster>/<group>/<version>.json
+Cache TTL: 10 minutes (default)
+```
+
+Force cache invalidation:
+```bash
+kubectl api-resources --request-timeout=0
+# or delete cache directory
+rm -rf ~/.kube/cache/discovery/
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the Kubernetes Discovery API?
+The Discovery API is a set of REST endpoints served by `kube-apiserver` that enumerate all available API groups, versions, and resources. Clients use it to dynamically discover what the cluster supports without hardcoded resource lists.
+
+### Q2. How does `kubectl api-resources` work?
+`kubectl` sends GET requests to `/api` and `/apis`, iterates over all returned groups and versions, queries each group's resource list, and formats the results into a table.
+
+### Q3. Why does `kubectl` need Discovery?
+To resolve short resource names (`deploy` → `deployments`), determine the correct API group for a resource (`Deployment` → `apps/v1`), and support CRDs and Aggregated APIs that are installed at runtime.
+
+### Q4. Where does kubectl cache discovery results?
+In `~/.kube/cache/discovery/<cluster>/`. The cache TTL is 10 minutes by default. It can be invalidated by deleting the cache directory.
+
+### Q5. How do CRDs appear in discovery?
+When a CRD is applied, `kube-apiserver` registers the new group, version, and resource dynamically. They immediately appear in subsequent discovery queries and in `kubectl api-resources` output.
+
+### Q6. What is Aggregated Discovery?
+A Kubernetes 1.27+ feature that returns the complete API group and resource list in a single HTTP request to `/apis?aggregated=true`, replacing the previous N-request pattern (one per group).
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| `kubectl api-resources` missing a CRD | CRD not installed or API Server not ready | Run `kubectl get crd` to verify installation |
+| `metrics.k8s.io` absent from `kubectl api-versions` | Metrics Server not installed or `APIService` unhealthy | Check `kubectl get apiservice v1beta1.metrics.k8s.io` |
+| Dynamic client 404 on known resource | Wrong GVR or stale discovery cache | Delete `~/.kube/cache/discovery/` and retry |
+| `kubectl api-resources` very slow | Cluster has many CRDs; no Aggregated Discovery | Upgrade to Kubernetes 1.27+ for aggregated discovery |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain what the Discovery API is and why it exists.
+2. Describe the discovery endpoint hierarchy (`/api`, `/apis`, `/apis/<group>/<version>`).
+3. Explain what `kubectl api-resources` and `kubectl api-versions` do internally.
+4. Explain how CRDs and Aggregated APIs appear in discovery.
+5. Describe how `client-go`'s dynamic client uses discovery.
+6. Explain what Aggregated Discovery is and why it was introduced.
+7. Describe where `kubectl` caches discovery results and how to invalidate the cache.
+
+---
+
+# Next Chapter
+
+**Chapter 6 — ResourceVersion**
+
+In the next chapter, you'll learn what `resourceVersion` is, how Kubernetes uses it to detect concurrent updates and provide consistent watch streams, and why it is critical for building reliable controllers.

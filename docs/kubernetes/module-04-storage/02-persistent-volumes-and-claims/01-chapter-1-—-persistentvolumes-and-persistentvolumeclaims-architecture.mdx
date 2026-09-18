@@ -1,0 +1,300 @@
+---
+title: "Chapter 1 — PV & PVC Architecture & Decoupling"
+sidebar_position: 1
+module: "Module 4.2 — PersistentVolumes & Claims"
+description: "Master Kubernetes PersistentVolumes and PersistentVolumeClaims — architectural decoupling, cluster-scoped vs namespace-scoped resources, 1:1 binding algorithms, and static vs dynamic provisioning."
+---
+
+# Chapter 1 — PV & PVC Architecture & Decoupling
+
+> **Goal:** Master the fundamental decoupling between infrastructure storage and application requests in Kubernetes — understanding why PersistentVolumes (PVs) are cluster-scoped administrator primitives while PersistentVolumeClaims (PVCs) are namespace-scoped developer requests, how the Persistent Volume Controller evaluates the 1:1 binding algorithm, and how to troubleshoot pending claim errors.
+>
+> By the end of this chapter, you will understand:
+> 1. The administrative separation of concerns: Infrastructure Providers vs Application Consumers
+> 2. The structural anatomy of cluster-scoped `PersistentVolume` and namespace-scoped `PersistentVolumeClaim`
+> 3. The 4-factor matching criteria required for the controller to bind a PV to a PVC
+> 4. Why PV-to-PVC binding is strictly a 1:1 mutual relationship
+> 5. Static provisioning vs automated dynamic provisioning via StorageClasses
+> 6. How to diagnose and resolve `Pending` PVC binding errors
+
+---
+
+## Real-Life Analogy
+
+Think of PersistentVolumes and Claims as **booking a rental car at an airport**:
+
+- **The Fleet Inventory (PersistentVolumes - PV):** The rental car company parking lot contains physical vehicles: a 7-passenger SUV with 4-wheel drive (`capacity: 100Gi, accessModes: ReadWriteOnce, storageClass: premium`). This is the cluster-wide hardware inventory managed by the fleet manager (Cluster Administrator).
+- **The Customer Voucher (PersistentVolumeClaim - PVC):** A traveler arrives at the desk with a voucher: *"I need a vehicle that seats at least 5 passengers with an automatic transmission (`requests.storage: 50Gi`)."* The traveler does not know the engine serial number or chassis ID; they just describe what they need.
+- **The Mutual Binding Contract (1:1 Binding):** The rental agent finds an available 7-passenger SUV in the lot. Even though the SUV is larger than the requested 5-seat minimum, it satisfies the requirement. The agent stamps the traveler's name on the SUV keys (`claimRef`) and hands the keys to the traveler. That specific SUV is now **exclusively bound** to that single customer; no other customer can rent it until the contract is closed.
+
+---
+
+## Architecture Diagram
+
+```text
+               PV and PVC Decoupled Binding Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Cluster Administrator Layer (Cluster-Scoped)                           │
+ │                                                                        │
+ │ PersistentVolume: pv-nfs-100gi                                         │
+ │ - Capacity: 100Gi                                                      │
+ │ - AccessModes: [ReadWriteMany]                                         │
+ │ - StorageClassName: nfs-storage                                        │
+ │ - Status: Available                                                    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ Matched & Bound by pv-controller!
+ ┌──────────────────────────────────┴─────────────────────────────────────┐
+ │ Application Developer Layer (Namespace-Scoped: namespace: prod)        │
+ │                                                                        │
+ │ PersistentVolumeClaim: app-data-pvc                                    │
+ │ - Requests Storage: 50Gi                                               │
+ │ - AccessModes: [ReadWriteMany]                                         │
+ │ - StorageClassName: nfs-storage                                        │
+ │ - Status: Bound (Points to pv-nfs-100gi)                               │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Mounted into Pod spec.volumes
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod: web-server (mountPath: /var/data)                                 │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Administrator vs Developer Separation of Concerns
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ PersistentVolume (PV)           │ PersistentVolumeClaim (PVC)     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Target Persona**        │ Infrastructure Admin / Storage  │ Application Developer / DevOps  │
+ │ **Resource Scope**        │ **Cluster-Scoped** (No namespace│ **Namespace-Scoped** (Bound to  │
+ │                           │ boundaries)                     │ specific namespace)             │
+ │ **Content**               │ Physical storage details (NFS   │ Request parameters (Size,       │
+ │                           │ IP, AWS EBS Volume ID, LUN)     │ AccessMode, StorageClassName)   │
+ │ **Lifecycle**             │ Independent of Pods & namespaces│ Tied to application lifecycle   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The 4-Factor Matching & Binding Algorithm
+
+When a developer submits a PVC, the `pv-controller` loop in `kube-controller-manager` searches for an `Available` PV that satisfies all four criteria:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Matching Factor      │ Requirement Rule                                                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. StorageClass**  │ PV `storageClassName` must EXACTLY match PVC `storageClassName`.            │
+ │                      │ (An empty string `""` matches only PVs with no class).                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Access Modes**   │ The PV must support ALL access modes requested in `pvc.spec.accessModes`.   │
+ │                      │ (e.g. PV with `[RWO, RWX]` satisfies a PVC requesting `[RWO]`).             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Volume Mode**   │ `volumeMode` must match (`Filesystem` vs `Block`).                          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **4. Capacity Floor**│ $\text{PV Capacity} \ge \text{PVC Requested Storage}$.                      │
+ │                      │ A 100Gi PV can satisfy a 50Gi PVC (the remaining 50Gi is allocated but      │
+ │                      │ cannot be claimed by another PVC).                                          │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Strict 1:1 Binding Cardinality
+
+> [!IMPORTANT]
+> **A PersistentVolume can only be bound to EXACTLY ONE PersistentVolumeClaim at a time.**
+> Even if a PV has 500GB capacity and a PVC only requests 50GB, the entire 500GB volume is dedicated to that single PVC. The remaining 450GB cannot be split or shared with another claim.
+
+When bound:
+- The PV's `.spec.claimRef` is set to point to the PVC (`namespace/name`).
+- The PVC's `.spec.volumeName` is set to the PV name.
+- Both resources transition to the **`Bound`** phase.
+
+---
+
+## Static vs Dynamic Provisioning
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Static Provisioning             │ Dynamic Provisioning            │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Workflow**              │ Admin manually creates PVs      │ StorageClass automatically      │
+ │                           │ ahead of time in `etcd`.        │ provisions PV on-demand.        │
+ │ **Automation**            │ Manual & prone to capacity gaps │ Fully automated zero-touch      │
+ │ **De-allocation**         │ Admin manually reclaims disk    │ StorageClass deletes cloud disk │
+ │ **Best For**              │ Legacy NFS shares, pre-existing │ Cloud environments (AWS EBS,    │
+ │                           │ SAN/NAS, static Bare-Metal      │ GCP PD, Azure Managed Disk)     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Complete Static PV and PVC Manifests
+
+```yaml
+# 1. Cluster-Scoped PersistentVolume (Admin Managed)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: static-nfs-pv
+  labels:
+    tier: enterprise-storage
+spec:
+  capacity:
+    storage: 50Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual-nfs
+  nfs:
+    server: 10.0.100.50
+    path: /exports/data
+---
+# 2. Namespace-Scoped PersistentVolumeClaim (Developer Managed)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: static-nfs-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: manual-nfs
+  resources:
+    requests:
+      storage: 20Gi
+  # Optional explicit label selector
+  selector:
+    matchLabels:
+      tier: enterprise-storage
+```
+
+---
+
+## Hands-On Lab: Static PV Provisioning & Binding
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace pv-lab
+
+# Step 2: Create a static hostPath PersistentVolume
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: lab-static-pv
+  labels:
+    environment: lab
+spec:
+  capacity:
+    storage: 1Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: lab-manual
+  hostPath:
+    path: /tmp/lab-pv-data
+    type: DirectoryOrCreate
+EOF
+
+# Step 3: Verify PV status is Available
+kubectl get pv lab-static-pv
+# Status: Available, Claim: None
+
+# Step 4: Create a matching PersistentVolumeClaim
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lab-claim
+  namespace: pv-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lab-manual
+  resources:
+    requests:
+      storage: 500Mi
+  selector:
+    matchLabels:
+      environment: lab
+EOF
+
+# Step 5: Verify that the PVC immediately binds to the PV
+sleep 2
+kubectl get pvc -n pv-lab
+kubectl get pv lab-static-pv
+# Status for both should be BOUND! Notice ClaimRef is set on PV!
+
+# Step 6: Deploy a Pod consuming the bound PVC
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-consumer
+  namespace: pv-lab
+spec:
+  volumes:
+  - name: data-vol
+    persistentVolumeClaim:
+      claimName: lab-claim
+  containers:
+  - name: writer
+    image: alpine:latest
+    command: ["sh", "-c", "echo 'Hello PV' > /mnt/data/test.txt; sleep 3600"]
+    volumeMounts:
+    - name: data-vol
+      mountPath: /mnt/data
+EOF
+
+# Step 7: Verify data persistence
+kubectl wait --for=condition=Ready pod/storage-consumer -n pv-lab --timeout=30s
+kubectl exec -n pv-lab storage-consumer -- cat /mnt/data/test.txt
+
+# Step 8: Clean up lab
+kubectl delete namespace pv-lab
+kubectl delete pv lab-static-pv
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the architectural distinction between a PersistentVolume and a PersistentVolumeClaim?**
+
+A `PersistentVolume` (PV) is a cluster-scoped resource representing an actual physical or cloud storage asset (e.g. AWS EBS volume, NFS export, Ceph pool) configured with fixed capacity, access modes, and volume plugins. A `PersistentVolumeClaim` (PVC) is a namespace-scoped request submitted by an application developer specifying required capacity, access modes, and storage class without exposing low-level infrastructure details. The Kubernetes `pv-controller` matches and binds them 1:1.
+
+**Q2: What causes a PersistentVolumeClaim to remain stuck in the `Pending` state?**
+
+A PVC remains `Pending` when no matching `Available` PV exists in the cluster and dynamic provisioning cannot fulfill the claim. Common root causes include: (1) No PV matches the requested `storageClassName`; (2) Available PVs do not provide the requested `accessModes` (e.g. asking for `ReadWriteMany` when only `ReadWriteOnce` PVs exist); (3) Available PVs have less capacity than requested; (4) The StorageClass has `volumeBindingMode: WaitForFirstConsumer`, which intentionally delays binding until a Pod using the PVC is scheduled onto a node.
+
+**Q3: Can a single PersistentVolume be bound to multiple PersistentVolumeClaims?**
+
+No. The binding between a PV and a PVC is strictly **1:1**. When the `pv-controller` binds a PV to a claim, it writes the PVC's namespace and name into the PV's `.spec.claimRef` and writes the PV's name into the PVC's `.spec.volumeName`. Even if the PV has surplus unused capacity, it cannot be bound to any other PVC.
+
+**Q4: How does a PVC specify a direct, explicit PersistentVolume to bind to?**
+
+A PVC can bypass the general matching algorithm and bind directly to a specific PV by setting `.spec.volumeName: "<target-pv-name>"`. If the specified PV is in the `Available` state and satisfies the basic access mode and capacity requirements, the controller will immediately bind the two objects together.
+
+**Q5: What is the difference between Static and Dynamic Volume Provisioning?**
+
+In **Static Provisioning**, cluster administrators must manually provision storage volumes in the cloud or SAN and create `PersistentVolume` manifests in the cluster before developers can use them. In **Dynamic Provisioning**, administrators define a `StorageClass` with a CSI provisioner; when a developer creates a PVC referencing that StorageClass, the CSI driver automatically provisions the underlying cloud disk via API calls and creates the matching PV object on-the-fly with zero human intervention.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that PVs are cluster-scoped while PVCs are namespace-scoped
+- [ ] Know the 4 matching criteria: StorageClass, AccessModes, VolumeMode, Capacity
+- [ ] Know that PV-to-PVC binding is strictly 1:1
+- [ ] Know the difference between Static (manual PV) and Dynamic (StorageClass) provisioning
+- [ ] Know that `spec.volumeName` enables direct explicit PV binding
+- [ ] Know that `claimRef` on a PV points bidirectionally to its bound PVC
+- [ ] Can diagnose pending PVCs using `kubectl describe pvc <name>`

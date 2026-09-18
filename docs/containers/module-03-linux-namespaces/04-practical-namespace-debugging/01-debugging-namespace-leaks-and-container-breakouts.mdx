@@ -1,0 +1,183 @@
+---
+title: "Chapter 1 — Debugging Namespace Leaks & Breakouts"
+sidebar_position: 1
+module: "Module 3.4 — Namespace Debugging"
+description: "Master advanced Linux namespace troubleshooting — diagnosing orphaned namespace leaks, analyzing container breakout vectors (--privileged, docker.sock), and SRE triage runbooks."
+---
+
+# Chapter 1 — Debugging Namespace Leaks & Breakouts
+
+> **Goal:** Master advanced Linux kernel namespace troubleshooting, leak detection, and security audit runbooks — diagnosing **Orphaned Namespace Leaks** holding open kernel memory, auditing dangerous **Container Breakout Anti-Patterns** (**`--privileged`**, **`--pid=host`**, and **`/var/run/docker.sock` mounts**), analyzing **Linux Capability Escalations**, and executing structured SRE remediation workflows.
+>
+> By the end of this chapter, you will understand:
+> 1. What causes silent namespace leaks and why orphaned network namespaces drain kernel memory
+> 2. How to detect leaked namespaces using `lsns`, `/proc/net/dev`, and bind mount tracking
+> 3. Why mounting `/var/run/docker.sock` inside a container is equivalent to giving root access to the host
+> 4. The mechanics of container escape exploits via `CAP_SYS_ADMIN` and host device node injection
+> 5. How host namespace sharing (`--net=host`, `--pid=host`) breaks multi-tenant isolation
+> 6. How to isolate, diagnose, and clean up leaked container namespaces without rebooting nodes
+
+---
+
+## Real-Life Analogy
+
+Think of Namespace Leaks and Container Breakouts as **detecting plumbing leaks in a submarine hull and preventing security airlock breaches**:
+
+- **The Ghost Water Valve (The Orphaned Namespace Leak):**
+  - A submarine crew member opens an auxiliary emergency water line to test a torpedo tube (**A temporary network namespace for a short-lived container**).
+  - When the test completes, the crew member removes the torpedo, but forgets to turn the shutoff valve (**An open file descriptor or uncleaned bind mount in `/var/run/netns/`**).
+  - Water silently circulates through the pipes, holding valve pressure and wasting hydraulic capacity (**Kernel memory and IPAM addresses remain locked forever**).
+- **The Airlock Keycard Override (The Docker Socket Mount Breakout):**
+  - A visitor in Room 4 (**An unprivileged container**) wants to order a room service sandwich.
+  - Instead of giving them a menu, the submarine captain hands them the **Master Engineering Skeleton Keycard** (**Mounting `/var/run/docker.sock`**).
+  - The visitor walks to the master control panel, orders the submarine's crane to build a new titanium room with all airlocks open, steps inside, and takes over the entire submarine (**Instant Host Root Compromise**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Namespace Leak Detection & Container Breakout Vectors
+
+ 1. ORPHANED NAMESPACE LEAK MECHANISM:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER EXITS ──► PID 48921 terminates                               │
+ │ 💥 BUT a background logging process or forgotten bind mount retains fd:│
+ │    `open("/proc/48921/ns/net")` ──► Reference Count Remains = 1!       │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ RESULT: Network namespace remains alive in kernel; IP address locked! │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. THE TOP 3 CONTAINER BREAKOUT VECTORS:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ VECTOR 1: `--privileged` MODE                                          │
+ │ - Gives all 40+ Linux capabilities (`CAP_SYS_ADMIN`, `CAP_SYS_MODULE`) │
+ │ - Exposes all host devices (`/dev/sda1` ──► Mounts host disk & escapes)│
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ VECTOR 2: MOUNTING `/var/run/docker.sock`                              │
+ │ - Container sends API request to Docker daemon to run `--privileged`   │
+ │   container mounting `/` to `/host` ──► Instant root shell on host!    │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ VECTOR 3: HOST NAMESPACE SHARING (`--pid=host`)                        │
+ │ - Container sees all host PIDs; uses `ptrace()` to inject shellcode    │
+ │   into host root `systemd` process!                                    │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Primary Container Breakout Vectors
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────────┐
+ │ Misconfiguration Vector   │ Underlying Kernel Flaw Exploited│ SRE Security Remediation            │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **1. `--privileged`**     │ Grants full hardware access and │ Never use in production; use fine-  │
+ │                           │ all Linux capabilities to pod.  │ grained capabilities (e.g. NET_BIND)│
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **2. Docker Socket Mount**│ Container controls Docker daemon│ Use daemonless rootless builders    │
+ │ (`/var/run/docker.sock`)  │ API; can spawn root containers. │ (Kaniko, Buildah) in CI/CD instead! │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **3. `--pid=host` +**     │ Process can attach to and       │ Forbid host PID sharing via K8s Pod │
+ │ **`CAP_SYS_PTRACE`**      │ hijack host systemd memory!     │ Security Standards (`restricted`).  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **4. Insecure Host Bind** │ Container writes malicious cron │ Enforce `readOnly: true` on all     │
+ │ Mount (`/etc` or `/`)     │ or systemd unit to host disk.   │ hostPath volume mounts!             │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## Why `/var/run/docker.sock` Mounts Are Catastrophic
+
+Mounting the Docker UNIX socket inside a container gives the container **the exact same privileges as the root Docker daemon**:
+
+```bash
+# How an attacker escapes from an unprivileged container to host root in 2 seconds:
+# 1. Attacker is inside an unprivileged container with /var/run/docker.sock mounted.
+# 2. Attacker runs:
+docker -H unix:///var/run/docker.sock run -it --privileged --net=host --pid=host \
+  -v /:/host-root alpine chroot /host-root /bin/bash
+
+# 💥 The attacker is now ROOT on the physical Linux host node!
+```
+
+---
+
+## SRE Runbook: Detecting and Cleaning Orphaned Namespace Leaks
+
+```bash
+# STEP 1: Scan for namespaces with 0 active processes holding references
+sudo lsns -t net | awk '$3 == 0 {print $0}'
+
+# STEP 2: Check for forgotten network namespace bind mounts in /var/run/netns/
+sudo ip netns list
+
+# STEP 3: Find any process holding an open file descriptor to a namespace
+# sudo lsof | grep -E "ns/net|ns/mnt|ns/pid"
+
+# STEP 4: Delete the leaked persistent network namespace
+# sudo ip netns del <leaked-namespace-name>
+```
+
+---
+
+## Hands-On Lab: Simulating and Cleaning a Leaked Namespace
+
+```bash
+# Step 1: Create a persistent namespace
+sudo ip netns add ghost-namespace
+
+# Step 2: Verify the namespace exists with 0 processes attached
+sudo lsns -t net | grep ghost-namespace 2>/dev/null || ip netns list
+
+# Step 3: Identify the inode of the ghost namespace
+sudo ls -l /var/run/netns/ghost-namespace
+
+# Step 4: Safely unbind and clean up the leaked namespace
+sudo ip netns del ghost-namespace
+
+# Step 5: Verify zero lingering references remain
+ip netns list
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is an orphaned namespace leak in Linux, and what operational problems does it cause?**
+
+An orphaned namespace leak occurs when a container process terminates, but its Linux namespace (typically a **Network Namespace**) is **not freed from kernel memory**. This happens if a host process holds an open file descriptor to `/proc/[pid]/ns/net` or if a CNI plugin fails to unmount a persistent bind mount in `/var/run/netns/`. Over time, leaked namespaces consume kernel memory structs (`struct net`), retain virtual ethernet interfaces (`veth`), lock assigned IP addresses in CNI IPAM pools, and eventually exhaust the node's maximum network device limits.
+
+**Q2: Why is mounting `/var/run/docker.sock` inside a CI/CD container considered a critical security vulnerability?**
+
+The Docker daemon socket (`/var/run/docker.sock`) is a root-privileged UNIX socket API. If a container mounts this socket, any process inside that container can issue commands directly to the host's Docker daemon. An attacker can instruct the daemon to launch a new privileged container with `-v /:/host-root`, chroot into the host's root filesystem, add backdoor SSH keys, modify `/etc/shadow`, and gain **unrestricted root control over the physical host server**.
+
+**Q3: What makes running a container with `--privileged` dangerous?**
+
+Running a container with `--privileged`: (1) Disables Seccomp syscall filtering; (2) Disables AppArmor / SELinux mandatory access controls; (3) Grants all 40+ Linux kernel capabilities (including `CAP_SYS_ADMIN` and `CAP_SYS_MODULE`); (4) Maps all physical host hardware device nodes (`/dev/sda`, `/dev/mem`, `/dev/kmsg`) directly into the container. An attacker inside a privileged container can simply mount the host disk (`mount /dev/sda1 /mnt`) and read or alter all host operating system files.
+
+**Q4: How can an attacker exploit `--pid=host` combined with `CAP_SYS_PTRACE` to escape a container?**
+
+When a container shares the host's PID namespace (`--pid=host`), it can see all host processes, including `systemd` (PID 1) and host SSH daemons. If the container also possesses the **`CAP_SYS_PTRACE`** capability (or runs as root), an attacker can use the `ptrace(2)` system call to attach to a running host root process, inject malicious shellcode or a reverse shell payload directly into that process's memory space, and execute arbitrary code with host root privileges.
+
+**Q5: How do Kubernetes Pod Security Standards (PSS) prevent container breakout attacks?**
+
+Kubernetes Pod Security Standards define three policy tiers: **Privileged**, **Baseline**, and **Restricted**. When a namespace enforces the **`restricted`** profile via Pod Security Admission (PSA):
+1. It forbids `privileged: true`.
+2. It forbids host namespace sharing (`hostPID: true`, `hostNetwork: true`, `hostIPC: true`).
+3. It forbids dangerous capabilities and mandates dropping `ALL` capabilities except `NET_BIND_SERVICE`.
+4. It forbids running as root (`runAsNonRoot: true`) and restricts hostPath volume mounts.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that orphaned namespaces occur when fds or bind mounts remain open
+- [ ] Know that mounting `/var/run/docker.sock` is equivalent to giving host root
+- [ ] Know that `--privileged` disables Seccomp/AppArmor and exposes `/dev/sda`
+- [ ] Know that `--pid=host` allows process memory injection via `ptrace`
+- [ ] Know how to detect zero-process leaked namespaces using `lsns -t net`
+- [ ] Know that Kubernetes `restricted` PSS policy blocks all breakout vectors

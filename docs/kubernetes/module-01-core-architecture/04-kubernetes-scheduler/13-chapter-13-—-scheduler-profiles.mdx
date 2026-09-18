@@ -1,0 +1,1356 @@
+---
+title: "Chapter 13 — Scheduler Profiles"
+sidebar_position: 13
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand how Kubernetes supports multiple scheduling behaviors using **Scheduler Profiles**. Learn how a single Scheduler process can expose multi..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 13 — Scheduler Profiles
+
+> **Goal:** Understand how Kubernetes supports multiple scheduling behaviors using **Scheduler Profiles**. Learn how a single Scheduler process can expose multiple scheduling policies, how Pods select profiles using `schedulerName`, how different plugin chains are configured, and how Scheduler Profiles enable multi-tenant platforms, AI infrastructure, and high-performance production environments without modifying Kubernetes source code.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What Scheduler Profiles are and why they exist
+> 2. How Pods select a profile via spec.schedulerName
+> 3. Profile configuration: different plugin chains per profile
+> 4. Enabling / disabling plugins per profile
+> 5. Multi-tenant scheduling: workload-specific profiles
+> 6. GPU and AI workload scheduling profiles
+> 7. High-throughput batch vs interactive latency profiles
+> 8. KubeSchedulerConfiguration API and production examples
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Scheduler Profiles like different security lanes at an airport.
+
+```text
+Airport Security Lane Analogy:
+
+All lanes belong to the same airport security department
+Business class lane (GPU profile) has different rules than economy
+TSA Pre lane (batch profile) has expedited processing
+Each lane has the same underlying staff (scheduler process)
+Passenger chooses lane at check-in (schedulerName in Pod spec)
+But all passengers exit to the same terminal (Kubernetes cluster)
+```
+
+| Airport Security Lane | Scheduler Profiles |
+| :--- | :--- |
+| Airport security department | Single `kube-scheduler` process |
+| Different security lanes | Different Profiles |
+| TSA Pre lane | High-throughput batch profile |
+| Business class lane | GPU/AI workload profile |
+| Passenger chooses lane | Pod sets `spec.schedulerName` |
+| Same terminal after security | Same Kubernetes cluster after scheduling |
+
+> **Important:** Multiple Scheduler Profiles **share the same scheduler process** — they are **not** separate processes. All profiles run within a single `kube-scheduler` binary and share the same Informer cache and event loop. This is fundamentally different from running multiple separate scheduler deployments with different `schedulerName` values.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Scheduler Architecture
+- Scheduling Framework
+- Extension Points
+- Filter Plugins
+- Score Plugins
+- Reserve
+- Permit
+- Bind
+- Preemption
+
+---
+
+# What Is a Scheduler Profile?
+
+A Scheduler Profile is:
+
+> **A named scheduling configuration that defines which plugins are enabled, disabled, ordered, and configured for Pods that use that profile.**
+
+Think of it as a **different personality** for the Scheduler.
+
+---
+
+# Why Do Scheduler Profiles Exist?
+
+Imagine a company running:
+
+```text
+Web Applications
+
+AI Training
+
+Databases
+
+Batch Jobs
+
+CI/CD
+
+Edge Services
+```
+
+Should every workload use exactly the same scheduling rules?
+
+Usually,
+
+the answer is:
+
+```text
+No
+```
+
+Different workloads have different requirements.
+
+---
+
+# Before Scheduler Profiles
+
+Historically,
+
+many organizations created:
+
+```text
+Scheduler A
+
+v
+
+Web Apps
+
+Scheduler B
+
+v
+
+AI
+
+Scheduler C
+
+v
+
+Batch Jobs
+```
+
+Problems:
+
+- Multiple Scheduler processes
+- More operational complexity
+- Configuration duplication
+- Higher maintenance cost
+
+---
+
+# With Scheduler Profiles
+
+Instead:
+
+```text
+One Scheduler
+
+        |
+
+ ┌──────┼────────┐
+
+ ▼      ▼        ▼
+
+Web   AI      Batch
+
+Profile Profile Profile
+```
+
+One Scheduler process,
+
+multiple scheduling behaviors.
+
+---
+
+# High-Level Architecture
+
+```text
+                   kube-scheduler
+
+                        |
+
+        ┌───────────────┼───────────────┐
+
+        ▼               ▼               ▼
+
+ Profile: web      Profile: ai     Profile: batch
+
+        |               |               |
+
+ Different Plugin  Different Plugin  Different Plugin
+
+      Chains           Chains            Chains
+```
+
+---
+
+# What Is Inside a Profile?
+
+A Scheduler Profile contains:
+
+- Scheduler name
+- Enabled plugins
+- Disabled plugins
+- Plugin order
+- Plugin-specific configuration
+
+Conceptually:
+
+```text
+Profile
+
+v
+
+Plugin Configuration
+
+v
+
+Scheduling Behavior
+```
+
+---
+
+# Multiple Profiles
+
+A single Scheduler may expose several profiles.
+
+Example:
+
+```text
+default
+
+v
+
+general-purpose
+
+ai
+
+v
+
+GPU optimized
+
+batch
+
+v
+
+High utilization
+```
+
+Each profile behaves differently,
+
+even though they run inside the same Scheduler process.
+
+---
+
+# Visual Example
+
+```text
+Incoming Pods
+
+        |
+
+        ▼
+
+schedulerName
+
+        |
+
+ ┌──────┼────────┐
+
+ ▼      ▼        ▼
+
+default ai      batch
+
+ |       |        |
+
+Profile Profile Profile
+
+ |       |        |
+
+Different Scheduling Logic
+```
+
+---
+
+# schedulerName
+
+How does Kubernetes know which profile to use?
+
+Every Pod contains:
+
+```yaml
+spec:
+  schedulerName: default-scheduler
+```
+
+The value of `schedulerName` determines which Scheduler (or Scheduler Profile) should process the Pod.
+
+---
+
+# Important Clarification
+
+There are two related concepts:
+
+1.
+
+```text
+Multiple Scheduler Processes
+```
+
+2.
+
+```text
+Multiple Profiles
+
+Inside One Scheduler
+```
+
+Within a single Scheduler,
+
+each profile is identified by its own scheduler name.
+
+Pods select the appropriate profile using:
+
+```yaml
+schedulerName
+```
+
+---
+
+# Example
+
+General application:
+
+```yaml
+spec:
+  schedulerName: default-scheduler
+```
+
+AI workload:
+
+```yaml
+spec:
+  schedulerName: ai-scheduler
+```
+
+Batch workload:
+
+```yaml
+spec:
+  schedulerName: batch-scheduler
+```
+
+Each Pod is evaluated using the matching Scheduler Profile.
+
+---
+
+# Scheduling Flow
+
+```text
+Pod Created
+
+v
+
+Read schedulerName
+
+v
+
+Find Matching Profile
+
+v
+
+Execute Profile's Plugin Chain
+
+v
+
+Schedule Pod
+```
+
+---
+
+# Different Plugin Chains
+
+Every profile can have a different plugin pipeline.
+
+Example:
+
+```text
+Default Profile
+
+v
+
+NodeResourcesFit
+
+v
+
+NodeAffinity
+
+v
+
+BalancedAllocation
+```
+
+---
+
+AI Profile:
+
+```text
+GPU Filter
+
+v
+
+GPU Scoring
+
+v
+
+Topology
+
+v
+
+ImageLocality
+```
+
+---
+
+Batch Profile:
+
+```text
+MostAllocated
+
+v
+
+Packing
+
+v
+
+Cost Optimization
+```
+
+Each profile optimizes for different objectives.
+
+---
+
+# Profile Comparison
+
+| Profile | Main Goal |
+|----------|-----------|
+| Default | General-purpose scheduling |
+| AI | GPU-aware scheduling |
+| Batch | Maximum resource utilization |
+| Database | Stable, predictable placement |
+| Edge | Low-latency placement |
+
+---
+
+# Different Filter Chains
+
+Example:
+
+Default:
+
+```text
+NodeResourcesFit
+
+v
+
+NodeAffinity
+
+v
+
+TaintToleration
+```
+
+---
+
+AI:
+
+```text
+GPU Availability
+
+v
+
+Driver Validation
+
+v
+
+NUMA Awareness
+
+v
+
+HugePages
+
+v
+
+NodeAffinity
+```
+
+Different workloads require different eligibility checks.
+
+---
+
+# Different Score Chains
+
+General workloads:
+
+```text
+LeastAllocated
+
+v
+
+BalancedAllocation
+```
+
+AI workloads:
+
+```text
+GPU Locality
+
+v
+
+ImageLocality
+
+v
+
+NUMA
+
+v
+
+Topology
+```
+
+Batch workloads:
+
+```text
+MostAllocated
+
+v
+
+Packing
+```
+
+---
+
+# Plugin Configuration
+
+Profiles do not merely enable plugins.
+
+They can also configure them differently.
+
+Example:
+
+```text
+Profile A
+
+LeastAllocated
+
+Weight
+
+1
+```
+
+---
+
+Profile B:
+
+```text
+LeastAllocated
+
+Weight
+
+5
+```
+
+Same plugin,
+
+different scheduling behavior.
+
+---
+
+# Multi-Tenant Scheduling
+
+One of the biggest uses of Scheduler Profiles is:
+
+```text
+Multi-Tenant Clusters
+```
+
+---
+
+# What Is Multi-Tenancy?
+
+One Kubernetes cluster hosts:
+
+```text
+Team A
+
+Team B
+
+Team C
+
+Customer D
+```
+
+Each tenant has different requirements.
+
+---
+
+# Example
+
+Platform:
+
+```text
+Finance
+
+v
+
+Strict Isolation
+
+AI
+
+v
+
+GPU Scheduling
+
+Analytics
+
+v
+
+Packing
+
+Web
+
+v
+
+Balanced
+```
+
+Instead of multiple clusters,
+
+Scheduler Profiles provide workload-specific scheduling behavior.
+
+---
+
+# Multi-Tenant Architecture
+
+```text
+Shared Cluster
+
+        |
+
+ ┌──────┼────────┐
+
+ ▼      ▼        ▼
+
+Team A Team B Team C
+
+ |       |        |
+
+Profile Profile Profile
+
+ |       |        |
+
+Different Policies
+```
+
+---
+
+# Benefits
+
+Multi-tenant scheduling provides:
+
+- Better resource utilization
+- Lower infrastructure cost
+- Centralized operations
+- Workload-specific optimization
+- Simplified management
+
+---
+
+# High Performance Profiles
+
+High-performance computing (HPC) workloads have unique needs.
+
+Examples:
+
+- Scientific simulations
+- Financial modeling
+- Weather forecasting
+- Genomics
+- Engineering analysis
+
+---
+
+# HPC Scheduling Priorities
+
+Typical goals include:
+
+```text
+Low Latency
+
+NUMA Awareness
+
+CPU Locality
+
+Topology
+
+Minimal Fragmentation
+```
+
+A dedicated profile can optimize for these objectives.
+
+---
+
+# Example HPC Profile
+
+```text
+Filter
+
+v
+
+NUMA
+
+v
+
+HugePages
+
+v
+
+CPU Affinity
+
+v
+
+Topology
+
+v
+
+Score
+
+v
+
+Balanced CPU
+```
+
+---
+
+# Why?
+
+Poor placement may cause:
+
+- Higher latency
+- Memory penalties
+- Cache inefficiency
+- Cross-socket communication
+
+Dedicated profiles help avoid these issues.
+
+---
+
+# AI Workload Profiles
+
+Modern AI clusters have specialized scheduling requirements.
+
+Typical resources:
+
+- GPUs
+- High-bandwidth networking
+- Large container images
+- Fast storage
+- Specialized accelerators
+
+---
+
+# AI Scheduling Priorities
+
+Typical plugin chain:
+
+```text
+GPU Filter
+
+v
+
+GPU Resource Fit
+
+v
+
+ImageLocality
+
+v
+
+Topology
+
+v
+
+Balanced Allocation
+```
+
+---
+
+# Why ImageLocality?
+
+AI images are often:
+
+```text
+20 GB
+
+40 GB
+
+80 GB
+```
+
+Scheduling onto a Node that already has the required image can significantly reduce startup time.
+
+---
+
+# AI Cluster Example
+
+Nodes:
+
+```text
+GPU-A
+
+v
+
+CUDA Cached
+
+GPU-B
+
+v
+
+Needs Download
+```
+
+ImageLocality favors:
+
+```text
+GPU-A
+```
+
+---
+
+# Production Example
+
+Training Job:
+
+```text
+16 GPUs
+
+v
+
+Profile
+
+AI
+
+v
+
+GPU Filters
+
+v
+
+GPU Scoring
+
+v
+
+Bind
+```
+
+No changes to Scheduler source code are required.
+
+---
+
+# Production Configuration
+
+Conceptually,
+
+the Scheduler configuration contains:
+
+```text
+Profiles
+
+v
+
+Plugin Configuration
+
+v
+
+Scheduler Names
+```
+
+Each profile defines:
+
+- Scheduler name
+- Enabled plugins
+- Disabled plugins
+- Plugin configuration
+- Plugin weights
+
+---
+
+# Conceptual Configuration
+
+```text
+Scheduler
+
+        |
+
+ ┌──────┼────────┐
+
+ ▼      ▼        ▼
+
+default ai     batch
+
+ |       |        |
+
+Plugins Plugins Plugins
+```
+
+Each profile behaves independently.
+
+---
+
+# End-to-End Workflow
+
+```text
+Pod Created
+
+v
+
+schedulerName
+
+v
+
+Matching Profile
+
+v
+
+Filter Plugins
+
+v
+
+Score Plugins
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+The scheduling pipeline is determined entirely by the selected profile.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Pod
+
+v
+
+schedulerName
+
+v
+
+Scheduler Profile
+
+v
+
+Plugin Chain
+
+v
+
+Filter
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+Scheduler Profiles determine **how** each phase behaves.
+
+---
+
+# Production Example 1
+
+Cloud Platform
+
+Applications:
+
+```text
+Customer APIs
+
+v
+
+Default Profile
+```
+
+Batch Analytics:
+
+```text
+Batch Profile
+
+v
+
+MostAllocated
+```
+
+Machine Learning:
+
+```text
+AI Profile
+
+v
+
+GPU Optimized
+```
+
+One cluster,
+
+three scheduling strategies.
+
+---
+
+# Production Example 2
+
+SaaS Platform
+
+Tenants:
+
+```text
+Enterprise
+
+v
+
+High Availability
+
+Startup
+
+v
+
+Cost Optimized
+
+Internal
+
+v
+
+Balanced
+```
+
+Different Scheduler Profiles optimize each tenant independently.
+
+---
+
+# Production Example 3
+
+Edge Computing
+
+Edge Profile:
+
+```text
+Latency
+
+v
+
+Network Awareness
+
+v
+
+Regional Preference
+
+v
+
+Bind
+```
+
+Workloads stay close to end users.
+
+---
+
+# Production Example 4
+
+Financial Services
+
+Trading Engine:
+
+```text
+High Performance Profile
+```
+
+Reporting Jobs:
+
+```text
+Batch Profile
+```
+
+Development:
+
+```text
+Default Profile
+```
+
+Different scheduling goals coexist within the same Kubernetes cluster.
+
+---
+
+# Performance Considerations
+
+Scheduler Profiles are lightweight because:
+
+- They share the same Scheduler process.
+- They share informers and caches.
+- Only the plugin pipeline changes.
+
+This is far more efficient than running multiple independent Schedulers for many common use cases.
+
+---
+
+# Scheduler Profiles vs Multiple Schedulers
+
+| Scheduler Profiles | Multiple Scheduler Processes |
+|--------------------|------------------------------|
+| One Scheduler process | Multiple Scheduler binaries |
+| Shared cache and informers | Separate caches and watches |
+| Lower operational overhead | Higher operational overhead |
+| Different plugin chains | Completely independent schedulers |
+| Best for policy customization | Best when complete scheduler isolation is required |
+
+---
+
+# Production Best Practices
+
+✔ Keep the default profile suitable for most workloads.
+
+✔ Create specialized profiles only when workload behavior genuinely differs.
+
+✔ Give each profile a clear and meaningful `schedulerName`.
+
+✔ Avoid excessive profile proliferation.
+
+✔ Reuse built-in plugins whenever possible.
+
+✔ Tune plugin weights independently for each profile.
+
+✔ Validate profile behavior in staging before production rollout.
+
+✔ Monitor scheduling latency separately for each profile.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Every Scheduler Profile requires a new Scheduler process.
+
+Wrong.
+
+Multiple profiles typically run inside the same Scheduler.
+
+---
+
+### ❌ Misconception 2
+
+Profiles only change scoring.
+
+Wrong.
+
+They can customize multiple extension points, including filtering, scoring, reserve, permit, pre-bind, bind, and post-bind.
+
+---
+
+### ❌ Misconception 3
+
+`schedulerName` always means a different Scheduler binary.
+
+Wrong.
+
+It may refer to a different profile within the same Scheduler process or to an entirely different Scheduler process, depending on the deployment.
+
+---
+
+### ❌ Misconception 4
+
+AI workloads only need GPU-aware filtering.
+
+Wrong.
+
+They often benefit from topology awareness, image locality, and accelerator-specific scoring.
+
+---
+
+### ❌ Misconception 5
+
+Scheduler Profiles improve performance automatically.
+
+Wrong.
+
+They improve flexibility. Performance depends on the quality of plugin configuration.
+
+---
+
+### ❌ Misconception 6
+
+Every tenant should have its own Scheduler Profile.
+
+Wrong.
+
+Profiles should reflect different scheduling policies, not simply organizational boundaries.
+
+---
+
+### ❌ Misconception 7
+
+Profiles modify Kubernetes source code.
+
+Wrong.
+
+Profiles configure Scheduler behavior without changing the Scheduler implementation.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is a Scheduler Profile?
+
+A named scheduling configuration that defines the plugin chain and plugin settings used for Pods selecting that profile.
+
+---
+
+### Q2. Why were Scheduler Profiles introduced?
+
+To support multiple scheduling behaviors within a single Scheduler process without modifying Kubernetes source code.
+
+---
+
+### Q3. How does a Pod select a Scheduler Profile?
+
+By specifying the appropriate `schedulerName` in its specification.
+
+---
+
+### Q4. Can different profiles use different plugin chains?
+
+Yes. Each profile can enable, disable, order, and configure plugins independently.
+
+---
+
+### Q5. What is the benefit of Scheduler Profiles in multi-tenant clusters?
+
+Different workloads or tenants can use different scheduling policies while sharing the same Kubernetes cluster.
+
+---
+
+### Q6. Why are AI workloads good candidates for dedicated Scheduler Profiles?
+
+Because they often require GPU-aware filtering, accelerator-aware scoring, topology optimization, and image locality.
+
+---
+
+### Q7. What is the difference between Scheduler Profiles and multiple Scheduler processes?
+
+Profiles share a Scheduler process and caches, while multiple Scheduler processes operate independently.
+
+---
+
+### Q8. Can plugin weights differ between profiles?
+
+Yes. Each profile can configure plugin weights independently.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod remains Pending with "no scheduler" behavior | `schedulerName` does not match any configured Scheduler or Scheduler Profile |
+| Workload uses unexpected scheduling policy | Incorrect `schedulerName` specified in the Pod |
+| AI workload scheduled onto non-GPU Nodes | AI profile missing GPU-related Filter or Score plugins |
+| Batch jobs spread across too many Nodes | Packing-oriented scoring strategy not configured |
+| Different teams observe inconsistent scheduling | Pods are using different Scheduler Profiles or plugin configurations |
+| High scheduling latency for one workload type | Plugin chain for that profile is too complex or inefficient |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is a Scheduler Profile?
+2. Why were Scheduler Profiles introduced?
+3. How does `schedulerName` influence scheduling?
+4. How can multiple profiles coexist within one Scheduler?
+5. What is a plugin chain?
+6. Why are different plugin chains useful?
+7. How do Scheduler Profiles support multi-tenant platforms?
+8. Why are dedicated AI profiles beneficial?
+9. How do HPC profiles differ from general-purpose profiles?
+10. What configuration elements define a Scheduler Profile?
+11. How do Scheduler Profiles differ from multiple Scheduler processes?
+12. What are the best practices for production profile design?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes uses **Scheduler Profiles** to support multiple scheduling behaviors within a single Scheduler.
+
+You learned:
+
+- Why Scheduler Profiles exist
+- How multiple profiles share one Scheduler process
+- How Pods select profiles using `schedulerName`
+- How different plugin chains provide workload-specific scheduling behavior
+- How Scheduler Profiles enable efficient multi-tenant platforms
+- How specialized profiles optimize AI, HPC, and batch workloads
+- How production environments configure and manage multiple scheduling strategies
+- Why Scheduler Profiles provide flexibility without modifying Kubernetes source code
+
+Scheduler Profiles are one of the most powerful features of the modern Scheduling Framework. By allowing different plugin chains and configurations to coexist, Kubernetes can optimize scheduling for diverse workload types while maintaining a single, scalable Scheduler architecture.
+
+---
+
+# Next Chapter
+
+**Chapter 14 — Writing Custom Scheduler Plugins**
+
+In the next chapter, we'll move beyond built-in functionality and learn how to extend Kubernetes scheduling.
+
+Topics include:
+
+- Scheduler Framework APIs
+- Plugin Interfaces
+- Writing Custom Filter Plugins
+- Writing Custom Score Plugins
+- Reserve and Permit Plugins
+- Plugin Registration
+- Building and Testing Plugins
+- Production Deployment Strategies
+
+You'll learn how to build your own Scheduler Plugins to implement organization-specific scheduling policies without rewriting the Kubernetes Scheduler.
+```

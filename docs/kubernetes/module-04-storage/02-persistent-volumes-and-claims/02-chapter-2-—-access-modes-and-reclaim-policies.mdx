@@ -1,0 +1,292 @@
+---
+title: "Chapter 2 — Access Modes & Reclaim Policies"
+sidebar_position: 2
+module: "Module 4.2 — PersistentVolumes & Claims"
+description: "Master Kubernetes storage access modes (RWO, ROX, RWX, RWOP) and reclaim policies (Retain, Delete) — single-pod exclusivity, multi-node shared storage, and Released PV data recovery."
+---
+
+# Chapter 2 — Access Modes & Reclaim Policies
+
+> **Goal:** Master storage access modes and volume lifecycle reclamation in Kubernetes — understanding the operational boundaries between `ReadWriteOnce`, `ReadOnlyMany`, `ReadWriteMany`, and the modern `ReadWriteOncePod` (RWOP) exclusivity mode, configuring `Retain` versus `Delete` reclaim policies, executing manual data recovery on `Released` volumes, and preventing multi-node block filesystem corruption.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4 Kubernetes Storage Access Modes (RWO, ROX, RWX, RWOP) and their node/pod boundaries
+> 2. Why `ReadWriteOncePod` (RWOP) is critical for single-writer database integrity
+> 3. Why block storage (AWS EBS, GCP PD) cannot support `ReadWriteMany`
+> 4. The 3 Reclaim Policies: `Retain` (manual safety), `Delete` (automated cleanup), and deprecated `Recycle`
+> 5. The exact step-by-step administrator protocol to safely rebind a `Released` PersistentVolume
+> 6. How storage access modes interact with Kubelet mount controllers
+
+---
+
+## Real-Life Analogy
+
+Think of access modes and reclaim policies as **different types of library study rooms and checkout policies**:
+
+- **`ReadWriteOnce` (RWO - One Household at a Time):** A private study room booked for Family A. Multiple family members (Pods on the same node) can enter the room and write on the whiteboards together. But members of Family B sitting in a different building (another worker node) are locked out.
+- **`ReadWriteMany` (RWX - A Communal Workshop):** A public makerspace (NFS / AWS EFS). Hundreds of students from 20 different universities (Pods across dozens of nodes) can walk in and work simultaneously on the shared tools.
+- **`ReadWriteOncePod` (RWOP - A Single-Person Soundproof Booth):** A solitary recording booth with a strict security latch. Only **one single individual** (one single Pod) is allowed inside. Even your own family members on the same node are locked out to ensure 100% uninterrupted audio quality.
+- **`Retain` Reclaim Policy (Personal Locker):** When you graduate and return your student ID (PVC deleted), the university does **not** throw your textbooks in the incinerator. They lock the locker (`Status: Released`) and wait for the dean (Administrator) to review your locker contents before assigning it to a new student.
+- **`Delete` Reclaim Policy (Hotel Keycard):** When you check out of a hotel room (PVC deleted), the room is automatically scrubbed and reset for the next guest immediately.
+
+---
+
+## Architecture Diagram
+
+```text
+               Access Mode Node & Pod Boundaries
+
+ 1. ReadWriteOnce (RWO): Node-Bound Multi-Pod
+ ┌──────────────────────────────────────┐     ┌──────────────────────────────────────┐
+ │ Worker Node A                        │     │ Worker Node B                        │
+ │ ┌──────────────┐    ┌──────────────┐ │     │ ┌──────────────┐                     │
+ │ │ Pod 1 (Read) │    │ Pod 2 (Write)│ │     │ │ Pod 3        │                     │
+ │ └──────┬───────┘    └──────┬───────┘ │     │ └──────┬───────┘                     │
+ │        │                   │         │     │        │                             │
+ │        ▼                   ▼         │     │        ▼                             │
+ │   [ Mounts EBS Volume (xvdf) ]       │     │   [ ACCESS DENIED! ]                 │
+ └──────────────────────────────────────┘     └──────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. ReadWriteMany (RWX): Multi-Node Network Shared
+ ┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+ │ Worker Node A        │    │ Worker Node B        │    │ Worker Node C        │
+ │ [ Pod 1 (Read/Write)│    │ [ Pod 2 (Read/Write)│    │ [ Pod 3 (Read/Write)│
+ └──────────┬───────────┘    └──────────┬───────────┘    └──────────┬───────────┘
+            │                           │                           │
+            └───────────────────────────┼───────────────────────────┘
+                                        ▼
+                  [ Shared NFS / AWS EFS / CephFS Mount ]
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 3. ReadWriteOncePod (RWOP - K8s 1.29+ GA): Single-Pod Exclusive
+ ┌──────────────────────────────────────┐
+ │ Worker Node A                        │
+ │ ┌──────────────────────────────────┐ │     ┌──────────────────────────────────┐
+ │ │ Pod 1: Active Writer (GRANTED!)  │ │     │ Pod 2 (Same Node): LOCKED OUT!   │
+ │ └──────────────────┬───────────────┘ │     │ (Blocked to prevent split-brain) │
+ │                    ▼                 │     └──────────────────────────────────┘
+ │        [ Dedicated EBS Disk ]        │
+ └──────────────────────────────────────┘
+```
+
+---
+
+## The 4 Storage Access Modes
+
+In Kubernetes, access modes describe **how nodes and pods can access the storage**:
+
+```text
+ ┌──────────────────────┬─────────┬───────────────────────────────────────────────────────────────────┐
+ │ Access Mode          │ CLI Tag │ Access Scope & Operational Rule                                   │
+ │──────────────────────┼─────────┼───────────────────────────────────────────────────────────────────┤
+ │ **`ReadWriteOnce`**  │ `RWO`   │ Volume can be mounted as read-write by **a single Node**.         │
+ │                      │         │ Multiple Pods on the *same node* can read/write simultaneously.   │
+ │──────────────────────┼─────────┼───────────────────────────────────────────────────────────────────┤
+ │ **`ReadOnlyMany`**   │ `ROX`   │ Volume can be mounted as read-only by **many Nodes** concurrently.│
+ │                      │         │ Ideal for static media assets or shared machine learning datasets.│
+ │──────────────────────┼─────────┼───────────────────────────────────────────────────────────────────┤
+ │ **`ReadWriteMany`**  │ `RWX`   │ Volume can be mounted as read-write by **many Nodes** concurrently│
+ │                      │         │ Requires network filesystems (NFS, AWS EFS, GCP Filestore, CephFS)│
+ │──────────────────────┼─────────┼───────────────────────────────────────────────────────────────────┤
+ │ **`ReadWriteOncePod`**│ `RWOP`  │ Volume can be mounted as read-write by **EXACTLY ONE Pod** in the │
+ │                      │ (GA 1.29│ entire cluster. Prevents concurrent writes even on the same node! │
+ └──────────────────────┴─────────┴───────────────────────────────────────────────────────────────────┘
+```
+
+> [!WARNING]
+> **Why Block Storage Cannot Support RWX:** Cloud block storage devices (such as AWS EBS, GCP Persistent Disk, or Azure Managed Disk) are raw block devices formatted with local filesystems (ext4/XFS). Local filesystems lack distributed metadata locking. Attaching a block volume to multiple nodes simultaneously will corrupt the filesystem within seconds. RWX **requires** a distributed network file server (NFS/CephFS).
+
+---
+
+## The 3 Reclaim Policies
+
+The `.spec.persistentVolumeReclaimPolicy` tells Kubernetes what to do with the physical storage asset when its bound PersistentVolumeClaim is deleted:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Reclaim Policy       │ Behavior & Data Safety                                                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Retain`**         │ **Manual Safety (Production Standard).**                                    │
+ │                      │ The PV transitions to `Released`. The underlying data on disk is preserved. │
+ │                      │ No other PVC can claim the PV until an administrator manually cleans it.    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Delete`**         │ **Automated Cleanup (Dynamic Default).**                                    │
+ │                      │ The PV object AND the underlying cloud storage asset (AWS EBS volume, etc.) │
+ │                      │ are deleted from the cloud provider immediately upon PVC deletion!         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Recycle`**        │ **Deprecated.**                                                             │
+ │                      │ Ran `rm -rf /volume/*` on the volume. Replaced by dynamic provisioning.     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The `Released` PV Recovery Runbook
+
+When a PVC bound to a `Retain` PV is deleted, the PV is marked **`Released`**. It cannot be claimed by any new PVC because its `.spec.claimRef` still contains the UID of the deleted claim.
+
+```text
+ Step-by-Step Administrator Recovery Protocol:
+
+ 1. Verify and Backup Data:
+    Mount the underlying cloud volume or NFS path and create a backup snapshot.
+
+ 2. Scrub Sensitive Data (Optional):
+    Delete obsolete database files if preparing for a new application.
+
+ 3. Strip the `claimRef` from the PersistentVolume:
+    Edit the PV YAML and remove `.spec.claimRef` (or patch via kubectl).
+
+ 4. Observe Status Transition:
+    As soon as `claimRef` is removed, the `pv-controller` immediately marks the 
+    PersistentVolume as **`Available`**!
+
+ 5. Rebinding:
+    New PVCs can now match and bind to the volume cleanly.
+```
+
+```bash
+# Removing claimRef to make a Released PV Available again
+kubectl patch pv <pv-name> -p '{"spec":{"claimRef": null}}'
+```
+
+---
+
+## Complete Production Manifest with RWOP Exclusivity
+
+```yaml
+# 1. High-Performance Single-Pod Exclusive Database Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mission-critical-db-pvc
+  namespace: database
+spec:
+  # Guarantees no two database pods can attach simultaneously during rolling updates
+  accessModes:
+    - ReadWriteOncePod    # GA in Kubernetes 1.29+
+  storageClassName: ebs-gp3-sc
+  resources:
+    requests:
+      storage: 100Gi
+---
+# 2. Shared Multi-Node Assets Storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-web-assets-pvc
+  namespace: web
+spec:
+  # Allows hundreds of web pods across all nodes to read/write concurrently
+  accessModes:
+    - ReadWriteMany
+  storageClassName: aws-efs-sc
+  resources:
+    requests:
+      storage: 500Gi
+```
+
+---
+
+## Hands-On Lab: Testing Reclaim Policies & Releasing PVs
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace reclaim-lab
+
+# Step 2: Create a PersistentVolume with Retain policy
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: safe-storage-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual-retain
+  hostPath:
+    path: /tmp/safe-data
+    type: DirectoryOrCreate
+EOF
+
+# Step 3: Create and bind a matching PVC
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: safe-claim
+  namespace: reclaim-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: manual-retain
+  resources:
+    requests:
+      storage: 500Mi
+EOF
+
+# Step 4: Verify PV and PVC are Bound
+sleep 2
+kubectl get pv safe-storage-pv
+# Status: Bound
+
+# Step 5: Delete the PVC to trigger the Retain lifecycle
+kubectl delete pvc safe-claim -n reclaim-lab
+
+# Step 6: Verify the PV transitions to "Released" status (Data is SAFE!)
+kubectl get pv safe-storage-pv
+# Notice Status: Released!
+
+# Step 7: Reclaim the PV by stripping the claimRef UID
+kubectl patch pv safe-storage-pv -p '{"spec":{"claimRef": null}}'
+
+# Step 8: Verify the PV is now "Available" for new claims!
+kubectl get pv safe-storage-pv
+# Status: Available!
+
+# Step 9: Clean up lab
+kubectl delete namespace reclaim-lab
+kubectl delete pv safe-storage-pv
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between `ReadWriteOnce` (RWO) and `ReadWriteOncePod` (RWOP)?**
+
+`ReadWriteOnce` (RWO) restricts volume access to a **single worker node**; however, multiple Pods running on that *same node* are permitted to mount and write to the volume simultaneously. `ReadWriteOncePod` (RWOP, GA in Kubernetes 1.29) restricts access to **exactly one Pod across the entire cluster**. If Pod A is running with an RWOP volume on Node 1, Pod B (even on Node 1) will be blocked by the CSI storage driver from mounting the volume, eliminating split-brain data corruption risks during database updates.
+
+**Q2: Why can't cloud block storage (like AWS EBS or GCP Persistent Disk) be configured with `ReadWriteMany`?**
+
+Cloud block storage represents virtual SCSI/NVMe hardware attached to a single VM hypervisor formatted with local filesystems (ext4, XFS). Local filesystems do not have distributed lock managers to synchronize block allocation tables, inode updates, or buffer caches across multiple distinct operating systems. If multiple nodes write to the same raw block disk concurrently, filesystem metadata becomes corrupt within seconds. `ReadWriteMany` requires distributed network storage (such as NFS, AWS EFS, or CephFS).
+
+**Q3: What happens to physical storage when a PVC is deleted under `persistentVolumeReclaimPolicy: Retain` vs `Delete`?**
+
+Under `Delete` (the default for dynamic StorageClasses), deleting the PVC triggers the CSI driver to immediately delete the `PersistentVolume` object and send an API call to the cloud provider to permanently destroy the underlying virtual disk. Under `Retain`, deleting the PVC preserves the PV object and leaves the physical cloud disk completely untouched; the PV transitions to the `Released` state, preventing data loss until an administrator manually recovers or archives the data.
+
+**Q4: How do you make a `Released` PersistentVolume available to bind to a new PVC?**
+
+When a PV is `Released`, its `.spec.claimRef` continues to hold the UUID of the deleted PVC to prevent accidental overwrites. To make it available: (1) Verify or backup the data on disk; (2) Remove the claim reference by running `kubectl patch pv <pv-name> -p '{"spec":{"claimRef": null}}'`. The `pv-controller` immediately detects that `claimRef` is empty and updates the PV status from `Released` to `Available`, allowing new PVCs to bind to it.
+
+**Q5: What was the `Recycle` reclaim policy, and why was it deprecated?**
+
+The `Recycle` reclaim policy performed a basic scrubbing routine on the volume (equivalent to running `rm -rf /volume/*`) before marking the PV as `Available` again. It was deprecated because it was insecure (did not guarantee cryptographic data erasure), only worked with a limited set of in-tree file plugins (like NFS and hostPath), and has been completely replaced by dynamic provisioning workflows where ephemeral volumes are cleanly deleted and recreated.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 access modes: RWO (1 node), ROX (multi-node read), RWX (multi-node write), RWOP (1 pod)
+- [ ] Know that `ReadWriteOncePod` (RWOP) guarantees single-pod exclusive access (GA 1.29+)
+- [ ] Know why block storage cannot support `ReadWriteMany` (filesystem corruption)
+- [ ] Know that `Retain` preserves data in `Released` status when PVC is deleted
+- [ ] Know that `Delete` destroys the cloud disk asset immediately upon PVC deletion
+- [ ] Know how to make a `Released` PV `Available` by clearing `.spec.claimRef`
+- [ ] Can patch a released PV using `kubectl patch pv <name> -p '{"spec":{"claimRef": null}}'`

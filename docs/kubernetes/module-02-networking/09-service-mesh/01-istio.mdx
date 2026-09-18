@@ -1,0 +1,321 @@
+---
+title: "Chapter 1 — Istio"
+sidebar_position: 1
+module: "Module 2.9 — Service Mesh"
+description: "Deep dive into Istio service mesh — its sidecar proxy architecture, the control plane (istiod), how Envoy proxies intercept all Pod traffic, traffic management with VirtualServices and DestinationRules, and observability (metrics, tracing, logging)."
+---
+
+# Chapter 1 — Istio
+
+> **Goal:** Understand Istio's architecture — how istiod manages the control plane and Envoy sidecars form the data plane, how all traffic is transparently intercepted, and how VirtualServices and DestinationRules enable advanced traffic management.
+>
+> By the end of this chapter, you will understand:
+> 1. What a service mesh is and what problems it solves
+> 2. Istio's control plane (istiod) and data plane (Envoy sidecars)
+> 3. How iptables intercepts all Pod traffic to the Envoy sidecar
+> 4. Traffic management: VirtualService, DestinationRule, canary, circuit breaking
+> 5. Observability: automatic metrics, distributed tracing, access logs
+> 6. mTLS: how Istio automatically secures all inter-service communication
+
+---
+
+## Real-Life Analogy
+
+Without a service mesh: each service team writes their own code for retries, timeouts, circuit breaking, logging, and encryption. Every team reimplements the wheel differently — inconsistent behavior, security gaps.
+
+**Istio** is like hiring a **universal diplomatic corps** for every service:
+
+Each employee (Pod) is assigned a personal diplomat (Envoy sidecar). The diplomat handles ALL communication on behalf of the employee: speaking the right protocol, presenting credentials (mTLS), retrying failed calls, recording the conversation (distributed tracing), and refusing to relay to services that are repeatedly failing (circuit breaking). The employee just says "call the payment service" — the diplomat handles everything else, invisibly and consistently.
+
+---
+
+## Architecture Diagram
+
+```text
+              Istio Architecture
+
+  Control Plane:
+  ┌────────────────────────────────────────────────────────────┐
+  │  istiod (single binary since Istio 1.5)                   │
+  │  ├── Pilot: Service discovery → Envoy xDS config          │
+  │  ├── Citadel: Certificate authority (SPIFFE/X.509 certs)  │
+  │  └── Galley: Config validation                            │
+  └──────────────────────────────────┬─────────────────────────┘
+                                     │ xDS (gRPC)
+                                     │ Push config to all Envoys
+  Data Plane:
+  Pod A                              Pod B
+  ┌─────────────────────────┐   ┌──────────────────────────────┐
+  │  App Container          │   │  App Container               │
+  │  (port 8080)            │   │  (port 8080)                 │
+  │         ↕ (iptables)    │   │       ↕ (iptables)           │
+  │  Envoy Sidecar          │   │  Envoy Sidecar               │
+  │  (port 15001 outbound)  │──▶│  (port 15006 inbound)        │
+  │  (port 15006 inbound)   │   │                              │
+  └─────────────────────────┘   └──────────────────────────────┘
+  Traffic: App → iptables → Envoy (outbound) → network → Envoy (inbound) → App
+```
+
+---
+
+## Sidecar Injection
+
+Istio injects an Envoy proxy container into every Pod in labeled namespaces:
+
+```bash
+# Enable automatic sidecar injection for a namespace
+kubectl label namespace production istio-injection=enabled
+
+# Verify injection
+kubectl get pods -n production
+# NAME                    READY   STATUS    AGE
+# api-deployment-xxx      2/2     Running   5m
+#   ↑ 2 containers: app + envoy sidecar
+
+# View the injected sidecar
+kubectl get pod api-xxx -n production -o jsonpath='{.spec.containers[*].name}'
+# api envoy   ← two containers!
+```
+
+---
+
+## iptables Traffic Interception
+
+The `istio-init` init container sets up iptables rules to redirect all traffic:
+
+```text
+iptables rules (set by istio-init container):
+  All outbound traffic → port 15001 (Envoy outbound listener)
+  All inbound traffic → port 15006 (Envoy inbound listener)
+  Exception: traffic from Envoy itself (UID 1337) is NOT redirected
+  Exception: health check ports are NOT redirected
+
+Result:
+  App opens connection to api-service:8080
+  iptables REDIRECT → Envoy:15001 (outbound)
+  Envoy applies policy (mTLS, retries, circuit breaker)
+  Envoy opens new connection to destination:8080 (with mTLS)
+  Connection: App → iptables → Envoy → (mTLS over network) → Envoy → App
+```
+
+---
+
+## Installing Istio
+
+```bash
+# Download istioctl
+curl -L https://istio.io/downloadIstio | ISTIO_VERSION=1.21.0 sh -
+export PATH=$HOME/istio-1.21.0/bin:$PATH
+
+# Install with the default profile (production use: production profile)
+istioctl install --set profile=default -y
+
+# Verify installation
+kubectl get pods -n istio-system
+# istiod-xxx-xxx   1/1   Running   5m
+# istio-ingressgateway-xxx   1/1   Running   5m
+
+# Check Istio version
+istioctl version
+
+# Enable injection for a namespace
+kubectl label namespace production istio-injection=enabled
+kubectl rollout restart deployment -n production
+```
+
+---
+
+## VirtualService: Traffic Routing
+
+VirtualService defines how traffic is routed to a Service — an L7 routing layer on top of Kubernetes Services:
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-virtual-service
+  namespace: production
+spec:
+  hosts:
+  - api-service          # Traffic for this Service name
+  - api.example.com      # Or this external hostname (via Gateway)
+
+  http:
+  # Canary: route 90% to v1, 10% to v2
+  - route:
+    - destination:
+        host: api-service
+        subset: v1       # Defined in DestinationRule
+      weight: 90
+    - destination:
+        host: api-service
+        subset: v2
+      weight: 10
+
+  # Header-based routing
+  - match:
+    - headers:
+        x-api-version:
+          exact: "v2"
+    route:
+    - destination:
+        host: api-service
+        subset: v2
+
+  # Fault injection for testing
+  - fault:
+      delay:
+        percentage:
+          value: 5.0      # 5% of requests get a 2s delay
+        fixedDelay: 2s
+      abort:
+        percentage:
+          value: 1.0      # 1% of requests return 503
+        httpStatus: 503
+    route:
+    - destination:
+        host: api-service
+```
+
+---
+
+## DestinationRule: Load Balancing and Circuit Breaking
+
+DestinationRule configures policies for traffic AFTER routing decisions:
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: api-destination-rule
+  namespace: production
+spec:
+  host: api-service
+
+  # Global traffic policy
+  trafficPolicy:
+    loadBalancer:
+      simple: LEAST_CONN    # ROUND_ROBIN, LEAST_CONN, RANDOM, PASSTHROUGH
+
+    # Circuit breaker (outlier detection)
+    outlierDetection:
+      consecutive5xxErrors: 3   # After 3 5xx errors...
+      interval: 10s              # ...in 10s window...
+      baseEjectionTime: 30s      # ...eject for 30s
+      maxEjectionPercent: 50     # Eject at most 50% of backends
+
+    # Connection pool (upstream connection limits)
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 5s
+      http:
+        http2MaxRequests: 1000
+        pendingRequests: 50     # Queue limit before triggering circuit breaker
+
+  # Subset definitions (for VirtualService routing)
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+  - name: v2
+    labels:
+      version: v2
+```
+
+---
+
+## Automatic Observability
+
+Istio automatically generates metrics, traces, and logs for all traffic:
+
+```bash
+# Install Prometheus + Grafana + Jaeger addons
+kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.21/samples/addons/prometheus.yaml
+kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.21/samples/addons/grafana.yaml
+kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.21/samples/addons/jaeger.yaml
+kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.21/samples/addons/kiali.yaml
+
+# Open dashboards
+istioctl dashboard grafana     # Istio service dashboard
+istioctl dashboard jaeger      # Distributed tracing
+istioctl dashboard kiali       # Service topology graph
+
+# Key automatic metrics (no instrumentation needed in app code!):
+# istio_requests_total{source_app, destination_app, response_code}
+# istio_request_duration_milliseconds{...}
+# istio_tcp_connections_opened_total{...}
+```
+
+---
+
+## Hands-On: Istio Debugging
+
+```bash
+# 1. Check if Envoy sidecar is injected
+kubectl describe pod api-xxx -n production | grep -A5 "Init Containers:"
+
+# 2. View Envoy config for a Pod (proxy-config)
+istioctl proxy-config routes api-xxx.production
+
+istioctl proxy-config clusters api-xxx.production
+
+istioctl proxy-config endpoints api-xxx.production
+
+# 3. Check Envoy access logs
+kubectl logs api-xxx -n production -c istio-proxy | tail -20
+
+# 4. Check proxy status (is Envoy synced with istiod?)
+istioctl proxy-status
+
+# 5. Check VirtualService is applied
+kubectl get virtualservice -n production
+kubectl describe virtualservice api-virtual-service -n production
+
+# 6. Diagnose a traffic issue
+istioctl analyze -n production
+# Shows: warnings about misconfigured resources
+
+# 7. View active circuit breaker state (is a backend ejected?)
+kubectl exec api-xxx -n production -c istio-proxy -- \
+  curl -s http://localhost:15000/clusters | grep "outlier"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Istio's sidecar proxy model and how does it intercept traffic without changing application code?**
+
+Istio injects an Envoy sidecar container into every Pod. The `istio-init` init container sets up iptables rules that redirect ALL inbound and outbound TCP traffic to Envoy (ports 15006 inbound, 15001 outbound). Traffic from Envoy itself (UID 1337) is excluded to prevent loops. Applications open connections normally — iptables silently redirects them to Envoy, which applies policies (mTLS, retries, circuit breaking, tracing) before forwarding to the actual destination. The application code is completely unaware of Envoy.
+
+**Q2: What is istiod and what does it do?**
+
+Istiod is the single control plane binary that consolidates three previously separate components: Pilot (service discovery and Envoy config generation), Citadel (certificate authority for mTLS certificates), and Galley (configuration validation). Istiod watches Kubernetes API objects (Services, Endpoints, VirtualServices, DestinationRules), translates them into Envoy's xDS configuration format, and pushes updates to all Envoy sidecars via gRPC streaming. It also signs SPIFFE-formatted X.509 certificates for all service identities.
+
+**Q3: What is the difference between VirtualService and DestinationRule in Istio?**
+
+VirtualService defines **where** traffic goes — routing rules based on HTTP headers, paths, methods, source labels. It answers: "Which subset (v1 or v2) gets this request, and what percentage?" DestinationRule defines **how** traffic behaves after routing — load balancing algorithm, circuit breaker settings, connection pool limits, TLS settings. It answers: "How should Envoy connect to the destination, and what are the connection policies?" They work together: VirtualService references DestinationRule subsets; DestinationRule defines what those subsets are.
+
+**Q4: How does Istio implement circuit breaking?**
+
+Istio uses Envoy's outlier detection via the `outlierDetection` field in DestinationRule. When a backend returns consecutive 5xx errors (configurable) within a time window, Envoy marks it as "ejected" — excluded from load balancing for `baseEjectionTime`. During ejection, Envoy routes around the failing backend to healthy ones. After the ejection window, Envoy probes the backend again. This prevents cascading failures: a slow or failing downstream service doesn't bring down all callers that wait for it.
+
+**Q5: What automatic observability does Istio provide without application code changes?**
+
+Istio's Envoy sidecars automatically emit: (1) **Metrics**: Prometheus metrics for every service-to-service call including request rate, error rate, and latency percentiles — no app code changes needed. (2) **Distributed Tracing**: If the first service propagates Istio's B3 trace headers (or W3C trace-context), Envoy automatically adds spans for each hop — full end-to-end trace visible in Jaeger/Zipkin. (3) **Access Logs**: Full HTTP access logs for every request through every Envoy, showing source, destination, status, timing. (4) **Service Graph**: Kiali visualizes the real-time service topology automatically from the metrics data.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know Istio's architecture: istiod (control plane) + Envoy sidecars (data plane)
+- [ ] Know iptables interception: istio-init sets rules redirecting all traffic to Envoy (15001/15006)
+- [ ] Know istiod's three merged roles: Pilot (xDS config), Citadel (certs), Galley (validation)
+- [ ] Know VirtualService = routing rules (where traffic goes, weights, matching)
+- [ ] Know DestinationRule = connection policies (LB algorithm, circuit breaker, subsets)
+- [ ] Know automatic observability: metrics, distributed traces, access logs — no app code changes
+- [ ] Can debug with `istioctl proxy-config`, `istioctl proxy-status`, `istioctl analyze`

@@ -1,0 +1,264 @@
+---
+title: "Chapter 2 — X.509 Client Certificates & PKI"
+sidebar_position: 2
+module: "Module 5.1 — Authentication & Identity"
+description: "Master Kubernetes PKI infrastructure — X.509 client certificate subject mappings (CN and O), the CertificateSigningRequest (CSR) API lifecycle, and certificate revocation challenges."
+---
+
+# Chapter 2 — X.509 Client Certificates & PKI Infrastructure
+
+> **Goal:** Master the Public Key Infrastructure (PKI) powering Kubernetes security — understanding how X.509 client certificates map cryptographic Subject fields (`CN` for usernames and `O` for groups), managing the Kubernetes `CertificateSigningRequest` (CSR) API lifecycle, configuring automated and manual certificate approval controllers, generating secure developer `kubeconfig` files, and mitigating the lack of native certificate revocation lists (CRL/OCSP).
+>
+> By the end of this chapter, you will understand:
+> 1. The PKI architecture of Kubernetes: Root CA, Front-Proxy CA, and etcd CA
+> 2. How the API Server parses X.509 `Subject: CN=<username>, O=<group>` fields into `UserInfo`
+> 3. The end-to-end `CertificateSigningRequest` (CSR) API workflow from OpenSSL to approval
+> 4. Why Kubernetes does not support Certificate Revocation Lists (CRL) or OCSP
+> 5. Defense-in-depth strategies for handling compromised or leaked client certificates
+> 6. How to generate, sign, and embed client certificates inside a portable `kubeconfig`
+
+---
+
+## Real-Life Analogy
+
+Think of X.509 client certificates as **embossed wax-sealed diplomatic passports issued by an embassy**:
+
+- **The Embassy Seal (The Cluster Root CA):** The government has a master golden seal (`ca.crt` / `ca.key`). Any document stamped with this golden seal is recognized as 100% authentic by every border guard in the kingdom (API Server).
+- **The Passport Fields (X.509 Subject Fields):**
+  - **Common Name (`CN=alice`):** Your legal name on the passport.
+  - **Organization (`O=finance-team`):** Your diplomatic organization or clearance level.
+- **The Application Form (`CertificateSigningRequest` - CSR):** You create a blank application with your photo and fingerprint (private key). You submit the application to the immigration office (Kubernetes CSR API). The consul reviews your request and stamps it (`kubectl certificate approve`), generating your official passport.
+- **The Revocation Dilemma (The No-Phone-Line Border):** The border guard station operates entirely offline: they only verify if the wax seal is real and the passport hasn't expired. There is no central telephone database to check if your passport was reported stolen (**No CRL/OCSP support**). The only way to revoke your access is to burn your visa permissions at the border gate (**Strip RBAC RoleBindings**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes CertificateSigningRequest (CSR) API Workflow
+
+ DEVELOPER WORKSTATION                                 KUBERNETES CONTROL PLANE
+ ┌──────────────────────────────────────┐             ┌──────────────────────────────────────┐
+ │ 1. Generate Private Key:             │             │ Kube-APIServer & CSR Controller      │
+ │    `openssl genrsa -out dev.key 2048`│             │                                      │
+ │                                      │             │                                      │
+ │ 2. Create Certificate Signing Request│             │                                      │
+ │    Subject: CN=developer-bob, O=devs │             │                                      │
+ │    `openssl req -new -key dev.key`   │             │                                      │
+ └──────────────────┬───────────────────┘             └──────────────────▲───────────────────┘
+                    │                                                    │
+                    │ 3. Submit CSR Manifest (base64 payload)            │
+                    └────────────────────────────────────────────────────┘
+                                         │
+                                         ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CertificateSigningRequest Object (Status: Pending)                     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ 4. Cluster Administrator Reviews:
+                                    │    `kubectl certificate approve dev-bob-csr`
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CSR Approver Controller (kube-controller-manager)                      │
+ │ 1. Signs CSR using Cluster Root CA Key (`/etc/kubernetes/pki/ca.key`)  │
+ │ 2. Injects signed certificate into `status.certificate`                │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ 5. Developer extracts signed certificate
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Developer workstation extracts cert and configures `kubeconfig`:       │
+ │ `kubectl config set-credentials developer-bob --client-certificate=...`│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## PKI Anatomy: Root CA, Front-Proxy CA & etcd CA
+
+A production Kubernetes cluster maintains three separate, isolated Certificate Authorities:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────┬───────────────────────────────────────┐
+ │ Certificate Authority│ File Paths on Control Plane         │ Purpose & Boundary                    │
+ │──────────────────────┼─────────────────────────────────────┼───────────────────────────────────────┤
+ │ **Cluster Root CA**  │ `/etc/kubernetes/pki/ca.crt`        │ Signs API Server server certs,        │
+ │                      │ `/etc/kubernetes/pki/ca.key`        │ Kubelet client certs, and user client │
+ │                      │                                     │ certificates via the CSR API.         │
+ │──────────────────────┼─────────────────────────────────────┼───────────────────────────────────────┤
+ │ **Front-Proxy CA**   │ `/etc/kubernetes/pki/front-proxy-...│ Secures communication between API     │
+ │                      │ `ca.crt` / `ca.key`                 │ Server and Aggregated API servers     │
+ │                      │                                     │ (e.g. `metrics-server`, Prometheus).  │
+ │──────────────────────┼─────────────────────────────────────┼───────────────────────────────────────┤
+ │ **etcd CA**          │ `/etc/kubernetes/pki/etcd/ca.crt`   │ Dedicated CA securing mTLS encryption │
+ │                      │ `/etc/kubernetes/pki/etcd/ca.key`   │ between API Server and `etcd` nodes.  │
+ └──────────────────────┴─────────────────────────────────────┴───────────────────────────────────────┘
+```
+
+---
+
+## X.509 Subject Mapping: `CN` and `O`
+
+When the API Server receives an X.509 client certificate during TLS handshake:
+
+```text
+ X.509 Subject Parsing:
+ Certificate Subject: /CN=jane.doe/O=frontend-engineers/O=contractors
+ 
+ ──► Username: "jane.doe"
+ ──► Groups:   ["frontend-engineers", "contractors", "system:authenticated"]
+```
+
+> [!IMPORTANT]
+> The Organization (`O`) field can be specified **multiple times** in the OpenSSL subject line to bind the user to multiple RBAC groups simultaneously.
+
+---
+
+## The `CertificateSigningRequest` API (`certificates.k8s.io/v1`)
+
+```yaml
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: developer-bob-csr
+spec:
+  # Base64-encoded standard PKCS#10 CSR generated by OpenSSL
+  request: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS...
+  # Standard signer for client authentication
+  signerName: kubernetes.io/kube-apiserver-client
+  expirationSeconds: 86400    # 24-hour expiration for security!
+  usages:
+  - client auth
+```
+
+### Signer Names:
+- `kubernetes.io/kube-apiserver-client`: Signs client certificates for authenticating against the API server.
+- `kubernetes.io/kubelet-serving`: Signs server certificates used by Kubelet to serve HTTPS endpoints on worker nodes.
+
+---
+
+## The Certificate Revocation Dilemma
+
+```text
+ Critical Security Fact:
+ Kubernetes does NOT support Certificate Revocation Lists (CRL) or OCSP (Online Certificate 
+ Status Protocol).
+ 
+ Once an X.509 certificate is signed by the cluster CA, it CANNOT be revoked until it expires!
+```
+
+### How to Mitigate Compromised Certificates:
+1. **Short Expiration TTLs:** Configure `spec.expirationSeconds: 28800` (8 hours) so compromised certificates expire quickly.
+2. **Revoke RBAC Permissions:** Immediately delete the user's `RoleBinding` or `ClusterRoleBinding`. The certificate will still authenticate, but all API requests will return HTTP `403 Forbidden`.
+3. **Emergency Root CA Rotation:** In the catastrophic event of a leaked master admin certificate, you must execute a full cluster Root CA rotation.
+
+---
+
+## Complete Step-by-Step Certificate Generation & CSR Manifest
+
+```bash
+# 1. Generate private key for user 'sarah'
+openssl genrsa -out sarah.key 2048
+
+# 2. Generate Certificate Signing Request with CN=sarah and O=data-team
+openssl req -new -key sarah.key -out sarah.csr -subj "/CN=sarah/O=data-team"
+
+# 3. Base64 encode the CSR for Kubernetes manifest
+CSR_BASE64=$(cat sarah.csr | base64 | tr -d '\n')
+```
+
+```yaml
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: sarah-csr
+spec:
+  request: <PASTE_CSR_BASE64_HERE>
+  signerName: kubernetes.io/kube-apiserver-client
+  expirationSeconds: 86400
+  usages:
+  - client auth
+```
+
+---
+
+## Hands-On Lab: Generating & Approving a Client Certificate
+
+```bash
+# Step 1: Create a working directory for keys
+mkdir -p /tmp/k8s-pki-lab && cd /tmp/k8s-pki-lab
+
+# Step 2: Generate OpenSSL private key and CSR
+openssl genrsa -out dev-alice.key 2048
+openssl req -new -key dev-alice.key -out dev-alice.csr -subj "/CN=alice/O=junior-devs"
+
+# Step 3: Create Kubernetes CertificateSigningRequest manifest
+cat <<EOF | kubectl apply -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: alice-access-csr
+spec:
+  request: $(cat dev-alice.csr | base64 | tr -d '\n')
+  signerName: kubernetes.io/kube-apiserver-client
+  expirationSeconds: 43200
+  usages:
+  - client auth
+EOF
+
+# Step 4: Verify the CSR is in Pending status
+kubectl get csr alice-access-csr
+# Status: Pending!
+
+# Step 5: Approve the CSR as Cluster Administrator
+kubectl certificate approve alice-access-csr
+
+# Step 6: Extract the signed certificate from status.certificate
+kubectl get csr alice-access-csr -o jsonpath='{.status.certificate}' | base64 --decode > dev-alice.crt
+
+# Step 7: Inspect the X.509 Subject fields of the signed certificate
+openssl x509 -in dev-alice.crt -noout -subject -issuer
+# Observe: Subject: CN=alice, O=junior-devs!
+
+# Step 8: Clean up lab
+kubectl delete csr alice-access-csr
+rm -rf /tmp/k8s-pki-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the Kubernetes API Server map X.509 client certificate fields to users and groups?**
+
+During the TLS client certificate handshake, the API server inspects the X.509 Subject Distinguished Name (DN):
+- The **Common Name (`CN`)** is extracted as the authenticated **Username** (e.g. `/CN=developer-bob` $\to$ `developer-bob`).
+- The **Organization (`O`)** fields are extracted as the user's **Group memberships** (e.g. `/O=engineering/O=backend` $\to$ groups `["engineering", "backend"]`).
+- These values populate the `UserInfo` struct evaluated by the RBAC engine.
+
+**Q2: What is the `CertificateSigningRequest` (CSR) API in Kubernetes?**
+
+The `CertificateSigningRequest` API (`certificates.k8s.io/v1`) provides a declarative, cluster-native mechanism for developers, nodes, and operators to request signed X.509 certificates from the Kubernetes cluster Root CA. Users submit their base64-encoded PKCS#10 request; authorized administrators approve it with `kubectl certificate approve`; and the CSR controller signs the certificate and returns it in `.status.certificate`.
+
+**Q3: What are the security risks associated with the lack of CRL and OCSP support in Kubernetes?**
+
+Because Kubernetes does not check Certificate Revocation Lists (CRL) or Online Certificate Status Protocol (OCSP) responders, **a signed client certificate cannot be revoked prior to its cryptographic expiration date**. If a private key is leaked or an employee leaves the company, the certificate remains valid. Mitigations include enforcing short expiration TTLs (`spec.expirationSeconds`), deleting associated RBAC `RoleBindings`, or performing an emergency cluster CA rotation.
+
+**Q4: What is the difference between `kubernetes.io/kube-apiserver-client` and `kubernetes.io/kubelet-serving` signer names?**
+
+- `kubernetes.io/kube-apiserver-client`: Signs client certificates used by users, CLI tools, and controllers to authenticate against the API server.
+- `kubernetes.io/kubelet-serving`: Signs server certificates used by Kubelet daemons on worker nodes to serve HTTPS endpoints (port 10250) for `kubectl exec`, `logs`, and metric scraping.
+
+**Q5: Why is the Front-Proxy CA isolated from the Main Cluster Root CA?**
+
+The Front-Proxy CA is a dedicated certificate authority used exclusively for the API Aggregation Layer (e.g. `metrics-server`, custom API servers). It allows the main API server to authenticate itself as an authenticating proxy to extension API servers without exposing the master cluster Root CA key, enforcing tight cryptographic privilege separation.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that X.509 `CN` maps to Username and `O` maps to Groups
+- [ ] Know the CSR API lifecycle: Generate Key $\to$ Submit CSR $\to$ Approve $\to$ Extract Cert
+- [ ] Know that `signerName: kubernetes.io/kube-apiserver-client` signs client auth certs
+- [ ] Know that Kubernetes does NOT support CRL or OCSP certificate revocation
+- [ ] Know to mitigate leaks by enforcing short `expirationSeconds` and revoking RBAC bindings
+- [ ] Know the difference between Cluster Root CA, Front-Proxy CA, and etcd CA
+- [ ] Can approve CSRs using `kubectl certificate approve <name>`

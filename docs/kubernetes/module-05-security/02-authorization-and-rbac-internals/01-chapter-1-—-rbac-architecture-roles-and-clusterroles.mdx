@@ -1,0 +1,298 @@
+---
+title: "Chapter 1 — RBAC Architecture: Roles & ClusterRoles"
+sidebar_position: 1
+module: "Module 5.2 — Authorization & RBAC"
+description: "Master Kubernetes Role-Based Access Control (RBAC) — Role vs ClusterRole, apiGroups, resources, subresources (pods/exec), verbs, resourceNames, and aggregated ClusterRoles."
+---
+
+# Chapter 1 — RBAC Architecture: Roles & ClusterRoles
+
+> **Goal:** Master the core architecture of Kubernetes Role-Based Access Control (RBAC) — understanding the structural differences between namespace-scoped `Role` and cluster-scoped `ClusterRole` resources, breaking down policy rule anatomy (`apiGroups`, `resources`, `subresources`, `verbs`, and `resourceNames`), evaluating the critical security implications of subresources like `pods/exec`, and configuring dynamic ClusterRole aggregation.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural anatomy of Kubernetes RBAC policy rules
+> 2. The difference between namespace-scoped `Role` and cluster-scoped `ClusterRole`
+> 3. How subresources (`pods/exec`, `pods/log`, `deployments/scale`) provide fine-grained API governance
+> 4. How `resourceNames` restricts permissions to specific named instances
+> 5. How `aggregationRule` dynamically builds composite ClusterRoles using label selectors
+> 6. Why granting `pods/exec` or `secrets` access requires extreme caution in production
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes RBAC as a **multi-tiered corporate access badge system for a pharmaceutical research building**:
+
+- **The Access Policy Document (`Role` / `ClusterRole`):** A job description document stating what permissions a role holds (e.g., *"Lab Chemist"* or *"Building Inspector"*).
+- **Namespace-Scoped Role (`Role`):** An access badge valid **only inside Room 104 (Namespace: `chemistry-lab`)**. The badge allows the chemist to open the refrigerator (`resources: ["refrigerators"]`), read the thermometer (`verbs: ["get", "list"]`), and mix chemicals (`verbs: ["create"]`). That exact badge is completely useless if they try to swipe into Room 202 (`Namespace: biology-lab`).
+- **Cluster-Scoped Role (`ClusterRole`):** A building-wide master badge for the Head of Safety (`ClusterRole`). It grants the right to inspect fire extinguishers across every single room in the entire corporate building, as well as cluster-scoped assets like main electrical generators (`Nodes` and `PersistentVolumes`).
+- **Subresources (`pods/exec` - The Master Key to the Safe Inside the Room):** Being allowed to look at a locked chemical safe through the glass window (`pods: get`) is safe. But granting someone the power to physically open the safe and climb inside with a wrench (**`pods/exec`**) is dangerous: if they climb inside, they have full access to everything in the room!
+
+---
+
+## Architecture Diagram
+
+```text
+               RBAC Policy Rule Matching Engine
+
+ Incoming API Request:
+ Verb: "create" | API Group: "apps" | Resource: "deployments" | Namespace: "prod"
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: RBAC Authorization Interceptor                         │
+ │                                                                        │
+ │ Evaluates User's Bound Roles in Namespace "prod":                      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           ▼                                                 ▼
+ ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+ │ Rule 1:                          │     │ Rule 2: (MATCH FOUND!)           │
+ │ apiGroups: [""]                  │     │ apiGroups: ["apps"]              │
+ │ resources: ["pods", "services"]  │     │ resources: ["deployments"]       │
+ │ verbs:     ["get", "list"]       │     │ verbs:     ["get", "create"]     │
+ └──────────────────────────────────┘     └─────────────────┬────────────────┘
+                                                            │
+                                                            ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ DECISION: GRANTED! Request allowed to write Deployment to etcd.        │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Anatomy of an RBAC Policy Rule
+
+Every `Role` and `ClusterRole` contains a list of `.rules[]` evaluated with **OR logic**:
+
+```yaml
+rules:
+- apiGroups: ["apps"]                   # 1. API Group (empty string "" = core API)
+  resources: ["deployments", "statefulsets"] # 2. Target Resource Types
+  verbs: ["get", "list", "watch", "create"] # 3. Permitted API Operations
+```
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Policy Rule Field    │ Description & Syntax Rules                                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`apiGroups`**      │ Array of API groups. `[""]` for core (`v1`), `["apps"]` for workloads,      │
+ │                      │ `["batch"]` for Jobs, `["*"]` for all groups (Dangerous).                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`resources`**      │ Target resource types in plural form: `["pods"]`, `["services"]`,           │
+ │                      │ `["configmaps"]`, `["nodes"]`, `["persistentvolumeclaims"]`.                │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`verbs`**          │ Permitted actions: `get`, `list`, `watch`, `create`, `update`, `patch`,     │
+ │                      │ `delete`, `deletecollection`.                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`resourceNames`**  │ Optional whitelist of specific individual object names.                     │
+ │                      │ (e.g. `resourceNames: ["app-config", "db-config"]`).                        │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `Role` vs `ClusterRole`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ `Role`                          │ `ClusterRole`                   │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Scope**                 │ **Namespace-Scoped**            │ **Cluster-Scoped**              │
+ │ **Resource Target**       │ Namespace-scoped resources only │ (1) Cluster-scoped resources    │
+ │                           │ (Pods, Services, PVCs, Configs) │     (Nodes, PVs, Namespaces)    │
+ │                           │                                 │ (2) Non-resource URLs (`/healthz│
+ │                           │                                 │ (3) Namespace-scoped resources  │
+ │                           │                                 │     reusable across namespaces  │
+ │ **API Manifest**          │ `kind: Role`                    │ `kind: ClusterRole`             │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Subresources: `pods/exec`, `pods/log` & Security Risks
+
+In Kubernetes, operations on sub-paths of an object are defined as **Subresources**:
+
+```yaml
+rules:
+# Grants read access to Pod logs without granting pod modification rights!
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+
+# Grants scaling permissions without allowing image updates!
+- apiGroups: ["apps"]
+  resources: ["deployments/scale"]
+  verbs: ["get", "update", "patch"]
+```
+
+> [!CAUTION]
+> **The `pods/exec` Security Hazard:** Granting `create` on `resources: ["pods/exec"]` allows a user to open an interactive terminal shell inside a running container. If the container runs as root or has host network access, the user can read all environment variables, steal cloud identity tokens, or compromise the node. **Never grant `pods/exec` in production without strict break-glass governance.**
+
+---
+
+## Aggregated ClusterRoles (`aggregationRule`)
+
+Kubernetes supports dynamically building composite ClusterRoles using label selectors:
+
+```yaml
+# 1. Base Aggregated ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: monitoring-aggregate-role
+aggregationRule:
+  clusterRoleSelectors:
+  - matchLabels:
+      rbac.company.com/aggregate-to-monitoring: "true"
+rules: [] # Automatically populated by the RBAC aggregation controller!
+---
+# 2. Extension Role (Automatically merged into monitoring-aggregate-role!)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-rule-extension
+  labels:
+    rbac.company.com/aggregate-to-monitoring: "true"
+rules:
+- apiGroups: ["monitoring.coreos.com"]
+  resources: ["prometheuses", "servicemonitors"]
+  verbs: ["get", "list", "watch"]
+```
+
+---
+
+## Complete Production RBAC Manifests
+
+```yaml
+# 1. Namespace-Scoped Developer Role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backend-developer-role
+  namespace: payment-dev
+rules:
+# Full lifecycle on core workloads
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+# Read-only access to Pods and Logs
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+
+# Strict fine-grained access to specific ConfigMaps only!
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["app-config", "feature-flags"]
+  verbs: ["get", "update", "patch"]
+---
+# 2. Cluster-Scoped Infrastructure Inspector Role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-node-viewer
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "persistentvolumes", "namespaces"]
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/healthz", "/version"]
+  verbs: ["get"]
+```
+
+---
+
+## Hands-On Lab: Testing Fine-Grained RBAC & `resourceNames`
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace rbac-lab
+
+# Step 2: Create a target ConfigMap and an unauthorized ConfigMap
+kubectl create configmap allowed-config --from-literal=status=ok -n rbac-lab
+kubectl create configmap secret-config --from-literal=admin=true -n rbac-lab
+
+# Step 3: Create a Role with resourceNames restriction
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: restricted-cm-reader
+  namespace: rbac-lab
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["allowed-config"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bind-restricted-reader
+  namespace: rbac-lab
+subjects:
+- kind: User
+  name: intern-dave
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: restricted-cm-reader
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# Step 4: Test that intern-dave CAN read allowed-config
+kubectl auth can-i get configmap/allowed-config --as=intern-dave -n rbac-lab
+# Output: 'yes'
+
+# Step 5: Test that intern-dave CANNOT read secret-config
+kubectl auth can-i get configmap/secret-config --as=intern-dave -n rbac-lab
+# Output: 'no'
+
+# Step 6: Test that intern-dave CANNOT list configmaps in the namespace
+# (resourceNames restricts 'get' to specific objects, but forbids 'list'!)
+kubectl auth can-i list configmaps --as=intern-dave -n rbac-lab
+# Output: 'no'
+
+# Step 7: Clean up lab
+kubectl delete namespace rbac-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between a `Role` and a `ClusterRole` in Kubernetes RBAC?**
+
+- `Role`: A namespace-scoped resource defining permissions that apply **strictly within a single namespace** (such as managing Pods, Deployments, and Secrets inside `marketing-dev`).
+- `ClusterRole`: A cluster-scoped resource that can: (1) Define permissions on cluster-wide non-namespaced resources (like `Nodes`, `PersistentVolumes`, and `StorageClasses`); (2) Grant access to non-resource REST URLs (`/healthz`, `/metrics`); or (3) Serve as a global permission template that can be bound within individual namespaces using a `RoleBinding`.
+
+**Q2: What are Subresources in Kubernetes RBAC, and why is `pods/exec` considered high risk?**
+
+Subresources represent distinct API endpoints nested under a parent resource (e.g. `pods/log`, `pods/status`, `pods/exec`, `deployments/scale`). `pods/exec` is considered a critical security risk because granting `create` on `pods/exec` allows a user to execute arbitrary shell commands inside the container. If the container process is running as root or mounts sensitive host directories, an attacker can use `pods/exec` to escape container boundaries or compromise the underlying node.
+
+**Q3: How does `resourceNames` work, and what are its limitations?**
+
+`resourceNames` allows administrators to restrict permissions to specific, individual named instances of a resource (e.g. allowing `get` only on `configmaps` named `app-config`). Its primary limitation is that `resourceNames` **only applies to individual-object verbs** (`get`, `update`, `patch`, `delete`). It cannot be used with collection verbs like `list` or `watch`, nor can it be used with `create` requests because the object name does not exist prior to creation.
+
+**Q4: What is an Aggregated ClusterRole, and how does the controller maintain it?**
+
+An Aggregated ClusterRole uses an `aggregationRule` with label selectors (`matchLabels`) to dynamically combine the rule definitions of multiple independent ClusterRoles into a single composite role. The Kubernetes cluster role aggregation controller continuously watches for ClusterRoles matching the selector; when a new extension role is created, the controller automatically merges its `.rules[]` into the aggregated ClusterRole.
+
+**Q5: How does the Kubernetes RBAC engine handle conflicts between multiple matching rules?**
+
+Kubernetes RBAC is strictly **additive (whitelist-based)**. There is no concept of a "deny" rule in native RBAC. If a user is bound to multiple Roles that grant conflicting or overlapping permissions, the RBAC engine computes the union of all permitted actions. If *any* matching rule permits the action, the request is authorized.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between namespace-scoped `Role` and cluster-scoped `ClusterRole`
+- [ ] Know the 4 rule fields: `apiGroups`, `resources`, `subresources`, and `verbs`
+- [ ] Know that `apiGroups: [""]` represents the core Kubernetes API (`v1`)
+- [ ] Know that `resourceNames` restricts access to specific named object instances
+- [ ] Know the severe security implications of granting `pods/exec`
+- [ ] Know how `aggregationRule` dynamically combines ClusterRoles via label selectors
+- [ ] Can test RBAC permissions using `kubectl auth can-i <verb> <resource> --as=<user>`

@@ -1,0 +1,370 @@
+---
+title: "Chapter 3 — API Versions"
+sidebar_position: 3
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand why Kubernetes versions its APIs, how Alpha, Beta, and Stable versions evolve, what Internal and Storage Versions are, and how Kubernetes converts objects between versions."
+---
+
+# Chapter 3 — API Versions
+
+> **Goal:** Understand why Kubernetes versions its APIs, how Alpha, Beta, and Stable APIs evolve, what Internal and Storage Versions are, and how Kubernetes converts objects between versions without breaking compatibility.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. Why API versioning exists
+> 2. Alpha (v1alpha1) API stage
+> 3. Beta (v1beta1) API stage
+> 4. Stable (v1) API stage
+> 5. Internal Version (Hub Version)
+> 6. Storage Version
+> 7. Version conversion
+> 8. Backward compatibility guarantees
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Common interview questions include:
+
+> **Why does Kubernetes have `apps/v1`, `autoscaling/v2`, and `batch/v1` instead of just `v1` everywhere?**
+
+> **How can Kubernetes upgrade APIs without breaking existing applications?**
+
+> **What happens when a cluster serves both `v1beta1` and `v1` of the same resource?**
+
+Without understanding API Versions, you cannot:
+- Write production-safe YAML (using the correct stable version)
+- Understand cluster upgrade impact
+- Explain why `kubectl convert` exists
+- Understand what happens inside the API Server during object storage
+- Build controllers that handle multiple API versions
+
+---
+
+# Real-Life Analogy
+
+Think of API versions like software product editions.
+
+```text
+Microsoft Office (API Group)
+        |
+        +-- Office 95    (v1alpha1 — experimental, may break)
+        |
+        +-- Office 2003  (v1beta1  — mostly stable, some changes possible)
+        |
+        +-- Office 365   (v1       — stable, backward compatible)
+```
+
+| Software Edition | Kubernetes Equivalent | Stability |
+| :--- | :--- | :--- |
+| Early prototype | `v1alpha1` | Experimental, no compatibility guarantee |
+| Release candidate | `v1beta1` | Mostly stable, may have breaking changes |
+| Production release | `v1` | Stable, backward compatible |
+
+Old documents (YAML) created for Office 2003 still open in Office 365 — Kubernetes version conversion works the same way.
+
+---
+
+# The Problem Without Versioning
+
+Imagine Kubernetes had only one version of every API.
+
+Version 1 of a Deployment:
+```yaml
+spec:
+  replicas: 3
+```
+
+Later, the team redesigns the spec:
+```yaml
+spec:
+  scaling:
+    replicas: 3
+```
+
+Every existing Deployment YAML in every cluster would immediately break on upgrade. This is unacceptable in production.
+
+**Kubernetes solution:** introduce new versions alongside existing ones. Old versions keep working until formally deprecated and removed.
+
+---
+
+# API Lifecycle: Three Stages
+
+## Stage 1 — Alpha (`v1alpha1`, `v1alpha2`, ...)
+
+- Experimental and subject to change without notice
+- **Disabled by default** — must be explicitly enabled with feature gates
+- No backward compatibility guaranteed
+- May be completely removed in any future release
+
+```text
+Feature Gate:
+  --feature-gates=MyFeature=true
+```
+
+Example:
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaim
+```
+
+> **Important:** Never use Alpha APIs in production. They can disappear without deprecation notice.
+
+---
+
+## Stage 2 — Beta (`v1beta1`, `v1beta2`, ...)
+
+- Feature is functionally complete and well-tested
+- **Enabled by default** in most Kubernetes clusters
+- May have breaking changes between beta versions
+- Will eventually be promoted to stable
+
+Example:
+```yaml
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+```
+
+> **Important:** Beta APIs have a minimum deprecation period (typically 9 months or 3 minor releases) before removal.
+
+---
+
+## Stage 3 — Stable (`v1`, `v2`, ...)
+
+- Production-ready with strong backward compatibility guarantee
+- Kubernetes commits to not removing or breaking stable APIs without long notice
+- `v1` is the most common stable version
+
+Example:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+```
+
+> **Important:** Always use the stable version in production manifests and automation.
+
+---
+
+# API Version Stability Table
+
+| Stability | Version Format | Default State | Removal Policy |
+| :--- | :--- | :--- | :--- |
+| Alpha | `v1alpha1`, `v1alpha2` | Disabled | Anytime, no guarantee |
+| Beta | `v1beta1`, `v1beta2` | Enabled | Min. 9 months / 3 releases |
+| Stable | `v1`, `v2` | Enabled | Minimum 12 months |
+
+---
+
+# Multiple Versions of the Same Resource
+
+Kubernetes can serve the same resource under multiple API versions simultaneously.
+
+Example — HorizontalPodAutoscaler served as both:
+```text
+autoscaling/v1/HorizontalPodAutoscaler
+autoscaling/v2/HorizontalPodAutoscaler
+```
+
+A client using `v1` and a client using `v2` both work against the same cluster, reading and writing the same objects.
+
+This is possible because of **Internal Version Conversion**.
+
+---
+
+# Internal Version (Hub Version)
+
+Inside `kube-apiserver`, there is a special version called the **internal version** (also called the **hub version**).
+
+```text
+External Request
+  apps/v1 Deployment
+  |
+  v
+  Decode
+  |
+  v
+  Internal Object (hub version)
+  [apps/__internal Deployment]
+  |
+  v
+  Validation, Admission, Business Logic
+  |
+  v
+  Encode to Storage Version
+  |
+  v
+  etcd
+```
+
+The internal version:
+- Is **never exposed to clients** over the API
+- Acts as the **central hub** for all version conversions
+- All external versions convert **to** and **from** internal, not directly to each other
+
+This hub pattern (also called "star topology") means that supporting N versions only requires N×2 conversion functions (to-internal + from-internal), not N² functions.
+
+---
+
+# Version Conversion Path
+
+```text
+Client Version  -->  Internal (Hub)  -->  Storage Version
+
+apps/v1beta1         __internal           apps/v1
+      |                   ^                  |
+      +---  convert  ---> +  <-- convert  ---+
+```
+
+All conversion logic lives in the API Server's Go code for built-in types, and in conversion webhooks for CRDs.
+
+---
+
+# Storage Version
+
+The **storage version** is the specific API version used when persisting objects to `etcd`.
+
+```text
+API Server receives: apps/v1beta1 Deployment
+  |
+  v
+Converts to internal version
+  |
+  v
+Converts to storage version (apps/v1)
+  |
+  v
+Serializes to Protobuf
+  |
+  v
+Writes to etcd: /registry/deployments/default/nginx
+```
+
+> **Important:** The storage version is independent of:
+> - The API version used by the client
+> - The API version you write in your YAML
+>
+> The stored object is always in the resource's configured storage version.
+
+---
+
+# Why Storage Version Matters for Upgrades
+
+When Kubernetes upgrades a resource to a new storage version (e.g., from `v1beta1` to `v1`), existing objects in `etcd` may still be stored in the old version.
+
+```text
+Old objects in etcd: apps/v1beta1 format
+New storage version: apps/v1
+
+API Server reads old object
+  |
+  v
+On-the-fly conversion to apps/v1 (lazy migration)
+  |
+  v
+Client receives apps/v1 format
+```
+
+Kubernetes performs lazy storage migration — objects are converted when read and re-written in the new storage version, not all at once.
+
+---
+
+# Backward Compatibility Guarantees
+
+Kubernetes follows strict compatibility rules for stable APIs:
+
+```text
+Rule 1: No required fields removed
+Rule 2: No field types changed
+Rule 3: Existing default values not changed
+Rule 4: Enum values not removed
+Rule 5: Optional fields remain optional
+```
+
+This means YAML written for `apps/v1` in Kubernetes 1.20 still works in Kubernetes 1.30.
+
+> **Important:** Alpha and Beta APIs do **not** carry these compatibility guarantees.
+
+---
+
+# kubectl convert (Legacy Tooling)
+
+For migrating old manifests to newer API versions, `kubectl` (via the `convert` plugin) can help:
+
+```bash
+kubectl convert -f old-deployment.yaml --output-version apps/v1
+```
+
+This reads the object in the old version, converts it using the API Server's conversion logic, and outputs the new version.
+
+---
+
+# Complete Version Lifecycle Example
+
+```text
+Kubernetes 1.8   apps/v1beta1  Deployment  (beta, enabled)
+Kubernetes 1.9   apps/v1beta2  Deployment  (beta, enabled)
+Kubernetes 1.9   apps/v1       Deployment  (stable, enabled)
+Kubernetes 1.16  apps/v1beta1  Deployment  (deprecated & removed)
+Kubernetes 1.16  apps/v1beta2  Deployment  (deprecated & removed)
+```
+
+Between 1.9 and 1.16, both `v1beta1` and `v1` coexisted. After 1.16, only `v1` remains.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does Kubernetes version its APIs?
+API versions allow Kubernetes to introduce new features and redesign schemas without immediately breaking existing applications. Old clients can continue using earlier API versions while new clients adopt stable ones.
+
+### Q2. What is the difference between Alpha, Beta, and Stable APIs?
+Alpha APIs are experimental and disabled by default; they can be removed at any time. Beta APIs are mostly stable and enabled by default; they have a minimum deprecation period. Stable APIs (`v1`, `v2`) have long-term backward compatibility guarantees.
+
+### Q3. What is the Internal Version?
+The internal version (hub version) is a private, unexposed version of a resource used inside `kube-apiserver`. All external versions convert to/from the internal version, enabling any external version to be converted to any other via the hub.
+
+### Q4. What is the Storage Version?
+The storage version is the API version used when persisting an object to `etcd`. It may differ from both the client's requested version and the internal version.
+
+### Q5. What happens when Kubernetes changes the storage version in a cluster upgrade?
+Existing objects in `etcd` stored in the old storage version are lazily migrated — converted on-the-fly when read and written back in the new storage version. The migration does not happen all at once.
+
+### Q6. Can two clients use different API versions of the same resource simultaneously?
+Yes. The API Server serves multiple versions of the same resource concurrently and converts between them transparently using the internal hub version.
+
+### Q7. What compatibility guarantees does a stable API provide?
+Kubernetes guarantees that stable APIs will not have required fields removed, field types changed, or default values altered without minimum 12-month deprecation notice. Objects created with an older stable version remain readable with newer versions.
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| `no matches for kind in version "apps/v1beta1"` | API version was removed | Update YAML to use `apps/v1` |
+| `kubectl apply` succeeds but object looks different | Storage version conversion added/changed defaults | Compare `kubectl get -o yaml` output with original manifest |
+| HPA behaves unexpectedly after upgrade | `autoscaling/v1` vs `v2` behavior difference | Check which version is stored and which the controller reads |
+| Old manifest breaks after cluster upgrade | Used beta/alpha API that was removed | Run `kubectl convert` to migrate to current stable version |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain the Alpha → Beta → Stable API lifecycle.
+2. State what stability guarantees apply to each stage.
+3. Explain what the Internal (Hub) Version is and why it exists.
+4. Explain what the Storage Version is and how it differs from the client version.
+5. Describe how lazy storage migration works during a cluster upgrade.
+6. Explain why `apps/v1beta1` was removed in Kubernetes 1.16.
+7. Trace an object's version conversion path from client submission to etcd storage.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — OpenAPI**
+
+In the next chapter, you'll learn how Kubernetes publishes its entire API schema using OpenAPI, how schema validation works, and how tools like `kubectl explain`, IDE plugins, and admission webhooks use the OpenAPI spec.

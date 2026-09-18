@@ -1,0 +1,301 @@
+---
+title: "Chapter 1 — StorageClass Architecture & Dynamic Provisioning"
+sidebar_position: 1
+module: "Module 4.3 — StorageClasses & Provisioning"
+description: "Master Kubernetes StorageClasses — dynamic volume provisioning, CSI provisioner sidecars, driver parameters (gp3, IOPS, encryption), default storage classes, and allowVolumeExpansion."
+---
+
+# Chapter 1 — StorageClass Architecture & Dynamic Provisioning
+
+> **Goal:** Master dynamic volume provisioning in Kubernetes — understanding how `StorageClass` resources act as automated volume factories, how the `csi-provisioner` sidecar translates developer PVC requests into cloud storage API calls, configuring driver-specific parameters (IOPS, throughput, encryption keys), managing default storage classes, and enabling volume expansion.
+>
+> By the end of this chapter, you will understand:
+> 1. How StorageClasses eliminate manual administrator PersistentVolume creation
+> 2. The internal control flow between API Server, `csi-provisioner`, and Cloud APIs
+> 3. How driver `parameters` configure low-level storage properties (e.g. AWS EBS `gp3`, Azure UltraDisk)
+> 4. How the `is-default-class` annotation automatically binds unassigned PVCs
+> 5. The operational importance of `allowVolumeExpansion: true`
+> 6. How to troubleshoot dynamic provisioning failures (IAM permission errors, cloud quota limits)
+
+---
+
+## Real-Life Analogy
+
+Think of a StorageClass as an **automated on-demand vending machine for cloud hard drives**:
+
+- **Static Provisioning (The Old Human Stockroom):** Whenever a developer needed a 50GB disk, they opened a ticket. A system administrator walked to the hardware storage room, partitioned a SAN LUN, wrote a YAML file, and pasted the disk ID. If the admin was asleep, the developer waited 24 hours.
+- **Dynamic Provisioning with StorageClass (The Automated Vending Machine):** The administrator sets up a vending machine labeled **"Fast NVMe Storage" (`StorageClass`)**.
+- **The Customer Coin (The PVC):** A developer approaches the machine and inserts a request: *"I need 50GB with encryption (`storageClassName: fast-nvme`)."*
+- **The Automated Robotic Arm (`csi-provisioner`):** The vending machine robot immediately calls the AWS / GCP cloud factory, manufactures a brand new 50GB disk in 2 seconds, formats it with ext4, writes a `PersistentVolume` receipt, and drops it into the developer's hands (`Status: Bound`).
+
+---
+
+## Architecture Diagram
+
+```text
+               Dynamic Volume Provisioning Workflow
+
+ 1. Developer submits PVC:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    spec:
+      storageClassName: ebs-gp3-sc
+      resources: { requests: { storage: 100Gi } }
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes API Server & etcd (PVC Status: Pending)                     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Watches for Unbound PVCs
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CSI External Provisioner Sidecar (`csi-provisioner`)                   │
+ │                                                                        │
+ │ 1. Reads StorageClass: ebs-gp3-sc                                      │
+ │    - Provisioner: ebs.csi.aws.com                                      │
+ │    - Parameters: { type: gp3, iops: 3000, encrypted: true }            │
+ │                                                                        │
+ │ 2. Issues gRPC Call over Unix Socket:                                  │
+ │    ──► `CreateVolume(name: pvc-123, size: 100Gi, params)`             │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ Cloud Provider REST API
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Cloud Provider (AWS / GCP / Azure / Ceph)                              │
+ │ Creates Cloud Volume (e.g. AWS EBS gp3 volume: `vol-0987654321`)       │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Volume ID returned
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CSI Provisioner creates matching PersistentVolume in API Server:       │
+ │   - Name: pvc-123-uuid                                                 │
+ │   - Capacity: 100Gi                                                    │
+ │   - VolumeHandle: vol-0987654321                                       │
+ │                                                                        │
+ │ pv-controller locks two-way binding ──► PVC Status: BOUND!             │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## StorageClass Resource Anatomy
+
+A `StorageClass` is a cluster-scoped resource defined under the `storage.k8s.io/v1` API group:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: premium-ssd-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+# 1. The CSI driver managing this storage backend
+provisioner: ebs.csi.aws.com
+
+# 2. Driver-specific configuration parameters
+parameters:
+  type: gp3
+  iops: "4000"
+  throughput: "250"
+  encrypted: "true"
+  fsType: ext4
+
+# 3. Automated Reclaim Policy (Default: Delete)
+reclaimPolicy: Delete
+
+# 4. Enable Online Volume Resizing
+allowVolumeExpansion: true
+
+# 5. When to provision: Immediate vs WaitForFirstConsumer
+volumeBindingMode: WaitForFirstConsumer
+```
+
+---
+
+## The Default StorageClass Annotation
+
+If a developer submits a PVC without declaring `.spec.storageClassName`, Kubernetes automatically assigns the **Default StorageClass**:
+
+```yaml
+metadata:
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+```
+
+```text
+ Rules Governing Default StorageClasses:
+ 1. If ONE StorageClass has `is-default-class: "true"`, any PVC with `storageClassName` omitted
+    will automatically provision from that class.
+ 2. If ZERO StorageClasses are marked default, PVCs without a class will wait for an admin to 
+    manually bind a PV with `storageClassName: ""`.
+ 3. If MULTIPLE StorageClasses are accidentally marked default, the admission controller logs 
+    a warning and PVCs will remain `Pending` due to ambiguous default selection.
+```
+
+---
+
+## Driver Parameters & Performance Tuning
+
+The `.parameters` field passes raw configuration maps directly to the CSI driver:
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Cloud Provider / CSI │ Driver Key              │ Production Parameters                             │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **AWS EBS CSI**      │ `ebs.csi.aws.com`       │ `type: gp3`, `iops: "3000"`, `throughput: "125"`, │
+ │                      │                         │ `encrypted: "true"`, `kmsKeyId: "arn:aws:kms..."` │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **GCP PD CSI**       │ `pd.csi.storage.gke.io` │ `type: pd-balanced` / `pd-ssd`, `replication-type:│
+ │                      │                         │ regional-pd` (replicates across 2 zones)          │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Azure Disk CSI**   │ `disk.csi.azure.com`    │ `skuName: Premium_LRS`, `cachingMode: ReadOnly`,  │
+ │                      │                         │ `diskEncryptionSetID: "/subscriptions/..."`       │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Ceph RBD CSI**     │ `rbd.csi.ceph.com`      │ `pool: replicapool`, `imageFeatures: layering`,   │
+ │                      │                         │ `csi.storage.k8s.io/fstype: ext4`                 │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production StorageClass & Dynamic PVC Manifest
+
+```yaml
+# 1. High-Performance Enterprise StorageClass
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: enterprise-gp3-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  type: gp3
+  iops: "5000"
+  throughput: "250"
+  encrypted: "true"
+mountOptions:
+  - noatime
+  - nodiratime
+---
+# 2. Dynamically Provisioned PVC (Zero Manual PV needed!)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dynamic-db-storage
+  namespace: production
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: enterprise-gp3-sc
+  resources:
+    requests:
+      storage: 150Gi
+```
+
+---
+
+## Hands-On Lab: Creating a StorageClass & Dynamic PVC
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace sc-lab
+
+# Step 2: Create a local mock StorageClass (or cloud SC if on cloud)
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-lab-storage
+provisioner: kubernetes.io/no-provisioner   # Static fallback or CSI
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+EOF
+
+# Step 3: Inspect all StorageClasses in cluster
+kubectl get storageclass
+# Notice default class marked with (default)
+
+# Step 4: Create a PVC requesting the new StorageClass
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dynamic-claim
+  namespace: sc-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-lab-storage
+  resources:
+    requests:
+      storage: 2Gi
+EOF
+
+# Step 5: Inspect PVC status (Notice it waits for consumer due to WaitForFirstConsumer)
+kubectl get pvc -n sc-lab
+# Status: Pending (Waiting for first pod to schedule)
+
+# Step 6: Deploy a Pod consuming the claim
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sc-consumer-pod
+  namespace: sc-lab
+spec:
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: dynamic-claim
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /var/data
+EOF
+
+# Step 7: Clean up lab
+kubectl delete namespace sc-lab
+kubectl delete storageclass fast-lab-storage
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a StorageClass in Kubernetes, and what problem does it solve?**
+
+A `StorageClass` is a cluster-scoped object that defines dynamic volume provisioning profiles. Before StorageClasses, cluster administrators had to manually pre-provision every `PersistentVolume` ahead of time. A StorageClass links developer `PersistentVolumeClaims` directly to a Container Storage Interface (CSI) provisioner, enabling the automated, on-demand creation and deletion of cloud disks, LUNs, and filesystems with zero administrator intervention.
+
+**Q2: How does the `csi-provisioner` sidecar orchestrate dynamic provisioning?**
+
+The `csi-provisioner` runs as a helper sidecar alongside the vendor's CSI Controller plugin. It continuously watches the Kubernetes API server for unbound `PersistentVolumeClaim` objects that reference its driver's `StorageClass`. When detected, it translates the PVC's requested size and StorageClass `parameters` into a standard CSI gRPC `CreateVolume()` call sent to the CSI driver. Upon receiving the cloud volume ID, it automatically creates a corresponding `PersistentVolume` object in `etcd`, which the `pv-controller` immediately binds to the PVC.
+
+**Q3: What happens when a developer creates a PVC without specifying `storageClassName`?**
+
+If `pvc.spec.storageClassName` is omitted: (1) If a default StorageClass exists in the cluster (bearing the annotation `storageclass.kubernetes.io/is-default-class: "true"`), the API server mutating admission controller automatically populates the PVC's `storageClassName` with the default class; (2) If no default StorageClass exists, the PVC behaves as a legacy claim with `storageClassName: ""`, matching only statically pre-created PVs that have no class assigned.
+
+**Q4: What does `allowVolumeExpansion: true` enable in a StorageClass?**
+
+`allowVolumeExpansion: true` permits developers to increase the storage capacity of existing PersistentVolumeClaims by editing `.spec.resources.requests.storage`. When edited, the `csi-resizer` sidecar intercepts the change and executes a `ControllerExpandVolume` call to expand the underlying cloud block device, while Kubelet expands the filesystem online without requiring volume deletion. If set to `false`, attempts to edit PVC capacity are rejected by the API server.
+
+**Q5: What are common causes of dynamic provisioning failures?**
+
+Common root causes include: (1) **IAM Permission Denied**: The CSI driver's ServiceAccount lacks cloud provider permissions (e.g. AWS `ec2:CreateVolume`); (2) **Cloud Quota Limits**: The cloud account has exhausted maximum EBS volume counts or total gigabyte limits in the region; (3) **Invalid Parameters**: Typos in StorageClass `parameters` (e.g. unsupported IOPS/throughput ratios on `gp3`); (4) **CSI Controller Crash**: The `csi-provisioner` or controller pod is in `CrashLoopBackOff`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that StorageClasses enable on-demand dynamic volume provisioning
+- [ ] Know the role of the `csi-provisioner` sidecar in translating PVCs to cloud disks
+- [ ] Know how `is-default-class: "true"` automatically handles claims without a class
+- [ ] Know how driver `parameters` configure IOPS, throughput, and cloud encryption
+- [ ] Know that `allowVolumeExpansion: true` is mandatory for resizing PVCs
+- [ ] Know that `reclaimPolicy: Delete` is the standard default for dynamic storage
+- [ ] Can view cluster storage classes using `kubectl get sc`

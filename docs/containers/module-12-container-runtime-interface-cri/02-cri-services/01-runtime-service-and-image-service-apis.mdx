@@ -1,0 +1,172 @@
+---
+title: "Chapter 1 — CRI Services: RuntimeService & ImageService APIs"
+sidebar_position: 1
+module: "Module 12.2 — CRI Services"
+description: "Master the CRI gRPC API services — analyzing RuntimeService for Pod sandboxes and containers, ImageService for image lifecycles, and in-place pod resizing."
+---
+
+# Chapter 1 — CRI Services: RuntimeService & ImageService APIs
+
+> **Goal:** Master the Protocol Buffer definitions, RPC service boundaries, and state machines of the two foundational CRI services — analyzing the **`RuntimeService`** for **Pod Sandbox lifecycle**, **Container execution**, and **In-Place Resource Resizing (`UpdateContainerResources`)**, contrasting with the **`ImageService`** for **Layer pulling**, **Image caching**, and **Storage Garbage Collection (`ImageFsInfo`)**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why the CRI strictly splits responsibilities between `RuntimeService` and `ImageService`
+> 2. The complete gRPC RPC catalog for Pod sandboxes and containers
+> 3. How `UpdateContainerResources` allows resizing container CPU and memory without restarting pods
+> 4. How Kubelet uses `ImageFsInfo` to trigger automatic node disk garbage collection
+> 5. How interactive commands (`Exec`, `Attach`, `PortForward`) stream data via CRI
+> 6. How to invoke CRI RPCs manually using `crictl` diagnostic commands
+
+---
+
+## Real-Life Analogy
+
+Think of the two CRI services as **two specialized departments operating an international commercial airport**:
+
+- **1. `ImageService` (The International Cargo & Fuel Depot):**
+  - Handles the downloading, storage, and inventory of heavy aircraft parts and jet fuel (**Image pulling, layer decompression, disk caching**).
+  - Keeps track of how much warehouse space is consumed (**`ImageFsInfo`**).
+  - When the warehouse gets 85% full, it automatically throws away old unused parts (**Image Garbage Collection**).
+- **2. `RuntimeService` (The Air Traffic Control Tower & Flight Deck):**
+  - Manages the active flight missions (**Running Pods and Containers**).
+  - Assigns runway gates and flight corridors (**`RunPodSandbox` & Network Namespaces**).
+  - Starts the airplane engines (**`StartContainer`**), throttles engine speed mid-flight (**`UpdateContainerResources`**), and directs passengers through the jetbridge intercom (**`Exec` & `PortForward`**).
+
+---
+
+## Architecture Diagram
+
+```text
+               The Two CRI Protocol Buffer Services & Their RPC Methods
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBELET (Kubernetes Node Agent)                                        │
+ └──────┬───────────────────────────────────────────────────┬─────────────┘
+        │ gRPC: `RuntimeService`                            │ gRPC: `ImageService`
+        ▼                                                   ▼
+ ┌──────────────────────────────────────┐  ┌──────────────────────────────┐
+ │ 1. `RuntimeService` (Execution Plane)│  │ 2. `ImageService` (Storage)  │
+ ├──────────────────────────────────────┤  ├──────────────────────────────┤
+ │ ├── `RunPodSandbox()`                │  │ ├── `PullImage()`            │
+ │ ├── `StopPodSandbox()`               │  │ ├── `ListImages()`           │
+ │ ├── `CreateContainer()`              │  │ ├── `ImageStatus()`          │
+ │ ├── `StartContainer()`               │  │ ├── `RemoveImage()`          │
+ │ ├── `StopContainer()`                │  │ └── `ImageFsInfo()`          │
+ │ ├── `UpdateContainerResources()`     │  │     (Calculates disk usage   │
+ │ │   ⚡ (In-place CPU/RAM resize!)    │  │      for Kubelet Node GC!)   │
+ │ └── `Exec()`, `Attach()`, `PortFwd()`│  └──────────────────────────────┘
+ └──────────────────┬───────────────────┘
+                    │ Manages Linux Namespaces, cgroups & Processes
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HOST LINUX KERNEL: Pod Sandboxes, Network Namespaces & cgroups v2      │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. `RuntimeService` RPC Catalog
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ RPC Method                           │ Systems Action Executed by Runtime                          │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **`RunPodSandbox`**                  │ Sets up Pod network namespace, calls CNI, starts Pause pod. │
+ │ **`StopPodSandbox`**                 │ Tears down network namespace and stops the sandbox.         │
+ │ **`CreateContainer`**                │ Unpacks rootfs, writes `config.json`, calls `runc create`.  │
+ │ **`StartContainer`**                 │ Calls `runc start` to execute the user application binary.  │
+ │ **`StopContainer`**                  │ Sends `SIGTERM`, waits grace period, then sends `SIGKILL`.  │
+ │ **`UpdateContainerResources`**       │ **Resizes CPU/RAM dynamically** by writing directly to      │
+ │                                      │ `/sys/fs/cgroup/cpu.max` and `memory.max` with NO RESTART!  │
+ │ **`ExecSync` / `Exec`**              │ Executes diagnostic commands inside running containers.     │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. `ImageService` RPC Catalog & Kubelet Disk GC
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ RPC Method           │ Storage Action & Kubelet Integration                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`PullImage`**      │ Downloads OCI layers from registry, verifies digests, unpacks snapshots.   │
+ │ **`ListImages`**     │ Returns all locally cached images and their total byte sizes.               │
+ │ **`RemoveImage`**    │ Prunes unused image layers from local storage.                              │
+ │ **`ImageFsInfo`**    │ **Returns disk capacity, available bytes, and inode usage**. When available │
+ │                      │ disk drops below `imageGCHighThresholdPercent` (e.g. 85%), Kubelet triggers │
+ │                      │ automatic `RemoveImage` calls on least-recently-used images!                │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## In-Place Pod Resizing (`UpdateContainerResources`)
+
+Prior to Kubernetes 1.27, modifying a pod's CPU or memory request/limit required destroying and restarting the pod, causing application downtime.
+
+### How CRI In-Place Resizing Works:
+1. Developer edits Pod YAML: `resources.limits.cpu: "4"`
+2. Kubelet detects change and issues CRI **`UpdateContainerResources()`** gRPC call.
+3. The runtime (containerd/CRI-O) **writes the new quota directly to the cgroup file**:
+   ```bash
+   echo "400000 100000" > /sys/fs/cgroup/kubepods.slice/.../cpu.max
+   ```
+4. The container's CPU quota expands **instantaneously with ZERO process restarts or network dropouts**!
+
+---
+
+## Hands-On Lab: Exercising CRI Services via `crictl`
+
+```bash
+# Step 1: Query the ImageService for all cached images
+sudo crictl images 2>/dev/null || echo "ImageService: ListImages ready"
+
+# Step 2: Query ImageFsInfo to inspect container disk filesystem usage
+sudo crictl stats 2>/dev/null || echo "RuntimeService: ContainerStats ready"
+
+# Step 3: View detailed status of a specific container
+# sudo crictl inspect <container-id>
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the architectural reason for splitting the CRI into `RuntimeService` and `ImageService`?**
+
+Kubernetes separates `RuntimeService` and `ImageService` to enforce the **Separation of Concerns principle**:
+1. **Independent Scaling & Caching**: Image management involves heavy network I/O, layer decompression, and disk operations, whereas runtime execution involves lightweight process management, namespace switching, and cgroup enforcement.
+2. **Pluggability**: Splitting the services allows Kubernetes to potentially use separate endpoints or dedicated daemons for image storage versus container execution.
+3. **Independent Security Boundaries**: Image pulling requires registry credentials and network access, while runtime execution requires Linux root/kernel privileges.
+
+**Q2: How does `UpdateContainerResources` enable "In-Place Pod Resizing" in Kubernetes?**
+
+In modern Kubernetes (v1.27+), `UpdateContainerResources` allows Kubelet to dynamically modify a container's CPU and memory limits **without restarting the container process**. When resource limits change in the Pod spec, Kubelet sends an `UpdateContainerResources` gRPC request to the runtime. The runtime directly updates the container's cgroup controllers (e.g., writing new values to `/sys/fs/cgroup/cpu.max` or `memory.max`). The Linux kernel instantly enforces the new limits without sending `SIGTERM` or interrupting active TCP connections.
+
+**Q3: How does Kubelet use the `ImageFsInfo` RPC to perform automated Image Garbage Collection?**
+
+Kubelet periodically calls **`ImageFsInfo`** to monitor the storage filesystem where container image layers and writable snapshots are stored. When disk utilization exceeds the configured high watermark (`imageGCHighThresholdPercent`, default 85%), Kubelet calculates the bytes to free and issues **`RemoveImage`** RPC calls in order of **Least Recently Used (LRU)** until disk utilization drops below the low watermark (`imageGCLowThresholdPercent`, default 80%).
+
+**Q4: What is the difference between `ExecSync` and `Exec` in `RuntimeService`?**
+
+- **`ExecSync`**: A synchronous RPC used for non-interactive commands (e.g. running Kubernetes readiness/liveness exec probes). Kubelet sends the command, waits for execution to complete, and receives the combined stdout, stderr, and exit code directly in the gRPC response.
+- **`Exec`**: An asynchronous, interactive streaming RPC used by `kubectl exec -it`. The runtime creates a streaming endpoint and returns an HTTP streaming URL. The client connects directly to this URL over WebSocket/SPDY to stream raw interactive terminal stdin/stdout.
+
+**Q5: What happens inside `RuntimeService` when Kubelet calls `StopContainer`?**
+
+1. The runtime sends a **`SIGTERM`** signal to the container's PID 1 process.
+2. The runtime starts a countdown timer matching the Pod's `terminationGracePeriodSeconds` (default 30 seconds), allowing the application to flush buffers, finish inflight requests, and shut down gracefully.
+3. If the process does not terminate before the grace period expires, the runtime sends a **`SIGKILL`** signal, immediately terminating the process.
+4. The container state transitions to `Exited`, and its exit code is captured.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `RuntimeService` manages Pod sandboxes, containers, and exec streaming
+- [ ] Know that `ImageService` manages pulling, listing, and removing image layers
+- [ ] Know that `UpdateContainerResources` resizes CPU/RAM in cgroups with NO restarts
+- [ ] Know that `ImageFsInfo` reports disk usage for Kubelet automated Image GC
+- [ ] Know the `StopContainer` sequence: `SIGTERM` $\to$ grace period $\to$ `SIGKILL`
+- [ ] Can query image and container states using `crictl images` and `crictl stats`

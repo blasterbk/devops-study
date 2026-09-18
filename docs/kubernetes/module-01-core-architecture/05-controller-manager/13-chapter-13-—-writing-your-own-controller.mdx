@@ -1,0 +1,1631 @@
+---
+title: "Chapter 13 — Writing Your Own Controller"
+sidebar_position: 13
+module: "Module 1.5 — Controller Manager Internals"
+description: "> **Goal:** Learn how to build a production-grade Kubernetes Controller from scratch using **controller-runtime**. Understand how Custom Resource Definitions (C..."
+---
+
+# Module 1.5 — Kubernetes Controller Manager Internals
+
+# Chapter 13 — Writing Your Own Controller
+
+> **Goal:** Learn how to build a production-grade Kubernetes Controller from scratch using **controller-runtime**. Understand how Custom Resource Definitions (CRDs), Watches, WorkQueues, Reconcilers, OwnerReferences, Finalizers, Status updates, error handling, testing, and deployment work together to create a fully functional Kubernetes Operator.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. CRDs: extending the Kubernetes API with custom resource types
+> 2. Scaffolding a controller with kubebuilder: project structure
+> 3. Watches: registering which resources trigger your reconcile function
+> 4. Reconcile(): implementing desired-vs-actual comparison and correction
+> 5. OwnerReferences: linking child resources to parent for garbage collection
+> 6. Finalizers: ensuring cleanup before an object is permanently deleted
+> 7. Status subresource: reporting observed state back to the cluster
+> 8. Testing: envtest, fake clients, unit and integration tests
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of writing a custom controller like opening a franchise restaurant.
+
+```text
+Franchise Restaurant Analogy:
+
+Franchise HQ (controller-runtime) provides the operating system
+You provide the menu (CRD: your custom resource type)
+Kitchen staff (reconcile function) prepares food to match each order
+If a dish is already made correctly: no action needed (idempotent check)
+If an ingredient is missing: order more (create child resource)
+If a customer cancels: clean up the kitchen (finalizer cleanup)
+Manager reports order status on receipt (status subresource update)
+```
+
+| Franchise | Writing Your Own Controller |
+| :--- | :--- |
+| Franchise operating system | controller-runtime framework |
+| Your menu | CRD (Custom Resource Definition) |
+| Customer order | Custom resource instance (`kubectl apply`) |
+| Kitchen preparing food | Reconcile() function executing desired state |
+| Cleaning up cancelled order | Finalizer: clean up before deletion |
+| Receipt with order status | Status subresource: observed state report |
+
+> **Important:** Your `Reconcile()` function **must be idempotent**. It will be called repeatedly — on creation, updates, periodic resyncs, and retries. If you call `Create()` without first checking whether the resource exists, you will get an `AlreadyExists` error on every subsequent reconcile. Always read first, compare, then act only on the diff.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes API Machinery
+- controller-runtime
+- Shared Informers
+- WorkQueues
+- Reconciliation Loop
+- Deployments
+- StatefulSets
+- Services
+- Pods
+
+---
+
+# Why Write Your Own Controller?
+
+Kubernetes includes built-in controllers:
+
+```text
+Deployment Controller
+
+ReplicaSet Controller
+
+StatefulSet Controller
+
+Job Controller
+```
+
+But suppose your company creates a new resource:
+
+```yaml
+kind: Database
+```
+
+Question:
+
+Who creates:
+
+- StatefulSet?
+- Service?
+- PVC?
+- Secret?
+- Backup Job?
+
+Kubernetes has no built-in logic for this.
+
+You must write your own Controller.
+
+---
+
+# Example
+
+User creates:
+
+```yaml
+apiVersion: database.example.com/v1
+
+kind: Database
+
+metadata:
+
+  name: postgres
+
+spec:
+
+  replicas: 3
+
+  storage: 100Gi
+```
+
+Desired outcome:
+
+```text
+Database CR
+
+v
+
+Controller
+
+v
+
+StatefulSet
+
+v
+
+PVCs
+
+v
+
+Service
+
+v
+
+Secret
+
+v
+
+Running PostgreSQL Cluster
+```
+
+---
+
+# High-Level Architecture
+
+```text
+             User
+
+               |
+
+        Create Database CR
+
+               |
+
+          API Server
+
+               |
+
+      Shared Informer Watch
+
+               |
+
+          WorkQueue
+
+               |
+
+         Reconcile()
+
+               |
+
+     ┌─────────┼─────────┐
+
+     ▼         ▼         ▼
+
+ StatefulSet  Service   Secret
+
+               |
+
+         Update Status
+```
+
+---
+
+# Step 1 — Define a CRD
+
+Every custom controller begins with a:
+
+```text
+Custom Resource Definition
+
+(CRD)
+```
+
+The CRD extends the Kubernetes API.
+
+---
+
+# What is a CRD?
+
+A CRD defines:
+
+- API Group
+- Version
+- Resource Name
+- Schema
+- Validation
+- Printer Columns
+
+Conceptually:
+
+```text
+CRD
+
+v
+
+New Kubernetes API
+```
+
+---
+
+# Example
+
+```text
+Built-in API
+
+v
+
+Deployment
+
+v
+
+Pod
+
+-----------------
+
+Custom API
+
+v
+
+Database
+
+v
+
+Backup
+
+v
+
+Certificate
+```
+
+After installing the CRD:
+
+```bash
+kubectl get databases
+```
+
+works exactly like:
+
+```bash
+kubectl get deployments
+```
+
+---
+
+# Step 2 — Watch Resources
+
+The Controller must know when something changes.
+
+Instead of polling:
+
+```text
+Every Second
+
+v
+
+Read API
+```
+
+It uses:
+
+```text
+Watch
+```
+
+---
+
+# Watch Architecture
+
+```text
+API Server
+
+v
+
+Informer
+
+v
+
+Watch Event
+
+v
+
+WorkQueue
+```
+
+---
+
+# Events
+
+Controllers typically watch:
+
+```text
+Create
+
+Update
+
+Delete
+
+Generic
+```
+
+Each event may trigger reconciliation.
+
+---
+
+# Primary Resource Watch
+
+Example:
+
+```text
+Database CR
+
+Updated
+
+v
+
+Queue Database
+```
+
+---
+
+# Secondary Resource Watch
+
+Suppose:
+
+```text
+StatefulSet
+
+Deleted
+```
+
+The controller should reconcile:
+
+```text
+Database
+```
+
+OwnerReferences allow mapping child resources back to their parent.
+
+---
+
+# Event Flow
+
+```text
+Database Updated
+
+v
+
+Informer
+
+v
+
+Predicate
+
+v
+
+Queue
+
+v
+
+Reconcile
+```
+
+---
+
+# Step 3 — WorkQueue
+
+The WorkQueue decouples:
+
+```text
+Events
+
+v
+
+Processing
+```
+
+---
+
+# Why Queue?
+
+Suppose:
+
+```text
+1000
+
+Updates
+
+Per Second
+```
+
+Without a queue:
+
+```text
+1000
+
+Concurrent
+
+Reconciliations
+```
+
+Very inefficient.
+
+---
+
+# Queue Workflow
+
+```text
+Watch Event
+
+v
+
+Queue Key
+
+v
+
+Worker
+
+v
+
+Reconcile()
+```
+
+Notice:
+
+The queue stores:
+
+```text
+Namespace
+
++
+
+Name
+```
+
+Not the entire object.
+
+---
+
+# Queue Architecture
+
+```text
+Watch
+
+v
+
+Queue
+
+v
+
+Worker 1
+
+Worker 2
+
+Worker 3
+
+v
+
+Reconcile()
+```
+
+The same object key is not processed concurrently by multiple workers.
+
+---
+
+# Step 4 — Reconcile()
+
+This is where your business logic lives.
+
+Everything else supports this function.
+
+---
+
+# Reconcile Loop
+
+```text
+Receive Request
+
+v
+
+Read Resource
+
+v
+
+Compare Desired
+
+v
+
+Compare Actual
+
+v
+
+Need Changes?
+
+ |
+
+ +-- No
+
+ |
+
+ ▼
+
+Return
+
+ |
+
+ +-- Yes
+
+      |
+
+      ▼
+
+Update Cluster
+```
+
+---
+
+# Typical Reconcile Logic
+
+Conceptually:
+
+```text
+Read Database
+
+v
+
+StatefulSet Exists?
+
+ |
+
+ +-- No
+
+ |
+
+ ▼
+
+Create
+
+ |
+
+ +-- Yes
+
+      |
+
+      ▼
+
+Compare
+
+v
+
+Update
+
+v
+
+Status
+
+v
+
+Return
+```
+
+---
+
+# Idempotency
+
+Reconcile should always be:
+
+```text
+Idempotent
+```
+
+Running:
+
+```text
+Once
+
+or
+
+100 Times
+```
+
+must produce the same desired state.
+
+---
+
+# Why?
+
+Suppose:
+
+```text
+Network Timeout
+
+v
+
+Controller Retries
+```
+
+The retry must be safe.
+
+---
+
+# Step 5 — OwnerReferences
+
+Controllers create child resources.
+
+Example:
+
+```text
+Database
+
+v
+
+StatefulSet
+
+v
+
+Pods
+```
+
+Relationships should be explicit.
+
+---
+
+# OwnerReference Architecture
+
+```text
+Database CR
+
+v
+
+OwnerReference
+
+v
+
+StatefulSet
+
+v
+
+OwnerReference
+
+v
+
+Pods
+```
+
+---
+
+# Why OwnerReferences?
+
+Benefits:
+
+- Automatic garbage collection
+- Event mapping
+- Ownership tracking
+- Easier debugging
+
+---
+
+# Example
+
+Delete:
+
+```text
+Database
+```
+
+Garbage Collector automatically removes:
+
+```text
+StatefulSet
+
+v
+
+Pods
+
+v
+
+Services
+```
+
+assuming appropriate ownership relationships.
+
+---
+
+# Step 6 — Finalizers
+
+Deletion is more complicated than creation.
+
+Suppose:
+
+```text
+Delete Database
+```
+
+Should Kubernetes immediately remove:
+
+```text
+Cloud Database
+
+v
+
+Backup
+
+v
+
+DNS
+
+v
+
+PVC?
+```
+
+Probably not.
+
+---
+
+# What is a Finalizer?
+
+A Finalizer delays deletion until cleanup finishes.
+
+Workflow:
+
+```text
+Delete Request
+
+v
+
+Deletion Timestamp
+
+v
+
+Run Cleanup
+
+v
+
+Remove Finalizer
+
+v
+
+Delete Object
+```
+
+---
+
+# Finalizer Workflow
+
+```text
+Database
+
+v
+
+Delete Requested
+
+v
+
+Finalizer Exists
+
+v
+
+Cleanup
+
+v
+
+Remove Finalizer
+
+v
+
+Object Deleted
+```
+
+---
+
+# Typical Cleanup
+
+Examples:
+
+- Delete cloud database
+- Remove DNS records
+- Delete external backups
+- Revoke certificates
+- Release cloud resources
+
+---
+
+# Step 7 — Status Updates
+
+Every Kubernetes object contains:
+
+```text
+Spec
+
+Status
+```
+
+---
+
+# Spec
+
+Desired state.
+
+Example:
+
+```yaml
+replicas: 3
+```
+
+---
+
+# Status
+
+Observed state.
+
+Example:
+
+```yaml
+readyReplicas: 3
+
+phase: Running
+```
+
+---
+
+# Why Separate Spec and Status?
+
+Users declare:
+
+```text
+What
+
+They Want
+```
+
+Controllers report:
+
+```text
+What
+
+Actually Exists
+```
+
+---
+
+# Status Workflow
+
+```text
+Observe Cluster
+
+v
+
+Calculate Status
+
+v
+
+Update Status
+
+v
+
+Return
+```
+
+---
+
+# Example
+
+```text
+Desired
+
+3 Replicas
+
+v
+
+Actual
+
+2 Replicas
+
+v
+
+Status
+
+Progressing
+```
+
+When all replicas become ready:
+
+```text
+Status
+
+Running
+```
+
+---
+
+# Step 8 — Error Handling
+
+Distributed systems fail.
+
+Examples:
+
+- API timeout
+- Network partition
+- Missing Secret
+- Storage unavailable
+- Cloud API failure
+
+Controllers must handle errors gracefully.
+
+---
+
+# Error Workflow
+
+```text
+API Call
+
+v
+
+Success?
+
+ |
+
+ +-- Yes
+
+ |
+
+ ▼
+
+Continue
+
+ |
+
+ +-- No
+
+      |
+
+      ▼
+
+Return Error
+
+v
+
+Queue Retry
+```
+
+---
+
+# Automatic Retry
+
+controller-runtime automatically requeues reconciliation when errors are returned.
+
+Conceptually:
+
+```text
+Reconcile
+
+v
+
+Error
+
+v
+
+Rate-Limited Queue
+
+v
+
+Retry
+```
+
+---
+
+# Transient vs Permanent Errors
+
+Transient:
+
+```text
+Network Timeout
+```
+
+Retry is appropriate.
+
+Permanent:
+
+```text
+Invalid Configuration
+```
+
+Usually update Status and avoid endless retries until the specification changes.
+
+---
+
+# Step 9 — Testing
+
+Production Controllers should be tested thoroughly.
+
+---
+
+# Unit Testing
+
+Test:
+
+```text
+Reconcile()
+
+v
+
+Mock Client
+
+v
+
+Expected Objects
+```
+
+Focus on business logic.
+
+---
+
+# Integration Testing
+
+Run against:
+
+```text
+API Server
+
++
+
+etcd
+```
+
+using a Kubernetes test environment.
+
+Verify:
+
+- Resource creation
+- Status updates
+- Finalizers
+- Watches
+- OwnerReferences
+
+---
+
+# End-to-End Testing
+
+Deploy Controller into a real cluster.
+
+Create:
+
+```text
+Database CR
+```
+
+Verify:
+
+```text
+StatefulSet
+
+PVC
+
+Service
+
+Status
+
+Cleanup
+```
+
+Everything should behave exactly as expected.
+
+---
+
+# Step 10 — Production Deployment
+
+Controllers are usually deployed as:
+
+```text
+Deployment
+```
+
+inside Kubernetes.
+
+---
+
+# Deployment Architecture
+
+```text
+Deployment
+
+v
+
+Controller Pod
+
+v
+
+Manager
+
+v
+
+Leader Election
+
+v
+
+Reconcile()
+```
+
+---
+
+# High Availability
+
+Multiple replicas may run:
+
+```text
+Replica 1
+
+Replica 2
+
+Replica 3
+```
+
+Leader election ensures:
+
+```text
+Only One
+
+Leader
+
+Reconciles
+```
+
+Followers remain ready to take over.
+
+---
+
+# Complete End-to-End Workflow
+
+```text
+User
+
+v
+
+Create Database CR
+
+v
+
+API Server
+
+v
+
+Informer
+
+v
+
+Watch Event
+
+v
+
+Predicate
+
+v
+
+WorkQueue
+
+v
+
+Worker
+
+v
+
+Reconcile()
+
+v
+
+Read Database
+
+v
+
+Create StatefulSet
+
+v
+
+Create Service
+
+v
+
+Create Secret
+
+v
+
+Set OwnerReferences
+
+v
+
+Update Status
+
+v
+
+Return
+
+v
+
+Watch New Events
+
+v
+
+Repeat
+```
+
+---
+
+# Complete Delete Workflow
+
+```text
+Delete Database
+
+v
+
+Deletion Timestamp
+
+v
+
+Finalizer
+
+v
+
+Delete External Resources
+
+v
+
+Delete Child Resources
+
+v
+
+Remove Finalizer
+
+v
+
+Garbage Collector
+
+v
+
+Object Removed
+```
+
+---
+
+# Production Example 1
+
+Database Operator
+
+```text
+Database CR
+
+v
+
+StatefulSet
+
+v
+
+PVC
+
+v
+
+Service
+
+v
+
+Running Database
+```
+
+---
+
+# Production Example 2
+
+Certificate Controller
+
+```text
+Certificate CR
+
+v
+
+Request Certificate
+
+v
+
+Create Secret
+
+v
+
+Renew Automatically
+```
+
+---
+
+# Production Example 3
+
+Cloud Load Balancer Controller
+
+```text
+Ingress
+
+v
+
+Create Cloud LB
+
+v
+
+Update Status
+
+v
+
+Cleanup On Delete
+```
+
+---
+
+# Production Example 4
+
+AI Model Controller
+
+```text
+AIModel CR
+
+v
+
+GPU Deployment
+
+v
+
+Autoscaler
+
+v
+
+Inference Service
+```
+
+---
+
+# Production Example 5
+
+Backup Controller
+
+```text
+Backup CR
+
+v
+
+CronJob
+
+v
+
+Job
+
+v
+
+Backup
+
+v
+
+Status Updated
+```
+
+---
+
+# Production Best Practices
+
+✔ Keep reconciliation idempotent.
+
+✔ Read from the cache; write only when necessary.
+
+✔ Use OwnerReferences for Kubernetes-managed child resources.
+
+✔ Use Finalizers only when external cleanup is required.
+
+✔ Update the Status subresource instead of modifying Spec.
+
+✔ Handle transient and permanent errors differently.
+
+✔ Avoid long-running operations inside `Reconcile()`; delegate lengthy work and return quickly.
+
+✔ Use leader election in production.
+
+✔ Expose metrics, health probes, and readiness probes.
+
+✔ Use structured logging with resource identifiers.
+
+✔ Limit RBAC permissions to the minimum required.
+
+✔ Test every reconciliation path, including failures and deletion.
+
+---
+
+# Common Mistakes
+
+### ❌ Mistake 1
+
+Polling the API continuously.
+
+Correct approach:
+
+Use Watches.
+
+---
+
+### ❌ Mistake 2
+
+Creating duplicate child resources.
+
+Correct approach:
+
+Read first, compare desired vs actual, then create only if needed.
+
+---
+
+### ❌ Mistake 3
+
+Ignoring OwnerReferences.
+
+Correct approach:
+
+Set ownership so Kubernetes can perform garbage collection and event mapping.
+
+---
+
+### ❌ Mistake 4
+
+Deleting external resources without Finalizers.
+
+Correct approach:
+
+Use Finalizers to guarantee cleanup before the custom resource disappears.
+
+---
+
+### ❌ Mistake 5
+
+Updating Spec instead of Status.
+
+Correct approach:
+
+Controllers normally update the Status subresource to report observed state.
+
+---
+
+### ❌ Mistake 6
+
+Returning errors for permanent configuration problems forever.
+
+Correct approach:
+
+Record the problem in Status and requeue only when appropriate or after relevant changes.
+
+---
+
+### ❌ Mistake 7
+
+Performing expensive operations on every reconciliation.
+
+Correct approach:
+
+Compare desired and actual state before making changes.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the first step in writing a Kubernetes Controller?
+
+Define a Custom Resource Definition (CRD) for the new API.
+
+---
+
+### Q2. Why does a Controller use Watches instead of polling?
+
+Watches provide efficient, event-driven reconciliation with significantly lower API load.
+
+---
+
+### Q3. What is stored in the WorkQueue?
+
+Typically the namespace/name key identifying the resource to reconcile.
+
+---
+
+### Q4. Why must `Reconcile()` be idempotent?
+
+Because reconciliation may run repeatedly due to retries, resyncs, or multiple events.
+
+---
+
+### Q5. What is the purpose of OwnerReferences?
+
+To establish ownership relationships for garbage collection and event mapping.
+
+---
+
+### Q6. When should Finalizers be used?
+
+When cleanup must occur before Kubernetes permanently deletes an object.
+
+---
+
+### Q7. Why are Spec and Status separated?
+
+Spec represents the desired state; Status reports the observed state.
+
+---
+
+### Q8. How should production Controllers be deployed?
+
+As highly available Deployments with leader election, health checks, metrics, and appropriate RBAC.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Controller never reconciles | Watch not registered, cache not synchronized, or Manager not running |
+| Child resources created repeatedly | Reconcile logic not idempotent or existing resources not checked |
+| Custom resource stuck deleting | Finalizer not removed after cleanup |
+| Status never updates | Status subresource not enabled or update logic incorrect |
+| Child resources remain after deletion | Missing OwnerReferences or external cleanup incomplete |
+| Excessive API traffic | Direct API reads instead of cache, unnecessary writes, or missing event filtering |
+
+---
+
+# Knowledge Check
+
+Before completing this module, you should be able to answer:
+
+1. Why does a custom Controller require a CRD?
+2. How do Watches trigger reconciliation?
+3. Why does the WorkQueue store keys instead of full objects?
+4. What are the responsibilities of `Reconcile()`?
+5. Why is idempotency essential?
+6. What is the purpose of OwnerReferences?
+7. When should Finalizers be used?
+8. Why are Status updates separate from Spec?
+9. How should Controllers handle transient versus permanent errors?
+10. What types of testing should every Controller include?
+11. How are Controllers deployed in production?
+12. What production practices improve Controller reliability and scalability?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how to build a complete Kubernetes Controller using **controller-runtime**.
+
+You learned:
+
+- How CRDs extend the Kubernetes API
+- How Watches detect changes efficiently
+- How the WorkQueue buffers reconciliation requests
+- How `Reconcile()` implements the desired-state reconciliation loop
+- How OwnerReferences establish ownership and enable garbage collection
+- How Finalizers guarantee cleanup before deletion
+- How Status updates communicate observed state
+- How Controllers handle retries and errors safely
+- How Controllers should be tested at the unit, integration, and end-to-end levels
+- How production Controllers are deployed with leader election, health checks, metrics, and minimal RBAC
+
+A production Kubernetes Controller is fundamentally an **event-driven reconciliation engine**. Rather than executing imperative workflows, it continuously observes cluster state, compares it with the desired state declared in Custom Resources, and makes only the changes required to converge the two. By combining **CRDs**, **Watches**, **WorkQueues**, **Reconcilers**, **OwnerReferences**, **Finalizers**, and **Status reporting**, custom Controllers become first-class citizens of the Kubernetes control plane, enabling sophisticated automation for virtually any infrastructure or application domain.
+
+---
+
+# Module 1.5 Complete
+
+You have completed **Module 1.5 — Kubernetes Controller Manager Internals**.
+
+You now have a production-level understanding of:
+
+```text
+Chapter 1   Introduction to Controllers    -- desired state, control theory, all writes via API Server
+Chapter 2   Reconciliation Loop            -- observe, compare, act; idempotent; event-driven
+Chapter 3   Shared Informers              -- List+Watch, DeltaFIFO, ONE shared Informer per resource
+Chapter 4   WorkQueues                    -- deduplication, rate-limiting, exponential backoff
+Chapter 5   Leader Election               -- Lease objects, standby replicas hold WorkQueue
+Chapter 6   ReplicaSet Controller         -- label selector ownership, adopt/orphan logic
+Chapter 7   Deployment Controller         -- never creates Pods directly; manages ReplicaSets only
+Chapter 8   StatefulSet Controller        -- ordered creation (0,1,2), reverse deletion, PVC retained
+Chapter 9   Job Controller                -- finite workload; completed Jobs not auto-deleted
+Chapter 10  CronJob Controller            -- at-least-once execution; idempotent Jobs required
+Chapter 11  Node Controller               -- Node Lease heartbeat; graceful taint-based eviction
+Chapter 12  controller-runtime           -- Manager, Cache, Client; foundation for kubebuilder/SDK
+Chapter 13  Writing Your Own Controller   -- CRD, Watch, Reconcile, OwnerRef, Finalizer, Status
+```
+
+You now understand not just **how controllers work** but **why every architectural decision exists** — from the shared Informer model to WorkQueue deduplication to the layered Deployment -> ReplicaSet -> Pod ownership chain.
+
+---
+
+# Next Module
+
+## Module 1.6 — Custom Resource Definitions (CRDs) & Operators
+
+The next module explores **how CRDs extend the Kubernetes API** and how production Operators automate complex stateful applications.
+
+Topics include CRD architecture, API registration, structural schemas, validation, defaulting, multiple versions, conversion webhooks, admission webhooks, and end-to-end Operator lifecycle with industry examples (cert-manager, Prometheus Operator, Crossplane, Argo CD).

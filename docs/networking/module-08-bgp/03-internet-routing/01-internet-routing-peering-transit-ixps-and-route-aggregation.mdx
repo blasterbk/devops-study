@@ -1,0 +1,142 @@
+---
+title: "Chapter 3 — Internet Routing: Peering, Transit, IXPs, RPKI & Route Leaks"
+sidebar_position: 1
+module: "Module 8.3 — Internet Routing"
+description: "Master global Internet routing economics and security — Transit vs Settlement-Free Peering, Internet Exchange Points (IXPs), Route Aggregation, RPKI Route Origin Authorization (ROA), and Route Leak prevention."
+---
+
+# Chapter 3 — Internet Routing: Peering, Transit, IXPs, RPKI & Route Leaks
+
+> **Goal:** Master the economic and topological mechanics of global Internet routing. Understand the financial difference between IP Transit and Settlement-Free Peering, how Internet Exchange Points (IXPs) cross-connect networks via switching fabrics, CIDR route aggregation/supernetting, and modern BGP security using Resource Public Key Infrastructure (RPKI) to prevent BGP Route Hijacking and Route Leaks.
+>
+> By the end of this chapter, you will understand:
+> 1. Transit (paid upstream bandwidth) vs Settlement-Free Peering (mutual zero-cost traffic exchange)
+> 2. Internet Exchange Points (IXPs): route servers, physical cross-connects, and bilateral peering
+> 3. Route Aggregation (CIDR supernetting) and minimizing the global DFZ routing table size
+> 4. BGP Route Hijacking (e.g. YouTube/Pakistan Telecom incident) and Route Leaks (RFC 7908)
+> 5. Resource Public Key Infrastructure (RPKI) & Route Origin Authorization (ROA) cryptographically validating origin ASNs
+> 6. CLI tools to verify RPKI validity states (`Valid`, `Invalid`, `NotFound`)
+
+---
+
+## Real-Life Analogy
+
+Think of global Internet routing as **the international commercial airline and airport runway alliance**:
+
+- **IP Transit (Buying First-Class Tickets on a Global Carrier):**
+  - A small regional airline pays Delta/Lufthansa a monthly fee to transport its passengers to any airport on Earth (**Tier-1 Transit Provider**).
+- **Settlement-Free Peering (Mutual Passenger Transfer Treaty):**
+  - Delta and Air France agree: *"We will exchange passengers transferring between Paris and Atlanta for free, because our traffic volume is roughly equal (**Peering Agreement**)"*.
+- **Internet Exchange Point (IXP — The Shared International Airport Terminal):**
+  - A massive physical terminal (e.g. DE-CIX Frankfurt) where 500 airlines park their planes at adjacent gates to swap passengers directly without paying third-party transit fees.
+- **RPKI / ROA (Biometric Passport & Aircraft Registration):**
+  - A cryptographic passport proving that Flight #101 is legally authorized by the civil aviation authority to fly to New York, preventing pirate aircraft from hijacking the runway (**BGP Hijack Defense**).
+
+---
+
+## Architecture Diagram
+
+```text
+                     Internet Exchange Point (IXP) & RPKI Validation
+                     
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ INTERNET EXCHANGE POINT (IXP) - High-Speed Ethernet Switching Fabric        │
+ │                                                                             │
+ │    [Cloudflare Router]   [Netflix Router]   [Google Router]  [Local ISP]    │
+ │       (ASN 13335)           (ASN 2906)        (ASN 15169)     (ASN 64500)   │
+ │            │                     │                 │               │        │
+ │            └─────────────────────┴────────┬────────┴───────────────┘        │
+ │                                           │                                 │
+ │                              ┌────────────▼────────────┐                    │
+ │                              │ IXP Shared Route Server │                    │
+ │                              │ (Settlement-Free Peering│                    │
+ │                              └─────────────────────────┘                    │
+ └───────────────────────────────────────────┬─────────────────────────────────┘
+                                             │
+                                             ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ RPKI ROUTE ORIGIN VALIDATION (ROV) ENGINE                                   │
+ │                                                                             │
+ │   Prefix Announced: `1.1.1.0/24` with Origin ASN: 13335                     │
+ │   Cryptographic ROA Signature Check against RIR Trust Anchor (ARIN/RIPE):   │
+ │   ├── Match: Origin ASN = 13335, Max-Length = 24  ──► [STATUS: VALID (Accept)]
+ │   └── Mismatch: Origin ASN = 99999 (Rogue/Hijack) ──► [STATUS: INVALID (DROP)]
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Transit vs Settlement-Free Peering
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Model                │ Economic Relationship                    │ Routing Scope                            │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **IP Transit**       │ Customer pays provider $/Mbps/month      │ Full Global Internet Routing Table       │
+ │                      │ (Committed Information Rate + Burst)     │ (All 950,000+ prefixes in the DFZ)       │
+ │ **Peering**          │ Free (Settlement-Free) or Shared Cost    │ Only customer routes of the peer         │
+ │                      │ (Mutual exchange of symmetric traffic)   │ (Cannot reach rest of global Internet)   │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 2. BGP Route Hijacking & RPKI Route Origin Authorization (ROA)
+
+- **BGP Route Hijack:** An unauthorized ASN announces a more specific prefix (e.g., announcing `1.1.1.0/24` when the legitimate owner announces `1.1.1.0/22`). Because of **Longest Prefix Match**, global traffic diverts to the attacker's network.
+- **RPKI (Resource Public Key Infrastructure):**
+  - Regional Internet Registries (RIRs like ARIN, RIPE) issue cryptographically signed **ROA (Route Origin Authorization)** objects.
+  - An ROA binds a prefix (e.g. `1.1.1.0/24`) to an authorized ASN (`AS13335`) and a `MaxLength` (e.g. `/24`).
+  - Routers running **Route Origin Validation (ROV)** verify the signature and mark routes as `Valid`, `Invalid`, or `NotFound`, automatically dropping all `Invalid` hijack advertisements.
+
+---
+
+## Hands-On Lab: Querying RPKI Validation via CLI
+
+```bash
+# Step 1: Query public RPKI validation status for a prefix using Cloudflare/RIPE APIs
+curl -s "https://rpki.cloudflare.com/api/v1/validity?prefix=1.1.1.0/24&asn=13335" | grep -i "status"
+
+# Step 2: Query WHOIS RADB database to verify Route Objects
+whois -h whois.radb.net 1.1.1.0/24 | grep -E "(route|origin|mnt-by)"
+
+# Step 3: View current size of the global Default-Free Zone (DFZ) routing table
+# (Over 950,000 IPv4 routes on the global Internet today)
+curl -s https://bgp.potaroo.net/as2.0/bgptable.txt | head -n 15 2>/dev/null || echo "Global IPv4 table ~950k prefixes"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Default-Free Zone (DFZ) of the Internet?**
+
+The **Default-Free Zone (DFZ)** is the collection of all Tier-1 Internet backbone routers that do not maintain a default route (`0.0.0.0/0`). Because Tier-1 carriers sit at the top of the hierarchy, they must maintain the complete, explicit global BGP routing table (over 950,000 IPv4 routes and 200,000 IPv6 routes) in their FIB to reach every public network on Earth.
+
+**Q2: What is a BGP Route Leak (RFC 7908) and how does it happen?**
+
+A BGP Route Leak occurs when a multi-homed customer network inadvertently learns routes from Transit Provider A and re-announces them to Transit Provider B. Transit Provider B sees a shorter path and begins routing massive volumes of international transit traffic through the customer's modest 1Gbps uplink, immediately crashing the customer's routers and causing widespread regional Internet outages.
+
+**Q3: How does RPKI Route Origin Validation (ROV) prevent BGP Hijacking?**
+
+In RPKI, domain and IP owners cryptographically sign a **Route Origin Authorization (ROA)** stating which ASN is legally authorized to originate their IP prefix. BGP routers download these validated ROA caches from local RPKI validators (e.g., Routinator). When a router receives an eBGP UPDATE, it compares the origin ASN against the ROA. If a rogue ASN is detected, the route is marked **`Invalid`** and dropped from the FIB.
+
+**Q4: What is an IXP Route Server and why is it used?**
+
+At an Internet Exchange Point with 500 members, establishing bilateral peering would require $500 \times 499 / 2 \approx 124,750$ individual BGP sessions. An **IXP Route Server** maintains a single multi-lateral peering session with every participant. Each member peers once with the Route Server, which reflects prefixes to all other members, drastically simplifying configuration.
+
+**Q5: What is BGP Autonomous System Confederation (RFC 5065)?**
+
+BGP Confederation is an alternative to Route Reflectors for scaling large iBGP networks. It divides a single massive public AS into multiple small, private sub-Autonomous Systems (Member-AS). Routers communicate between Member-ASNs using eBGP-like rules (bypassing iBGP split-horizon) while presenting a single unified public ASN to the outside Internet.
+
+---
+
+## Summary Checksheet
+
+- [ ] Understand IP Transit vs Settlement-Free Peering economics
+- [ ] Understand IXP switching fabrics and Route Servers
+- [ ] Know how RPKI and ROAs prevent BGP Route Hijacking
+- [ ] Understand BGP Route Leaks (RFC 7908) and multi-homed customer risks
+- [ ] Know the concept of the Default-Free Zone (DFZ)

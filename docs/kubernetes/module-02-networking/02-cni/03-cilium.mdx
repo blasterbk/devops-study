@@ -1,0 +1,294 @@
+---
+title: "Chapter 3 — Cilium"
+sidebar_position: 3
+module: "Module 2.2 — CNI Plugins"
+description: "Deep dive into Cilium — the eBPF-native CNI plugin covering its architecture, Hubble observability, IPAM modes, kube-proxy replacement, identity-based security, and why it's the leading choice for high-performance Kubernetes networking."
+---
+
+# Chapter 3 — Cilium
+
+> **Goal:** Understand Cilium's eBPF-native architecture, how it replaces kube-proxy, enforces identity-based NetworkPolicy, provides deep observability through Hubble, and achieves near wire-speed performance by operating directly in the Linux kernel.
+>
+> By the end of this chapter, you will understand:
+> 1. Cilium's core architecture: cilium-agent, Hubble, Operator
+> 2. What makes Cilium eBPF-native (vs iptables-based CNIs)
+> 3. How Cilium replaces kube-proxy entirely
+> 4. Cilium's identity-based security model (vs IP-based)
+> 5. Hubble — the built-in network observability layer
+> 6. Cilium's IPAM modes and when to use each
+
+---
+
+## Real-Life Analogy
+
+Traditional CNIs (Calico iptables, Flannel) are like a **security guard checking a list** at the door — for every person (packet) that arrives, the guard scans a long list of rules top-to-bottom to decide if they can enter. More people = longer list = slower checks.
+
+Cilium is like a **smart turnstile with RFID** — each person has a cryptographic identity badge (Pod identity). The turnstile reads the badge in microseconds using a hash lookup, grants or denies access based on policy, and logs the event — all at hardware speed. No list scanning. The system also monitors traffic patterns in real-time (Hubble) without adding overhead.
+
+---
+
+## Architecture Diagram
+
+```text
+                        Cilium Architecture
+
+┌────────────────────────────────────────────────────────────────┐
+│ Kubernetes API / etcd                                          │
+│  - NetworkPolicies, CiliumNetworkPolicies                      │
+│  - Endpoints, Services, Pods                                   │
+└───────────────────────────┬────────────────────────────────────┘
+                            │ Watch
+┌───────────────────────────▼────────────────────────────────────┐
+│ Cilium Operator (cluster-scoped)                               │
+│  - Manages IP pools (CiliumIPAMPool CRDs)                      │
+│  - Syncs endpoint identities across cluster                    │
+│  - Manages Cilium Node resources                               │
+└───────────────────────────┬────────────────────────────────────┘
+                            │ Sync
+┌───────────────────────────▼────────────────────────────────────┐
+│ cilium-agent DaemonSet (on every node)                         │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  cilium-agent (Go daemon)                                │  │
+│  │  - Compiles & loads eBPF programs into kernel            │  │
+│  │  - Manages endpoint identity maps                        │  │
+│  │  - Handles Service DNAT without kube-proxy               │  │
+│  │  - Exposes Hubble gRPC API                               │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌─────────────────┐  ┌─────────────────┐                     │
+│  │  eBPF Programs  │  │  Hubble Observer │                     │
+│  │  (kernel space) │  │  (userspace)     │                     │
+│  │                 │  │                  │                     │
+│  │  TC hooks on    │  │  Reads events    │                     │
+│  │  every veth     │  │  from eBPF ring  │                     │
+│  │  XDP on NICs    │  │  buffer          │                     │
+│  └─────────────────┘  └─────────────────┘                     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why eBPF-Native Changes Everything
+
+Traditional CNIs operate at the **iptables level** (Layer 3/4 of the networking stack). Cilium operates at the **eBPF level** — programs running directly in the kernel at packet-processing time.
+
+```text
+Traditional CNI (iptables) packet path:
+  NIC → kernel TCP/IP stack → iptables PREROUTING → iptables FORWARD
+    → iptables POSTROUTING → veth → Pod
+
+Cilium eBPF packet path:
+  NIC → XDP hook (before kernel stack)
+    → TC hook (traffic control, per-interface)
+      → eBPF program: lookup policy, apply DNAT, forward
+        → veth → Pod
+
+Cilium bypasses:
+  ✗ iptables chains (no O(N) rule scanning)
+  ✗ conntrack table (for known flows)
+  ✗ kube-proxy (Service DNAT handled in eBPF)
+```
+
+---
+
+## Identity-Based Security Model
+
+This is Cilium's most important differentiator. Instead of IP-based policy (which IPs can talk to which IPs), Cilium uses **cryptographic endpoint identities**:
+
+```text
+Every Cilium endpoint (Pod) gets an identity derived from:
+  - Kubernetes labels
+  - Namespace
+  - ServiceAccount
+
+Example:
+  Pod labels: {app: frontend, env: production}
+  → Identity Hash: 12345
+
+Policy: "allow identity 12345 to talk to identity 67890 on port 8080"
+```
+
+Why this matters:
+- **IP recycling safe**: When a Pod dies and its IP is reused, the old identity is gone. The new Pod gets a different identity if it has different labels.
+- **No IP enumeration**: Policies don't break when Pods scale up/down.
+- **L7 policy**: Because Cilium parses packets above L3/L4, it can enforce HTTP-level policies (specific paths, headers, methods).
+
+```yaml
+# CiliumNetworkPolicy — HTTP-level (L7) policy
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-get-only
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/api/v1/data"
+```
+
+---
+
+## kube-proxy Replacement
+
+Cilium can completely replace `kube-proxy`. Instead of iptables DNAT rules for Services, Cilium implements Service load balancing directly in eBPF:
+
+```bash
+# Enable kube-proxy replacement
+helm install cilium cilium/cilium \
+  --set kubeProxyReplacement=strict \
+  --set k8sServiceHost=<API_SERVER_IP> \
+  --set k8sServicePort=6443
+
+# Verify kube-proxy replacement is active
+kubectl exec -n kube-system cilium-<id> -- cilium status | grep KubeProxyReplacement
+
+# View all Services handled by Cilium (not kube-proxy)
+kubectl exec -n kube-system cilium-<id> -- cilium service list
+```
+
+How eBPF Service handling works:
+```text
+Client Pod → sends to ClusterIP:80 (e.g., 10.96.0.10:80)
+
+eBPF program (at TC hook of client's veth):
+  1. Look up 10.96.0.10:80 in eBPF Service map (O(1) hash lookup)
+  2. Select backend Pod (e.g., 10.244.1.5:8080) using consistent hashing
+  3. Rewrite dst IP/port in-place (DNAT, no conntrack)
+  4. Forward directly to backend
+
+No iptables rules. No conntrack entry creation.
+~3x faster than iptables at high Service count (1000+ Services).
+```
+
+---
+
+## Hubble: Built-In Network Observability
+
+Hubble is Cilium's built-in observability layer. It uses eBPF to capture network events at the kernel level and expose them without packet copying:
+
+```bash
+# Install Hubble UI
+helm upgrade cilium cilium/cilium \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true
+
+# Use Hubble CLI for real-time flow observation
+hubble observe --follow
+hubble observe --namespace production --follow
+hubble observe --pod frontend-xxx --follow
+hubble observe --verdict DROPPED  # Only show dropped packets
+
+# View service dependency map
+hubble observe --output json | jq '{src: .source.labels, dst: .destination.labels, verdict: .verdict}'
+
+# Port-forward to Hubble UI
+kubectl port-forward -n kube-system svc/hubble-ui 12000:80
+```
+
+Hubble captures:
+- **Layer 3/4**: src/dst IP, port, protocol, verdict (ALLOW/DROP/REDIRECT)
+- **Layer 7**: HTTP method, URL, status code; DNS queries; Kafka topics
+- **Identity**: which Kubernetes workload sent/received each packet
+- **Policy**: which NetworkPolicy allowed or denied each connection
+
+---
+
+## IPAM Modes
+
+Cilium supports multiple IPAM modes:
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| `cluster-pool` | Cilium manages its own IPAM CRDs, allocates blocks per node | Default, works everywhere |
+| `kubernetes` | Uses node's `spec.podCIDR` (kube-controller-manager allocated) | Compatibility mode |
+| `azure` | Delegates to Azure CNI for IP allocation | Azure AKS native |
+| `aws-eni` | One IP per ENI, no overlay, native AWS routing | AWS EKS native |
+| `gke` | GKE's native pod IP management | GKE |
+
+```yaml
+# Helm values for cluster-pool IPAM
+helm install cilium cilium/cilium \
+  --set ipam.mode=cluster-pool \
+  --set ipam.operator.clusterPoolIPv4PodCIDRList="10.244.0.0/16" \
+  --set ipam.operator.clusterPoolIPv4MaskSize=24
+```
+
+---
+
+## Hands-On: Cilium Debugging
+
+```bash
+# 1. Check Cilium overall status
+kubectl exec -n kube-system cilium-<id> -- cilium status
+
+# 2. List all endpoints (Pods) tracked by Cilium
+kubectl exec -n kube-system cilium-<id> -- cilium endpoint list
+
+# 3. Inspect a specific endpoint (Pod)
+kubectl exec -n kube-system cilium-<id> -- cilium endpoint get <endpoint-id>
+
+# 4. Check policy enforcement for an endpoint
+kubectl exec -n kube-system cilium-<id> -- cilium endpoint get <id> | grep -A20 policy
+
+# 5. Run connectivity test
+kubectl exec -n kube-system cilium-<id> -- cilium connectivity test
+
+# 6. Monitor live packet events
+kubectl exec -n kube-system cilium-<id> -- cilium monitor --type drop
+kubectl exec -n kube-system cilium-<id> -- cilium monitor --type l7
+
+# 7. Check eBPF maps
+kubectl exec -n kube-system cilium-<id> -- cilium bpf policy get <endpoint-id>
+kubectl exec -n kube-system cilium-<id> -- cilium bpf lb list  # Service load balancer table
+
+# 8. Run the official connectivity tests
+cilium connectivity test
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Cilium differ from iptables-based CNIs like Calico or Flannel?**
+
+Cilium replaces the entire iptables/Netfilter framework with eBPF programs running directly in the kernel. Instead of packet processing going through multiple iptables chains (each scanned sequentially), eBPF programs attach to TC hooks on each interface and perform hash map lookups (O(1)). Cilium can also enforce L7 policies (HTTP paths, headers), which is impossible with iptables. kube-proxy is replaced by Cilium's eBPF Service handling.
+
+**Q2: What is Cilium's identity-based security and how does it differ from IP-based policy?**
+
+Cilium assigns each Pod an identity derived from its Kubernetes labels, namespace, and ServiceAccount — not its IP address. NetworkPolicy rules reference these identities rather than IPs. When a Pod dies and its IP is reused by a different workload, the identity changes automatically. This means policies are always accurate even as Pods scale and IPs recycle. Additionally, Cilium can apply the same policy regardless of which IP a Pod happens to have.
+
+**Q3: How does Cilium replace kube-proxy?**
+
+In kube-proxy-replacement mode, Cilium loads eBPF programs that intercept traffic destined for Service ClusterIPs. When a packet arrives for a ClusterIP, an eBPF program performs a hash map lookup (O(1)) to find the backend Pod, rewrites the destination IP/port in-place, and forwards directly. This bypasses iptables DNAT rules, conntrack table creation, and all Netfilter hooks — resulting in ~3x faster Service routing at high Service/Pod counts.
+
+**Q4: What is Hubble and how does it achieve observability without performance overhead?**
+
+Hubble is Cilium's built-in observability system. Cilium's eBPF programs write network flow events (src/dst, verdict, L7 data) into eBPF ring buffers in kernel memory. Hubble reads these buffers from userspace without copying packets. This gives full L3-L7 visibility (including HTTP, DNS, Kafka) with near-zero performance impact — events are already being processed by the eBPF dataplane, Hubble just observes the output.
+
+**Q5: What are the requirements to enable Cilium's kube-proxy replacement mode?**
+
+The Linux kernel must be 4.19+ (5.10+ recommended for full feature support). Cilium must be able to attach eBPF programs at system boot before any other network traffic. kube-proxy must not be running — if deploying on an existing cluster, kube-proxy DaemonSet must be deleted. The Cilium agent must have the API server IP/port specified (since it can't use the in-cluster DNS before its own network is up).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know Cilium's three main components: cilium-agent, Hubble, Operator
+- [ ] Understand eBPF-native vs iptables — eBPF uses TC/XDP hooks with O(1) hash maps vs O(N) rule chains
+- [ ] Know Cilium's identity-based security model (label-derived identity, not IP-based)
+- [ ] Understand how Cilium replaces kube-proxy (eBPF Service DNAT at TC hook)
+- [ ] Know what Hubble is and how it captures L3-L7 events via eBPF ring buffers
+- [ ] Know Cilium's IPAM modes: cluster-pool, kubernetes, aws-eni, azure, gke
+- [ ] Can use `cilium status`, `cilium endpoint list`, `cilium monitor`, and `hubble observe`

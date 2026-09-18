@@ -1,0 +1,239 @@
+---
+title: "Chapter 1 — Kustomize Base & Overlay Architecture"
+sidebar_position: 1
+module: "Module 8.6 — Kustomize Configuration"
+description: "Master template-free declarative Kubernetes configuration with Kustomize — Base and Overlay architecture, image transformers, and configMapGenerator hash rolling updates."
+---
+
+# Chapter 1 — Kustomize Base & Overlay Architecture
+
+> **Goal:** Master template-free declarative configuration management in Kubernetes using **Kustomize** — understanding the architectural philosophy of customizing pure, valid Kubernetes YAML without complex templating engines, structuring modular **Base & Overlay** directory hierarchies across environments (`dev`, `staging`, `production`), executing global transformations (`namespace`, `namePrefix`, `commonLabels`), and automating pod rollouts using **`configMapGenerator`** content-hash suffixes.
+>
+> By the end of this chapter, you will understand:
+> 1. The fundamental architectural difference between Helm (Templating) and Kustomize (Patching)
+> 2. How Kustomize is natively embedded into the `kubectl` CLI (`kubectl apply -k`)
+> 3. How to structure a clean, maintainable Base & Overlay repository tree
+> 4. How global transformers modify namespaces, name prefixes, and common labels across all manifests
+> 5. How `configMapGenerator` and `secretGenerator` append SHA-256 hashes to force rolling updates
+> 6. How to render and inspect generated Kustomize outputs using `kustomize build`
+
+---
+
+## Real-Life Analogy
+
+Think of Kustomize as **a professional architectural drafting table using clear transparent overlay sheets over a master blueprint**:
+
+- **The Templating Approach (The String Search-and-Replace Form - Helm):** You take a master blueprint, erase all the dimensions with whiteout, and insert hundreds of placeholder brackets (**`{{ .Values.databaseName }}`**). If someone misplaces a single curly bracket or space, the entire blueprint fails to compile and corrupts the builder's machine.
+- **The Kustomize Approach (The Pure Master Blueprint - Base):** The architect draws a complete, 100% valid, buildable master house blueprint (**The Base**). Every door, window, and wall is drawn in pure standard ink (**100% valid Kubernetes YAML**). You can take the Base and immediately build a working house.
+- **The Transparent Overlays (Environment Overlays - Dev / Staging / Prod):**
+  - **The Dev Overlay:** You place a clear plastic sheet over the master blueprint and write with a blue marker: *"Add a small 1-car garage and paint the door blue (**`replicas: 1`**, **`namePrefix: dev-`**)."*
+  - **The Production Overlay:** You place a different plastic sheet over the master blueprint and write with a red marker: *"Add a 4-car garage, reinforce the roof with titanium, and hook up the industrial electrical feed (**`replicas: 10`**, **`resources.limits`**, **`namespace: production`**)."*
+- **The Master Blueprint remains 100% untouched and clean!**
+
+---
+
+## Architecture Diagram
+
+```text
+               Kustomize Base & Multi-Environment Overlay Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ BASE DIRECTORY (`./base/` - 100% Pure Valid Kubernetes YAML)           │
+ │ ├── kustomization.yaml (Declares resources: deployment.yaml, svc.yaml) │
+ │ ├── deployment.yaml    (Replicas: 1, Port: 8080, CPU: 100m)           │
+ │ └── service.yaml       (ClusterIP Port 80)                             │
+ └──────────────────┬───────────────────────────────────┬─────────────────┘
+                    │ Inherited via `resources: ../../base`
+                    ▼                                   ▼
+ ┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
+ │ DEV OVERLAY (`./overlays/dev/`)      │  │ PROD OVERLAY (`./overlays/prod/`)    │
+ │ kustomization.yaml:                  │  │ kustomization.yaml:                  │
+ │ ├── namespace: `development`         │  │ ├── namespace: `production`          │
+ │ ├── namePrefix: `dev-`               │  │ ├── namePrefix: `prod-`              │
+ │ ├── replicas: 1                      │  │ ├── replicas: 10 (High Availability) │
+ │ └── images: tag: `dev-latest`        │  │ ├── images: tag: `v2.4.0` (Pinned!)  │
+ │                                      │  │ └── configMapGenerator (App Config)  │
+ └──────────────────┬───────────────────┘  └──────────────────┬───────────────────┘
+                    │ `kubectl apply -k`                      │ `kubectl apply -k`
+                    ▼                                         ▼
+ ┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
+ │ DEV KUBERNETES CLUSTER               │  │ PRODUCTION KUBERNETES CLUSTER        │
+ │ Deployment: `dev-payment-api`        │  │ Deployment: `prod-payment-api`       │
+ │ Namespace: `development`, Replicas: 1│  │ Namespace: `production`, Replicas: 10│
+ └──────────────────────────────────────┘  └──────────────────────────────────────┘
+```
+
+---
+
+## Kustomize vs Helm: The Paradigm Comparison
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ CNCF Kustomize                  │ CNCF Helm                       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Core Mechanism**        │ **Template-free Patching.**     │ **Go Templating Engine.**       │
+ │                           │ Overlays patch valid YAML bases.│ Evaluates `{{ .Values }}` tags. │
+ │ **YAML Validity**         │ **100% Valid Kubernetes YAML.** │ Invalid YAML until rendered.    │
+ │                           │ Linters can parse every file!   │ Hard to debug template errors.  │
+ │ **Kubectl Integration**   │ **Native.** Built into `kubectl`│ Requires external `helm` CLI    │
+ │                           │ (`kubectl apply -k <dir>`).     │ binary and release tracking.    │
+ │ **Package Distribution**  │ Git repository subdirectories.  │ Packaged `.tgz` OCI archives.   │
+ │ **Release State Storage** │ None (Pure declarative files).  │ In-cluster Secret objects.      │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## 1. The Base Specification (`base/kustomization.yaml`)
+
+```yaml
+# base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+
+commonLabels:
+  app.kubernetes.io/name: payment-api
+  app.kubernetes.io/managed-by: kustomize
+```
+
+---
+
+## 2. Production Overlay (`overlays/production/kustomization.yaml`)
+
+```yaml
+# overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 1. Inherit from Base
+resources:
+  - ../../base
+
+# 2. Global Transformations
+namespace: production
+namePrefix: prod-
+commonLabels:
+  environment: production
+
+# 3. Dynamic Image Transformer
+images:
+  - name: payment-api-image            # Matches placeholder in base deployment
+    newName: ghcr.io/enterprise/payment-api
+    newTag: v2.4.1                     # Pinned immutable production version!
+
+# 4. ConfigMap Generator with Automated Hash Rolling Updates!
+configMapGenerator:
+  - name: payment-app-config
+    files:
+      - configs/app.properties
+      - configs/logback.xml
+```
+
+---
+
+## Why `configMapGenerator` Solves the Stale Config Problem
+
+```text
+ The Kubernetes ConfigMap Update Flaw:
+ When you update a standard ConfigMap via `kubectl apply`:
+ - Existing Pods DO NOT restart automatically.
+ - Applications continue running with stale in-memory configuration!
+ 
+ The Kustomize Hash-Suffix Solution:
+ 1. `configMapGenerator` computes a SHA-256 hash of the file contents.
+ 2. Names the ConfigMap: `payment-app-config-7b8f9k2`.
+ 3. Automatically updates the `configMapRef` inside the Pod spec to match!
+ 4. When config files change, the name changes ──► Kube-Scheduler triggers a zero-downtime rolling update!
+```
+
+---
+
+## Hands-On Lab: Building & Inspecting Kustomize Overlays
+
+```bash
+# Step 1: Create a mock Base and Overlay directory structure
+mkdir -p /tmp/kustomize-demo/base /tmp/kustomize-demo/overlays/prod
+
+# Step 2: Create base deployment
+cat <<EOF > /tmp/kustomize-demo/base/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: api
+        image: payment-api-image
+EOF
+
+# Step 3: Create base kustomization
+cat <<EOF > /tmp/kustomize-demo/base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+EOF
+
+# Step 4: Create production overlay
+cat <<EOF > /tmp/kustomize-demo/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+namespace: production
+namePrefix: prod-
+images:
+  - name: payment-api-image
+    newName: nginx
+    newTag: 1.25-alpine
+EOF
+
+# Step 5: Render and inspect the generated output using native kubectl!
+kubectl kustomize /tmp/kustomize-demo/overlays/prod
+
+# Step 6: Clean up lab
+rm -rf /tmp/kustomize-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the core architectural philosophy of Kustomize compared to Helm?**
+
+Kustomize adopts a **template-free, pure declarative patching** philosophy. Unlike Helm, which mixes Go templating brackets into YAML (making raw chart templates un-parseable by standard YAML linters), Kustomize operates on 100% valid, well-formed Kubernetes manifests. A "Base" contains standalone valid manifests, while "Overlays" declare delta patches and transformers to specialize the manifests for specific environments (`dev`, `staging`, `prod`) without duplicating boilerplate code.
+
+**Q2: How does `configMapGenerator` in Kustomize force automatic rolling updates on pods when configuration changes?**
+
+By default, updating a Kubernetes ConfigMap does not trigger a Deployment restart. Kustomize's `configMapGenerator` computes a cryptographic **SHA-256 hash of the configuration file's content** and appends it to the ConfigMap name (e.g. `app-config-g8h7b9k`). Kustomize automatically updates all container `envFrom` and `volumeMounts` references in the Pod spec to point to this new hashed name. Because the Deployment's Pod template changes, the Kubernetes Deployment controller triggers an automated rolling update.
+
+**Q3: How does the `images` transformer work in Kustomize?**
+
+The `images` transformer allows CI/CD pipelines to update container image repositories, tags, or digests without modifying the underlying deployment YAML files. An overlay defines `images: [{ name: my-app, newName: ghcr.io/org/my-app, newTag: v1.4.0 }]`. During build time, Kustomize scans all container specs for any image matching `my-app` and replaces the string with the fully qualified repository and tag.
+
+**Q4: What is the difference between `commonLabels` and standard labels in Kustomize?**
+
+When `commonLabels` is declared in a `kustomization.yaml`, Kustomize automatically injects those labels into: (1) The `metadata.labels` of every generated resource; (2) The `spec.selector.matchLabels` of Deployments and Services; and (3) The `spec.template.metadata.labels` of Pod templates, guaranteeing that selectors and pod labels always remain perfectly synchronized across the stack.
+
+**Q5: How do you build and apply Kustomize overlays without installing the standalone `kustomize` binary?**
+
+Kustomize was officially merged into the Kubernetes core CLI in version 1.14. You can build and inspect manifests using **`kubectl kustomize <directory>`** and apply them directly to a cluster using **`kubectl apply -k <directory>`**, eliminating the need to install or manage separate external tooling in CI/CD runners.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Kustomize is template-free and operates on 100% valid Kubernetes YAML
+- [ ] Know that Kustomize is built natively into `kubectl` (`kubectl apply -k`)
+- [ ] Know the Base & Overlay architecture for multi-environment configuration
+- [ ] Know how `namePrefix` and `namespace` perform global transformations
+- [ ] Know how `configMapGenerator` hash suffixes force zero-downtime rolling updates
+- [ ] Know how `images` transformers dynamically update container tags in CI/CD
+- [ ] Can render overlays locally using `kubectl kustomize ./overlays/prod`

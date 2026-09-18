@@ -1,0 +1,301 @@
+---
+title: "Chapter 2 — Audit Logging Architecture & Policies"
+sidebar_position: 2
+module: "Module 5.10 — Hardening & CIS Benchmarks"
+description: "Master Kubernetes API server audit logging — the 4 audit stages, the 4 audit levels (None, Metadata, Request, RequestResponse), zero-noise policy authoring, and SIEM streaming backends."
+---
+
+# Chapter 2 — Kubernetes Audit Logging Architecture & Policies
+
+> **Goal:** Master security accountability and forensic telemetry in Kubernetes using the API Server Audit Logging pipeline — understanding how the API server captures, filters, and formats audit records, mastering the 4 Audit Stages (`RequestReceived`, `ResponseStarted`, `ResponseComplete`, `Panic`) and 4 Audit Levels (`None`, `Metadata`, `Request`, `RequestResponse`), authoring hardened production Audit Policies that prevent Secret credential leakage, and streaming audit events to enterprise SIEMs (Splunk, Elasticsearch, Datadog) via Log and Webhook backends.
+>
+> By the end of this chapter, you will understand:
+> 1. The security purpose of Kubernetes Audit Logging in compliance, threat detection, and post-mortem forensics
+> 2. The 4 Audit Stages generated during the HTTP request lifecycle
+> 3. The 4 Audit Levels: `None`, `Metadata`, `Request`, and `RequestResponse`
+> 4. Why logging Secrets at `RequestResponse` level violates PCI-DSS/SOC2 compliance (Secret leakage in logs)
+> 5. How to write a low-noise, high-security `AuditPolicy` manifest that drops Kubelet probe noise
+> 6. How to configure Log file backends and Webhook streaming backends to external SIEM platforms
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes Audit Logging as **the black box flight data recorder and court stenographer inside the cockpit of a commercial airliner**:
+
+- **The Flight Recorder (The API Server Audit Pipeline):** Records every single button pressed by the pilot (User), every automated autopilot adjustment (Controllers), and every air traffic control communication (Worker Node Kubelets).
+- **The 4 Audit Stages (The Timeline of an Event):**
+  - **`RequestReceived` (The Pilot Reaches for the Switch):** The moment the pilot touches the throttle lever.
+  - **`ResponseComplete` (The Engines Accelerate & Land):** The final confirmation that the plane accelerated and reached altitude safely.
+- **The 4 Audit Levels (The Detail of the Court Transcript):**
+  - **`None` (Ignore the White Noise):** You don't write down every breath the pilot takes (**Ignore `/healthz` probes and leader election leases**).
+  - **`Metadata` (The Summary Note):** *"At 14:02:15, Pilot Alice adjusted the cabin temperature."*
+  - **`RequestResponse` (The Full Audio & Video Recording):** *"At 14:05:00, Pilot Bob entered the flight plan: Route LAX $\to$ JFK."*
+- **The Redaction Rule (Never Record Passenger Bank PINs):** When a passenger pays for a drink (A `Secret` write), you record that a purchase occurred (**`Metadata` Level**), but you **never print their 16-digit credit card number into the flight log (`RequestResponse` Forbidden for Secrets)**.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes API Server Audit Logging Pipeline
+
+ Incoming API Request: `kubectl delete deployment payment-api -n production`
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: Audit Pipeline Handler (`audit.k8s.io/v1`)             │
+ │ Configured: `--audit-policy-file=/etc/kubernetes/audit-policy.yaml`    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Evaluates Audit Policy Rules (Top-to-Bottom)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ AUDIT POLICY EVALUATION ENGINE:                                        │
+ │                                                                        │
+ │ Rule 1: Is it a health check (`/healthz`, `/livez`)? ──► Level: NONE   │
+ │ Rule 2: Is it a Secret/ConfigMap write?              ──► Level: METADATA│
+ │ Rule 3: Is it a Deployment delete in 'production'?   ──► Level: REQUEST│
+ │         (MATCH FOUND! Stage: ResponseComplete)                         │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Generates Structured JSON Audit Event
+                                    ▼
+ ┌──────────────────────────────────┴─────────────────────────────────────┐
+ │ AUDIT BACKENDS: Dual Output Routing                                    │
+ │                                                                        │
+ │ 1. LOG FILE BACKEND:                                                   │
+ │    Writes to `/var/log/kubernetes/audit/audit.log` (Rotated at 100MB)  │
+ │    ──► Forwarded by Fluentbit / Vector to CloudWatch / S3              │
+ │                                                                        │
+ │ 2. WEBHOOK BACKEND:                                                    │
+ │    Streams real-time JSON HTTP POST to Enterprise SIEM (Splunk/Datadog)│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Audit Stages
+
+As an HTTP request progresses through the API server, audit events can be recorded at four distinct stages:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Audit Stage          │ Trigger Point & Description                                                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`RequestReceived`**│ Generated the instant the API server receives the request, before it is     │
+ │                      │ processed by authentication, authorization, or admission handlers.          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`ResponseStarted`**│ Generated once the HTTP response headers are sent, but before the body is   │
+ │                      │ finished. (Used exclusively for long-running streaming/watch requests).     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`ResponseComplete`**│ **The Most Common & Useful Stage.** Generated after the response body is    │
+ │                      │ completely sent back to the client. Contains the final HTTP status code.    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Panic`**          │ Generated only if an internal unhandled panic occurred in the API server.   │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Audit Levels
+
+Audit levels define how much detail is recorded in the audit event:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Audit Level          │ Data Captured & Production Recommendation                                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`None`**           │ **Do NOT log events matching this rule.**                                   │
+ │                      │ Used to filter out high-volume noise (read probes, leases, endpoints).      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Metadata`**       │ Logs request metadata: User, Group, Timestamp, Verb, Resource, Namespace,   │
+ │                      │ Client IP, User-Agent, and Response Code. **Mandatory for Secrets!**         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Request`**        │ Logs event metadata PLUS the full request JSON body sent by the user,       │
+ │                      │ but excludes the response body.                                             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`RequestResponse`**│ **Highest Fidelity.** Logs metadata, full request body, and response body.  │
+ │                      │ **WARNING: NEVER use for Secrets!** Logs cleartext passwords in audit log!  │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `AuditPolicy` Manifest
+
+Saved at `/etc/kubernetes/audit-policy.yaml`:
+
+```yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+# Define which stages to omit to reduce audit log size
+omitStages:
+  - "RequestReceived"
+
+rules:
+  # 1. DROP NOISE: Do not log read-only health checks and metrics
+  - level: None
+    nonResourceURLs:
+      - "/healthz*"
+      - "/livez*"
+      - "/readyz*"
+      - "/version"
+      - "/metrics"
+
+  # 2. DROP NOISE: Do not log high-frequency control-plane leader elections
+  - level: None
+    users: ["system:kube-scheduler", "system:kube-controller-manager"]
+    verbs: ["get", "update"]
+    resources:
+      - group: "coordination.k8s.io"
+        resources: ["leases"]
+
+  # 3. DROP NOISE: Do not log high-frequency Kubelet node status updates
+  - level: None
+    userGroups: ["system:nodes"]
+    verbs: ["get", "update", "patch"]
+    resources:
+      - group: ""
+        resources: ["nodes", "nodes/status"]
+
+  # 4. CRITICAL SECURITY: Log Secrets and ConfigMaps at METADATA level only!
+  # (Prevents passwords and private keys from being exposed in audit logs!)
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+
+  # 5. HIGH-RISK SECURITY: Log full Request & Response for RBAC modifications!
+  - level: RequestResponse
+    verbs: ["create", "update", "patch", "delete"]
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources: ["roles", "clusterroles", "rolebindings", "clusterrolebindings"]
+
+  # 6. WORKLOADS: Log Request body for all write operations on Deployments/Pods
+  - level: Request
+    verbs: ["create", "update", "patch", "delete"]
+    resources:
+      - group: ""
+        resources: ["pods", "services", "persistentvolumeclaims"]
+      - group: "apps"
+        resources: ["deployments", "statefulsets", "daemonsets"]
+
+  # 7. CATCH-ALL: Default fallback to Metadata level for all other requests
+  - level: Metadata
+    omitStages:
+      - "RequestReceived"
+```
+
+---
+
+## API Server Configuration Flags
+
+Configured in `/etc/kubernetes/manifests/kube-apiserver.yaml`:
+
+```yaml
+spec:
+  containers:
+  - name: kube-apiserver
+    command:
+    - kube-apiserver
+    # 1. Enable Audit Policy File
+    - --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+    # 2. Configure Log File Backend
+    - --audit-log-path=/var/log/kubernetes/audit/audit.log
+    - --audit-log-maxage=30          # Retain logs for 30 days
+    - --audit-log-maxbackup=10       # Keep 10 rotated log files
+    - --audit-log-maxsize=100        # Rotate when file reaches 100 Megabytes
+    # 3. Optional: Configure Webhook Streaming Backend to SIEM
+    - --audit-webhook-config-file=/etc/kubernetes/audit-webhook.yaml
+    - --audit-webhook-batch-max-size=100
+    - --audit-webhook-batch-max-wait=1s
+```
+
+---
+
+## Hands-On Lab: Querying API Server Audit Logs
+
+```bash
+# Step 1: Check if audit logs exist on the control plane node
+ls -la /var/log/kubernetes/audit/audit.log 2>/dev/null || echo "Running on Managed Cloud (EKS/GKE - Audit logs streamed to CloudWatch/Cloud Logging)"
+
+# Step 2: Simulate inspecting an audit record for an unauthorized RBAC deletion
+cat <<EOF > /tmp/sample-audit-event.json
+{
+  "kind": "Event",
+  "apiVersion": "audit.k8s.io/v1",
+  "level": "Metadata",
+  "auditID": "3b2e1f40-1234-5678-9abc-def012345678",
+  "stage": "ResponseComplete",
+  "requestURI": "/apis/rbac.authorization.k8s.io/v1/namespaces/production/rolebindings/admin-binding",
+  "verb": "delete",
+  "user": {
+    "username": "attacker-intern",
+    "groups": ["system:authenticated", "interns"]
+  },
+  "sourceIPs": ["192.168.1.105"],
+  "userAgent": "kubectl/v1.30.0",
+  "objectRef": {
+    "resource": "rolebindings",
+    "namespace": "production",
+    "name": "admin-binding",
+    "apiGroup": "rbac.authorization.k8s.io",
+    "apiVersion": "v1"
+  },
+  "responseStatus": {
+    "metadata": {},
+    "code": 403,
+    "reason": "Forbidden"
+  },
+  "stageTimestamp": "2026-08-18T12:00:00.000000Z"
+}
+EOF
+
+# Step 3: Query audit event with jq to extract attacker IP and rejected action
+cat /tmp/sample-audit-event.json | jq '{User: .user.username, Action: .verb, Target: .objectRef.name, Result: .responseStatus.code, IP: .sourceIPs[0]}'
+
+# Step 4: Clean up lab
+rm -rf /tmp/sample-audit-event.json
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the primary purpose of Kubernetes API Server Audit Logging?**
+
+API Server Audit Logging provides a chronological, security-relevant record documenting the sequence of activities that have affected the cluster. It answers four essential questions for security operations, compliance (PCI-DSS, SOC 2, HIPAA), and forensic post-mortems: **Who** made the request (User, ServiceAccount, Groups), **What** action was executed (Verb, Resource, Request Payload), **When** was it executed (Timestamp, Stages), and **What** was the result (HTTP status code, admission verdict).
+
+**Q2: What are the four Audit Levels in Kubernetes, and what data does each level capture?**
+
+1. `None`: Completely disables audit logging for matching events (used to drop high-volume noise like read probes).
+2. `Metadata`: Logs request metadata (user, timestamp, verb, resource, namespace, response code) but excludes request and response payload bodies.
+3. `Request`: Logs metadata plus the full JSON body sent in the client's request payload, but excludes the response body.
+4. `RequestResponse`: Logs metadata, the full client request payload body, and the full API server response body.
+
+**Q3: Why is logging `Secrets` and `ConfigMaps` at the `RequestResponse` level considered a severe security violation?**
+
+If Secrets or ConfigMaps are evaluated at `Request` or `RequestResponse` levels, the API server writes the entire base64-encoded secret payload directly into the `/var/log/kubernetes/audit/audit.log` plaintext file. Anyone with access to the log files, SIEM dashboards (Splunk/Datadog), or S3 log storage archives can decode the base64 strings and steal corporate database passwords, private encryption keys, and cloud API tokens. Secrets must strictly be logged at the **`Metadata`** level.
+
+**Q4: What are the four Audit Stages in the Kubernetes API request lifecycle?**
+
+1. `RequestReceived`: Generated the instant the API server receives the request, before authentication or admission control.
+2. `ResponseStarted`: Generated when HTTP response headers are transmitted for long-running streaming/watch requests.
+3. `ResponseComplete`: Generated when the response body is completed and closed (the most useful stage for auditing).
+4. `Panic`: Generated if an internal panic occurred during request processing.
+
+**Q5: How do Audit Policy rules evaluate incoming requests?**
+
+The API server evaluates the rules in the `AuditPolicy` manifest in strict **top-to-bottom order**. The first matching rule determines the audit level for that event. Once a match is found, evaluation halts. If an event does not match any rule in the policy, it defaults to being logged at the `None` level (no audit record produced). Therefore, policy authors place specific exclusions (`level: None` for noise) at the top, followed by critical write operations, ending with a general fallback rule at the bottom.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 audit stages: `RequestReceived`, `ResponseStarted`, `ResponseComplete`, `Panic`
+- [ ] Know the 4 audit levels: `None`, `Metadata`, `Request`, `RequestResponse`
+- [ ] Know that Secrets MUST be logged at `Metadata` level to prevent password leakage
+- [ ] Know that audit rules evaluate top-to-bottom until first match
+- [ ] Know how to filter high-volume noise (`/healthz`, leases, Kubelet node status)
+- [ ] Know the difference between Log file backends and Webhook streaming backends
+- [ ] Can parse and inspect audit events using `jq`

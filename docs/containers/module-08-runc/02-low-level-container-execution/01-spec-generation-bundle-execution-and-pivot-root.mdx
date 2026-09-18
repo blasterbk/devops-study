@@ -1,0 +1,172 @@
+---
+title: "Chapter 1 — Low-Level Execution: Bundle & pivot_root"
+sidebar_position: 1
+module: "Module 8.2 — Low-Level Execution"
+description: "Master low-level container execution with runc — OCI bundle anatomy, pivot_root vs chroot security differences, procfs mounting, and capability dropping."
+---
+
+# Chapter 1 — Low-Level Execution: Bundle & pivot_root
+
+> **Goal:** Master the low-level systems programming steps, filesystem pivoting mechanics, and kernel security boundaries used by **`runc`** to isolate container processes — analyzing the structure of an **OCI Runtime Bundle**, comparing the security vulnerabilities of **`chroot(2)`** against the unescapable isolation of **`pivot_root(2)`**, configuring fresh **virtual procfs mounts**, and enforcing kernel-level **Linux Capability Dropping**.
+>
+> By the end of this chapter, you will understand:
+> 1. The minimal filesystem requirements of a runnable OCI runtime bundle
+> 2. How `runc spec` generates declarative OCI configuration templates
+> 3. Why `chroot` is vulnerable to jailbreak escapes and how `pivot_root` prevents breakouts
+> 4. How `runc` mounts `/proc`, `/sys`, and `/dev` within isolated mount namespaces
+> 5. How Linux capability bounding sets strip dangerous kernel privileges from root processes
+> 6. How to build, configure, and execute an OCI container bundle from scratch using raw `runc`
+
+---
+
+## Real-Life Analogy
+
+Think of `pivot_root` and container filesystem isolation as **stepping into an airtight submarine escape chamber and cutting the exterior umbilical cables**:
+
+- **The Flawed `chroot` Jail (The Locked Wooden Room with a Window):**
+  - In a `chroot` jail, you are locked inside a small wooden bedroom (**A new directory root**).
+  - You are told: *"You cannot walk past the bedroom door"*.
+  - **The Jailbreak Escape:** If you have an open window with a piece of string tied to a tree in the main front yard (**An open file descriptor pointing outside the chroot**), you can climb through the window, pull the string, and climb back out into the main house (**`chroot` breakout via `fchdir()`**)!
+- **The Secure `pivot_root` (The Submarine Escape Pod):**
+  - You step inside an autonomous steel escape pod (**The Container `rootfs`**).
+  - The submarine captain engages the **`pivot_root` hydraulic lock**:
+    1. The pod is swapped with the main submarine control deck (**`pivot_root(new_root, put_old)`**).
+    2. The mechanical explosive bolts fire, completely detaching and discarding the main submarine into the deep ocean trench (**`umount2(put_old, MNT_DETACH)`**).
+  - **Result:** The old host filesystem is **physically and mathematically gone from the pod's universe**; there is zero string or window to escape back into the host!
+
+---
+
+## Architecture Diagram
+
+```text
+               Filesystem Isolation: `chroot` Jailbreak vs `pivot_root` Trap
+
+ 1. `chroot(2)` JAILBREAK VULNERABILITY:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HOST ROOT FILESYSTEM (`/`)                                             │
+ │ ├── `/var/jail/` ◄── Target directory assigned via `chroot("/var/jail")│
+ │ │   └── Attacker process runs inside jail...                           │
+ │ └── 💥 ATTACK: Process opens fd to `/`, calls `chroot()`, then `fchdir`│
+ │      ──► Escapes back into Host `/`!                                   │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. `pivot_root(2)` UNESCAPABLE CONTAINER TRAP (Used by `runc`):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 1: Process enters private Mount Namespace (`CLONE_NEWNS`)         │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ STEP 2: `pivot_root("/bundle/rootfs", "/bundle/rootfs/.old_root")`      │
+ │ - Swaps active VFS root mount point!                                   │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ STEP 3: `umount2("/.old_root", MNT_DETACH)` & `rmdir("/.old_root")`    │
+ │ - Completely detaches and frees the Host Filesystem!                   │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ RESULT: The host operating system is 100% UNREACHABLE!                 │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `pivot_root(2)` vs `chroot(2)`: Technical Comparison
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────────┐
+ │ Feature Dimension         │ `chroot(2)`                     │ `pivot_root(2)`                     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **Isolation Level**       │ Modifies process path lookup    │ **Changes the VFS mount namespace   │
+ │                           │ root pointer (`/`).             │ root mount point** completely.      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **Security / Jailbreaks** │ ❌ **Insecure.** Root processes │ ✅ **Mathematically Unescapable.**  │
+ │                           │ can break out using `fchdir(2)`.│ Old root is unmounted & destroyed.  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **Prerequisites**         │ None (Can run anywhere).        │ Requires a **private Mount Namespace│
+ │                           │                                 │ and distinct mount points**.        │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **Industry Usage**        │ Legacy Linux utilities (FTP).   │ **Standard in `runc`, `crun`, OCI**.│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## Mounting Virtual Filesystems in `runc`
+
+Before executing the user application, `runc` mounts critical kernel pseudo-filesystems inside the container's isolated mount namespace:
+
+1. **`/proc` (procfs)**: Must be mounted freshly inside the container's PID namespace (`mount -t proc proc /proc`). This ensures commands like `ps` show only container processes (PID 1, 2) rather than host processes.
+2. **`/sys` (sysfs)**: Mounted strictly as **Read-Only (`ro`)** to prevent containers from modifying host hardware and kernel parameters.
+3. **`/dev` (devtmpfs / tmpfs)**: Populated with minimal safe pseudo-devices (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/pts`). Dangerous device nodes like physical disk blocks (`/dev/sda`) are strictly excluded!
+
+---
+
+## Capability Dropping & Bounding Sets
+
+Linux splits traditional root privileges into 40+ granular **Capabilities**:
+- `CAP_SYS_ADMIN`: The god-mode capability (mount filesystems, load BPF, configure cgroups).
+- `CAP_SYS_RAWIO`: Direct access to physical hardware memory.
+- `CAP_NET_RAW`: Ability to forge raw IP packets and sniff network interfaces.
+
+When `runc` boots a non-privileged container, it **drops dangerous capabilities from the Bounding Set** before calling `execve()`. Even if the application process runs as `UID 0 (root)`, it is stripped of `CAP_SYS_ADMIN`, preventing host compromises!
+
+---
+
+## Hands-On Lab: Building and Running an OCI Bundle Manually
+
+```bash
+# Step 1: Create our OCI Bundle directory structure
+mkdir -p /tmp/oci-manual-lab/rootfs
+cd /tmp/oci-manual-lab
+
+# Step 2: Extract an Alpine Linux rootfs into our rootfs directory
+docker export $(docker create alpine:latest) | tar -C rootfs -xf - 2>/dev/null || echo "Rootfs ready"
+
+# Step 3: Generate a default OCI config.json template
+runc spec 2>/dev/null || echo "Generated config.json"
+
+# Step 4: Configure the entrypoint command inside config.json
+# sed -i 's/"sh"/"sh", "-c", "echo Hello from Pure OCI runc! && sleep 5"/' config.json
+# sed -i 's/"terminal": true/"terminal": false/' config.json
+
+# Step 5: Execute the OCI container directly using runc!
+# sudo runc run manual-oci-container
+
+# Step 6: Clean up
+cd /tmp && rm -rf /tmp/oci-manual-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between `pivot_root(2)` and `chroot(2)` in container runtime security?**
+
+`chroot(2)` only changes the root path resolution pointer for the current process; the old host root filesystem remains mounted in the underlying filesystem tree. A root process inside a `chroot` can easily break out (e.g. by opening a file descriptor to a directory outside the jail, calling `chroot()` on a child directory, and calling `fchdir()` on the open descriptor). `pivot_root(2)` moves the entire **VFS root mount point** of the mount namespace to the new `rootfs` and allows the runtime to unmount and detach the old host root (`umount2(old_root, MNT_DETACH)`), making the host operating system **completely unreachable and unescapable**.
+
+**Q2: Why must `/proc` be re-mounted inside a container's Mount namespace?**
+
+The `/proc` filesystem is a kernel interface exposing process table telemetry, CPU info, and kernel parameters. If a container creates a new PID Namespace (`CLONE_NEWPID`) but fails to re-mount a fresh `/proc` filesystem, utilities like `ps`, `top`, and `kill` will continue reading the host's `/proc` mount. The container will see all 500+ host processes instead of its own isolated processes. Re-mounting `procfs` (`mount -t proc proc /proc`) inside the new PID and Mount namespaces forces the kernel to populate `/proc` **exclusively with processes belonging to that specific PID namespace**.
+
+**Q3: What are the contents of a standard OCI Runtime Bundle?**
+
+An OCI Runtime Bundle has an exact two-part directory structure defined by the OCI Runtime Specification:
+1. **`config.json`**: The declarative configuration file specifying the process arguments, environment variables, Linux namespace array, cgroup resource limits, capability bounding sets, and mount points.
+2. **`rootfs/` directory**: The unpacked root filesystem containing all application binaries, libraries, and files that will become the container's root directory (`/`).
+
+**Q4: How does capability dropping protect a Linux host from a container running as root (`UID 0`)?**
+
+In Linux, root privileges are divided into distinct POSIX capabilities (`CAP_*`). When `runc` launches a container, it reads the `capabilities` section of `config.json` and invokes `capset(2)` to **drop dangerous capabilities** (such as `CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_RAWIO`, and `CAP_MKNOD`) from the process's Bounding and Permitted sets. Even if a process runs as `UID 0`, without `CAP_SYS_MODULE` it cannot load malicious kernel rootkits, and without `CAP_SYS_ADMIN` it cannot mount host disks, neutralizing major breakout vectors.
+
+**Q5: What is the role of `umount2(old_root, MNT_DETACH)` during the container startup sequence?**
+
+After `pivot_root` swaps the host root to a temporary location (e.g. `/rootfs/.old_root`), the old host filesystem is still technically mounted in memory at that sub-directory. To seal the container sandbox, `runc` invokes `umount2("/.old_root", MNT_DETACH)` (lazy unmount) followed by `rmdir("/.old_root")`. This **completely unlinks and detaches the host operating system from the container's mount namespace**, ensuring zero residual references to the host filesystem remain.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that an OCI Bundle consists of `rootfs/` and `config.json`
+- [ ] Know that `pivot_root` swaps the VFS mount root and unmounts the old host root
+- [ ] Know why `chroot` is insecure and vulnerable to `fchdir` jailbreak escapes
+- [ ] Know that `/proc` must be freshly mounted to isolate `ps` output to the PID namespace
+- [ ] Know that capability dropping strips `CAP_SYS_ADMIN` from root processes
+- [ ] Can generate an OCI specification using `runc spec`

@@ -1,0 +1,162 @@
+---
+title: "Chapter 1 — Rootless Storage: fuse-overlayfs & Native Overlay"
+sidebar_position: 1
+module: "Module 13.3 — Rootless Storage"
+description: "Master rootless container storage drivers — comparing fuse-overlayfs in user space, Linux 5.11+ unprivileged kernel OverlayFS, and the vfs disk bloat trap."
+---
+
+# Chapter 1 — Rootless Storage: fuse-overlayfs & Native Overlay
+
+> **Goal:** Master the filesystem drivers, extended attributes, and kernel security models of **Rootless Container Storage** — analyzing why mounting OverlayFS historically required root privileges, evaluating **`fuse-overlayfs` (User-Space FUSE driver)**, dissecting the **Linux 5.11+ Unprivileged Native Kernel OverlayFS breakthrough**, and avoiding the catastrophic **`vfs` storage explosion trap**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why `mount(2)` for Union Filesystems was historically restricted to host `CAP_SYS_ADMIN`
+> 2. How `fuse-overlayfs` implements full OverlayFS semantics in user space via `/dev/fuse`
+> 3. How Linux 5.11+ enabled native in-kernel OverlayFS for unprivileged user namespaces
+> 4. How `user.overlay.*` extended attributes replace privileged `trusted.overlay.*` xattrs
+> 5. Why the `vfs` storage driver wastes gigabytes of disk through recursive full-directory copies
+> 6. How to configure `/etc/containers/storage.conf` for maximum I/O performance
+
+---
+
+## Real-Life Analogy
+
+Think of Rootless Storage as **an office worker writing edits onto sensitive company blueprints without having access to the master blueprint vault**:
+
+- **The Privileged Approach (Modifying the Master Company Safe):**
+  - Only the executive director has the master key to open the central blueprint vault (**Requires host `CAP_SYS_ADMIN` to execute kernel `mount -t overlay`**).
+- **1. The `fuse-overlayfs` Approach (The Personal Desk Lightbox):**
+  - An unprivileged junior designer sits at their own desk (**User Space**).
+  - They place transparent plastic acetate sheets over the master blueprint and trace their modifications with a dry-erase marker (**User-Space FUSE filesystem via `/dev/fuse`**).
+  - They don't need the master vault key, but tracing lines by hand takes extra time and arm effort (**Slight FUSE CPU overhead**).
+- **2. The Native Linux 5.11+ Kernel Overlay (The Modern Smart Glass Overlay):**
+  - The building installs modern automated smart-glass overlays that allow any employee to project digital layers natively at the speed of light (**Unprivileged In-Kernel OverlayFS**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Rootless Storage Evolution: fuse-overlayfs vs Native Kernel 5.11+
+
+ 1. USER-SPACE `fuse-overlayfs` (Linux < 5.11):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER PROCESS: `touch /app/data.txt`                               │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ VFS System Call
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `/dev/fuse` KERNEL INTERFACE ──► User/Kernel Context Switch            │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Forwards to User Space Daemon
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `fuse-overlayfs` DAEMON (Runs as unprivileged User in User Space):     │
+ │ ├── Computes layer diffs and writes `user.overlay.whiteout` xattrs     │
+ │ └── Writes files directly to `~/.local/share/containers/storage/`      │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. NATIVE UNPRIVILEGED OVERLAYFS (Linux 5.11+):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER PROCESS ──► LINUX KERNEL OVERLAYFS (Ring 0) ──► HOST DISK    │
+ │ ⚡ ZERO FUSE CONTEXT SWITCHING! 100% NATIVE KERNEL READ/WRITE SPEEDS!   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 Rootless Storage Drivers Compared
+
+```text
+ ┌──────────────────────┬───────────────────┬───────────────────┬───────────────────┐
+ │ Storage Dimension    │ Native OverlayFS  │ `fuse-overlayfs`  │ `vfs` Driver      │
+ │──────────────────────┼───────────────────┼───────────────────┼───────────────────┤
+ │ **Kernel Support**   │ **Linux 5.11+**   │ Linux 4.18+       │ Any Linux kernel  │
+ │ **Execution Space**  │ **Kernel Space**  │ **User Space**    │ Kernel Space      │
+ │ **I/O Performance**  │ **100% (Native)** │ ~80 - 90%         │ Fast Write / Slow │
+ │ **Disk Utilization** │ **Optimal**       │ **Optimal**       │ 💥 **DISASTER!**  │
+ │                      │ (Copy-on-write)   │ (Copy-on-write)   │ (10x disk bloat)  │
+ │ **Memory Overhead**  │ Negligible        │ FUSE daemon RSS   │ High (duplication)│
+ └──────────────────────┴───────────────────┴───────────────────┴───────────────────┘
+```
+
+---
+
+## The Linux 5.11 Milestone: `user.overlay.*` Extended Attributes
+
+Historically, the Linux kernel's OverlayFS used privileged extended attributes (**`trusted.overlay.*`**) to mark deleted files (whiteouts) and opaque directories. Modifying `trusted.*` attributes strictly required `CAP_SYS_ADMIN` in the root namespace.
+
+### The Kernel 5.11 Breakthrough:
+In Linux 5.11, kernel developers introduced **`user.overlay.*`** xattrs:
+- Unprivileged users in their own User Namespace can write `user.overlay.whiteout` and `user.overlay.opaque` attributes without root permissions.
+- This allows rootless Podman and Docker to execute **native in-kernel `mount -t overlay`**, completely eliminating the need for `fuse-overlayfs`!
+
+---
+
+## The `vfs` Storage Driver Trap
+
+> [!CAUTION]
+> If neither native OverlayFS nor `fuse-overlayfs` is available, container engines fall back to the **`vfs` driver**. 
+> The `vfs` driver has **zero Copy-on-Write capabilities**: every time a container starts, it creates a **100% full recursive copy of all underlying layers on disk**! Launching 10 containers from a 1GB image consumes **10 Gigabytes of disk space immediately**, leading to rapid disk exhaustion!
+
+---
+
+## Hands-On Lab: Configuring Rootless Storage in `storage.conf`
+
+```bash
+# Step 1: Inspect user storage configuration file
+cat ~/.config/containers/storage.conf 2>/dev/null || cat /etc/containers/storage.conf 2>/dev/null || echo "storage.conf ready"
+
+# Step 2: Optimal storage configuration for rootless performance:
+cat << 'EOF' > ~/.config/containers/storage.conf
+[storage]
+driver = "overlay"
+runroot = "/run/user/1000/containers"
+graphroot = "/home/developer/.local/share/containers/storage"
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+EOF
+
+# Step 3: Check kernel version to determine native overlay capability
+uname -r
+# If kernel is >= 5.11, Podman automatically uses Native In-Kernel OverlayFS!
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why did mounting OverlayFS historically require root privileges (`CAP_SYS_ADMIN`) on Linux?**
+
+Historically, the Linux kernel's OverlayFS driver used **`trusted.overlay.*` extended attributes** to manage metadata (such as creating whiteout devices to simulate file deletion and setting opaque directory markers). In Linux, writing `trusted.*` attributes strictly requires `CAP_SYS_ADMIN` in the initial (root) user namespace. If an unprivileged user was allowed to mount arbitrary overlay layers, they could craft malicious whiteouts or spoof system device nodes, creating severe privilege escalation vulnerabilities.
+
+**Q2: What is `fuse-overlayfs`, and how does it enable rootless container storage?**
+
+`fuse-overlayfs` is a user-space implementation of the OverlayFS specification created by Giuseppe Scrivano. It connects to the kernel's **Filesystem in Userspace (`/dev/fuse`)** interface. When a rootless container executes filesystem calls, the kernel routes the requests to the `fuse-overlayfs` user-space daemon. The daemon implements copy-on-write logic, whiteouts, and layer stacking using standard user-accessible extended attributes (**`user.fuseoverlayfs.*`**), allowing rootless containers to run on older Linux kernels ($< 5.11$) without host root access.
+
+**Q3: What changed in Linux kernel 5.11 for rootless container storage?**
+
+Linux kernel 5.11 added native support for **unprivileged OverlayFS mounts inside User Namespaces**. The kernel was updated to use **`user.overlay.*`** extended attributes instead of `trusted.overlay.*`. This allows unprivileged users to execute native in-kernel `mount -t overlay` system calls. As a result, rootless containers on modern Linux distros (RHEL 9, Ubuntu 22.04+, Debian 12+) achieve **100% native kernel file I/O speed with zero FUSE user-space context-switching overhead**.
+
+**Q4: Why is the `vfs` storage driver considered an anti-pattern for production rootless containers?**
+
+The `vfs` storage driver provides zero Copy-on-Write (CoW) layer sharing. When an image has 5 layers and a container is started, `vfs` literally performs a recursive `cp -r` of every single layer into a new directory. Running 20 containers from an 800MB base image consumes **16 Gigabytes of physical disk space instead of 800 Megabytes**, destroying disk performance and causing rapid SSD exhaustion.
+
+**Q5: Where does rootless Podman store its images and container layers on the host filesystem?**
+
+- **Rootless Graphroot (Persistent Storage)**: `~/.local/share/containers/storage/` (stores image layer tarballs, overlay layers, and container metadata in the user's home directory).
+- **Rootless Runroot (Volatile Runtime State)**: `/run/user/<UID>/containers/` (mounted on `tmpfs` in RAM, stores volatile runtime locks, container PID files, and active mount points).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why OverlayFS historically required root for `trusted.overlay.*` xattrs
+- [ ] Know that `fuse-overlayfs` enables user-space OverlayFS via `/dev/fuse`
+- [ ] Know that Linux 5.11+ supports native unprivileged in-kernel OverlayFS
+- [ ] Know that `user.overlay.*` xattrs enable native speed for rootless users
+- [ ] Know that the `vfs` driver causes massive disk bloat and must be avoided
+- [ ] Know the storage paths: `~/.local/share/containers/storage` and `/run/user/<UID>/`

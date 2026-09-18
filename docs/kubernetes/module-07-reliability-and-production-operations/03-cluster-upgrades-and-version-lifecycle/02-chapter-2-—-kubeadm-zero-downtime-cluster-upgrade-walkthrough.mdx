@@ -1,0 +1,294 @@
+---
+title: "Chapter 2 — Kubeadm Zero-Downtime Upgrades"
+sidebar_position: 2
+module: "Module 7.3 — Cluster Upgrades & Lifecycle"
+description: "Master the step-by-step production kubeadm zero-downtime cluster upgrade walkthrough — control-plane apply vs node upgrade, sequential worker drains, and PodDisruptionBudget enforcement."
+---
+
+# Chapter 2 — Kubeadm Zero-Downtime Cluster Upgrade Walkthrough
+
+> **Goal:** Master the step-by-step production operational procedure for executing zero-downtime Kubernetes cluster upgrades using **`kubeadm`** — understanding the distinction between `kubeadm upgrade apply` (for the primary control plane) and `kubeadm upgrade node` (for secondary masters and workers), orchestrating sequential node maintenance with **`kubectl cordon`** and **`kubectl drain`**, enforcing **PodDisruptionBudgets (PDB)** to prevent customer-facing service disruptions, and recovering from failed node upgrades.
+>
+> By the end of this chapter, you will understand:
+> 1. The complete 4-phase cluster upgrade sequence (Primary Master $\to$ Secondary Masters $\to$ Worker Pool)
+> 2. The exact operational difference between `kubeadm upgrade apply` and `kubeadm upgrade node`
+> 3. How `kubectl cordon` and `kubectl drain` safely evict pods to healthy nodes
+> 4. How PodDisruptionBudgets (PDB) protect microservices from simultaneous eviction outages
+> 5. How package locking (`apt-mark hold`) prevents accidental background OS package updates
+> 6. How to troubleshoot and recover a worker node when `kubectl drain` hangs
+
+---
+
+## Real-Life Analogy
+
+Think of a zero-downtime Kubernetes cluster upgrade as **an in-flight engine overhaul and passenger cabin refurbishment on a multi-engine airliner flying at 30,000 feet**:
+
+- **Phase 1: Upgrading Cockpit Computer #1 (`kubeadm upgrade apply` on Master 01):** The chief pilot turns on the new autopilot software on the primary navigation screen. The co-pilot's screen (**Master 02**) and the flight engineer's screen (**Master 03**) keep flying the plane using the existing software (**Active-Active Control Plane HA**).
+- **Phase 2: Upgrading Secondary Cockpit Computers (`kubeadm upgrade node` on Masters 02 & 03):** The secondary screens download the new configuration from the primary computer one by one without restarting the master plane.
+- **Phase 3: The Passenger Cabin Refresh (The Worker Node Drain):**
+  - **The Safety Warning (`kubectl cordon`):** The flight attendant tapes a "Closed for Maintenance" sign over Row 12 (**Marks Worker Node Unschedulable**).
+  - **Moving the Passengers (`kubectl drain`):** The flight attendant politely asks the passengers in Row 12 (**The Pods**) to unbuckle and walk to open seats in Rows 14 and 15 (**Scheduled onto other healthy nodes**).
+  - **The Minimum Passenger Rule (PodDisruptionBudget - PDB):** If a family has 3 children, the airline rules state: *"You cannot move all 3 children at the same time; at least 2 children must always be seated (**`minAvailable: 2`**)."* The drain process pauses until the first child is safely seated in Row 14 before moving the next child.
+  - **Reopening the Row (`kubectl uncordon`):** Once Row 12 has new seat cushions installed (**Kubelet v1.30 Restarted**), the attendant removes the tape and allows new passengers to sit down.
+
+---
+
+## Architecture Diagram
+
+```text
+               Production Zero-Downtime Kubeadm Upgrade Workflow
+
+ PHASE 1: PRIMARY CONTROL PLANE UPGRADE (Master 01)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `apt-get install -y kubeadm=1.30.0`                                 │
+ │ 2. `kubeadm upgrade plan` ──► Validates cluster health & versions      │
+ │ 3. `kubeadm upgrade apply v1.30.0` ──► Upgrades static pod manifests   │
+ │ 4. `apt-get install -y kubelet=1.30.0 kubectl=1.30.0` ──► Restart Kubelet
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Generates updated cluster configuration
+                                    ▼
+ PHASE 2: SECONDARY CONTROL PLANE NODES (Master 02 & Master 03)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `apt-get install -y kubeadm=1.30.0`                                 │
+ │ 2. `kubeadm upgrade node` ──► Fetches updated config from Master 01    │
+ │ 3. `apt-get install -y kubelet=1.30.0 kubectl=1.30.0` ──► Restart Kubelet
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Control Plane is 100% upgraded to v1.30!
+                                    ▼
+ PHASE 3: SEQUENTIAL WORKER NODE UPGRADES (Executed Node-by-Node!)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `kubectl cordon worker-01` ──► Blocks new pod scheduling            │
+ │ 2. `kubectl drain worker-01 --ignore-daemonsets --delete-emptydir-data`│
+ │    (Evicts Pods to healthy nodes while respecting active PDBs!)        │
+ │ 3. `apt-get install -y kubeadm=1.30.0` ──► `kubeadm upgrade node`      │
+ │ 4. `apt-get install -y kubelet=1.30.0` ──► `systemctl restart kubelet` │
+ │ 5. `kubectl uncordon worker-01` ──► Node returns to scheduling pool!   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 1: Upgrading the Primary Control Plane Node
+
+Log into **Master Node 01**:
+
+```bash
+# 1. Unhold and install target kubeadm version
+sudo apt-mark unhold kubeadm
+sudo apt-get update && sudo apt-get install -y kubeadm=1.30.0-1.1
+sudo apt-mark hold kubeadm
+
+# 2. Verify upgrade feasibility and component versions
+sudo kubeadm upgrade plan
+
+# 3. Apply the upgrade (Generates new certificates and updates static pod manifests)
+sudo kubeadm upgrade apply v1.30.0 -y
+
+# 4. Upgrade Kubelet and Kubectl binaries on Master 01
+sudo apt-mark unhold kubelet kubectl
+sudo apt-get install -y kubelet=1.30.0-1.1 kubectl=1.30.0-1.1
+sudo apt-mark hold kubelet kubectl
+
+# 5. Reload systemd and restart Kubelet
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+```
+
+---
+
+## Phase 2: Upgrading Secondary Control Plane Nodes
+
+Log into **Master Node 02** and **Master Node 03** sequentially:
+
+```bash
+# 1. Upgrade kubeadm binary
+sudo apt-mark unhold kubeadm
+sudo apt-get update && sudo apt-get install -y kubeadm=1.30.0-1.1
+sudo apt-mark hold kubeadm
+
+# 2. Upgrade the node (Fetches cluster config from Master 01!)
+# NOTE: Use 'upgrade node', NEVER 'upgrade apply' on secondary masters!
+sudo kubeadm upgrade node
+
+# 3. Upgrade Kubelet and Kubectl
+sudo apt-mark unhold kubelet kubectl
+sudo apt-get install -y kubelet=1.30.0-1.1 kubectl=1.30.0-1.1
+sudo apt-mark hold kubelet kubectl
+
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+```
+
+---
+
+## Phase 3: Upgrading Worker Nodes (Zero-Downtime Loop)
+
+Execute this sequence on your management workstation for **each worker node one at a time**:
+
+```bash
+# STEP 1: Cordon the node (Prevents new pods from scheduling)
+kubectl cordon worker-01
+
+# STEP 2: Drain active workloads (Respects PodDisruptionBudgets!)
+kubectl drain worker-01 \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --force \
+  --timeout=5m
+```
+
+Log into **Worker Node 01**:
+
+```bash
+# STEP 3: Upgrade kubeadm
+sudo apt-mark unhold kubeadm
+sudo apt-get update && sudo apt-get install -y kubeadm=1.30.0-1.1
+sudo apt-mark hold kubeadm
+
+# STEP 4: Upgrade local node configuration
+sudo kubeadm upgrade node
+
+# STEP 5: Upgrade Kubelet
+sudo apt-mark unhold kubelet
+sudo apt-get install -y kubelet=1.30.0-1.1
+sudo apt-mark hold kubelet
+
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+```
+
+Return to management workstation:
+
+```bash
+# STEP 6: Uncordon the node (Returns node to active cluster pool)
+kubectl uncordon worker-01
+
+# Verify node status is Ready with v1.30.0!
+kubectl get nodes -o wide
+```
+
+---
+
+## The Role of PodDisruptionBudgets (PDB)
+
+To guarantee zero customer downtime during `kubectl drain`, applications must define a **`PodDisruptionBudget`**:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-api-pdb
+  namespace: production
+spec:
+  minAvailable: 2                      # At least 2 pods MUST remain running during maintenance!
+  selector:
+    matchLabels:
+      app: payment-api
+```
+
+```text
+ How PDB Enforces Zero Downtime During Node Drains:
+ 1. `kubectl drain` requests eviction via the Eviction API (`/api/v1/namespaces/prod/pods/name/eviction`).
+ 2. The API server checks the PDB: If evicting the pod would drop running replicas below `minAvailable: 2`, 
+    the API server REJECTS the eviction request with `429 Too Many Requests`.
+ 3. The `drain` command pauses, waits for replacement pods to become Ready on other nodes, 
+    and only proceeds once PDB constraints are satisfied!
+```
+
+---
+
+## Hands-On Lab: Simulating a Node Cordon and Drain
+
+```bash
+# Step 1: Deploy a high-availability test application with PDB
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drain-demo-app
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: drain-demo
+  template:
+    metadata:
+      labels:
+        app: drain-demo
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.25-alpine
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: drain-demo-pdb
+  namespace: default
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: drain-demo
+EOF
+
+# Step 2: Wait for deployment to become Ready
+kubectl rollout status deployment/drain-demo-app -n default
+
+# Step 3: Identify a worker node to cordon
+TARGET_NODE=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[0].metadata.name}')
+echo "Targeting worker node: $TARGET_NODE"
+
+# Step 4: Cordon the target node
+kubectl cordon $TARGET_NODE
+
+# Step 5: Verify node is SchedulingDisabled
+kubectl get nodes $TARGET_NODE
+
+# Step 6: Uncordon the node
+kubectl uncordon $TARGET_NODE
+
+# Step 7: Clean up lab
+kubectl delete deployment drain-demo-app -n default
+kubectl delete pdb drain-demo-pdb -n default
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the exact operational difference between `kubeadm upgrade apply` and `kubeadm upgrade node`?**
+
+- **`kubeadm upgrade apply <version>`**: Executed **strictly on the first control plane node**. It checks the cluster state, generates new certificate authorities if necessary, upgrades the cluster configuration stored in the `kube-system/kubeadm-config` ConfigMap, applies `etcd` schema upgrades, and updates static pod manifests (`apiserver`, `controller-manager`, `scheduler`).
+- **`kubeadm upgrade node`**: Executed on all **secondary control plane nodes and all worker nodes**. It downloads the pre-migrated cluster configuration directly from the primary control plane, adjusts local Kubelet configuration, and updates local static pod manifests without re-executing cluster-wide migrations.
+
+**Q2: What is the difference between `kubectl cordon` and `kubectl drain`?**
+
+- **`kubectl cordon <node>`**: Marks the target node as unschedulable (`spec.unschedulable: true`). Existing running Pods continue executing normally, but the Kubernetes scheduler will not place new Pods onto that node.
+- **`kubectl drain <node>`**: First cordons the node, and then safely evicts all running workloads using the Kubernetes Eviction API, respecting `PodDisruptionBudgets`. It ignores DaemonSets (`--ignore-daemonsets`) and deletes local temporary storage (`--delete-emptydir-data`).
+
+**Q3: Why are the `--ignore-daemonsets` and `--delete-emptydir-data` flags required when running `kubectl drain`?**
+
+- `--ignore-daemonsets`: DaemonSet pods (like CNI plugins, Node Exporter, FluentBit) are bound to every single node by design. If `drain` evicted a DaemonSet pod, the DaemonSet controller would immediately recreate it on the exact same node, causing `drain` to hang indefinitely.
+- `--delete-emptydir-data`: Pods using `emptyDir` storage store temporary state on the node's local disk. By default, `drain` protects against data loss by refusing to delete these pods unless the administrator explicitly confirms that ephemeral data can be discarded.
+
+**Q4: How does a `PodDisruptionBudget` (PDB) prevent downtime during sequential cluster upgrades?**
+
+When `kubectl drain` executes, it uses the Kubernetes Eviction API. The API server evaluates all active PDBs matching the target Pod. If evicting the pod would violate the declared `minAvailable` (e.g. `minAvailable: 2` on a 3-replica deployment where 1 replica is already down), the API server rejects the eviction. `kubectl drain` retries periodically, allowing time for replacement pods to start and pass readiness probes on other worker nodes before completing the eviction.
+
+**Q5: Why should administrators run `apt-mark hold kubeadm kubelet kubectl` on Linux hosts?**
+
+Linux package managers (like `apt` or `yum`) frequently execute automated unattended security upgrades. If an automated `apt-get upgrade` cron job updates the Kubelet or kubeadm binary to a newer minor version before the control plane is upgraded, it violates the Version Skew Policy and can cause node crashes. `apt-mark hold` locks the package versions, guaranteeing that updates occur only during deliberate, coordinated maintenance windows.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 upgrade phases: Master 01 $\to$ Secondary Masters $\to$ Worker Nodes
+- [ ] Know that `kubeadm upgrade apply` is run on Master 01; `upgrade node` on all other nodes
+- [ ] Know the drain sequence: `cordon` $\to$ `drain` $\to$ `upgrade` $\to$ `uncordon`
+- [ ] Know why `--ignore-daemonsets` and `--delete-emptydir-data` are required for drain
+- [ ] Know how PodDisruptionBudgets (PDB) prevent outages during sequential node drains
+- [ ] Know why `apt-mark hold` is mandatory to prevent accidental automated package upgrades
+- [ ] Can inspect upgrade status using `kubeadm upgrade plan`

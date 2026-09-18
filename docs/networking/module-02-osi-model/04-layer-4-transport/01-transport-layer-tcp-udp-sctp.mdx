@@ -1,0 +1,177 @@
+---
+title: "Chapter 1 — Layer 4: Transport Layer — TCP, UDP & SCTP Deep Dive"
+sidebar_position: 1
+module: "Module 2.4 — Layer 4: Transport Layer"
+description: "Master OSI Layer 4: Transport Layer — TCP 3-way handshakes, sequence numbers, UDP datagrams, SCTP multi-homing, port multiplexing, and socket state machines."
+---
+
+# Chapter 1 — Layer 4: Transport Layer — TCP, UDP & SCTP Deep Dive
+
+> **Goal:** Master the process-to-process communication mechanics of **OSI Layer 4 (Transport Layer)** — dissecting **TCP connection lifecycles (3-way handshake, sliding window flow control, 4-way teardown)**, **UDP low-overhead datagrams**, and **SCTP (Stream Control Transmission Protocol)** with multi-homing and multi-streaming, alongside **5-tuple socket multiplexing**.
+>
+> By the end of this chapter, you will understand:
+> 1. Layer 4 socket multiplexing: Port ranges (Well-Known, Registered, Ephemeral) and the IP 5-Tuple
+> 2. TCP header format: 20-byte baseline, Sequence/Ack numbers, Window Size, and TCP Control Flags
+> 3. TCP connection lifecycle: 3-way handshake (SYN, SYN-ACK, ACK), data transfer, and 4-way FIN teardown
+> 4. UDP 8-byte minimal header structure and why real-time systems (DNS, RTP, QUIC) prefer connectionless transport
+> 5. SCTP architecture: 4-way handshake with COOKIE ECHO, multi-homing for fault-tolerance, and multi-streaming
+> 6. How to inspect active TCP/UDP sockets, connection states, and buffer queues using Linux `ss` and `netcat`
+
+---
+
+## Real-Life Analogy
+
+Think of Layer 4 (Transport Layer) as **the specialized delivery service agreements between two business partners**:
+
+- **TCP (Certified Registered Mail with Return Receipt):**
+  - Before sending contracts, you send an introductory letter (**SYN**), the partner acknowledges (**SYN-ACK**), and you confirm (**ACK**). Every single page is numbered (**Sequence Numbers**). If page 4 is smudged or missing, the partner demands a replacement (**Retransmission**). No pages are read out of order (**In-order delivery**).
+- **UDP (Postcards Dropped in a Mailbox):**
+  - You write a quick note on a postcard and drop it in the mail slot. There is no prior handshake, no tracking number, and no receipt. If it arrives in 2 days, great; if it gets lost in rain, nobody asks for a retransmission (**Zero overhead, maximum speed**).
+- **SCTP (Multi-Truck Armored Courier Fleet):**
+  - An elite logistics service that maintains connections across multiple independent highway routes simultaneously (**Multi-Homing**). It can deliver 10 separate binders in parallel across different compartments so a delay in Binder #1 never stops the reader from opening Binder #2 (**Multi-Streaming without Head-of-Line Blocking**).
+
+---
+
+## Architecture Diagram
+
+```text
+               OSI Layer 4: Transport Layer Protocol Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TCP Header (20 Bytes)                  UDP Header (8 Bytes)            │
+ │ ┌──────────────────┬─────────────────┐ ┌──────────────────┬──────────┐ │
+ │ │ Source Port (16) │ Dest Port (16)  │ │ Source Port (16) │Dest Port │ │
+ │ ├──────────────────┴─────────────────┤ ├──────────────────┼──────────┤ │
+ │ │      Sequence Number (32-bit)      │ │ Length (16-bit)  │Checksum  │ │
+ │ ├────────────────────────────────────┤ └──────────────────┴──────────┘ │
+ │ │   Acknowledgment Number (32-bit)   │                                 │
+ │ ├─────┬──────┬───────────────────────┤ SCTP Packet Format              │
+ │ │Off. │Flags │   Window Size (16)    │ ┌─────────────────────────────┐ │
+ │ ├─────┴──────┼───────────────────────┤ │ Common Header (12 Bytes)    │ │
+ │ │Checksum(16)│ Urgent Pointer (16)   │ ├─────────────────────────────┤ │
+ │ └────────────┴───────────────────────┘ │ Chunk 1 (Data / Control)    │ │
+ │ (Flags: SYN, ACK, FIN, RST, PSH, URG)  │ Chunk 2 (Data / Control)    │ │
+ └────────────────────────────────────────┴─────────────────────────────┴─┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Protocol Comparison Matrix: TCP vs UDP vs SCTP
+
+```text
+ ┌──────────────────────┬───────────────────────────────┬───────────────────────────────┬───────────────────────────────┐
+ │ Feature              │ TCP (RFC 793)                 │ UDP (RFC 768)                 │ SCTP (RFC 4960)               │
+ │──────────────────────┼───────────────────────────────┼───────────────────────────────┼───────────────────────────────┤
+ │ **Connection Model** │ Connection-Oriented           │ Connectionless                │ Association-Oriented          │
+ │ **Header Size**      │ 20 – 60 Bytes                 │ 8 Bytes Fixed                 │ 12 Bytes + Chunks             │
+ │ **Reliability**      │ Guaranteed (ACK + Retransmit) │ Unreliable (Best-effort)      │ Configurable (Reliable/Unrel) │
+ │ **Ordering**         │ Strict In-Order Stream        │ No Ordering Guarantees        │ In-Order per Stream           │
+ │ **Framing**          │ Byte Stream (No message bound)│ Message / Datagram Oriented   │ Message / Chunk Oriented      │
+ │ **Head-of-Line Block**│ Yes (Single stream block)    │ No (Independent datagrams)    │ **No** (Multi-stream channels)│
+ │ **Multi-Homing**     │ No (Single IP pair)           │ No (Single IP pair)           │ **Yes** (Multiple NICs/IPs)   │
+ │ **Handshake**        │ 3-Way (SYN, SYN-ACK, ACK)     │ None (0-RTT)                  │ 4-Way (Cookie Guarded)        │
+ │ **Primary Use Cases**│ HTTP/HTTPS, SSH, SQL, gRPC    │ DNS, DHCP, WebRTC, QUIC, VoIP │ Telecom SS7/SIGTRAN, WebRTC   │
+ └──────────────────────┴───────────────────────────────┴───────────────────────────────┴───────────────────────────────┘
+```
+
+---
+
+### 2. The IP 5-Tuple & Port Multiplexing
+
+The operating system kernel multiplexes thousands of independent network connections over a single physical NIC using the **IP 5-Tuple**:
+
+$$\text{Session Flow} = \{\text{Source IP}, \text{Destination IP}, \text{Source Port}, \text{Destination Port}, \text{Protocol}\}$$
+
+- **Port Ranges:**
+  - **Well-Known Ports ($0 - 1023$):** Privileged system services (e.g., HTTP `80`, HTTPS `443`, SSH `22`, DNS `53`).
+  - **Registered Ports ($1024 - 49151$):** User applications and databases (e.g., MySQL `3306`, Redis `6379`, Postgres `5432`).
+  - **Dynamic / Ephemeral Ports ($49152 - 65535$):** Temporarily allocated by the client OS for outbound connections.
+
+---
+
+### 3. TCP 3-Way Handshake & 4-Way Teardown State Machine
+
+```text
+    Client                                           Server
+      │                                                │  (LISTEN)
+      │ ─── 1. SYN (seq=1000) ───────────────────────► │  (SYN_RCVD)
+      │ ◄── 2. SYN-ACK (seq=5000, ack=1001) ────────── │
+      │ ─── 3. ACK (seq=1001, ack=5001) ─────────────► │  (ESTABLISHED)
+      │                                                │
+   (ESTABLISHED)                                       │
+      │ ─── Data Exchange (seq/ack incremented) ─────► │
+      │                                                │
+      │ ─── 1. FIN (seq=1500) ───────────────────────► │  (CLOSE_WAIT)
+      │ ◄── 2. ACK (ack=1501) ──────────────────────── │  (LAST_ACK)
+      │ ◄── 3. FIN (seq=7000) ──────────────────────── │
+      │ ─── 4. ACK (ack=7001) ───────────────────────► │  (CLOSED)
+   (TIME_WAIT: 2 * MSL ~ 60s)                          │
+```
+
+---
+
+## Hands-On Lab: Socket Inspection & TCP State Analysis
+
+```bash
+# Step 1: Display all listening TCP and UDP sockets with process names and port numbers
+ss -tulpn
+
+# Step 2: Display socket statistics summary (ESTABLISHED, TIME-WAIT, SYN-RECV)
+ss -s
+
+# Step 3: Start a TCP listener on port 9090 in the background
+nc -l -p 9090 &
+NC_PID=$!
+
+# Step 4: Verify the socket is in the LISTEN state
+ss -tan | grep 9090
+
+# Step 5: Connect to the listener and verify ESTABLISHED state
+echo "Testing Layer 4 Socket" | nc -w 1 127.0.0.1 9090
+
+# Step 6: Clean up background netcat process
+kill $NC_PID 2>/dev/null || echo "Listener closed"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What happens during the TCP 3-Way Handshake, and what is the purpose of Initial Sequence Numbers (ISNs)?**
+
+The TCP 3-way handshake establishes a reliable bidirectional connection:
+1. **SYN:** The client generates a pseudorandom Initial Sequence Number (ISN_C) and transmits a packet with the `SYN` flag set.
+2. **SYN-ACK:** The server acknowledges the client's ISN with `ACK = ISN_C + 1`, generates its own random ISN (ISN_S), and sets both `SYN` and `ACK` flags.
+3. **ACK:** The client acknowledges the server's sequence number with `ACK = ISN_S + 1`.
+ISNs must be cryptographically pseudorandom to prevent **TCP Sequence Prediction attacks**, where an attacker guesses sequence numbers to hijack an active connection or inject malicious payloads.
+
+**Q2: What is the purpose of the `TIME_WAIT` state in TCP and why does it last for $2 \times \text{MSL}$?**
+
+The `TIME_WAIT` state is entered by the endpoint that initiates the active close after sending its final ACK. It lasts for **2 Maximum Segment Lifetimes ($2 \times \text{MSL}$, typically 60–120 seconds)** for two vital reasons:
+1. **Graceful Termination:** If the final ACK is lost in transit, the remote server will retransmit its `FIN`. The client in `TIME_WAIT` can retransmit the final `ACK`. Without `TIME_WAIT`, the client would respond with a `RST`, terminating the connection abnormally.
+2. **Old Duplicate Packet Drainage:** It ensures that any delayed, wandering duplicate packets from the old connection expire and drain from the Internet before a new connection can reuse the exact same 5-tuple.
+
+**Q3: What is Head-of-Line (HoL) Blocking and how does SCTP / QUIC solve it?**
+
+In TCP, data is delivered as a single monolithic ordered byte stream. If Packet #2 is dropped in transit while Packets #3, #4, and #5 arrive safely, the receiving operating system must hold Packets #3–5 in kernel memory and cannot deliver them to the application until Packet #2 is retransmitted and acknowledged (**Head-of-Line Blocking**). **SCTP** and **QUIC (HTTP/3)** solve this by supporting **independent multiplexed streams** over a single association. A dropped packet in Stream A only delays Stream A; Streams B and C continue delivering data to the application with zero latency penalty.
+
+**Q4: How does SCTP Multi-Homing provide automatic carrier-grade failover?**
+
+In traditional TCP/UDP, a connection is bound to a single IP address pair. If the underlying network cable or ISP fails, the TCP session drops. In **SCTP (Stream Control Transmission Protocol)**, each endpoint advertises multiple IP addresses (e.g., connected to two separate physical NICs and diverse ISPs). SCTP continuously monitors all paths with heartbeat chunks. If the primary IP path fails, traffic is transparently redirected to the secondary IP path **without dropping the transport association or disconnecting the application**.
+
+**Q5: What is a SYN Flood attack and how do SYN Cookies defend against it?**
+
+A **SYN Flood** is a Denial-of-Service (DoS) attack where an attacker sends thousands of spoofed TCP `SYN` packets without completing the 3-way handshake. The server allocates kernel memory for half-open connections in its SYN backlog table until resources are exhausted, rejecting legitimate users. **SYN Cookies** eliminate this vulnerability: instead of allocating memory upon receiving a `SYN`, the server encodes all connection state (timestamp, MSS, client details) cryptographically into the 32-bit Initial Sequence Number of the `SYN-ACK`. Memory is allocated only when the client returns a valid `ACK` containing the matching sequence number, rendering the attack ineffective.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between TCP (reliable stream), UDP (datagram), and SCTP (multi-stream/multi-homing)
+- [ ] Know the complete TCP header fields (20 bytes) and control flags (SYN, ACK, FIN, RST, PSH, URG)
+- [ ] Know the TCP 3-way handshake and 4-way FIN teardown state machines
+- [ ] Know why the `TIME_WAIT` state exists ($2 \times \text{MSL}$)
+- [ ] Know how SCTP and QUIC eliminate Head-of-Line (HoL) blocking
+- [ ] Can inspect active sockets and connection states using Linux `ss -tulpn`

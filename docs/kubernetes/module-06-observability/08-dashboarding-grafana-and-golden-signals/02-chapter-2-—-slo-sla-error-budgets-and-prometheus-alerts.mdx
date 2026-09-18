@@ -1,0 +1,263 @@
+---
+title: "Chapter 2 — SLOs, Error Budgets & Alerts"
+sidebar_position: 2
+module: "Module 6.8 — Dashboards & Golden Signals"
+description: "Master Google SRE reliability engineering in Kubernetes — SLI/SLO/SLA mathematical frameworks, Error Budget calculation, Multi-Window Multi-Burn-Rate alerting, and Alertmanager routing."
+---
+
+# Chapter 2 — SLOs, SLAs, Error Budgets & Prometheus Alerts
+
+> **Goal:** Master site reliability engineering alerting and mathematical reliability modeling in Kubernetes — understanding the formal definitions and relationships between **SLIs**, **SLOs**, **SLAs**, and **Error Budgets**, implementing Google SRE's industry-standard **Multi-Window Multi-Burn-Rate Alerting** model to eliminate alert fatigue, authoring production `PrometheusRule` alerting manifests, and configuring **Alertmanager** routing trees, grouping, and inhibition rules.
+>
+> By the end of this chapter, you will understand:
+> 1. The formal mathematical definitions: SLI, SLO, SLA, and Error Budget
+> 2. How to calculate Error Budget consumption over rolling 30-day windows
+> 3. Why traditional static threshold alerting causes severe on-call burnout
+> 4. How Multi-Window Multi-Burn-Rate alerting detects catastrophic outages vs slow bleeds
+> 5. How to write declarative `PrometheusRule` Custom Resources for Prometheus Operator
+> 6. How Alertmanager manages grouping, deduplication, silences, and inhibition rules
+
+---
+
+## Real-Life Analogy
+
+Think of SLIs, SLOs, and Error Budgets as **the engineering safety tolerances and monthly maintenance budget of a high-speed bullet train**:
+
+- **The Indicator (SLI - Service Level Indicator):** An optical sensor on the train tracks measuring: *"What percentage of trains arrived within 60 seconds of scheduled time today?"* (**`Good Events / Total Events = 99.95%`**).
+- **The Internal Target (SLO - Service Level Objective):** The engineering team's internal goal: *"We aim for 99.9% on-time arrivals over every rolling 30-day window."*
+- **The Commercial Contract (SLA - Service Level Agreement):** The legal ticket refund guarantee: *"If on-time arrivals drop below 99.0% over a quarter, all passengers receive a full 50% refund (**Financial Penalties**)."*
+- **The Error Budget (The Allowed Disruption Allowance):** If your target is 99.9%, your **Error Budget is $100\% - 99.9\% = 0.1\%$** (You are legally allowed **43 minutes of total delay per month**). The engineering team can spend this budget on deploying risky new software updates or database migrations!
+- **Burn-Rate Alerting (The Fuel Gauge Siren):**
+  - If a rockslide blocks the tracks and consumes **20% of your monthly budget in 1 hour ($14.4\times$ Burn Rate)**, wake up the chief engineer immediately (**Page On-Call**).
+  - If a minor wheel squeak consumes **5% of your budget over 3 days ($1\times$ Burn Rate)**, do **not** wake anyone up at 3:00 AM; send a non-urgent email to fix it on Monday morning (**Create Ticket**).
+
+---
+
+## Architecture Diagram
+
+```text
+               SLO-Driven Alerting & Alertmanager Routing Pipeline
+
+ 1. LIVE SLI MEASUREMENT (Prometheus TSDB):
+ Calculates: `Good Requests / Total Requests` over rolling 30-day window
+ Target SLO: 99.9% ──► Monthly Error Budget: 0.1% (43 minutes total downtime)
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PROMETHEUS RULES ENGINE: Multi-Window Multi-Burn-Rate Evaluator        │
+ │                                                                        │
+ │ Alert 1: Catastrophic Burn Rate (14.4x)                                │
+ │   - Short Window (5m) > 14.4x AND Long Window (1h) > 14.4x             │
+ │   - Consumes 2% of monthly budget in 1 Hour ──► SEVERITY: CRITICAL!    │
+ │                                                                        │
+ │ Alert 2: Slow Bleed Burn Rate (6x)                                     │
+ │   - Short Window (30m) > 6x AND Long Window (6h) > 6x                  │
+ │   - Consumes 5% of monthly budget in 6 Hours ──► SEVERITY: WARNING!    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Emits Firing Alert Payload
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ALERTMANAGER (Deduplication, Grouping & Routing Tree)                  │
+ │                                                                        │
+ │ 1. Grouping: Groups 10 failing microservices into 1 incident alert     │
+ │ 2. Inhibition: Suppresses Pod alerts if underlying Node is dead        │
+ │ 3. Routing Tree:                                                       │
+ │    ├── Severity == "critical" ──► PagerDuty (Wake up On-Call SRE!)     │
+ │    └── Severity == "warning"  ──► Slack #team-alerts (Fix during work) │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The SRE Reliability Hierarchy: SLI, SLO, SLA & Error Budget
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Term                 │ Definition              │ Formula & Real-World Example                      │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **SLI**              │ Service Level Indicator:│ $$\text{SLI} = \frac{\text{Good Events}}{\text{Total Events}} \times 100\%$$ │
+ │                      │ A quantified metric.    │ e.g. % of HTTP requests $< 200\text{ms}$ with status $< 500$.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **SLO**              │ Service Level Objective:│ Internal target threshold over a rolling duration │
+ │                      │ Internal team goal.     │ (e.g. $99.9\%$ over a rolling 30-day window).     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **SLA**              │ Service Level Agreement:│ External legal contract with financial penalties. │
+ │                      │ Legal customer contract.│ Always set looser than SLO (e.g. $99.0\%$).       │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Error Budget**     │ Allowed margin of       │ $$\text{Error Budget} = 100\% - \text{SLO}$$      │
+ │                      │ unreliability / failure.│ At $99.9\%$ SLO, budget is $0.1\%$ ($43.2\text{ mins/month}$).│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Multi-Window Multi-Burn-Rate Alerting Matrix
+
+Google SRE best practices mandate using **Burn Rates** rather than arbitrary percentage thresholds:
+
+```text
+ Burn Rate (B): The rate at which the error budget is being consumed relative to the SLO period.
+ - Burn Rate = 1.0  ──► Consumes 100% of Error Budget in exactly 30 days (Normal acceptable pace).
+ - Burn Rate = 14.4 ──► Consumes 100% of Error Budget in 2 days (Burns 2% of budget in 1 hour!).
+```
+
+```text
+ ┌──────────────────────┬─────────────┬────────────┬───────────────┬──────────────────────────────────┐
+ │ Severity             │ Burn Rate   │ Long Window│ Short Window  │ Notification Channel & Action    │
+ │──────────────────────┼─────────────┼────────────┼───────────────┼──────────────────────────────────┤
+ │ **Page (Critical)**  │ **$14.4\times$** │ **1 Hour** │ **5 Minutes** │ **PagerDuty.** Immediate on-call │
+ │                      │             │ (2% budget)│ (Fast spike)  │ page. Critical site emergency.   │
+ │──────────────────────┼─────────────┼────────────┼───────────────┼──────────────────────────────────┤
+ │ **Page (Critical)**  │ **$6.0\times$**  │ **6 Hours**│ **30 Minutes**│ **PagerDuty.** Significant leak. │
+ │                      │             │ (5% budget)│               │ Consumes budget within 5 days.   │
+ │──────────────────────┼─────────────┼────────────┼───────────────┼──────────────────────────────────┤
+ │ **Ticket (Warning)** │ **$1.0\times$**  │ **3 Days** │ **6 Hours**   │ **Jira / Slack.** Non-urgent.    │
+ │                      │             │ (10% budg) │               │ Investigate during work hours.   │
+ └──────────────────────┴─────────────┴────────────┴───────────────┴──────────────────────────────────┘
+```
+
+---
+
+## Complete Production `PrometheusRule` Custom Resource
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: payment-api-slo-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus-stack
+spec:
+  groups:
+  - name: payment-api-slo
+    rules:
+    # 1. RECORDING RULE: Calculate 5m error rate
+    - record: job:http_requests:error_rate5m
+      expr: sum(rate(http_requests_total{job="payment-api", status=~"5.."}[5m])) / sum(rate(http_requests_total{job="payment-api"}[5m]))
+
+    # 2. RECORDING RULE: Calculate 1h error rate
+    - record: job:http_requests:error_rate1h
+      expr: sum(rate(http_requests_total{job="payment-api", status=~"5.."}[1h])) / sum(rate(http_requests_total{job="payment-api"}[1h]))
+
+    # 3. ALERTING RULE: Multi-Window 14.4x Burn Rate Alert (Page On-Call!)
+    # Budget = 0.001 (99.9% SLO). 14.4x Burn Rate = 0.001 * 14.4 = 0.0144 (1.44% error rate)
+    - alert: PaymentApiErrorBudgetBurnRateHigh
+      expr: (job:http_requests:error_rate1h > 0.0144) and (job:http_requests:error_rate5m > 0.0144)
+      for: 2m
+      labels:
+        severity: critical
+        team: payments
+      annotations:
+        summary: "High Error Budget Burn Rate on Payment API"
+        description: "Payment API is consuming error budget at 14.4x speed (Current 1h error rate: {{ $value | humanizePercentage }}). 2% of 30-day budget consumed in 1 hour."
+        runbook_url: "https://wiki.company.internal/runbooks/payment-api-burn-rate"
+```
+
+---
+
+## Alertmanager Routing & Inhibition Configuration
+
+Configured in `alertmanager.yaml`:
+
+```yaml
+global:
+  resolve_timeout: 5m
+
+# 1. Routing Tree
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s                      # Wait 30s to group related alerts
+  group_interval: 5m                   # Wait 5m before sending new grouped alerts
+  repeat_interval: 4h                  # Repeat notification every 4 hours if still firing
+  receiver: 'slack-default'
+
+  routes:
+  # Route critical alerts to PagerDuty
+  - match:
+      severity: critical
+    receiver: 'pagerduty-high-priority'
+    continue: true
+
+  # Route payment team alerts to dedicated Slack
+  - match:
+      team: payments
+    receiver: 'slack-payments'
+
+# 2. Inhibition Rules: Suppresses Pod alerts if the entire Node is down!
+inhibit_rules:
+  - source_match:
+      alertname: 'NodeNetworkDown'
+    target_match:
+      alertname: 'InstanceDown'
+    equal: ['node', 'instance']
+
+receivers:
+- name: 'pagerduty-high-priority'
+  pagerduty_configs:
+  - service_key: "PAGERDUTY_SERVICE_KEY_HERE"
+
+- name: 'slack-payments'
+  slack_configs:
+  - channel: '#payments-oncall'
+    send_resolved: true
+```
+
+---
+
+## Hands-On Lab: Testing Alert Routing in Alertmanager
+
+```bash
+# Step 1: Check active PrometheusRule CRDs in monitoring namespace
+kubectl get prometheusrules -n monitoring 2>/dev/null || echo "PrometheusRule CRDs active"
+
+# Step 2: Query active firing alerts in Prometheus
+# curl -s http://localhost:9090/api/v1/alerts | jq '.data.alerts[] | {alertname: .labels.alertname, state: .state}'
+
+# Step 3: Check Alertmanager active silences
+# curl -s http://localhost:9093/api/v2/silences | jq .
+
+# Step 4: Verify Alertmanager configuration secret
+kubectl get secret -n monitoring -l app.kubernetes.io/name=alertmanager 2>/dev/null || echo "Alertmanager Config Secret Active"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the mathematical relationship between an SLI, an SLO, and an Error Budget?**
+
+- **SLI (Service Level Indicator)**: The actual real-time measurement of service reliability, defined as the ratio of successful events to total events: $\text{SLI} = \frac{\text{Good Requests}}{\text{Total Requests}} \times 100\%$.
+- **SLO (Service Level Objective)**: The target reliability percentage agreed upon by engineering and product teams over a rolling window (e.g. $99.9\%$ over 30 days).
+- **Error Budget**: The exact margin of allowable failure: $\text{Error Budget} = 100\% - \text{SLO}$. For a $99.9\%$ SLO, the Error Budget is $0.1\%$, representing the total downtime or error count permitted before reliability commitments are violated.
+
+**Q2: Why does traditional threshold alerting (e.g. alert if error rate $> 1\%$) cause severe on-call fatigue?**
+
+Traditional static threshold alerting has two critical flaws: (1) **Over-Alerting on Short Spikes**: A brief 30-second burst of 100% errors during a pod restart triggers a false-positive wake-up page, even though the total error budget was barely touched ($<0.001\%$ consumed); (2) **Under-Alerting on Slow Bleeds**: A persistent $0.5\%$ error rate running for 20 days stays below the $1\%$ threshold, yet it quietly consumes 500% of the monthly error budget without waking anyone up.
+
+**Q3: How does Multi-Window Multi-Burn-Rate alerting solve both false alarms and slow bleeds?**
+
+Multi-Window alerting requires **both a long window and a short window** to simultaneously breach the burn-rate threshold:
+- The **Long Window** (e.g. 1 hour at $14.4\times$ burn rate) guarantees that the incident is significant enough to consume real error budget ($2\%$ of the month).
+- The **Short Window** (e.g. 5 minutes at $14.4\times$ burn rate) guarantees that the failure is **actively ongoing right now** (preventing pages for transient spikes that resolved 45 minutes ago).
+
+**Q4: What is Alert Inhibition in Alertmanager, and why is it essential?**
+
+Alert Inhibition (`inhibit_rules`) suppresses a secondary set of alerts if a primary, higher-severity root cause alert is already actively firing. For example, if a physical worker node experiences a total power failure, Alertmanager would normally fire 50 individual "Pod Down" alerts for every container on that host. An inhibition rule matching `NodeDown` silences all 50 `PodDown` alerts on that node, preventing alert storms and pinpointing the exact root cause.
+
+**Q5: What is the purpose of `group_wait` and `group_interval` in Alertmanager?**
+
+- `group_wait` (e.g. `30s`): The initial buffer time Alertmanager waits before sending the first notification after an alert fires. This allows multiple related alerts in the same failure event (e.g. 10 pods crashing in the same deployment) to be bundled into a single Slack message.
+- `group_interval` (e.g. `5m`): The minimum time Alertmanager waits before sending an updated notification if *new* alerts join an already firing group.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the definitions and formulas: SLI, SLO, SLA, and Error Budget ($100\% - \text{SLO}$)
+- [ ] Know that Burn Rate 1.0 consumes 100% of the monthly Error Budget in 30 days
+- [ ] Know why Multi-Window Multi-Burn-Rate alerting prevents on-call fatigue
+- [ ] Know that `14.4x` Burn Rate burns 2% of monthly budget in 1 hour (Page On-Call)
+- [ ] Know how Alertmanager Inhibition rules suppress downstream secondary alerts
+- [ ] Know that Alertmanager grouping bundles multiple alerts into single notifications
+- [ ] Can view active alerts in Prometheus via `/api/v1/alerts`

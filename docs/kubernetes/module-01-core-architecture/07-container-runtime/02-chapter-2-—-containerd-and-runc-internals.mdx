@@ -1,0 +1,1462 @@
+---
+title: "Chapter 2 — containerd & runc Internals"
+sidebar_position: 2
+module: "Module 1.7 — Container Runtime Internals"
+description: "> **Goal:** Understand how **containerd**, **containerd-shim**, and **runc** work together to create and manage Linux containers. Learn the complete container c..."
+---
+
+# Module 1.7 — Container Runtime Internals
+
+# Chapter 2 — containerd & runc Internals
+
+> **Goal:** Understand how **containerd**, **containerd-shim**, and **runc** work together to create and manage Linux containers. Learn the complete container creation workflow, the OCI Runtime Specification, and the lifecycle of a container process from image to execution.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. containerd architecture: daemon, gRPC API, plugins, snapshotter
+> 2. containerd-shim: the per-container intermediary process
+> 3. runc: the OCI-compliant low-level runtime that creates the container
+> 4. Container creation workflow: CRI call -> containerd -> shim -> runc
+> 5. OCI Runtime Specification: the bundle (config.json + rootfs)
+> 6. Linux namespaces created by runc: PID, Network, Mount, UTS, IPC
+> 7. cgroups: CPU and memory limits enforced by runc on behalf of kubelet
+> 8. Container lifecycle: created, running, paused, stopped, deleted
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of containerd & runc like a restaurant kitchen with a head chef and line cooks.
+
+```text
+Restaurant Kitchen Analogy:
+
+Head chef (containerd) receives the order from the waiter (kubelet via CRI)
+Head chef assigns the order to a station manager (containerd-shim)
+Station manager assigns a line cook (runc) to prepare the dish
+Line cook prepares the dish (creates the container process) and leaves
+Station manager stays to serve and monitor the dish (shim stays alive)
+If head chef takes a break (containerd restarts): station manager keeps dish warm
+```
+
+| Kitchen | containerd & runc |
+| :--- | :--- |
+| Head chef | containerd |
+| Order ticket | CRI RunPodSandbox / CreateContainer request |
+| Station manager | containerd-shim (per-container process) |
+| Line cook | runc (OCI runtime) |
+| Line cook prepares dish and leaves | runc creates container process and exits |
+| Station manager stays | containerd-shim stays alive to own the container |
+| Head chef takes a break | containerd restarts |
+
+> **Important:** After `runc` creates the container process, **runc exits**. The container process is then owned by `containerd-shim`, not runc or containerd. This means if `containerd` crashes and restarts, **running containers are not affected** — the shim processes keep them alive. This is a deliberate design choice for container process lifecycle isolation.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- CRI (Container Runtime Interface)
+- OCI (Open Container Initiative)
+- kubelet ↔ CRI Communication
+- Linux Processes (basic understanding)
+- Linux Namespaces (basic understanding)
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapter, we learned:
+
+```text
+kubelet
+  |
+  v
+CRI
+  |
+  v
+Container Runtime
+```
+
+Now the question becomes:
+
+> **What actually happens inside the Container Runtime?**
+
+For a modern Kubernetes cluster, the answer is usually:
+
+```text
+containerd
+  |
+  v
+containerd-shim
+  |
+  v
+runc
+  |
+  v
+Linux Kernel
+```
+
+This chapter explains how these components cooperate to run containers.
+
+---
+
+# Modern Runtime Stack
+
+Most Kubernetes clusters today use:
+
+```text
+                 kubelet
+
+                    |
+
+                 CRI gRPC
+
+                    |
+
+                    ▼
+
+               containerd
+
+                    |
+
+                    ▼
+
+            containerd-shim
+
+                    |
+
+                    ▼
+
+                  runc
+
+                    |
+
+                    ▼
+
+              Linux Kernel
+
+                    |
+
+                    ▼
+
+          Running Container Process
+```
+
+Each layer has a very specific responsibility.
+
+---
+
+# Why Multiple Components?
+
+A common question is:
+
+> Why not let containerd run containers directly?
+
+Because each component solves a different problem.
+
+```text
+containerd
+  |
+  v
+Container Management
+
+────────────
+
+runc
+  |
+  v
+Container Creation
+
+────────────
+
+Linux
+  |
+  v
+Process Execution
+```
+
+This separation keeps each component simple and reusable.
+
+---
+
+# What is containerd?
+
+**containerd** is a high-level container runtime responsible for managing the complete lifecycle of containers.
+
+It is responsible for:
+
+- Image management
+- Snapshot management
+- Container metadata
+- Container lifecycle
+- Task management
+- CRI integration
+- Event handling
+
+Think of containerd as the **container management platform**.
+
+---
+
+# containerd Responsibilities
+
+containerd manages:
+
+```text
+Images
+  |
+  v
+Snapshots
+  |
+  v
+Containers
+  |
+  v
+Tasks
+  |
+  v
+Events
+```
+
+It **does not** directly create Linux namespaces.
+
+Instead, it delegates that work.
+
+---
+
+# High-Level Architecture
+
+```text
+                 kubelet
+
+                    |
+
+                  CRI
+
+                    |
+
+                    ▼
+
+               containerd
+
+        ┌─────────┼─────────┐
+
+        ▼         ▼         ▼
+
+     Images   Snapshots   Metadata
+
+                    |
+
+                    ▼
+
+           containerd-shim
+
+                    |
+
+                    ▼
+
+                  runc
+
+                    |
+
+                    ▼
+
+             Linux Kernel
+```
+
+---
+
+# Major containerd Components
+
+Internally, containerd consists of several logical components.
+
+```text
+containerd
+
++-- CRI Plugin
+
++-- Image Service
+
++-- Snapshot Manager
+
++-- Content Store
+
++-- Metadata Store
+
++-- Task Manager
+
++-- Event Service
+
++-- Runtime Manager
+```
+
+Each component performs a specialized task.
+
+---
+
+# CRI Plugin
+
+The CRI Plugin receives requests from kubelet.
+
+Example:
+
+```text
+PullImage()
+  |
+  v
+CreateContainer()
+  |
+  v
+StartContainer()
+```
+
+The plugin translates CRI requests into internal containerd operations.
+
+---
+
+# Image Service
+
+Responsible for:
+
+```text
+Pull Images
+
+Store Images
+
+Delete Images
+
+List Images
+```
+
+Images are stored locally for future reuse.
+
+---
+
+# Snapshot Manager
+
+Containers should not modify the original image.
+
+Instead:
+
+```text
+Container Image
+  |
+  v
+Read-Only Layers
+  |
+  v
+Writable Snapshot
+  |
+  v
+Running Container
+```
+
+The Snapshot Manager creates this writable layer.
+
+---
+
+# Content Store
+
+The Content Store keeps:
+
+```text
+Image Layers
+  |
+  v
+Blobs
+  |
+  v
+Manifests
+  |
+  v
+Configurations
+```
+
+Image data is stored only once even if multiple containers use it.
+
+---
+
+# Metadata Store
+
+Stores runtime metadata.
+
+Examples:
+
+```text
+Container IDs
+
+Image References
+
+Labels
+
+Runtime Configuration
+```
+
+This is not the application data inside the container.
+
+---
+
+# Task Manager
+
+Important distinction:
+
+```text
+Container
+
+≠
+
+Running Process
+```
+
+A container is configuration.
+
+A **Task** is a running process.
+
+The Task Manager controls:
+
+```text
+Start
+
+Pause
+
+Resume
+
+Kill
+
+Delete
+```
+
+---
+
+# Event Service
+
+Generates events such as:
+
+```text
+Container Started
+
+Container Exited
+
+Task Deleted
+
+Image Pulled
+```
+
+These events are consumed by containerd and kubelet.
+
+---
+
+# Runtime Manager
+
+The Runtime Manager decides:
+
+```text
+Which OCI Runtime
+
+Should Be Used?
+```
+
+Examples:
+
+```text
+runc
+
+gVisor
+
+Kata Containers
+```
+
+---
+
+# containerd Architecture
+
+Putting everything together:
+
+```text
+                 kubelet
+
+                    |
+
+                  CRI
+
+                    |
+
+                    ▼
+
+             CRI Plugin
+
+                    |
+
+        ┌───────────┼───────────┐
+
+        ▼           ▼           ▼
+
+   Image Service  Metadata   Snapshot
+
+                    |
+
+                    ▼
+
+              Task Manager
+
+                    |
+
+                    ▼
+
+             Runtime Manager
+
+                    |
+
+                    ▼
+
+            containerd-shim
+
+                    |
+
+                    ▼
+
+                  runc
+```
+
+---
+
+# What is containerd-shim?
+
+This is one of the most misunderstood Kubernetes topics.
+
+Many people think:
+
+```text
+containerd
+  |
+  v
+Runs Container Forever
+```
+
+Not true.
+
+Instead:
+
+```text
+containerd
+  |
+  v
+containerd-shim
+  |
+  v
+runc
+  |
+  v
+Container
+```
+
+---
+
+# Why containerd-shim Exists
+
+Suppose:
+
+```text
+containerd
+  |
+  v
+Crash
+```
+
+Without a shim:
+
+```text
+Container
+  |
+  v
+Also Dies
+```
+
+This would be unacceptable.
+
+Instead:
+
+```text
+containerd
+  |
+  v
+Starts Shim
+  |
+  v
+Shim Starts Container
+  |
+  v
+Container Continues Running
+```
+
+The shim becomes the parent process.
+
+---
+
+# containerd-shim Architecture
+
+```text
+containerd
+  |
+  v
+containerd-shim
+  |
+  v
+Container Process
+```
+
+After startup:
+
+```text
+runc
+  |
+  v
+Exits
+```
+
+The shim remains alive.
+
+---
+
+# Responsibilities of containerd-shim
+
+The shim:
+
+- Becomes the parent of container processes
+- Reports container exit status
+- Manages stdin/stdout/stderr
+- Supports container lifecycle
+- Keeps containers alive if containerd restarts
+
+---
+
+# Process Tree
+
+Example:
+
+```text
+systemd
+  |
+  v
+containerd
+  |
+  v
+containerd-shim
+  |
+  v
+nginx
+```
+
+Notice:
+
+The application process is not a child of containerd.
+
+It is a child of the shim.
+
+---
+
+# What is runc?
+
+**runc** is a low-level OCI Runtime.
+
+Its job is extremely focused:
+
+```text
+Receive OCI Bundle
+  |
+  v
+Configure Linux
+  |
+  v
+Start Container
+  |
+  v
+Exit
+```
+
+It is **not** a long-running daemon.
+
+---
+
+# Responsibilities of runc
+
+runc performs:
+
+- Namespace creation
+- cgroup configuration
+- Mount configuration
+- Capability configuration
+- Process creation
+
+Once complete:
+
+```text
+runc
+  |
+  v
+Exit
+```
+
+---
+
+# OCI Runtime Specification
+
+The OCI Runtime Specification defines how a runtime such as runc creates containers.
+
+It specifies:
+
+```text
+Namespaces
+
+cgroups
+
+Mounts
+
+Capabilities
+
+Environment Variables
+
+Root Filesystem
+
+Process Arguments
+```
+
+Every OCI-compliant runtime follows these rules.
+
+---
+
+# OCI Bundle
+
+Before runc can start a container,
+
+containerd prepares an **OCI Bundle**.
+
+Conceptually:
+
+```text
+OCI Bundle
+
++-- config.json
+
++-- rootfs/
+```
+
+---
+
+# config.json
+
+This file describes:
+
+```text
+Process
+  |
+  v
+Namespaces
+  |
+  v
+Mounts
+  |
+  v
+Resources
+  |
+  v
+Capabilities
+```
+
+It is the blueprint used by runc.
+
+---
+
+# rootfs
+
+Contains:
+
+```text
+Merged Image
+
++
+
+Writable Snapshot
+```
+
+This becomes the container's filesystem.
+
+---
+
+# Container Creation Workflow
+
+Let's follow the entire journey.
+
+---
+
+# Step 1
+
+kubelet requests:
+
+```text
+CreateContainer()
+```
+
+---
+
+# Step 2
+
+containerd receives the request.
+
+---
+
+# Step 3
+
+containerd prepares:
+
+```text
+Container Metadata
+  |
+  v
+Snapshot
+  |
+  v
+OCI Bundle
+```
+
+---
+
+# Step 4
+
+containerd starts:
+
+```text
+containerd-shim
+```
+
+---
+
+# Step 5
+
+The shim invokes:
+
+```text
+runc create
+```
+
+---
+
+# Step 6
+
+runc performs:
+
+```text
+Namespaces
+  |
+  v
+cgroups
+  |
+  v
+Mounts
+  |
+  v
+Filesystem
+  |
+  v
+Process
+```
+
+---
+
+# Step 7
+
+runc exits.
+
+---
+
+# Step 8
+
+The shim manages:
+
+```text
+Running Container
+```
+
+---
+
+# Complete Workflow
+
+```text
+kubelet
+  |
+  v
+CRI
+  |
+  v
+containerd
+  |
+  v
+Create Snapshot
+  |
+  v
+Generate OCI Bundle
+  |
+  v
+Start containerd-shim
+  |
+  v
+runc create
+  |
+  v
+Linux Container Created
+  |
+  v
+runc Exit
+  |
+  v
+containerd-shim Continues
+  |
+  v
+Application Running
+```
+
+---
+
+# Container Start Workflow
+
+Creation and starting are separate operations.
+
+```text
+Create
+  |
+  v
+Container Exists
+  |
+  v
+Start
+  |
+  v
+Application Running
+```
+
+---
+
+# Process Lifecycle
+
+The application process follows this lifecycle.
+
+```text
+Create Container
+  |
+  v
+Process Created
+  |
+  v
+Running
+  |
+  v
+Exit
+  |
+  v
+Shim Reports Exit
+  |
+  v
+containerd Updates State
+  |
+  v
+kubelet Reads Status
+```
+
+---
+
+# Container Exit
+
+Suppose:
+
+```text
+Application
+  |
+  v
+Exit Code 1
+```
+
+Workflow:
+
+```text
+Application Exits
+  |
+  v
+Shim Detects Exit
+  |
+  v
+Notify containerd
+  |
+  v
+CRI Status Updated
+  |
+  v
+kubelet Reads Exit Code
+  |
+  v
+Restart Policy Evaluated
+```
+
+---
+
+# Restart Scenario
+
+Suppose:
+
+```text
+restartPolicy=Always
+```
+
+Workflow:
+
+```text
+Application Crash
+  |
+  v
+Shim Reports Exit
+  |
+  v
+containerd
+  |
+  v
+kubelet
+  |
+  v
+SyncPod()
+  |
+  v
+Create New Task
+  |
+  v
+Container Running Again
+```
+
+---
+
+# Process Relationships
+
+```text
+systemd
+  |
+  v
+containerd
+  |
+  v
+containerd-shim
+  |
+  v
+Application
+```
+
+The application never becomes a direct child of containerd after startup.
+
+---
+
+# Why Doesn't runc Stay Running?
+
+A common misconception:
+
+```text
+runc
+  |
+  v
+Long Running
+```
+
+Incorrect.
+
+runc performs setup only.
+
+```text
+Namespaces
+  |
+  v
+cgroups
+  |
+  v
+Start Process
+  |
+  v
+Exit
+```
+
+The shim manages the running container.
+
+---
+
+# Failure Scenario
+
+Suppose:
+
+```text
+containerd
+  |
+  v
+Crash
+```
+
+What happens?
+
+```text
+containerd
+
+❌ Down
+  |
+  v
+containerd-shim
+  |
+  v
+Application
+
+✓ Still Running
+```
+
+Existing containers continue running.
+
+However:
+
+```text
+New Containers
+
+Cannot Be Created
+```
+
+until containerd recovers.
+
+---
+
+# Complete Internal Architecture
+
+```text
+              kubelet
+
+                 |
+
+                 ▼
+
+               CRI
+
+                 |
+
+                 ▼
+
+            containerd
+
+        ┌────────┼─────────┐
+
+        ▼        ▼         ▼
+
+    Images   Snapshots  Metadata
+
+                 |
+
+                 ▼
+
+         containerd-shim
+
+                 |
+
+                 ▼
+
+               runc
+
+                 |
+
+                 ▼
+
+          Linux Kernel
+
+                 |
+
+                 ▼
+
+       Running Application
+```
+
+---
+
+# Production Example 1
+
+Web Server
+
+```text
+nginx Image
+  |
+  v
+containerd Pulls Image
+  |
+  v
+Snapshot Created
+  |
+  v
+OCI Bundle Generated
+  |
+  v
+runc Creates Container
+  |
+  v
+nginx Running
+```
+
+---
+
+# Production Example 2
+
+containerd Restart
+
+```text
+containerd
+  |
+  v
+Restart
+  |
+  v
+containerd-shim
+  |
+  v
+Application Continues Running
+```
+
+No downtime for existing containers.
+
+---
+
+# Production Example 3
+
+Application Crash
+
+```text
+Application Exit
+  |
+  v
+Shim Detects Exit
+  |
+  v
+containerd
+  |
+  v
+kubelet
+  |
+  v
+Restart Container
+```
+
+---
+
+# Production Example 4
+
+Multiple Containers
+
+```text
+containerd
+  |
+  v
+shim-1
+  |
+  v
+nginx
+
+────────────
+
+shim-2
+  |
+  v
+redis
+
+────────────
+
+shim-3
+  |
+  v
+api-server
+```
+
+Each container has its own shim process.
+
+---
+
+# Production Best Practices
+
+✔ Use containerd as the default runtime for Kubernetes.
+
+✔ Monitor containerd and containerd-shim separately.
+
+✔ Keep OCI runtimes (such as runc) updated with security patches.
+
+✔ Monitor image storage and snapshot usage.
+
+✔ Avoid manually killing containerd-shim processes.
+
+✔ Investigate repeated container exits instead of relying solely on automatic restarts.
+
+✔ Secure access to the containerd socket.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+containerd creates Linux namespaces directly.
+
+**Correct:** containerd prepares the environment and invokes an OCI runtime (such as runc) to create the container.
+
+---
+
+### ❌ Misconception 2
+
+runc is a long-running daemon.
+
+**Correct:** runc is a short-lived executable that creates the container and exits.
+
+---
+
+### ❌ Misconception 3
+
+containerd-shim is optional.
+
+**Correct:** The shim keeps containers running independently of the containerd daemon and manages their lifecycle.
+
+---
+
+### ❌ Misconception 4
+
+A container is the same as a running process.
+
+**Correct:** A container is configuration and filesystem state. A task is the running process inside that container.
+
+---
+
+### ❌ Misconception 5
+
+If containerd crashes, all containers stop immediately.
+
+**Correct:** Existing containers continue running because they are managed by their respective containerd-shim processes.
+
+---
+
+### ❌ Misconception 6
+
+OCI defines Kubernetes APIs.
+
+**Correct:** OCI defines container image and runtime standards. Kubernetes communicates with runtimes using CRI.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is containerd?
+
+A high-level container runtime that manages images, snapshots, metadata, tasks, and container lifecycle.
+
+---
+
+### Q2. What is the purpose of containerd-shim?
+
+It becomes the parent process for containers, manages their lifecycle, and keeps them running even if containerd restarts.
+
+---
+
+### Q3. What is runc?
+
+A low-level OCI-compliant runtime that creates Linux containers using namespaces, cgroups, mounts, and other kernel features.
+
+---
+
+### Q4. Why does runc exit after creating the container?
+
+Its responsibility is limited to container creation. Ongoing lifecycle management is handled by containerd-shim.
+
+---
+
+### Q5. What is an OCI Bundle?
+
+A directory containing the container root filesystem (`rootfs`) and a `config.json` file describing how the container should be created.
+
+---
+
+### Q6. What is the difference between a container and a task in containerd?
+
+A container is the stored configuration and metadata, while a task is the running process created from that container.
+
+---
+
+### Q7. What happens if containerd crashes?
+
+Existing containers continue running under their shims, but new container operations cannot be performed until containerd is available again.
+
+---
+
+### Q8. Which component actually creates Linux namespaces?
+
+The OCI runtime (such as runc).
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| New Pods fail to start | containerd unavailable or CRI communication failure |
+| Existing containers still running after containerd restart | Expected behavior due to containerd-shim |
+| Container exits immediately | Application error, incorrect command, or OCI configuration issue |
+| Snapshot creation fails | Storage exhaustion or snapshotter problems |
+| runc errors during startup | Invalid OCI bundle, namespace, mount, or cgroup configuration |
+| Container status not updating | Shim unable to report status or containerd communication problems |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What are the primary responsibilities of containerd?
+2. Why is containerd divided into multiple internal components?
+3. What problem does containerd-shim solve?
+4. Why does every container have its own shim process?
+5. What is the role of runc?
+6. What does the OCI Runtime Specification define?
+7. What is contained in an OCI Bundle?
+8. How does a container move from creation to a running process?
+9. What happens when an application exits?
+10. Why do existing containers survive a containerd restart?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the modern Kubernetes runtime stack transforms a container image into a running Linux process.
+
+You learned:
+
+- The internal architecture of containerd and its major components
+- How containerd manages images, snapshots, metadata, tasks, and events
+- Why containerd-shim exists and how it isolates running containers from the containerd daemon
+- How runc implements the OCI Runtime Specification to create Linux containers
+- What an OCI Bundle contains and how it is used during container creation
+- The complete workflow from CRI request to a running application process
+- How container lifecycle events propagate back to kubelet through containerd
+
+Understanding the relationship between **containerd**, **containerd-shim**, and **runc** is essential for troubleshooting container startup issues, runtime failures, and Kubernetes internals. Together, these components form the execution engine that every Pod ultimately relies upon.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — Image Management**
+
+In the next chapter, we'll explore how Kubernetes manages container images.
+
+Topics include:
+
+- Image Pull Workflow
+- Image Pull Policy
+- Image Cache
+- Image Pull Secrets
+- Private Registries
+- Image Garbage Collection
+
+You'll learn how images are downloaded, cached, authenticated, updated, and cleaned up by the container runtime.
+```

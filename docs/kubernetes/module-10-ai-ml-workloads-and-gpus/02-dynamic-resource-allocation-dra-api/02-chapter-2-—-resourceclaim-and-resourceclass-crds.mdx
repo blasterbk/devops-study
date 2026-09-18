@@ -1,0 +1,242 @@
+---
+title: "Chapter 2 — ResourceClaim & ResourceClass CRDs"
+sidebar_position: 2
+module: "Module 10.2 — Dynamic Resource Allocation"
+description: "Master Dynamic Resource Allocation declarative APIs — ResourceClass, ResourceClaim, ResourceClaimTemplate CRDs, and Common Expression Language (CEL) hardware filtering."
+---
+
+# Chapter 2 — ResourceClaim & ResourceClass CRDs
+
+> **Goal:** Master the declarative Custom Resource Definitions of the **Dynamic Resource Allocation (DRA)** API (`resource.k8s.io`) — authoring cluster-wide **`ResourceClass`** definitions (the accelerator equivalent of `StorageClass`), provisioning on-demand hardware reservations via **`ResourceClaim`** and **`ResourceClaimTemplate`**, and evaluating fine-grained hardware selection rules using **Common Expression Language (CEL)** filters for enterprise AI/ML clusters.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural mapping: ResourceClass $\approx$ StorageClass, ResourceClaim $\approx$ PVC
+> 2. How `ResourceClass` defines driver parameters, selectors, and scheduling modes
+> 3. How `ResourceClaim` requests specific device counts and memory requirements
+> 4. How `ResourceClaimTemplate` dynamically creates unique claims for StatefulSet replicas
+> 5. How to write Common Expression Language (CEL) queries to filter GPU models and VRAM sizes
+> 6. How to author production DRA manifests and inspect allocated hardware device bindings
+
+---
+
+## Real-Life Analogy
+
+Think of `ResourceClass` and `ResourceClaim` as **the dynamic car rental reservation system for an enterprise corporate fleet**:
+
+- **The Storage vs Accelerator Analogy:**
+  - In storage: You define a **`StorageClass`** (*"Fast NVMe SSD with 5000 IOPS"*), and the application requests a **`PersistentVolumeClaim` (PVC)** (*"Give me 500GB from that Fast NVMe class"*).
+  - In DRA: You define a **`ResourceClass`** (*"High-End NVIDIA Hopper Tensor Core GPU"*), and the application requests a **`ResourceClaim`** (*"Give me 8 GPUs with at least 80GB VRAM connected via NVLink from that Hopper class"*).
+- **The Vehicle Class Specification (`ResourceClass`):** The rental agency publishes a catalog entry: Class *Luxury-High-Power* (**`driverName: gpu.nvidia.com`**).
+- **The Driver's Specific Reservation (`ResourceClaim`):** The driver fills out a form: *"I want 2 vehicles from Class Luxury-High-Power, but they MUST have 80GB VRAM and support CUDA compute capability $\ge 9.0$ (**CEL Selection Expression**)."*
+- **The Multi-Driver Auto-Reservation (`ResourceClaimTemplate`):** A team of 10 engineers (**A 10-replica StatefulSet**) arrives. Instead of filing 10 manual forms, the master company template automatically issues 10 unique, isolated vehicle reservations, one for each engineer!
+
+---
+
+## Architecture Diagram
+
+```text
+               DRA ResourceClass & ResourceClaim Lifecycle Pipeline
+
+ 1. PLATFORM SRE: Defines Cluster-Wide Hardware Classes
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ResourceClass: `h100-sxm5-high-bandwidth` (Driver: `gpu.nvidia.com`)   │
+ │ - CEL Filter: `device.vram >= 80Gi && device.interconnect == "nvlink"` │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Available for Workload Selection
+                    ▼
+ 2. AI ENGINEER: Authors Pod with `ResourceClaimTemplate`
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod: `distributed-llama-trainer`                                       │
+ │ ├── References ResourceClaimTemplate: `h100-nvlink-mesh`               │
+ │ └── Specifies: `count: 8`, `allocationMode: ExactCount`                │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Kube-Scheduler Evaluates Constraints
+                    ▼
+ 3. KUBE-SCHEDULER & DRA DRIVER (In-Memory CEL Evaluation)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Matches Node `worker-gpu-04` containing 8x H100 SXM5 GPUs           │
+ │ 2. Binds `ResourceClaim` to Node and generates `DeviceAllocation`      │
+ │ 3. Node DRA Driver prepares `/dev/nvidia*` nodes via CDI               │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Mounts Devices into Container
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TRAINING CONTAINER: Discovers 8x H100 GPUs with 900 GB/s NVLink Fabric!│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Storage vs DRA Paradigm Mapping
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Kubernetes Storage API    │ Dynamic Resource Allocation     │ Operational Role in Cluster     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`StorageClass`**        │ **`ResourceClass`**             │ Cluster-wide blueprint defining │
+ │                           │                                 │ driver and default parameters.  │
+ │ **`PersistentVolume-**    │ **`ResourceClaim`**             │ Namespace-scoped request for    │
+ │ **Claim (PVC)`**          │                                 │ specific hardware instances.    │
+ │ **`volumeClaim-**         │ **`resourceClaim-**             │ Embedded template generating a  │
+ │ **Templates`**            │ **Template`**                   │ unique claim per pod replica.   │
+ │ **`PersistentVolume (PV)`**│ **`ResourceSlice` / Device**   │ The actual physical hardware    │
+ │                           │                                 │ device allocated on the node.   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## 1. Production `ResourceClass` Manifest with CEL Filtering
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClass
+metadata:
+  name: nvidia-h100-nvlink
+driverName: gpu.nvidia.com
+structuredParameters: true
+suitableNodes:
+  # Filters nodes that possess physical NVIDIA Hopper GPUs
+  nodeSelector:
+    matchLabels:
+      nvidia.com/gpu.family: hopper
+```
+
+---
+
+## 2. Standalone `ResourceClaim` Manifest with CEL Constraints
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaim
+metadata:
+  name: dual-h100-claim
+  namespace: ai-training
+spec:
+  devices:
+    requests:
+      - name: req-gpu
+        deviceClassName: nvidia-h100-nvlink
+        allocationMode: ExactCount
+        count: 2                       # Requests exactly 2 GPUs!
+        selectors:
+          # Common Expression Language (CEL) Hardware Query!
+          - cel:
+              expression: |
+                device.attributes["gpu.nvidia.com"].memory >= 80 * 1024 * 1024 * 1024 &&
+                device.attributes["gpu.nvidia.com"].driverVersion.compareTo("550.0.0") >= 0
+```
+
+---
+
+## 3. Production Pod with Embedded `ResourceClaimTemplate`
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-inference-server
+  namespace: ai-inference
+spec:
+  # 1. Dynamically generates an ephemeral claim for this pod!
+  resourceClaims:
+    - name: gpu-claim
+      resourceClaimTemplateName: vllm-gpu-template
+  containers:
+  - name: vllm
+    image: vllm/vllm-openai:v0.4.2
+    args: ["--model", "meta-llama/Meta-Llama-3-70B-Instruct", "--tensor-parallel-size", "4"]
+    resources:
+      claims:
+        - name: gpu-claim
+---
+apiVersion: resource.k8s.io/v1alpha3
+kind: ResourceClaimTemplate
+metadata:
+  name: vllm-gpu-template
+  namespace: ai-inference
+spec:
+  spec:
+    devices:
+      requests:
+        - name: vllm-4gpu-req
+          deviceClassName: nvidia-h100-nvlink
+          allocationMode: ExactCount
+          count: 4                     # Allocates 4 GPUs for 4-way Tensor Parallelism!
+```
+
+---
+
+## Common Expression Language (CEL) Attribute Reference
+
+```text
+ ┌──────────────────────────────────┬─────────────────────────────┬───────────────────────────────────┐
+ │ CEL Attribute Query              │ Expected Value / Type       │ Use Case Example                  │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `device.attributes["...memory"]` │ Integer (Bytes)             │ Filter GPUs with $\ge 80\text{GB}$│
+ │                                  │                             │ VRAM for 70B parameter models.    │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `device.attributes["...family"]` │ String (`hopper`, `ampere`) │ Restrict training to FP8-capable  │
+ │                                  │                             │ Hopper architecture.              │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `device.attributes["...mig"]`    │ Boolean (`true` / `false`)  │ Require physical dedicated GPUs   │
+ │                                  │                             │ rather than sliced MIG instances. │
+ └──────────────────────────────────┴─────────────────────────────┴───────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying & Inspecting DRA Allocations
+
+```bash
+# Step 1: Query all ResourceClasses registered across the cluster
+kubectl get resourceclasses.resource.k8s.io -A 2>/dev/null || echo "DRA ResourceClasses active / simulated"
+
+# Step 2: Query active ResourceClaims and their allocation status
+kubectl get resourceclaims.resource.k8s.io -n ai-inference -o wide
+
+# Step 3: Describe an allocated ResourceClaim to inspect assigned device handles
+# kubectl describe resourceclaim dual-h100-claim -n ai-training
+
+# Step 4: Verify ResourceClaimTemplate bindings in active Pods
+# kubectl get pods -n ai-inference -o jsonpath='{.items[*].spec.resourceClaims}'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the relationship between `ResourceClass`, `ResourceClaim`, and `ResourceClaimTemplate` in the Kubernetes DRA API?**
+
+The DRA architecture directly mirrors the Kubernetes Storage API:
+- **`ResourceClass`**: A cluster-scoped administrative resource (analogous to `StorageClass`) defining the hardware driver name (`gpu.nvidia.com`), node selectors, and structured parameter definitions.
+- **`ResourceClaim`**: A namespace-scoped user request (analogous to `PersistentVolumeClaim`) specifying the quantity of devices (`count: 4`), allocation mode, and CEL hardware attribute constraints.
+- **`ResourceClaimTemplate`**: An embedded template inside workload controllers (Deployments, StatefulSets) that automatically instantiates an ephemeral, unique `ResourceClaim` for each generated Pod replica.
+
+**Q2: How does Common Expression Language (CEL) enhance device selection in DRA?**
+
+CEL provides a secure, lightweight, non-Turing-complete expression language embedded directly into the Kubernetes API server. In DRA, CEL allows AI engineers to write **fine-grained mathematical and string filters over hardware attributes** (e.g. `device.attributes["gpu.nvidia.com"].memory >= 80Gi && device.attributes["gpu.nvidia.com"].family == "hopper"`). The scheduler parses these expressions and matches only the physical devices that satisfy all conditions, eliminating custom admission webhooks.
+
+**Q3: What is the difference between `allocationMode: ExactCount` and `allocationMode: All` in a `ResourceClaim`?**
+
+- **`ExactCount`**: Instructs the scheduler to allocate a precise integer number of devices (e.g. `count: 4`). If a node has only 3 matching devices, the node is rejected.
+- **`All`**: Instructs the scheduler to allocate **every single matching device** available on the selected node, allowing high-density batch training jobs to greedily consume an entire node's GPU capacity.
+
+**Q4: Can a single `ResourceClaim` be shared across multiple Pods concurrently?**
+
+**Yes**. Unlike the legacy Device Plugin framework (where an allocated GPU device is strictly locked to a single container), DRA supports **Multi-Pod Resource Sharing**. A standalone `ResourceClaim` created in a namespace can be referenced by multiple pods simultaneously (e.g. a master training pod and a monitoring sidecar pod sharing the same physical GPU device nodes).
+
+**Q5: How does the scheduler handle DRA claims when nodes run out of GPU hardware?**
+
+If all nodes in the cluster lack the required GPU count or fail the CEL attribute filters, the `ResourceClaim` remains in `status.allocation.allocated: false`. The associated Pod transitions to the **`Pending`** phase. If a cluster autoscaler (such as Karpenter or Cluster Autoscaler) is active, it detects the pending claim and automatically provisions a new cloud GPU node with matching hardware specs.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that ResourceClass defines hardware blueprints (analogous to StorageClass)
+- [ ] Know that ResourceClaim requests specific devices (analogous to PVC)
+- [ ] Know how ResourceClaimTemplate creates dynamic claims for StatefulSet replicas
+- [ ] Know how CEL filters hardware by VRAM, architecture family, and driver version
+- [ ] Know that DRA claims can be shared across multiple pods concurrently
+- [ ] Can view active ResourceClaims using `kubectl get resourceclaims -A`

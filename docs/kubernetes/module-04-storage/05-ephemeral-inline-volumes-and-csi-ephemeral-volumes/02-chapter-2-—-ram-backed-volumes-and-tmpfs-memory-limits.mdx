@@ -1,0 +1,249 @@
+---
+title: "Chapter 2 — RAM-Backed Volumes & tmpfs Limits"
+sidebar_position: 2
+module: "Module 4.5 — Ephemeral & Inline Volumes"
+description: "Master RAM-backed Kubernetes volumes — emptyDir tmpfs mechanics, cgroup memory accounting, OOMKill prevention, sizeLimit evictions, and PyTorch /dev/shm shared memory tuning."
+---
+
+# Chapter 2 — RAM-Backed Volumes & tmpfs Memory Limits
+
+> **Goal:** Master RAM-backed temporary filesystems in Kubernetes — understanding how `emptyDir.medium: Memory` provisions Linux `tmpfs` RAM disks, how the Linux kernel charges `tmpfs` consumption against container cgroup memory limits (`resources.limits.memory`), configuring Kubelet `sizeLimit` quotas, and expanding `/dev/shm` to prevent PyTorch distributed training bus errors.
+>
+> By the end of this chapter, you will understand:
+> 1. How Linux `tmpfs` operates under the hood inside container mount namespaces
+> 2. The cgroup memory accounting formula: Why `tmpfs` files trigger Out-Of-Memory (OOMKill) crashes
+> 3. The difference between Kernel OOMKill (`Exit Code 137`) and Kubelet Pod Eviction (`sizeLimit`)
+> 4. Why the default container runtime `/dev/shm` (64MB) crashes multi-threaded Python/PyTorch workloads
+> 5. How to safely mount an expanded `emptyDir.medium: Memory` volume to `/dev/shm`
+> 6. Best practices for caching, IPC, and secure ephemeral scratch storage
+
+---
+
+## Real-Life Analogy
+
+Think of a RAM-backed volume as **a high-speed memory whiteboard inside a strictly measured office**:
+
+- **Standard Disk Storage (A Filing Cabinet in the Hallway):** Storing files on standard SSDs is like walking to a steel filing cabinet down the hall. It has virtually unlimited capacity, but retrieving and writing files requires walking back and forth (disk I/O latency).
+- **RAM `tmpfs` Storage (A Digital Glass Desk):** You install an ultra-sleek digital touch-screen desk (`emptyDir.medium: Memory`). You can write and read notes with zero latency (millions of operations per second at memory bus speed).
+- **The Cgroup Electricity Quota (The OOMKill Trap):** The building manager gives your office a strict 4-kilowatt power budget (`limits.memory: 4Gi`). Crucially, your digital touch desk draws power from that **exact same 4-kilowatt budget**.
+  - If your staff writes 3.5GB of files onto the digital desk, your application only has 0.5GB of power left to think.
+  - The second your application tries to allocate 600MB of heap space, the main circuit breaker trips (**OOMKill Exit Code 137**) and the entire office goes dark instantly.
+
+---
+
+## Architecture Diagram
+
+```text
+               RAM-Backed tmpfs inside Cgroup Memory Boundary
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod Sandbox: ml-pytorch-trainer (limits.memory: 8Gi)                   │
+ │                                                                        │
+ │ ┌────────────────────────────────────────────────────────────────────┐ │
+ │ │ Total Cgroup Memory Allocation Budget (8 GiB Cap)                 │ │
+ │ │                                                                    │ │
+ │ │ ┌───────────────────────────────┐ ┌──────────────────────────────┐ │ │
+ │ │ │ Active Application Memory     │ │ RAM-Backed tmpfs Volume      │ │ │
+ │ │ │ (Python Heap, Tensors, Stack) │ │ (emptyDir medium: Memory)    │ │ │
+ │ │ │ Consuming: 4.5 GiB            │ │ Consuming: 3.0 GiB           │ │ │
+ │ │ └───────────────────────────────┘ └──────────────────────────────┘ │ │
+ │ │                                                                    │ │
+ │ │ Total Used = 4.5 + 3.0 = 7.5 GiB / 8.0 GiB (93.7% Memory Pressure!)│ │
+ │ └────────────────────────────────────────────────────────────────────┘ │
+ │                                                                        │
+ │ If tmpfs grows by +600 MiB ──► Total = 8.1 GiB ──► KERNEL OOMKILL!     │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Linux `tmpfs` & Cgroup Memory Accounting
+
+When you configure `emptyDir: { medium: Memory }`, Kubelet mounts a Linux **`tmpfs`** (temporary RAM filesystem) instance into the container.
+
+```text
+ The Cgroup Memory Formula:
+ \text{Total Cgroup Memory} = \text{Anonymous Memory (Heap/Stack)} + \text{Page Cache (tmpfs files)}
+```
+
+> [!CAUTION]
+> **The Hidden OOMKill Cause:** Many engineers assume that `emptyDir.medium: Memory` is "free" memory provided by the host node. **It is not.** All files written to a memory-backed `emptyDir` are stored directly in Linux page cache and charged against the container's `resources.limits.memory`. If the sum of your application code and stored files exceeds the limit, the Linux kernel terminates the container with `SIGKILL` (`OOMKilled: true`).
+
+---
+
+## OOMKill vs Kubelet `sizeLimit` Eviction
+
+It is essential to distinguish between the two distinct failure modes of RAM-backed volumes:
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Failure Mode         │ Trigger Mechanism       │ Result & Event Reason                             │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Kernel OOMKill**   │ `tmpfs files` + `App`   │ Container killed immediately by Linux Kernel      │
+ │                      │ exceeds `limits.memory` │ (`Exit Code 137`). Container restarts in-place.   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Kubelet Eviction** │ `tmpfs files` exceeds   │ Kubelet detects quota breach during periodic sync.│
+ │                      │ `emptyDir.sizeLimit`    │ Pod is **EVICTED** and permanently terminated!    │
+ └──────────────────────┴─────────────────────────┴───────────────────────────────────────────────────┘
+```
+
+```yaml
+volumes:
+- name: memory-cache
+  emptyDir:
+    medium: Memory
+    sizeLimit: 2Gi    # Prevents tmpfs from consuming more than 2GB of RAM!
+```
+
+---
+
+## Solving the PyTorch `/dev/shm` 64MB Crash
+
+By default, container runtimes (Docker, containerd, CRI-O) allocate a fixed **64 Megabytes** to the container's POSIX shared memory mount (`/dev/shm`).
+
+```text
+ The Machine Learning Multi-Processing Problem:
+ In Python multiprocessing, PyTorch DataLoader (`num_workers > 0`), and Ray, workers share 
+ large tensor batches via `/dev/shm`.
+ 
+ ──► A single training batch for computer vision or NLP exceeds 64MB within milliseconds!
+ ──► The process crashes with: `RuntimeError: DataLoader worker (pid XXX) is killed by signal: Bus error.`
+```
+
+### The Kubernetes `/dev/shm` Solution:
+Mount an `emptyDir.medium: Memory` directly to `/dev/shm`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pytorch-training
+  namespace: ml-workloads
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pytorch-training
+  template:
+    metadata:
+      labels:
+        app: pytorch-training
+    spec:
+      containers:
+      - name: trainer
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+        command: ["python", "train_model.py"]
+        resources:
+          requests:
+            cpu: "4"
+            memory: "16Gi"
+          limits:
+            cpu: "8"
+            memory: "32Gi"      # Sized large enough to hold shared memory + model!
+        volumeMounts:
+        # Overrides default 64MB /dev/shm with a large 8GB shared memory pool!
+        - name: dshm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+```
+
+---
+
+## Hands-On Lab: Observing tmpfs Cgroup Memory & /dev/shm
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace tmpfs-lab
+
+# Step 2: Deploy a Pod with /dev/shm mounted via emptyDir.medium: Memory
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shm-tester
+  namespace: tmpfs-lab
+spec:
+  containers:
+  - name: test-app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      limits:
+        memory: "256Mi"
+    volumeMounts:
+    - name: custom-shm
+      mountPath: /dev/shm
+  volumes:
+  - name: custom-shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 128Mi
+EOF
+
+# Step 3: Wait for Pod to enter Ready state
+kubectl wait --for=condition=Ready pod/shm-tester -n tmpfs-lab --timeout=30s
+
+# Step 4: Verify the size and type of /dev/shm inside the container
+kubectl exec -n tmpfs-lab shm-tester -- df -h /dev/shm
+# Observe: Filesystem is tmpfs, Size is configured according to sizeLimit!
+
+# Step 5: Write a 50MB file to the RAM-backed /dev/shm
+kubectl exec -n tmpfs-lab shm-tester -- dd if=/dev/zero of=/dev/shm/batch.dat bs=1M count=50
+
+# Step 6: Verify memory consumption via cgroups (tmpfs is charged to memory!)
+kubectl exec -n tmpfs-lab shm-tester -- cat /sys/fs/cgroup/memory.current 2>/dev/null || kubectl exec -n tmpfs-lab shm-tester -- cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+
+# Step 7: Trigger an intentional OOMKill by exceeding container memory limits
+# Writing 220MB into tmpfs inside a 256MB limited container will trigger OOMKill!
+echo "Triggering intentional OOMKill..."
+kubectl exec -n tmpfs-lab shm-tester -- dd if=/dev/zero of=/dev/shm/boom.dat bs=1M count=220 2>&1 || true
+
+# Step 8: Verify container restart and OOMKilled status
+sleep 3
+kubectl get pod shm-tester -n tmpfs-lab
+kubectl describe pod shm-tester -n tmpfs-lab | grep -E "(OOMKilled|Exit Code)"
+
+# Step 9: Clean up lab
+kubectl delete namespace tmpfs-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does `emptyDir.medium: Memory` work in Kubernetes, and what are its primary use cases?**
+
+`emptyDir.medium: Memory` instructs Kubelet to mount a Linux `tmpfs` (RAM-backed temporary filesystem) rather than creating a directory on the node's physical root disk. It provides sub-microsecond read/write I/O performance and is used for: (1) Ultra-fast caching layers (Redis/Memcached scratch spaces); (2) High-speed Inter-Process Communication (POSIX shared memory via `/dev/shm`); and (3) Storing transient sensitive cryptographic keys that should never be written to persistent physical storage.
+
+**Q2: Why does writing files to `emptyDir.medium: Memory` cause container OOMKills?**
+
+Under the Linux kernel memory cgroup controller, `tmpfs` files reside in the operating system page cache. The kernel accounts for page cache allocations against the container's cgroup memory limit (`resources.limits.memory`). If a container's application heap plus its `tmpfs` file allocations exceed `limits.memory`, the kernel Out-Of-Memory killer terminates the container with `SIGKILL` (`Exit Code 137`).
+
+**Q3: What happens when an application exceeds `emptyDir.sizeLimit` on a RAM-backed volume?**
+
+When `sizeLimit` is configured on an `emptyDir` volume, Kubelet's `ephemeral-storage` monitoring loop periodically inspects the volume's disk/RAM usage. If the total data written exceeds the specified `sizeLimit`, Kubelet evicts the Pod from the node, transitioning its status to `Evicted` (`reason: EvictionByEvictionThreshold / The node had condition: [DiskPressure/EphemeralStoragePressure]`).
+
+**Q4: Why do PyTorch and machine learning workloads frequently crash with `Bus error` in Kubernetes, and how does `emptyDir.medium: Memory` fix it?**
+
+Container runtimes configure a default hard limit of **64 Megabytes** on `/dev/shm` (POSIX shared memory). PyTorch data loaders with multiple workers (`num_workers > 0`) share large training tensors across processes via `/dev/shm`, quickly exhausting 64MB and throwing `Bus error` crashes. Mounting an `emptyDir.medium: Memory` volume with an explicit `sizeLimit` (e.g. 8Gi) directly to `/dev/shm` expands shared memory to the required capacity.
+
+**Q5: What happens to data stored in a RAM-backed `emptyDir` volume when a worker node reboots?**
+
+Because `emptyDir.medium: Memory` is backed entirely by volatile system RAM (`tmpfs`), any reboot, power outage, or kernel panic on the host worker node results in the immediate, permanent loss of all data stored in the volume. RAM-backed volumes must only be used for transient, disposable, or easily reconstructible data.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `emptyDir.medium: Memory` mounts a Linux `tmpfs` RAM disk
+- [ ] Know that `tmpfs` allocations are counted against container `resources.limits.memory`
+- [ ] Know that unconstrained `tmpfs` usage triggers Kernel OOMKill (`Exit Code 137`)
+- [ ] Know that exceeding `sizeLimit` triggers Kubelet Pod Eviction
+- [ ] Know how to mount `emptyDir.medium: Memory` to `/dev/shm` for PyTorch/Ray ML workloads
+- [ ] Know that RAM-backed storage is volatile and permanently lost on node reboot
+- [ ] Can inspect container shared memory using `df -h /dev/shm`

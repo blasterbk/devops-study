@@ -1,0 +1,168 @@
+---
+title: "Chapter 1 — DNS Fundamentals: Hierarchy, Recursive Resolvers & Root Servers"
+sidebar_position: 1
+module: "Module 5.1 — DNS Fundamentals"
+description: "Master the global Domain Name System (DNS) architecture — 13 Root Server clusters, TLD nameservers, Authoritative Servers, recursive resolution flow, caching, and TTL mechanics."
+---
+
+# Chapter 1 — DNS Fundamentals: Hierarchy, Recursive Resolvers & Root Servers
+
+> **Goal:** Master the hierarchical architecture of the global Domain Name System (DNS, RFC 1034 & RFC 1035). Understand how a client request resolves across the 4-tier tree (Stub Resolver $\to$ Recursive Resolver $\to$ Root Nameserver $\to$ TLD Nameserver $\to$ Authoritative Nameserver), DNS caching mechanisms, TTL expiration, and negative caching (`NXDOMAIN`).
+>
+> By the end of this chapter, you will understand:
+> 1. The hierarchical DNS namespace structure (Root `.`, TLDs `.com`/`.org`, SLDs `example`, Subdomains `api`)
+> 2. The 13 global Root Server clusters ($A\dots M$) powered by BGP Anycast across thousands of physical locations
+> 3. Step-by-step recursive vs iterative query mechanics
+> 4. DNS Caching hierarchy (OS resolver cache, recursive resolver cache, TTL decrementing)
+> 5. DNS wire protocol: UDP port 53 (queries $<512$ bytes) vs TCP port 53 (zone transfers and large responses)
+> 6. CLI exploration with `dig +trace`, `drill`, and `nslookup`
+
+---
+
+## Real-Life Analogy
+
+Think of DNS resolution as **finding a specific book in the world's largest multi-level library system**:
+
+- **Stub Resolver (You):**
+  - You ask the front desk librarian: *"Where is the book `api.example.com`?"*
+- **Recursive Resolver (The Helpful Head Librarian):**
+  - The librarian does all the legwork on your behalf (**Recursive resolution**).
+- **The 13 Root Nameservers (Library Master Directory):**
+  - The master directory points: *"All `.com` books are in Wing C on the 3rd Floor (**TLD Server**)"*.
+- **The TLD Nameservers (Wing C Directory):**
+  - Wing C directory points: *"The `example.com` collection is managed by Authoritative Curators `ns1.example.com` on Aisle 4"*.
+- **The Authoritative Nameserver (The Shelf Curator):**
+  - The curator hands over the exact coordinate: *"Book `api.example.com` is located at IP `93.184.216.34` with a 300-second checkout pass (**TTL**)"*.
+
+---
+
+## Architecture Diagram
+
+```text
+                  The Step-by-Step DNS Resolution Architecture
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. CLIENT QUERY:                                                            │
+ │                                                                             │
+ │   [Client App] ──── 1. Query: "api.example.com" ───► [Recursive Resolver]  │
+ │   [Browser   ] ◄─── 8. Answer: "93.184.216.34" ───── (e.g. 1.1.1.1, 8.8.8.8)│
+ └──────────────────────────────────────────────────────────────┬──────────────┘
+                                                                │
+                                                                ▼ (Iterative Queries)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 2. ITERATIVE RESOLUTION HIERARCHY:                                          │
+ │                                                                             │
+ │   [Recursive Resolver]                                                      │
+ │         │                                                                   │
+ │         │──── 2. Query "." (Root) ─────────► [13 Root Servers (A-M)]        │
+ │         │◄─── 3. Referral: ".com" TLD NS ─── (e.g. a.root-servers.net)      │
+ │         │                                                                   │
+ │         │──── 4. Query ".com" (TLD) ───────► [TLD Nameservers]              │
+ │         │◄─── 5. Referral: example.com NS ── (e.g. a.gtld-servers.net)      │
+ │         │                                                                   │
+ │         │──── 6. Query "api.example.com" ──► [Authoritative NS]             │
+ │         │◄─── 7. Authoritative Answer ───── (e.g. ns1.cloudflare.com)      │
+ │                                                                             │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The Global 13 Root Server Clusters
+
+Although labeled `a.root-servers.net` through `m.root-servers.net` (13 IP identifiers due to the 512-byte UDP packet limit of legacy DNS), each root letter is distributed across hundreds of locations worldwide using **BGP Anycast** (over 1,700 physical root server instances globally today).
+
+```text
+ ┌───────────────┬───────────────────────────────┬──────────────────────────────────────────┐
+ │ Root Cluster  │ Operating Organization        │ Anycast Sites Worldwide                  │
+ │───────────────┼───────────────────────────────┼──────────────────────────────────────────┤
+ │ **A-Root**    │ Verisign                      │ Global Anycast (Dozens of PoPs)          │
+ │ **B-Root**    │ USC Information Sciences Inst │ Global Anycast                           │
+ │ **C-Root**    │ Cogent Communications         │ Global Anycast                           │
+ │ **D-Root**    │ University of Maryland        │ Global Anycast                           │
+ │ **E-Root**    │ NASA (Ames Research Center)   │ Global Anycast                           │
+ │ **F-Root**    │ Internet Systems Consortium   │ 200+ Global Anycast nodes                │
+ │ **J-Root**    │ Verisign                      │ 100+ Global Anycast nodes                │
+ │ **K-Root**    │ RIPE NCC                      │ Global Anycast                           │
+ └───────────────┴───────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 2. Recursive vs Iterative DNS Queries
+
+- **Recursive Query:** The client instructs the resolver: *"Find the final IP address for me and return the result; do not return partial intermediate referrals."*
+- **Iterative Query:** The resolver queries the Root, TLD, and Authoritative servers: *"If you do not have the answer, return the referral address of the next nameserver down the tree."*
+
+---
+
+### 3. DNS Transport: UDP vs TCP Port 53
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────┐
+ │ Protocol             │ When It Is Used & Operational Trigger                           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────┤
+ │ **UDP Port 53**      │ Standard DNS queries and responses $< 512$ bytes (or $< 4096$   │
+ │                      │ bytes with EDNS0 Extension RFC 6891)                            │
+ │ **TCP Port 53**      │ 1. DNS Zone Transfers (AXFR / IXFR) between primary/secondary  │
+ │                      │ 2. Responses exceeding EDNS0 buffer size (Truncation `TC=1` set)│
+ │                      │ 3. Large cryptographic DNSSEC response payloads                 │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Tracing the DNS Hierarchy via CLI
+
+```bash
+# Step 1: Perform a full recursive trace from Root to Authoritative NS using dig
+dig +trace +nodnssec api.github.com
+
+# Step 2: Query a specific DNS Root server directly
+dig @a.root-servers.net com. NS +noall +answer
+
+# Step 3: Inspect response headers, TTL, and Query Time
+dig @1.1.1.1 google.com
+
+# Step 4: Test DNS Truncation and force a query over TCP port 53
+dig +tcp @8.8.8.8 cloudflare.com ANY
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between an Authoritative Nameserver and a Recursive Resolver?**
+
+- **Authoritative Nameserver:** Holds the actual source-of-truth DNS zone files (configured by the domain owner) for a specific domain (e.g. `example.com`). It only answers queries for domains it is configured to manage.
+- **Recursive Resolver (e.g., Google `8.8.8.8`, Cloudflare `1.1.1.1`):** Does not own zone files. It acts as an intermediary for clients, recursively querying the Root, TLD, and Authoritative servers to discover and cache the answer.
+
+**Q2: What is the Truncation Flag (`TC=1`) in DNS responses and how does the client respond?**
+
+When a DNS response exceeds the maximum buffer size (512 bytes for standard UDP, or negotiated EDNS0 size), the server truncates the response, sets the `TC=1` flag in the DNS header, and returns the partial packet. Upon seeing `TC=1`, the client automatically opens a **TCP connection on Port 53** to re-issue the query and retrieve the complete, untruncated response.
+
+**Q3: How does Negative Caching work for `NXDOMAIN` responses?**
+
+When a domain does not exist, the authoritative nameserver returns an `NXDOMAIN` (Non-Existent Domain) status code along with its **SOA (Start of Authority) record**. The recursive resolver caches this negative result for the duration specified in the SOA record's **MINIMUM TTL field** (typically 300–3600 seconds) to prevent clients from overwhelming the DNS hierarchy with spam queries for nonexistent domains.
+
+**Q4: Why are there only 13 Root Server IP addresses?**
+
+The original RFC 1035 specification limited DNS UDP packets to **512 bytes** to prevent IP fragmentation on legacy networks. Inside a 512-byte response, only 13 IPv4 addresses plus header metadata and NS records could reliably fit. Modern Anycast BGP and IPv6 (AAAA records) have expanded these 13 logical IP addresses into thousands of globally distributed physical servers.
+
+**Q5: What is DNS Cache Poisoning (Kaminsky Attack) and how is it mitigated?**
+
+In DNS Cache Poisoning, an attacker floods a recursive resolver with forged UDP responses while guessing the 16-bit **Transaction ID (TxID)** and source port. If successful, the resolver caches the attacker's malicious IP for `bank.com`. Mitigation includes:
+1. **Source Port Randomization (RFC 5452):** Randomizing all 16 bits of the UDP source port ($2^{16} \times 2^{16} = 4.3 \text{ billion combinations}$).
+2. **DNSSEC:** Cryptographically signing DNS records with asymmetric keys.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 4-tier resolution flow: Stub $\to$ Recursive $\to$ Root $\to$ TLD $\to$ Authoritative
+- [ ] Understand BGP Anycast distribution of the 13 Root Server clusters
+- [ ] Differentiate UDP Port 53 vs TCP Port 53 (`TC=1` truncation)
+- [ ] Know how TTL and Negative Caching (`NXDOMAIN` SOA MINIMUM) work
+- [ ] Understand Source Port Randomization and DNSSEC anti-poisoning defenses

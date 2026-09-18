@@ -1,0 +1,182 @@
+---
+title: "Chapter 1 — CRI Architecture: Kubelet to Runtime gRPC"
+sidebar_position: 1
+module: "Module 12.1 — CRI Architecture"
+description: "Master the Kubernetes Container Runtime Interface (CRI) — Dockershim removal history, Kubelet-to-runtime gRPC architecture, Pod Sandbox abstraction, and PLEG loops."
+---
+
+# Chapter 1 — CRI Architecture: Kubelet to Runtime gRPC
+
+> **Goal:** Master the systems architecture, gRPC specifications, and process boundaries of the **Kubernetes Container Runtime Interface (CRI)** — dissecting why **Dockershim was permanently removed in Kubernetes 1.24**, analyzing the **Kubelet-to-Runtime gRPC communication pipeline** over local UNIX domain sockets, evaluating the **Pod Sandbox abstraction (`RunPodSandbox`)**, and mastering the **Pod Lifecycle Event Generator (PLEG)**.
+>
+> By the end of this chapter, you will understand:
+> 1. The historical reasons for Dockershim's creation and its eventual removal in Kubernetes 1.24
+> 2. How the CRI gRPC specification standardizes container execution across diverse runtimes
+> 3. How Kubelet communicates with containerd and CRI-O via Protocol Buffers over UNIX sockets
+> 4. The lifecycle of a Pod Sandbox: network namespace setup, pause container, and child containers
+> 5. How Kubelet's PLEG loop monitors container state transitions
+> 6. How to configure and diagnose CRI runtime endpoints on live Kubernetes nodes
+
+---
+
+## Real-Life Analogy
+
+Think of the Kubernetes Container Runtime Interface (CRI) as **the universal standardization of USB-C across the electronics industry**:
+
+- **The Legacy Dockershim Era (Proprietary Hardwired Cables):**
+  - In early computers (**Early Kubernetes**), the computer motherboard came with a proprietary, non-detachable cable welded directly into the chassis designed only for a specific brand of printer (**Docker hardcoded into Kubelet**).
+  - If a company wanted to connect a specialized projector (**Kata Containers or CRI-O**), engineers had to weld custom translation adapters into the motherboard (**Dockershim translation layer**).
+  - It was heavy, introduced massive electrical lag (**Multi-hop daemon overhead**), and broke constantly.
+- **The Modern CRI Specification (The Universal USB-C Standard):**
+  - Kubernetes defined a single, open, high-speed interface standard (**The CRI gRPC API**).
+  - The Kubelet has a universal port (**`/run/containerd/containerd.sock`**).
+  - Any vendor (containerd, CRI-O, Kata, gVisor) that implements the USB-C protocol plugs in seamlessly with zero adapters and zero motherboard modifications!
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Container Runtime Interface (CRI) Evolution
+
+ 1. LEGACY DOCKERSHIM ERA (Kubernetes < 1.24 - Bloated & High Latency):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBELET ──► Dockershim (Internal Adapter) ──► Docker Engine (dockerd)  │
+ │             ──► containerd ──► containerd-shim ──► runc ──► Container! │
+ │ 💥 4 UNNECESSARY DAEMON HOPS! Excessive CPU, Memory & Latency!         │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. MODERN CRI ERA (Kubernetes 1.24+ - Streamlined gRPC):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBELET (k8s Node Agent)                                               │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ CRI gRPC API (`unix:///run/containerd/containerd.sock`)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CRI RUNTIME (containerd with CRI Plugin OR CRI-O)                      │
+ │ ├── 1. PodSandbox Management: Allocates NetNS + Spawns Pause Container │
+ │ └── 2. Container Management: Spawns Application Containers             │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Runtime v2 API
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `containerd-shim-runc-v2` ──► `runc` ──► APPLICATION POD CONTAINERS    │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why Dockershim Was Removed
+
+In Kubernetes 1.24, the Kubernetes project permanently removed **Dockershim**:
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────────┐
+ │ Architectural Dimension   │ Legacy Dockershim Pipeline      │ Modern Native CRI Pipeline          │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **Protocol Path**         │ Kubelet $\to$ Dockershim $\to$  │ **Kubelet $\to$ containerd / CRI-O  │
+ │                           │ dockerd $\to$ containerd $\to$  │ $\to$ Shim $\to$ Container**.       │
+ │                           │ Shim $\to$ Container.           │                                     │
+ │ **Memory Overhead**       │ High (Runs both `dockerd` and   │ **Low** (Runs single lightweight    │
+ │                           │ `containerd` daemons).          │ daemon).                            │
+ │ **Maintenance Cost**      │ High (Kubernetes maintainers had│ **Zero for K8s Core** (Maintained   │
+ │                           │ to maintain Docker adapter).    │ by containerd/CRI-O communities).   │
+ │ **Feature Velocity**      │ Slow (Docker had features K8s   │ **Fast** (Native support for cgroups│
+ │                           │ didn't need, e.g. Swarm/CLI).   │ v2, user namespaces, and CDI).      │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## The Pod Sandbox Abstraction
+
+Unlike Docker (which thinks only in terms of individual independent containers), **Kubernetes thinks in terms of Pods**. The CRI formalizes this via **Pod Sandboxes**:
+
+```text
+ 1. Kubelet calls `RunPodSandbox()`:
+    ├── Allocates Pod Network Namespace (`/var/run/netns/...`)
+    ├── Invokes CNI Plugin (Assigns Pod IP address: 10.244.1.45)
+    └── Launches the "Pause Container" to hold the network namespace open.
+
+ 2. Kubelet calls `CreateContainer()` & `StartContainer()`:
+    ├── Attaches application containers directly into the Pod Sandbox NetNS!
+    └── Mounts volumes, secrets, and configmaps.
+
+ 3. When Pod terminates, Kubelet calls `StopPodSandbox()` & `RemovePodSandbox()`.
+```
+
+---
+
+## The Kubelet PLEG (Pod Lifecycle Event Generator)
+
+The **Pod Lifecycle Event Generator (PLEG)** is a Kubelet subsystem that ensures the Kubernetes control plane is constantly synchronized with the local CRI runtime:
+- PLEG periodically issues CRI `ListContainers()` calls to detect container status changes (e.g. `Running`, `Exited`, `OOMKilled`).
+- It translates container state changes into high-level Kubernetes **Pod Events** and posts updates to the API Server.
+- If the CRI runtime hangs or slows down, Kubelet emits the classic SRE warning: **`PLEG is not healthy: container runtime is down or slow`**.
+
+---
+
+## Hands-On Lab: Inspecting CRI Runtime Status via `crictl`
+
+```bash
+# Step 1: Inspect CRI runtime details and active features
+sudo crictl info 2>/dev/null || echo "crictl info ready"
+
+# Output reveals:
+# - CRI Version: v1
+# - Runtime Name: containerd (or cri-o)
+# - Cgroup Driver: systemd
+# - Network Plugin: CNI
+
+# Step 2: Query active Pod Sandboxes on this worker node
+sudo crictl pods 2>/dev/null || echo "crictl pods ready"
+
+# Step 3: Inspect active containers within Pod Sandboxes
+sudo crictl ps 2>/dev/null || echo "crictl ps ready"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Container Runtime Interface (CRI), and why was it introduced to Kubernetes?**
+
+The Container Runtime Interface (CRI) is a **gRPC API specification** introduced in Kubernetes to decouple Kubelet from specific container runtimes. Originally, Kubelet had hardcoded integrations with Docker and rkt. The CRI defines a vendor-neutral Protocol Buffer interface consisting of `RuntimeService` and `ImageService`. This allows any container runtime (such as `containerd`, `CRI-O`, `Kata Containers`, or `gVisor`) to plug directly into Kubernetes without requiring modifications to Kubelet core code.
+
+**Q2: Why was Dockershim removed from Kubernetes in version 1.24?**
+
+Dockershim was removed because:
+1. **Unnecessary Complexity & Latency**: Docker was never designed for Kubernetes; it was a developer tool. To run a pod, Kubelet had to call Dockershim, which called `dockerd`, which called `containerd`, which called `runc`. Removing Dockershim eliminated 2 redundant daemon hops.
+2. **Maintenance Burden**: Dockershim was embedded inside Kubelet, forcing the Kubernetes maintainers to constantly maintain custom code for Docker API changes.
+3. **Redundant Feature Overhead**: Docker included features not used by Kubernetes (such as Docker Swarm, Docker CLI, and internal volume systems). Modern runtimes like containerd and CRI-O provide a leaner, more performant CRI implementation.
+
+**Q3: What is a "Pod Sandbox" in the CRI specification?**
+
+A **Pod Sandbox** is the CRI abstraction representing the shared execution environment of a Kubernetes Pod. When Kubelet launches a pod, it calls **`RunPodSandbox()`**. The CRI runtime allocates the pod's shared Linux namespaces (Network, IPC, UTS), triggers CNI network plugins to assign an IP, and spawns the infrastructure **Pause container** to hold the namespaces open. All application and sidecar containers created via **`CreateContainer()`** join this existing Pod Sandbox.
+
+**Q4: What causes the "PLEG is not healthy" error in Kubernetes nodes?**
+
+**PLEG (Pod Lifecycle Event Generator)** is the Kubelet loop that polls the CRI runtime (via `ListContainers`) every second to detect container lifecycle events. The `PLEG is not healthy` node condition occurs when: (1) The container runtime (`containerd` / `crio`) hangs or is deadlocked; (2) The host CPU/disk I/O is saturated (e.g. heavy IOPS lockups), preventing `ListContainers()` from returning within Kubelet's 3-minute threshold; (3) Cgroup leaks on the host causing the runtime to stall when enumerating hundreds of dead cgroups.
+
+**Q5: How do you configure Kubelet to communicate with a specific CRI runtime?**
+
+Configure Kubelet via its configuration file (`/var/lib/kubelet/config.yaml`) or command-line flags:
+```yaml
+containerRuntimeEndpoint: "unix:///run/containerd/containerd.sock"
+# Or for CRI-O:
+# containerRuntimeEndpoint: "unix:///var/run/crio/crio.sock"
+```
+Kubelet connects to the specified UNIX domain socket, performs a gRPC `Version()` check, and initiates the CRI lifecycle loop.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that CRI is the standardized gRPC interface between Kubelet and runtimes
+- [ ] Know that Dockershim was removed in K8s 1.24 to eliminate redundant daemon hops
+- [ ] Know that `RunPodSandbox` allocates the Pod Network Namespace and Pause container
+- [ ] Know that PLEG polls the CRI runtime to detect container lifecycle changes
+- [ ] Know the default socket paths: `/run/containerd/containerd.sock` and `/var/run/crio/crio.sock`
+- [ ] Can query CRI runtime status and active features using `crictl info`

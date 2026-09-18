@@ -1,0 +1,238 @@
+---
+title: "Chapter 2 — cert-manager & Automated TLS"
+sidebar_position: 2
+module: "Module 7.8 — Ingress & Edge Routing"
+description: "Master automated TLS certificate lifecycle management with CNCF cert-manager — Issuer vs ClusterIssuer, HTTP-01 vs DNS-01 ACME challenges, wildcard certificates, and automated renewals."
+---
+
+# Chapter 2 — cert-manager Integration & Automated TLS
+
+> **Goal:** Master automated, zero-touch X.509 TLS certificate lifecycle management in Kubernetes using **CNCF cert-manager** — understanding the internal CRD state machine (**`Issuer`**, **`ClusterIssuer`**, **`Certificate`**, **`Order`**, **`Challenge`**), dissecting the ACME protocol mechanics of **HTTP-01** and **DNS-01** challenges (enabling wildcard SSL certificates `*.company.com`), automating Ingress TLS provisioning via annotations, and configuring 60-day proactive certificate renewals.
+>
+> By the end of this chapter, you will understand:
+> 1. The architecture of cert-manager and its Custom Resource Definitions
+> 2. The operational difference between namespace-scoped `Issuer` and cluster-wide `ClusterIssuer`
+> 3. The ACME HTTP-01 challenge workflow and why it cannot issue wildcard certificates
+> 4. How the ACME DNS-01 challenge enables wildcard and private internal cluster TLS
+> 5. How to enable zero-code automatic TLS on Ingress objects using annotations
+> 6. How cert-manager prevents outages by automatically renewing certificates 30 days before expiry
+
+---
+
+## Real-Life Analogy
+
+Think of cert-manager and the ACME protocol as **an automated notary public and passport renewal robot for your microservices**:
+
+- **The Problem (The Expired SSL Disaster):** A human engineer manually generates an SSL certificate, copies the private key to Kubernetes, and sets a calendar reminder. 90 days later, the engineer is on vacation, the certificate expires at 2:00 AM, and all customer web browsers block the website with a bright red warning: *"Security Risk Ahead! (**Outage!**)"*.
+- **The Automated Notary Robot (cert-manager):** cert-manager lives inside the cluster. It watches your website hostnames (**`api.company.com`**) and communicates directly with the international passport office (**Let's Encrypt ACME CA**).
+- **The Proof of Ownership (The ACME Challenges):**
+  - **HTTP-01 Challenge (The Front Door Secret Sign):** Let's Encrypt says: *"If you really own `api.company.com`, hang a green sign on your front porch at `/.well-known/acme-challenge/xyz`."* cert-manager creates a temporary webpage in 1 second, Let's Encrypt reads it, and issues the certificate.
+  - **DNS-01 Challenge (The City Hall Deed - Wildcards `*.company.com`):** To prove you own the entire town (**Wildcard `*.company.com`**), you don't hang signs on 500 houses. cert-manager writes a certified secret stamp into the town deed records (**AWS Route53 / Cloudflare DNS TXT Record**).
+- **The 30-Day Auto-Renewal (The Proactive Clock):** cert-manager never waits for the expiration date. When a 90-day certificate reaches Day 60 (**30 days remaining**), it automatically contacts Let's Encrypt, renews the certificate, and updates the Kubernetes Secret seamlessly.
+
+---
+
+## Architecture Diagram
+
+```text
+               cert-manager Automated ACME HTTP-01 Challenge Workflow
+
+ DEVELOPER: Deploys Ingress with annotation: `cert-manager.io/cluster-issuer: letsencrypt-prod`
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CERT-MANAGER CONTROLLER: (Watches Ingress & Creates `Certificate` CRD) │
+ │ 1. Spawns `Order` and `Challenge` Custom Resources                     │
+ │ 2. Generates temporary Ingress & Pod: `/.well-known/acme-challenge/tok`│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ HTTP GET Verification over Public Internet
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LET'S ENCRYPT ACME SERVER (Certificate Authority)                      │
+ │ Queries: `http://api.company.com/.well-known/acme-challenge/tok`       │
+ │ ──► Challenge Verified! Ownership of domain confirmed!                 │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Issues Cryptographic X.509 Certificate
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES SECRET (`kind: Secret`, `type: kubernetes.io/tls`)          │
+ │ - `tls.crt`: Signed Leaf & Intermediate Certificate Chain              │
+ │ - `tls.key`: RSA / ECDSA Private Key                                  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Mounted dynamically into Ingress-NGINX
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ INGRESS CONTROLLER: Terminates HTTPS with Valid Trusted TLS!           │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `Issuer` vs `ClusterIssuer`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ `Issuer`                        │ `ClusterIssuer`                 │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Scope**                 │ **Namespace-Scoped.**           │ **Cluster-Wide (Global).**      │
+ │                           │ Valid strictly in 1 namespace.  │ Available to ALL namespaces.    │
+ │ **Standard Use Case**     │ Dev/Test namespaces or team-    │ **Production Standard.**        │
+ │                           │ specific private CAs (Vault).   │ Let's Encrypt Production / Stage│
+ │ **Ingress Annotation**    │ `cert-manager.io/issuer: name`  │ `cert-manager.io/cluster-issuer`│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## ACME Challenge Comparison: HTTP-01 vs DNS-01
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ HTTP-01 Challenge               │ DNS-01 Challenge                │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Verification Method**   │ Provisions HTTP endpoint at     │ Inserts a `_acme-challenge`     │
+ │                           │ `/.well-known/acme-challenge/`  │ **TXT Record** in Cloud DNS.    │
+ │ **Wildcard Certs?**       │ **NO.** (`*.company.com` fails) │ **YES! (Full Wildcard Support)**│
+ │ **Private / Internal K8s?**│ **NO.** Requires public port 80 │ **YES!** Works on private VPCs  │
+ │                           │ accessible from internet.       │ with zero inbound public ports! │
+ │ **Cloud Credentials**     │ None required.                  │ Requires IAM policy to edit DNS │
+ │                           │                                 │ (AWS Route53, Cloudflare, GCP). │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Complete Production `ClusterIssuer` Manifests
+
+### 1. HTTP-01 Let's Encrypt Production ClusterIssuer:
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: security-alerts@company.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+    - http01:
+        ingress:
+          class: nginx-external        # Uses Ingress-NGINX to solve challenge!
+```
+
+---
+
+### 2. DNS-01 Let's Encrypt Wildcard ClusterIssuer (AWS Route53):
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-dns01-wildcard
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: security-alerts@company.com
+    privateKeySecretRef:
+      name: letsencrypt-dns01-account-key
+    solvers:
+    - dns01:
+        route53:
+          region: us-east-1
+          hostedZoneID: Z1234567890EXAMPLE
+```
+
+---
+
+## Automating Ingress TLS with Annotations
+
+Developers add a single annotation to their `Ingress` manifest; cert-manager handles the rest:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secured-payment-ingress
+  namespace: production
+  annotations:
+    # 1. Binds cert-manager to the global ClusterIssuer!
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx-external
+  tls:
+  - hosts:
+    - api.company.com
+    secretName: api-company-tls        # cert-manager automatically creates this Secret!
+  rules:
+  - host: api.company.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: payment-api
+            port:
+              number: 8080
+```
+
+---
+
+## Hands-On Lab: Inspecting Certificates & Challenges
+
+```bash
+# Step 1: Check cert-manager components in the cluster
+kubectl get pods -n cert-manager 2>/dev/null || echo "cert-manager active / simulated"
+
+# Step 2: Query active ClusterIssuers
+kubectl get clusterissuers
+
+# Step 3: Query Certificate resources and validation status
+kubectl get certificates -A
+
+# Step 4: Inspect active ACME Challenges and Orders (if an issuance is in flight)
+kubectl get orders,challenges -A 2>/dev/null || echo "Zero active challenge operations"
+
+# Step 5: Inspect a generated TLS Secret
+# kubectl get secret api-company-tls -n production -o yaml
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNCF cert-manager, and what is its core architecture in Kubernetes?**
+
+cert-manager is an open-source Kubernetes-native certificate management controller. It automates the issuance, validation, and renewal of X.509 certificates from public ACME CAs (Let's Encrypt), HashiCorp Vault, Venafi, or private in-cluster PKI CAs. It operates through a declarative state machine using Custom Resources: `Issuer`/`ClusterIssuer` defines the certificate authority; `Certificate` defines the desired SANs and duration; and the controller reconciles `CertificateRequest`, `Order`, and `Challenge` objects to populate Kubernetes TLS Secrets.
+
+**Q2: What is the operational difference between the ACME HTTP-01 and DNS-01 challenge types?**
+
+- **HTTP-01 Challenge**: Proves domain control by serving a temporary token at `http://<domain>/.well-known/acme-challenge/<token>`. It requires public inbound HTTP traffic on port 80 and **cannot issue Wildcard certificates (`*.company.com`)**.
+- **DNS-01 Challenge**: Proves domain control by programmatically creating an `_acme-challenge.<domain>` TXT record in the domain's authoritative DNS provider (e.g. AWS Route53 or Cloudflare). It **supports wildcard certificates** and works for private internal clusters with zero inbound internet ports.
+
+**Q3: How does cert-manager automate TLS certificate provisioning for Kubernetes Ingresses?**
+
+cert-manager includes an ingress-shim controller that continuously watches `Ingress` objects. When it detects the annotation `cert-manager.io/cluster-issuer: <issuer-name>`, it automatically generates a matching `Certificate` resource using the hostnames declared in `spec.tls[].hosts` and the secret name in `spec.tls[].secretName`. Once the ACME challenge completes, cert-manager writes the signed `tls.crt` and `tls.key` into the Secret, and the Ingress Controller reloads TLS dynamically.
+
+**Q4: When and how does cert-manager renew certificates before they expire?**
+
+Standard Let's Encrypt certificates are valid for 90 days. cert-manager schedules automated renewals when a certificate reaches its **`renewBefore` threshold (default: 30 days before expiration / Day 60)**. The controller initiates a new ACME Order in the background, completes the challenge, updates the target Kubernetes Secret with the renewed certificate chain, and fires an event, guaranteeing zero downtime and eliminating manual renewal outages.
+
+**Q5: How do you troubleshoot a Certificate that is stuck in `Ready: False`?**
+
+1. Run `kubectl describe certificate <name>` to inspect the **Events** and find the active `CertificateRequest` or `Order`.
+2. Run `kubectl describe order <order-name>` and `kubectl describe challenge <challenge-name>`.
+3. Common root causes: (1) **HTTP-01**: Ingress controller cannot route port 80 traffic to the temporary solver pod; (2) **DNS-01**: IAM permissions to modify Route53 TXT records are missing or Cloud DNS propagation timed out; (3) **Rate Limits**: Let's Encrypt production rate limit exceeded (5 duplicate certs/week).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between `Issuer` (namespace) and `ClusterIssuer` (cluster-wide)
+- [ ] Know that HTTP-01 requires public port 80 and DOES NOT support wildcard certs
+- [ ] Know that DNS-01 uses TXT records and SUPPORTS wildcard certificates (`*.company.com`)
+- [ ] Know how `cert-manager.io/cluster-issuer` automatically provisions TLS for Ingresses
+- [ ] Know that cert-manager automatically renews certificates 30 days before expiration
+- [ ] Can inspect certificate issuance status using `kubectl describe certificate <name>`

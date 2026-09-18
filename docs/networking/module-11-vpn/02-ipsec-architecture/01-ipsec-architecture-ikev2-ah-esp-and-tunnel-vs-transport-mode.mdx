@@ -1,0 +1,144 @@
+---
+title: "Chapter 2 — IPsec Architecture: IKEv2, AH vs ESP & Tunnel vs Transport Modes"
+sidebar_position: 1
+module: "Module 11.2 — IPsec Architecture"
+description: "Master Internet Protocol Security (IPsec) — IKEv2 phase negotiation, Authentication Header (AH) vs Encapsulating Security Payload (ESP), Tunnel vs Transport modes, NAT-Traversal (NAT-T), and strongSwan."
+---
+
+# Chapter 2 — IPsec Architecture: IKEv2, AH vs ESP & Tunnel vs Transport Modes
+
+> **Goal:** Master Internet Protocol Security (IPsec, RFC 4301–4309), the legacy enterprise and cloud standard for Site-to-Site VPNs (AWS Site-to-Site VPN, Azure VPN Gateway, Cisco ASA). Understand the Internet Key Exchange protocol (IKEv1 vs IKEv2), Security Associations (SA), Security Policy Database (SPD), Authentication Header (AH) vs Encapsulating Security Payload (ESP), Tunnel vs Transport modes, and NAT-Traversal (NAT-T over UDP port 4500).
+>
+> By the end of this chapter, you will understand:
+> 1. The two IPsec security protocols: Authentication Header (AH / IP Protocol `51`) vs Encapsulating Security Payload (ESP / IP Protocol `50`)
+> 2. Tunnel Mode (site-to-site gateway encryption with a new outer IP header) vs Transport Mode (host-to-host payload encryption)
+> 3. Internet Key Exchange v2 (IKEv2 / RFC 7296): `IKE_SA_INIT` and `IKE_AUTH` message exchanges
+> 4. Security Associations (SAs), Security Parameter Index (SPI), and Security Policy Database (SPD)
+> 5. NAT-Traversal (NAT-T / RFC 3948): encapsulating ESP packets inside UDP port 4500 to pass through PAT firewalls
+> 6. CLI configuration and diagnostics using `strongSwan` (`ipsec status`, `swanctl`)
+
+---
+
+## Real-Life Analogy
+
+Think of IPsec as **an armored diplomatic postal truck system between corporate branch offices**:
+
+- **Transport Mode (Armored Safe Inside Your Own Car):**
+  - You put a secure steel safe around your cargo, but you drive your own private car with your original license plates visible (**Host-to-Host; original IP header is preserved**).
+- **Tunnel Mode (Armored Postal Carrier Truck):**
+  - Your entire car (including original driver and license plates) is loaded inside a giant armored military transport truck with new official government license plates (**Gateway-to-Gateway; new outer IP header is added**). Observers on the highway cannot see who is inside.
+- **ESP vs AH (Encryption vs Signature Only):**
+  - **AH (Signature Only):** You seal the envelope with wax; anyone can hold it to the light and read the letter, but nobody can tamper with it (**Integrity only, Zero Encryption**).
+  - **ESP (Complete Encryption & Integrity):** You shred the message into unbreakable ciphertext and lock it in the armored vault (**Confidentiality + Integrity**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  IPsec Tunnel Mode vs Transport Mode Packet Layouts
+                  
+ 1. ORIGINAL IP PACKET (Before IPsec):
+ ┌──────────────────────┬──────────────────────┬───────────────────────────────┐
+ │ Original IP Header   │ TCP / UDP Header     │ Payload Data                  │
+ │ (Src: 10.1.1.5, Dst) │ (Port 80/443)        │ (HTML / JSON)                 │
+ └──────────────────────┴──────────────────────┴───────────────────────────────┘
+ 
+ 2. IPSEC TRANSPORT MODE (Host-to-Host - Encrypts Payload Only):
+ ┌──────────────────────┬────────────┬─────────────────────────────────┬───────┐
+ │ Original IP Header   │ ESP Header │ ENCRYPTED (TCP Header + Payload)│ESP Trl│
+ │ (Protocol = 50 [ESP])│ (SPI + Seq)│                                 │+ Auth │
+ └──────────────────────┴────────────┴─────────────────────────────────┴───────┘
+ 
+ 3. IPSEC TUNNEL MODE (Site-to-Site Gateway - Encrypts Entire Original Packet):
+ ┌──────────────────┬────────────┬─────────────────────────────────────┬───────┐
+ │ New Outer IP Hdr │ ESP Header │ ENCRYPTED (Orig IP + TCP + Payload) │ESP Trl│
+ │ (Gateway Public) │ (SPI + Seq)│                                     │+ Auth │
+ └──────────────────┴────────────┴─────────────────────────────────────┴───────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. AH vs ESP Protocols
+
+```text
+ ┌──────────────────────┬──────────────────────────┬─────────────────────────────────────────────────────────┐
+ │ Protocol             │ IP Protocol Number       │ Security Services Provided                              │
+ │──────────────────────┼──────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ **AH (Auth Header)** │ Protocol **51**          │ Data Origin Authentication, Integrity, Anti-Replay.     │
+ │                      │                          │ **NO ENCRYPTION! Incompatible with NAT (breaks NAT).**   │
+ │ **ESP (Encaps. Sec)**│ Protocol **50**          │ **Confidentiality (Encryption)**, Authentication,       │
+ │                      │                          │ Integrity, Anti-Replay. (Industry Standard).           │
+ └──────────────────────┴──────────────────────────┴─────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. IKEv2 (Internet Key Exchange v2 / RFC 7296)
+
+IKEv2 operates over **UDP Port 500** (or UDP 4500 for NAT-T) in two rapid round-trips (4 messages):
+1. **`IKE_SA_INIT` (1st RTT):** Negotiates cryptographic algorithms (AES-GCM, DH Group 14/19), exchanges nonces, and completes Diffie-Hellman key exchange.
+2. **`IKE_AUTH` (2nd RTT):** Authenticates peers using Pre-Shared Keys (PSK) or X.509 Certificates, verifies identities, and establishes the first **Child IPsec SA** for data traffic.
+
+---
+
+### 3. NAT-Traversal (NAT-T / RFC 3948)
+
+Because ESP (IP Protocol 50) has no Layer 4 Port numbers, standard PAT routers cannot track or translate ESP connections. Furthermore, AH includes the IP header in its hash, so NAT's IP modification immediately corrupts AH checksums.
+- **NAT-T Solution:** During IKE negotiation, endpoints detect intermediate NAT gateways. All ESP packets are encapsulated inside standard **UDP Port 4500** headers, allowing seamless traversal across NAT firewalls.
+
+---
+
+## Hands-On Lab: Inspecting IPsec with strongSwan
+
+```bash
+# Step 1: Check if IPsec Linux kernel XFRM transformation modules are loaded
+lsmod | grep xfrm
+
+# Step 2: In strongSwan (if installed), query active Security Associations (SAs)
+# sudo ipsec statusall 2>/dev/null || sudo swanctl --list-sas 2>/dev/null
+
+# Step 3: Inspect active kernel Security Policy Database (SPD) via ip xfrm
+sudo ip xfrm policy
+sudo ip xfrm state
+
+# Step 4: Monitor IKE (UDP 500/4500) and ESP (Protocol 50) packets
+sudo tcpdump -n -i any "port 500 or port 4500 or ip proto 50" -c 4
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is Authentication Header (AH) completely incompatible with Network Address Translation (NAT)?**
+
+AH computes an integrity checksum over the entire packet, **including the outer IP header's Source and Destination IP addresses**. When the packet hits a NAT router, the router modifies the IP address (SNAT or DNAT). When the receiving endpoint verifies the AH hash against the modified IP header, the checksum fails, and the packet is discarded as tampered with.
+
+**Q2: What is the difference between IPsec Tunnel Mode and Transport Mode?**
+
+- **Transport Mode:** Encrypts only the Layer 4 payload while keeping the original IP header visible. Used for host-to-host end-to-end communication where both endpoints are the cryptographic endpoints.
+- **Tunnel Mode:** Encrypts the **entire original IP packet** (including original IP headers) and encapsulates it inside a brand-new outer IP header. Used for Site-to-Site VPNs connecting two remote office networks across the public Internet.
+
+**Q3: How does NAT-Traversal (NAT-T) detect whether NAT is present on the path?**
+
+During the `IKE_SA_INIT` exchange, both endpoints compute a SHA-1 hash of the Source IP, Source Port, Destination IP, and Destination Port (`NAT_DETECTION_SOURCE_IP` and `NAT_DETECTION_DESTINATION_IP` payloads). If intermediate NAT modified the IP or port in transit, the calculated hash does not match the received hash, automatically triggering NAT-T fallback to **UDP port 4500**.
+
+**Q4: What is Perfect Forward Secrecy (PFS) in IPsec?**
+
+PFS ensures that if an attacker compromises the long-term private key or master IKE SA key in the future, they **cannot decrypt past recorded VPN sessions**. When PFS is enabled, the router executes a brand-new Diffie-Hellman key exchange for every individual Child SA rekey cycle, generating unique, ephemeral encryption keys that are discarded upon session completion.
+
+**Q5: What is the Security Parameter Index (SPI) in an IPsec packet?**
+
+The SPI is a 32-bit identifier in the ESP/AH header. When a router receives an encrypted IPsec packet, it uses the combination of the **Destination IP and SPI** to look up the matching **Security Association (SA)** in its local database to locate the correct decryption key and cryptographic algorithm.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master AH (Protocol 51, no encryption) vs ESP (Protocol 50, full encryption)
+- [ ] Differentiate Tunnel Mode (Site-to-Site) from Transport Mode (Host-to-Host)
+- [ ] Understand IKEv2 negotiation (`IKE_SA_INIT` and `IKE_AUTH`)
+- [ ] Know how NAT-T encapsulates ESP in UDP Port 4500
+- [ ] Understand Linux kernel `ip xfrm` state and policy tables

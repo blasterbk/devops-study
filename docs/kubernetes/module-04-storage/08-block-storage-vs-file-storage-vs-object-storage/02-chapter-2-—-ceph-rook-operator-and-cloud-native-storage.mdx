@@ -1,0 +1,242 @@
+---
+title: "Chapter 2 — Ceph Rook Operator & Cloud-Native Storage"
+sidebar_position: 2
+module: "Module 4.8 — Block vs File vs Object Storage"
+description: "Master Cloud-Native Software-Defined Storage (SDS) with the Rook Ceph Operator — Ceph MONs, OSDs, MGRs, MDS architecture, CephBlockPool (RWO), CephFilesystem (RWX), and CephObjectStore (S3)."
+---
+
+# Chapter 2 — Ceph Rook Operator & Cloud-Native Storage
+
+> **Goal:** Master cloud-native Software-Defined Storage (SDS) on Kubernetes using the CNCF Rook Ceph Operator — understanding how Rook turns raw bare-metal node disks into a unified, self-healing storage cluster, analyzing the core Ceph daemons (MON, OSD, MGR, MDS, RGW), and provisioning all three storage modalities: Block (Ceph RBD / RWO), Shared File (CephFS / RWX), and Object Storage (Ceph RGW / S3).
+>
+> By the end of this chapter, you will understand:
+> 1. The architecture of Software-Defined Storage (SDS) running natively on Kubernetes
+> 2. The roles of Ceph core daemons: Monitors (MON), Object Storage Daemons (OSD), Managers (MGR), and Metadata Servers (MDS)
+> 3. How the Rook Operator automates storage provisioning, health checks, and CRUSH map rebalancing
+> 4. How to configure `CephBlockPool` for low-latency RWO block storage
+> 5. How to configure `CephFilesystem` for multi-node RWX shared storage
+> 6. How Ceph self-heals during node disk failures with zero data loss
+
+---
+
+## Real-Life Analogy
+
+Think of the Rook Ceph Operator as an **automated master builder turning hundreds of individual home toolboxes into a massive communal hardware superstore**:
+
+- **The Raw Hardware (Individual Node Disks):** 50 worker nodes in your cluster each have 2 raw unformatted NVMe SSDs (`/dev/nvme0n1`). On their own, they are isolated, non-redundant, and fragile: if Node #12 crashes, its local disk goes offline.
+- **The Rook Operator (The Master Architect):** A Kubernetes operator that inspects all 50 nodes, claims all 100 raw NVMe SSDs, and stitches them together into a single, unified, distributed storage fabric (**Ceph RADOS**).
+- **The Ceph Daemons (The Superstore Staff):**
+  - **MONs (The Board of Directors):** 3 elected officials who maintain the master map of where every byte of data lives.
+  - **OSDs (The Warehouse Workers):** Daemons running on each physical drive that physically write, replicate, and scrub data blocks.
+  - **MDS (The High-Speed Filing Clerks):** Dedicated servers tracking directory trees and file metadata for shared network drives (CephFS).
+- **The 3 Service Counters (Unified Modalities):**
+  - Counter 1 (RBD): Delivers ultra-fast private block hard drives to databases (RWO).
+  - Counter 2 (CephFS): Delivers shared communal network folders to web servers (RWX).
+  - Counter 3 (RGW): Delivers an Amazon S3-compatible REST API for object storage.
+
+---
+
+## Architecture Diagram
+
+```text
+               Rook Ceph Software-Defined Storage Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes Control Plane: Rook Operator Reconciler                     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Deploys & Manages Ceph Cluster CRD
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CEPH CLUSTER FABRIC (Deployed across Kubernetes Worker Nodes)          │
+ │                                                                        │
+ │ ┌──────────────────────┐  ┌──────────────────────┐  ┌────────────────┐ │
+ │ │ Ceph MONs (Quorum)   │  │ Ceph MGRs (Metrics)  │  │ Ceph MDS (POSIX│ │
+ │ │ (3-Pod Paxos Quorum) │  │ (Prometheus / GUI)   │  │ Shared CephFS) │ │
+ │ └──────────────────────┘  └──────────────────────┘  └────────────────┘ │
+ │                                                                        │
+ │ ┌────────────────────────────────────────────────────────────────────┐ │
+ │ │ Physical Storage Nodes: Ceph OSD Daemons (Raw Block Disks)        │ │
+ │ │   Node 1: [OSD-0: /dev/sdb]  [OSD-1: /dev/sdc]                     │ │
+ │ │   Node 2: [OSD-2: /dev/sdb]  [OSD-3: /dev/sdc]                     │ │
+ │ │   Node 3: [OSD-4: /dev/sdb]  [OSD-5: /dev/sdc]                     │ │
+ │ └────────────────────────────────────────────────────────────────────┘ │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Exposes 3 Storage Types via CSI
+         ┌──────────────────────────┼──────────────────────────┐
+         ▼                          ▼                          ▼
+ ┌───────────────┐          ┌───────────────┐          ┌───────────────┐
+ │ CephBlockPool │          │ CephFilesystem│          │CephObjectStore│
+ │ (RWO Block)   │          │ (RWX Shared)  │          │ (S3 / REST)   │
+ └───────────────┘          └───────────────┘          └───────────────┘
+```
+
+---
+
+## Core Ceph Daemons & Responsibilities
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Ceph Daemon          │ Architecture & Functional Responsibility                                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **MON (Monitor)**    │ Maintains cluster state, OSD maps, and consensus using Paxos quorum.        │
+ │                      │ Requires an odd number of replicas (typically 3 or 5) for split-brain safety│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **OSD (Daemon)**     │ Runs directly on top of each physical block device. Handles disk I/O,       │
+ │                      │ 3x replication, data recovery, scrubbing, and CRUSH map calculations.       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **MGR (Manager)**    │ Collects cluster telemetry, manages placement groups (PGs), exposes the Ceph│
+ │                      │ Web Dashboard, and feeds Prometheus storage metrics.                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **MDS (Metadata)**   │ Manages POSIX filesystem metadata for **CephFS** (shared `ReadWriteMany`).   │
+ │                      │ Required only if shared filesystem storage is enabled.                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **RGW (Gateway)**    │ Exposes an **Amazon S3-compatible HTTP REST endpoint** backed by Ceph.      │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3 Storage Modalities in One Cluster
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Modality                  │ Kubernetes API Primitives       │ Access Mode & Performance       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **1. Block (Ceph RBD)**   │ `CephBlockPool` $\to$           │ `ReadWriteOnce` (RWO)           │
+ │                           │ `StorageClass: rook-ceph-block` │ Ultra-low latency for DBs.      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **2. File (CephFS)**      │ `CephFilesystem` $\to$          │ `ReadWriteMany` (RWX)           │
+ │                           │ `StorageClass: rook-cephfs`     │ Multi-pod concurrent sharing.   │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **3. Object (Ceph RGW)**  │ `CephObjectStore` $\to$         │ S3 HTTP API (`s3.internal`)     │
+ │                           │ `CephObjectStoreUser`           │ Unstructured media/backups.     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The CRUSH Algorithm & Automated Self-Healing
+
+Ceph does **not** rely on a central lookup table to find data blocks. Instead, it uses the **CRUSH (Controlled Replication Under Scalable Hashing)** algorithm:
+
+```text
+ The Self-Healing Lifecycle:
+ 1. Write: Client hashes object name ──► CRUSH calculates exact OSDs on Node 1, Node 2, and Node 3.
+ 2. Failure: If Node 1 experiences a motherboard failure, MONs detect OSD-0 marked `down` and `out`.
+ 3. Automated Rebalancing: OSD-2 and OSD-3 immediately read the surviving copies and replicate 
+    the missing data to OSD-4 on Node 4!
+ 4. Zero Data Loss: The cluster returns to 100% health (`HEALTH_OK`) automatically without human 
+    intervention!
+```
+
+---
+
+## Complete Production Manifests: Rook Ceph Block & Filesystem
+
+```yaml
+# 1. CephBlockPool for High-Performance RWO Storage
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: enterprise-block-pool
+  namespace: rook-ceph
+spec:
+  failureDomain: host          # Replicate across distinct physical servers
+  replicated:
+    size: 3                    # 3-way replication for zero data loss
+---
+# 2. StorageClass Exposing Ceph RBD Block Storage
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: rook-ceph-block-sc
+provisioner: rook-ceph.rbd.csi.ceph.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  pool: enterprise-block-pool
+  imageFormat: "2"
+  imageFeatures: layering
+  csi.storage.k8s.io/fstype: ext4
+---
+# 3. CephFilesystem for Multi-Node RWX Storage
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystem
+metadata:
+  name: enterprise-cephfs
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPools:
+    - failureDomain: host
+      replicated:
+        size: 3
+  metadataServer:
+    activeCount: 1
+    activeStandby: true
+```
+
+---
+
+## Hands-On Lab: Inspecting Rook Ceph Resources
+
+```bash
+# Step 1: Query Rook Ceph Operator and Cluster Status
+kubectl get cephcluster -n rook-ceph 2>/dev/null || echo "Simulating Rook Ceph Environment"
+
+# Step 2: Inspect Ceph Daemon Pods (MONs, MGRs, OSDs)
+kubectl get pods -n rook-ceph -l app=rook-ceph-operator
+kubectl get pods -n rook-ceph -l app=rook-ceph-mon
+kubectl get pods -n rook-ceph -l app=rook-ceph-osd
+
+# Step 3: Inspect CephBlockPools and CephFilesystems
+kubectl get cephblockpools.ceph.rook.io -n rook-ceph
+kubectl get cephfilesystems.ceph.rook.io -n rook-ceph
+
+# Step 4: Run Ceph Health Check via Ceph Tools Pod
+# kubectl exec -n rook-ceph deploy/rook-ceph-tools -- ceph status
+# Expected output: health: HEALTH_OK, 3 mons, 6 osds all up and in
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Rook Operator, and what role does it play in Kubernetes storage?**
+
+Rook is an open-source, CNCF-graduated cloud-native storage orchestrator that turns Kubernetes into a Software-Defined Storage (SDS) platform. Rook automates the deployment, configuration, provisioning, scaling, upgrading, and self-healing of Ceph storage clusters. It manages physical disks on worker nodes and provides dynamic Block (RBD), Shared Filesystem (CephFS), and Object (RGW) storage via standard Kubernetes CSI drivers.
+
+**Q2: What is the responsibility of Ceph MONs, and why must they run in an odd-numbered quorum?**
+
+Ceph Monitors (MONs) maintain master maps of the cluster topology (OSD map, Monitor map, CRUSH map) and manage cluster consensus. They require an odd number of replicas (typically 3 or 5) running the Paxos consensus algorithm to maintain quorum and prevent split-brain scenarios during network partitions.
+
+**Q3: How does Ceph handle physical disk or node failures without a centralized metadata index?**
+
+Ceph uses the **CRUSH (Controlled Replication Under Scalable Hashing)** algorithm. When data is written, CRUSH mathematically determines which OSDs across separate failure domains will store the 3 replicated copies. If a disk or node fails, the surviving OSDs detect the missing replica and automatically re-replicate the affected data blocks to other healthy disks in the cluster, restoring full redundancy without administrator intervention.
+
+**Q4: What is the difference between Ceph RBD and CephFS in Kubernetes?**
+
+- **Ceph RBD (RADOS Block Device)**: Exposes virtual raw block devices formatted with ext4/XFS, providing high IOPS and low latency for single-node workloads (`ReadWriteOnce`).
+- **CephFS**: A distributed POSIX-compliant shared filesystem managed by Ceph Metadata Servers (MDS), allowing hundreds of Pods across all worker nodes to concurrently mount, read, and write to the same shared directory (`ReadWriteMany`).
+
+**Q5: What is `failureDomain: host` versus `failureDomain: zone` in Ceph CRDs?**
+
+`failureDomain` defines the physical boundaries between replicated data copies:
+- `failureDomain: host`: Guarantees that the 3 replicas of any data block are stored on 3 physically distinct server hosts, surviving single-node failures.
+- `failureDomain: zone` (or `rack`): Guarantees that replicas are placed on servers in completely separate data center racks or Availability Zones, surviving entire rack power outages or datacenter-level network disruptions.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Rook is a Kubernetes operator managing Ceph Software-Defined Storage
+- [ ] Know the 4 core daemons: MON (Quorum), OSD (Disk I/O), MGR (Metrics), MDS (CephFS)
+- [ ] Know the 3 storage types: Block (RBD / RWO), File (CephFS / RWX), Object (RGW / S3)
+- [ ] Know that CRUSH algorithm calculates data placement deterministically
+- [ ] Know how Ceph self-heals by re-replicating data when an OSD dies
+- [ ] Know that MONs require an odd-numbered quorum (3 or 5) for split-brain safety
+- [ ] Can view Ceph cluster status using `kubectl get cephcluster -n rook-ceph`

@@ -1,0 +1,380 @@
+---
+title: "Chapter 2 — emptyDir, hostPath & Projected Volumes"
+sidebar_position: 2
+module: "Module 4.1 — Volumes & Mounts"
+description: "Master Kubernetes ephemeral and local storage primitives — emptyDir memory vs disk mechanics, sizeLimit evictions, hostPath types and security hardening, and multi-source Projected Volumes."
+---
+
+# Chapter 2 — emptyDir, hostPath & Projected Volumes
+
+> **Goal:** Master the operational mechanics, security risks, and architecture of Kubernetes node-local and projected volume primitives — understanding `emptyDir` disk versus `tmpfs` RAM backends, Kubelet `sizeLimit` eviction enforcement, `hostPath` file/socket types and security escape vectors, and consolidating multiple configuration sources using Projected Volumes with bound service account token rotation.
+>
+> By the end of this chapter, you will understand:
+> 1. The lifecycle of an `emptyDir` volume across container crashes versus Pod deletion
+> 2. How `emptyDir.medium: Memory` allocates Linux `tmpfs` RAM and interacts with cgroup limits
+> 3. How Kubelet monitors `sizeLimit` and executes eviction on runaway scratch disks
+> 4. The 7 `hostPath` types and why `hostPath` is classified as high-risk under Pod Security Standards
+> 5. How Projected Volumes merge `secret`, `configMap`, `downwardAPI`, and `serviceAccountToken` into a single directory
+> 6. How Bound Service Account Tokens enhance cluster security with short-lived audiences
+
+---
+
+## Real-Life Analogy
+
+Think of these volume types as **different storage drawers in an office workstation**:
+
+- **`emptyDir` (The Temporary Whiteboard on the Wall):** When a temporary project team moves into an office room (Pod), the office manager installs a blank whiteboard (`emptyDir`). Team members write notes to each other (inter-container communication). If an employee steps out for coffee and returns (container restart), the whiteboard notes are still there. But when the project ends and the team vacates the building (Pod deletion), the cleaners wipe the board clean for the next team.
+- **`emptyDir.medium: Memory` (High-Speed RAM Cache):** Writing notes on ultra-fast digital tablets instead of dry-erase markers. It operates at lightning speed, but drawing too many large images exhausts the office battery budget (cgroup memory limit) and trips the circuit breaker (OOMKill).
+- **`hostPath` (A Direct Keyhole to the Building's Master Electrical Duct):** A specialized fiber-optic cable that taps directly into the central building server room (Node OS filesystem). System maintenance engineers (DaemonSets) need this keyhole to inspect pipes (`/var/log`). But giving regular office tenants a keyhole lets malicious actors crawl through the duct into other tenants' private offices (**Security Breakout**).
+- **Projected Volumes (The Executive Binder):** A single 3-ring binder on the desk that holds meeting minutes (ConfigMap), corporate passwords (Secrets), the office room number (DownwardAPI), and a daily rotating security keycard (ServiceAccountToken).
+
+---
+
+## Architecture Diagram
+
+```text
+               emptyDir vs hostPath vs Projected Volumes
+
+ 1. emptyDir Volume (Scoped strictly to Pod Sandbox)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod: analytics-worker (Node: worker-01)                                │
+ │                                                                        │
+ │   ┌───────────────────────────┐      ┌───────────────────────────┐     │
+ │   │ Container A: Downloader   │      │ Container B: Processor    │     │
+ │   │ Writes: /shared/chunk.csv │      │ Reads: /data/chunk.csv    │     │
+ │   └─────────────┬─────────────┘      └─────────────┬─────────────┘     │
+ │                 │                                  │                   │
+ │                 ▼                                  ▼                   │
+ │         ┌──────────────────────────────────────────────────┐           │
+ │         │ emptyDir Volume Mount (RAM tmpfs or Node Disk)   │           │
+ │         └──────────────────────────────────────────────────┘           │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. hostPath Volume (Direct escape to Node Host OS)
+ ┌──────────────────────────────┐
+ │ Pod: fluent-bit (DaemonSet)  │
+ │ MountPath: /host/logs        │
+ └──────────────┬───────────────┘
+                │ Directly mounts /var/log on Node OS!
+                ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Worker Node Linux Host Filesystem (/var/log, /proc, /run/containerd)   │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 3. Projected Volume (Multi-Source Unified Directory)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod Container Mount: /var/run/all-in-one/                               │
+ │   ├── app.config    ◄── Projected from ConfigMap                       │
+ │   ├── api-key.txt   ◄── Projected from Secret                          │
+ │   ├── pod-name      ◄── Projected from DownwardAPI                     │
+ │   └── token         ◄── Projected from Bound ServiceAccountToken       │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `emptyDir` Internals: Disk vs RAM `tmpfs`
+
+An `emptyDir` volume is automatically created when a Pod is scheduled onto a node. It starts completely empty and is shared by all containers in that Pod.
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Parameter                 │ `emptyDir: {}` (Default)        │ `emptyDir: { medium: Memory }`  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Underlying Medium**     │ Node disk (Rootfs / Ephemeral)  │ RAM-backed Linux `tmpfs` disk   │
+ │ **I/O Latency**           │ Standard NVMe / SSD disk speed  │ Sub-microsecond memory speed    │
+ │ **Memory Accounting**     │ Does NOT count toward RAM       │ **COUNTS toward container RAM** │
+ │                           │                                 │ **`resources.limits.memory`!**  │
+ │ **Reboot Behavior**       │ Preserved on disk until delete  │ Lost on node power loss         │
+ │ **Best For**              │ Large scratch files, sorting,   │ High-performance caching, shared│
+ │                           │ intermediate build artifacts    │ IPC POSIX queues, secret temp   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+### The `sizeLimit` Enforcement:
+To prevent an application from filling the node's entire root disk or RAM:
+```yaml
+volumes:
+- name: scratch
+  emptyDir:
+    medium: Memory
+    sizeLimit: 256Mi    # Hard cap!
+```
+Kubelet's `ephemeral-storage` manager polls `emptyDir` usage periodically. If total data written to the volume exceeds `sizeLimit`, Kubelet **evicts the Pod** from the node!
+
+---
+
+## `hostPath` Types and Security Vulnerabilities
+
+A `hostPath` volume mounts a file, directory, or UNIX socket directly from the host node's filesystem into a container:
+
+```text
+ ┌───────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ `hostPath.type`           │ Validation & Kernel Action                                             │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ `DirectoryOrCreate`       │ If directory exists, mount it; if not, create directory (`0755`).      │
+ │ `Directory`               │ Directory MUST exist on node; if missing, Pod fails with mount error.  │
+ │ `FileOrCreate`            │ If file exists, mount it; if not, create empty file (`0644`).          │
+ │ `File`                    │ File MUST exist on node; if missing, Pod fails with mount error.       │
+ │ `Socket`                  │ UNIX socket MUST exist (e.g. `/run/containerd/containerd.sock`).       │
+ │ `CharDevice` / `BlockDev` │ Character device (`/dev/null`) or Block device (`/dev/sda`).           │
+ └───────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+```yaml
+volumes:
+- name: containerd-sock
+  hostPath:
+    path: /run/containerd/containerd.sock
+    type: Socket
+```
+
+### The Severe Security Risks of `hostPath`:
+- **Privilege Escalation:** A container with root privileges mounting `/etc` or `/var/lib/kubelet` can overwrite node credentials, steal cluster secrets, or modify Kubelet configuration.
+- **Node Breakout:** Mounting the Docker or containerd UNIX socket allows a container to escape its cgroups and control all containers running on that node.
+- **Pod Security Standards:** `hostPath` is strictly **prohibited** under the `Baseline` and `Restricted` Pod Security Standards.
+
+---
+
+## Projected Volumes: Consolidating Configuration
+
+Instead of defining 4 separate volumes and 4 separate mount points, **Projected Volumes** unify multiple configuration sources into a single coherent folder:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: projected-volume-demo
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts:
+    - name: unified-config
+      mountPath: /var/run/app-environment
+      readOnly: true
+
+  volumes:
+  - name: unified-config
+    projected:
+      sources:
+      # Source 1: ConfigMap
+      - configMap:
+          name: app-settings
+          items:
+          - key: database.conf
+            path: db.conf
+
+      # Source 2: Secret
+      - secret:
+          name: db-credentials
+          items:
+          - key: password
+            path: db-pass.txt
+
+      # Source 3: Downward API (Pod Metadata)
+      - downwardAPI:
+          items:
+          - path: pod_name
+            fieldRef:
+              fieldPath: metadata.name
+          - path: cpu_limit
+            resourceFieldRef:
+              containerName: app
+              resource: limits.cpu
+
+      # Source 4: Bound Service Account Token (Short-lived, auto-rotating)
+      - serviceAccountToken:
+          audience: "https://vault.company.internal"
+          expirationSeconds: 3600
+          path: vault-token
+```
+
+---
+
+## Bound Service Account Token Projection
+
+In modern Kubernetes (1.21+ / default in 1.24+), Kubernetes deprecated static legacy ServiceAccount secrets in favor of **Bound Service Account Tokens**:
+
+```text
+ Key Security Guarantees:
+ 1. Short-Lived Expiration: Token expires after `expirationSeconds: 3600` (1 hour).
+ 2. Audience Binding: Token is valid ONLY for the designated target (`audience: api.vault.internal`).
+ 3. Pod Binding: The token is cryptographically bound to the specific Pod's UID. If the Pod is 
+    deleted, the token becomes immediately invalid across the cluster!
+ 4. Automated Live Rotation: Kubelet automatically refreshes and rewrites the token file on disk 
+    at 80% of its lifetime without restarting the container!
+```
+
+---
+
+## Complete Production Manifest with Ephemeral & Projected Volumes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-gateway
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: secure-gateway
+  template:
+    metadata:
+      labels:
+        app: secure-gateway
+    spec:
+      containers:
+      - name: gateway
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        # High-speed RAM scratch disk for TLS session caching
+        - name: ram-cache
+          mountPath: /var/cache/nginx
+        # Unified projected directory for configurations & tokens
+        - name: runtime-env
+          mountPath: /etc/gateway/runtime
+          readOnly: true
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+      volumes:
+      - name: ram-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Mi
+
+      - name: runtime-env
+        projected:
+          sources:
+          - configMap:
+              name: gateway-config
+          - secret:
+              name: gateway-tls-certs
+          - serviceAccountToken:
+              audience: "api://production-mesh"
+              expirationSeconds: 7200
+              path: mesh-token
+```
+
+---
+
+## Hands-On Lab: Testing emptyDir RAM Limits & Projected Volumes
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace local-vol-lab
+
+# Step 2: Create mock Secret and ConfigMap
+kubectl create configMap gateway-config --from-literal=mode=strict -n local-vol-lab
+kubectl create secret generic gateway-tls-certs --from-literal=cert.pem="MOCK_CERT" -n local-vol-lab
+
+# Step 3: Deploy Pod with RAM-backed emptyDir and Projected volume
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: volume-tester
+  namespace: local-vol-lab
+spec:
+  containers:
+  - name: test-app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts:
+    - name: ram-disk
+      mountPath: /mnt/ram
+    - name: projected-dir
+      mountPath: /mnt/projected
+      readOnly: true
+  volumes:
+  - name: ram-disk
+    emptyDir:
+      medium: Memory
+      sizeLimit: 50Mi
+  - name: projected-dir
+    projected:
+      sources:
+      - configMap:
+          name: gateway-config
+      - secret:
+          name: gateway-tls-certs
+      - downwardAPI:
+          items:
+          - path: my_pod_name
+            fieldRef:
+              fieldPath: metadata.name
+EOF
+
+# Step 4: Wait for Pod to enter Running state
+kubectl wait --for=condition=Ready pod/volume-tester -n local-vol-lab --timeout=30s
+
+# Step 5: Verify Projected volume unified directory structure
+kubectl exec -n local-vol-lab volume-tester -- ls -la /mnt/projected
+# Notice: mode (from CM), cert.pem (from Secret), and my_pod_name (from DownwardAPI) all live in the SAME directory!
+
+# Step 6: Read projected DownwardAPI value
+kubectl exec -n local-vol-lab volume-tester -- cat /mnt/projected/my_pod_name
+
+# Step 7: Test emptyDir sizeLimit Eviction Behavior
+# Write a 60MB file to the 50MB sizeLimit RAM disk
+kubectl exec -n local-vol-lab volume-tester -- dd if=/dev/zero of=/mnt/ram/test.img bs=1M count=60
+
+# Wait for Kubelet ephemeral-storage monitoring loop to detect breach
+sleep 15
+kubectl get pod volume-tester -n local-vol-lab
+# Status should transition to 'Evicted' with reason 'EvictionByEvictionThreshold / sizeLimitExceeded'!
+
+# Step 8: Clean up lab
+kubectl delete namespace local-vol-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What happens to data stored in an `emptyDir` volume when a container inside the Pod crashes?**
+
+Data stored in an `emptyDir` volume **persists** across container crashes and restarts. Because the `emptyDir` volume lifecycle is bound to the **Pod sandbox** (managed by the `pause` container), Kubelet restarts the application container inside the existing sandbox and re-binds the intact `emptyDir` directory. Data in `emptyDir` is only deleted when the entire Pod object is removed from the node or evicted.
+
+**Q2: What is the risk of using `emptyDir.medium: Memory` without proper container memory limits?**
+
+`emptyDir.medium: Memory` is backed by a Linux `tmpfs` RAM disk. Crucially, memory consumed by files written to `tmpfs` is counted by the Linux kernel against the container's cgroup memory limit (`resources.limits.memory`). If an application writes more data to the `emptyDir` than its memory limit allows, the kernel Out-Of-Memory (OOM) killer will immediately terminate the container with `SIGKILL` (`Exit Code 137`).
+
+**Q3: Why is `hostPath` considered a critical security risk, and when is it legitimately permitted?**
+
+`hostPath` mounts directories from the host node directly into the container. If a privileged or root container mounts `/etc`, `/var/run/docker.sock`, or `/`, it can escape container isolation, inspect credentials from other tenants, alter host OS configurations, and compromise the entire cluster. `hostPath` is strictly restricted in multi-tenant clusters and is legitimately permitted only for node-level system DaemonSets (such as CNI network drivers, log forwarders reading `/var/log`, or hardware device monitors).
+
+**Q4: What is a Projected Volume, and what sources can be combined within it?**
+
+A Projected Volume is a Kubernetes volume abstraction that maps multiple existing volume sources into a single, unified mount directory. It supports combining four distinct source types: (1) `configMap` (configuration files), (2) `secret` (credentials and certificates), (3) `downwardAPI` (dynamic pod and cluster metadata), and (4) `serviceAccountToken` (short-lived, audience-bound OIDC authentication tokens).
+
+**Q5: How do Bound Service Account Tokens improve cluster security compared to legacy ServiceAccount tokens?**
+
+Legacy ServiceAccount tokens were long-lived, static secrets stored directly in `etcd` with infinite expiration and cluster-wide validity. Bound Service Account Tokens: (1) Have short time-to-live expirations (`expirationSeconds: 3600`); (2) Are bound to specific audiences (`audience: vault`); (3) Are cryptographically tied to the Pod's lifecycle UID (invalidated immediately if the Pod is deleted); and (4) Are automatically rotated and refreshed in-place by Kubelet without restarting containers.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `emptyDir` survives container crashes but is destroyed on Pod deletion
+- [ ] Know that `emptyDir.medium: Memory` counts toward container cgroup RAM limits
+- [ ] Know that exceeding `emptyDir.sizeLimit` results in Kubelet Pod eviction
+- [ ] Know that `hostPath` is restricted under Pod Security Standards due to breakout risks
+- [ ] Know the 7 `hostPath` validation types (`DirectoryOrCreate`, `Socket`, `File`, etc.)
+- [ ] Know that Projected Volumes merge ConfigMaps, Secrets, DownwardAPI, and Tokens
+- [ ] Know how Bound Service Account Tokens provide time-limited, audience-restricted security

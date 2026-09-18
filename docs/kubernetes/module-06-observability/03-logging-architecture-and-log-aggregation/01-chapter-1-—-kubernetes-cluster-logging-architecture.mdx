@@ -1,0 +1,274 @@
+---
+title: "Chapter 1 — Cluster Logging Architecture"
+sidebar_position: 1
+module: "Module 6.3 — Logging & Log Aggregation"
+description: "Master Kubernetes cluster logging architecture — container stdout/stderr capture, /var/log/pods directory layout, CRI log formatting, Kubelet log rotation, and kubectl logs streaming."
+---
+
+# Chapter 1 — Kubernetes Cluster Logging Architecture
+
+> **Goal:** Master the core container logging architecture of Kubernetes — understanding how container runtime engines (containerd and CRI-O) capture `stdout` and `stderr` streams, analyzing the physical directory layout on host worker nodes (`/var/log/pods/`), dissecting the CRI log format, configuring Kubelet log rotation parameters (`containerLogMaxSize`, `containerLogMaxFiles`), examining the internals of `kubectl logs` streaming over port 10250, and comparing Node-Level DaemonSet agents against the Sidecar logging pattern.
+>
+> By the end of this chapter, you will understand:
+> 1. How container standard output (`stdout`) and standard error (`stderr`) flow from process to host disk
+> 2. The physical directory structure of `/var/log/pods/` and `/var/log/containers/`
+> 3. The structural difference between the CRI log format and legacy Docker JSON logs
+> 4. How Kubelet automatically rotates log files on disk without external `logrotate` cron jobs
+> 5. How `kube-apiserver` proxies `kubectl logs` streaming calls over Kubelet port 10250
+> 6. The architectural tradeoffs: Node-Level Logging DaemonSets vs Sidecar log forwarders
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes container logging as **an automated transcript recording and public stenographer system in a corporate boardroom**:
+
+- **The Microservice Process (The Speaker):** Whenever an application speaks out loud (**Writing to `stdout` or `stderr`**), it doesn't need to write to paper or manage files. It simply speaks into the room's open microphone.
+- **The Container Runtime (The Audio Recording Machine - containerd / CRI-O):** The microphone is connected to an automated tape recorder. The recorder stamps each spoken sentence with a precise microsecond timestamp and the speaker's room name (**CRI Log Format**) and writes it to a file in the building's basement archive (**`/var/log/pods/`**).
+- **The Building Janitor (Kubelet Log Rotation):** The basement archive has limited shelf space. When a tape reaches 50 Megabytes (**`containerLogMaxSize: 50Mi`**), the janitor seals it, numbers it (`0.log.1`), and deletes the oldest tape once there are more than 5 files (**`containerLogMaxFiles: 5`**).
+- **The Remote Court Stenographer (`kubectl logs`):** When the CEO dials in from another city (`kubectl logs -f pod-name`), the main office switchboard (`kube-apiserver`) connects directly to the basement phone line (**Kubelet Port 10250**) and reads the tape out loud in real time.
+- **The Central Library Courier (Logging DaemonSet - Fluentbit / Vector):** A courier agent continuously reads every tape in the basement and trucks the archives to the central corporate library (**Elasticsearch / Grafana Loki**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Container Logging & Streaming Pipeline
+
+ WORKER NODE HOST
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Process: application (PID: 1042)                             │
+ │ Writes log: `printf("Order #501 processed successfully\n")`            │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Emits to `stdout` (File Descriptor 1)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER RUNTIME (containerd / CRI-O)                                 │
+ │ 1. Intercepts stdout/stderr stream from FIFO pipe                      │
+ │ 2. Formats line according to CRI Log Specification:                   │
+ │    `2026-08-18T12:00:00.123456789Z stdout F Order #501 processed...`   │
+ │ 3. Appends line to on-disk log file:                                   │
+ │    `/var/log/pods/prod_payment-api-6b9c_a1b2/payment-container/0.log`  │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           ▼                                                 ▼
+ ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+ │ 1. Streaming via `kubectl logs`: │     │ 2. Cluster-Wide Log Aggregation: │
+ │                                  │     │                                  │
+ │ Client: `kubectl logs -f ...`    │     │ DaemonSet: FluentBit / Vector    │
+ │   │                              │     │   │ Reads `/var/log/pods/*.log`  │
+ │   ▼                              │     │   ▼                              │
+ │ kube-apiserver (Port 6443)       │     │ Ships structured JSON logs to:   │
+ │   │ (Proxies over mTLS)          │     │ - Grafana Loki                   │
+ │   ▼                              │     │ - Elasticsearch / OpenSearch     │
+ │ Kubelet (Port 10250)             │     │ - Amazon CloudWatch / S3         │
+ │   │ Streams local 0.log file     │     └──────────────────────────────────┘
+ └──────────────────────────────────┘
+```
+
+---
+
+## The `/var/log/pods/` Directory Layout
+
+Modern container runtimes write container logs to a standardized filesystem hierarchy:
+
+```text
+ /var/log/pods/
+   └── <namespace>_<pod-name>_<pod-uid>/
+         └── <container-name>/
+               ├── 0.log          <-- Active current log file
+               ├── 0.log.20260818 <-- Rotated historical archive 1
+               └── 0.log.20260817 <-- Rotated historical archive 2
+```
+
+```text
+ Symlink Compatibility Layer:
+ For legacy backward compatibility, Kubelet creates symlinks in `/var/log/containers/`:
+ `/var/log/containers/<pod-name>_<namespace>_<container-name>-<container-id>.log` 
+ ──► Points directly to `/var/log/pods/<namespace>_<pod>_<uid>/<container>/0.log`
+```
+
+---
+
+## The CRI Log Format Specification
+
+The modern Container Runtime Interface (CRI) formats every log entry as space-delimited text:
+
+```text
+2026-08-18T12:00:00.123456789Z stdout F {"level":"info","msg":"User logged in","uid":102}
+│                              │      │ └── Actual application log message (Payload)
+│                              │      └──── Stream State: 'F' (Full line) or 'P' (Partial line)
+│                              └─────────── Stream Type: 'stdout' or 'stderr'
+└────────────────────────────────────────── ISO 8601 UTC Timestamp (Nanosecond precision)
+```
+
+```text
+ The Partial Line ('P') Flag:
+ If an application outputs a massive 50KB stack trace or JSON payload exceeding the CRI buffer, 
+ the runtime splits the message across multiple lines, tagging intermediate chunks with 'P' 
+ (Partial) and the final chunk with 'F' (Full). Logging agents assemble 'P' chunks into single events.
+```
+
+---
+
+## Kubelet Automated Log Rotation
+
+Kubelet manages log rotation directly, eliminating the need for host OS `logrotate` cron jobs.
+
+Configured in `/var/lib/kubelet/config.yaml`:
+
+```yaml
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# 1. Maximum file size before rotation triggers
+containerLogMaxSize: "50Mi"
+
+# 2. Maximum number of historical rotated files to retain per container
+containerLogMaxFiles: 5
+```
+
+```text
+ Log Rotation Impact:
+ Under this configuration, each container can consume at most:
+ Total Max Disk per Container = 50Mi * 5 = 250 Megabytes
+ Prevents runaway application crash loops from exhausting host disk space (DiskPressure)!
+```
+
+---
+
+## Logging Patterns: Node-Level Agent vs Sidecar Forwarder
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Node-Level Agent (DaemonSet)    │ Sidecar Container Pattern       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Architecture**          │ **1 Pod per Worker Node.**      │ **+1 Container in every Pod.**  │
+ │                           │ Scrapes `/var/log/pods/` disk.  │ Tails local file $\to$ stdout.  │
+ │ **Resource Overhead**     │ **Minimal.** Low memory & CPU   │ **High.** Scales linearly with  │
+ │                           │ shared across all containers.   │ every single application pod.   │
+ │ **Application Coupling**  │ Decoupled (App writes stdout).  │ Coupled (App writes custom file)│
+ │ **Standard Use Case**     │ 99% of cloud-native workloads.  │ Legacy apps that cannot be      │
+ │                           │ (FluentBit, Vector, Promtail).  │ configured to write to stdout.  │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The Sidecar Logging Pattern Manifest (For Legacy File Writers)
+
+If a legacy application hardcodes its output to a disk file (`/var/log/app.log`), a sidecar container tails the file to `stdout`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legacy-app-logging
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: legacy-app
+  template:
+    metadata:
+      labels:
+        app: legacy-app
+    spec:
+      volumes:
+      - name: shared-log-volume
+        emptyDir: {}
+
+      containers:
+      # 1. Legacy Application (Writes to disk file)
+      - name: app
+        image: busybox:latest
+        command: ["sh", "-c", "while true; do echo \"$(date) - Legacy Log Record\" >> /var/log/app.log; sleep 2; done"]
+        volumeMounts:
+        - name: shared-log-volume
+          mountPath: /var/log
+
+      # 2. Sidecar Log Streamer (Tails disk file to stdout!)
+      - name: log-sidecar
+        image: busybox:latest
+        command: ["sh", "-c", "tail -n+1 -F /var/log/app.log"]
+        volumeMounts:
+        - name: shared-log-volume
+          mountPath: /var/log
+```
+
+---
+
+## Hands-On Lab: Inspecting Kubelet Log Paths & CRI Format
+
+```bash
+# Step 1: Deploy a test container generating formatted JSON logs
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: log-generator-pod
+  namespace: default
+spec:
+  containers:
+  - name: logger
+    image: alpine:latest
+    command: ["sh", "-c", "while true; do echo '{\"level\":\"info\",\"msg\":\"Transaction completed\",\"ts\":'$(date +%s)'}'; sleep 3; done"]
+EOF
+
+# Step 2: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/log-generator-pod -n default --timeout=30s
+
+# Step 3: Stream logs using kubectl logs
+kubectl logs log-generator-pod --tail=5
+
+# Step 4: Stream previous container logs (if container crashed/restarted)
+kubectl logs log-generator-pod --previous 2>/dev/null || echo "No previous container crash detected"
+
+# Step 5: Check active Kubelet log rotation configuration on node
+# stat /var/lib/kubelet/config.yaml
+
+# Step 6: Clean up lab
+kubectl delete pod log-generator-pod -n default
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Kubernetes capture and store container logs on worker nodes?**
+
+When a containerized process writes to standard output (`stdout`) or standard error (`stderr`), the container runtime (containerd or CRI-O) intercepts the file descriptors via Unix FIFO pipes. The runtime formats each line according to the **CRI Log Specification** (prepending an ISO 8601 UTC timestamp, stream identifier `stdout`/`stderr`, and tag `F`/`P`) and appends the stream to a persistent file located at `/var/log/pods/<namespace>_<pod>_<uid>/<container>/0.log` on the host worker node.
+
+**Q2: How does the `kubectl logs` command work under the hood?**
+
+When a developer executes `kubectl logs <pod-name>`, the request reaches the `kube-apiserver`. The API server resolves which worker node the Pod is scheduled on, authenticates the client via RBAC, and establishes an HTTPS connection to the Kubelet daemon on port 10250. The Kubelet opens the container's local `/var/log/pods/.../0.log` file on host disk and streams the contents back through the API server to the developer's terminal.
+
+**Q3: What do the 'F' and 'P' stream tags mean in the CRI log format?**
+
+- **'F' (Full)**: Indicates a complete, terminated log line. The entire message fit within the runtime's single-line buffer.
+- **'P' (Partial)**: Indicates a fragmented log line. If an application prints an extremely long log message (such as a massive stack trace or a 50KB JSON payload) that exceeds the runtime's line buffer (typically 16KB), the runtime breaks the message across multiple lines, tagging partial chunks with 'P' and the final chunk with 'F'. Log aggregation agents (like Vector or FluentBit) use these tags to reassemble multi-chunk messages.
+
+**Q4: How does Kubelet manage log rotation, and what parameters control it?**
+
+Kubelet contains built-in log rotation controllers that monitor `/var/log/pods/`. It is controlled by two primary settings in `KubeletConfiguration`:
+1. `containerLogMaxSize` (default `10Mi`): The maximum size a container's `0.log` file can reach before Kubelet rotates it.
+2. `containerLogMaxFiles` (default `5`): The maximum number of rotated historical log files Kubelet retains before purging the oldest archive.
+
+**Q5: What is the Sidecar Logging Pattern, and why is the Node-Level Agent pattern preferred?**
+
+- **Sidecar Logging Pattern**: Deploys an additional helper container inside the same Pod to tail local log files and redirect them to `stdout`. It is required for legacy applications that cannot write directly to `stdout`. However, it duplicates container resource overhead and increases cluster CPU/RAM consumption.
+- **Node-Level Agent Pattern (Preferred)**: Deploys a single logging agent (e.g. FluentBit or Vector) per worker node as a **DaemonSet**. The single agent reads all container logs directly from `/var/log/pods/`, delivering maximum resource efficiency and decoupling logging configuration from application deployments.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that container runtimes capture stdout/stderr to `/var/log/pods/`
+- [ ] Know the CRI log format structure: `timestamp stream tag message`
+- [ ] Know what 'F' (Full) and 'P' (Partial) stream tags represent
+- [ ] Know that Kubelet rotates logs via `containerLogMaxSize` and `containerLogMaxFiles`
+- [ ] Know how `kubectl logs` streams data over Kubelet HTTPS port 10250
+- [ ] Know why Node-Level DaemonSets are preferred over Sidecar forwarders
+- [ ] Can stream live logs using `kubectl logs -f <pod-name>`

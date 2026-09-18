@@ -1,0 +1,301 @@
+---
+title: "Chapter 2 — Volcano, Kueue & YuniKorn Schedulers"
+sidebar_position: 2
+module: "Module 3.10 — Batch & HPC Scheduling"
+description: "Compare Kubernetes Batch & HPC schedulers — CNCF Kueue cloud-native queuing, Volcano HPC/AI engine, Apache YuniKorn big data scheduler, ClusterQueues, ResourceFlavors, and multi-tenant quota sharing."
+---
+
+# Chapter 2 — Volcano, Kueue & YuniKorn Batch Schedulers
+
+> **Goal:** Master the three leading enterprise Batch and High-Performance Computing (HPC) schedulers in the Kubernetes ecosystem — understanding the architectural differences between CNCF Kueue (queue manager layered atop `kube-scheduler`), Volcano (full replacement batch scheduler), and Apache YuniKorn (hierarchical big data scheduler), mastering Kueue primitives (`ClusterQueue`, `LocalQueue`, `ResourceFlavor`), and selecting the right scheduling engine for enterprise AI/ML and big data clusters.
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural trade-offs: Queue Management Layer (Kueue) vs Standalone Replacement Scheduler (Volcano, YuniKorn)
+> 2. How CNCF Kueue coordinates multi-tenant quotas, cohorts, and resource borrowing via `spec.suspend`
+> 3. How Volcano implements task-topology NUMA awareness, gang scheduling, and bin-packing
+> 4. How Apache YuniKorn powers multi-tenant Apache Spark and Flink workloads with hierarchical queues
+> 5. How `ResourceFlavor` models Spot vs On-Demand and GPU hardware tiers
+> 6. The complete enterprise decision matrix for Kubernetes batch scheduling
+
+---
+
+## Real-Life Analogy
+
+Think of batch schedulers as **different logistics coordination systems for a massive multi-airline international airport**:
+
+- **Default Kube-Scheduler (First-Come, First-Served Gate):** Airplanes line up on the taxiway. Whoever arrives at the runway first takes off. If an 8-engine jumbo jet (distributed ML job) arrives and finds only half a runway open, it sits across the tarmac, blocking all small regional flights behind it from taking off.
+- **CNCF Kueue (The Smart Terminal Gate Manager):** Kueue does **not** replace the air traffic controllers on the runway (`kube-scheduler`). Instead, it sits at the airport gates (`ClusterQueue`). It tells the jumbo jet: *"Stay parked at Gate 14 with your engines off (`spec.suspend: true`) until we verify that the runway AND all 8 engines have clear clearance."* It also lets Cargo Airlines borrow spare runway slots from Passenger Airlines when Passenger traffic is slow (**Cohort Borrowing**).
+- **Volcano (A Dedicated Military Airbase Scheduler):** A complete replacement for commercial air traffic control, optimized exclusively for supersonic fighter jet formations (**Gang Scheduling**), complex airborne mid-flight refueling coordination (**Task-Topology**), and extreme packing density (**Binpacking**).
+- **Apache YuniKorn (The Multi-Tenant Freight Railway Dispatcher):** Built for massive freight logistics (Spark/Flink data streams) with nested organizational hierarchies: `Company -> Division -> Team -> User`, guaranteeing fair-share bandwidth and dynamic quota reallocation across departments.
+
+---
+
+## Architecture Diagram
+
+```text
+               Batch Schedulers: Architecture Comparison
+
+ 1. CNCF Kueue Architecture (Layered Atop Standard Kube-Scheduler):
+ 
+ User Job ──► Submits to LocalQueue ──► ClusterQueue (Evaluates Quota & Cohorts)
+                                                │
+                                                ▼ (When Quota Available)
+                                    Patches Job `spec.suspend: false`
+                                                │
+                                                ▼
+                                    Standard `kube-scheduler`
+                                    (Binds Pods to Nodes)
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. Volcano / YuniKorn Architecture (Standalone Replacement Scheduler):
+ 
+ User Job ──► Volcano Job / Spark CRD
+                    │
+                    ▼
+          ┌────────────────────────────────────────────────────────┐
+          │ Volcano / YuniKorn Scheduler                           │
+          │ (Completely replaces default `kube-scheduler`)         │
+          │                                                        │
+          │ - Gang Scheduling / Task Topology                      │
+          │ - Hierarchical Fair-Share Queues                       │
+          │ - Direct Node Binding                                  │
+          └────────────────────────┬───────────────────────────────┘
+                                   │
+                                   ▼
+          Bypasses kube-scheduler ──► Binds directly to Worker Nodes!
+```
+
+---
+
+## Comprehensive Scheduler Comparison Matrix
+
+```text
+ ┌──────────────────────┬─────────────────────────┬─────────────────────────┬─────────────────────────┐
+ │ Feature / Capability │ CNCF Kueue              │ Volcano (CNCF Incubating│ Apache YuniKorn         │
+ │──────────────────────┼─────────────────────────┼─────────────────────────┼─────────────────────────┤
+ │ **Architecture**     │ Queue Manager (Works    │ Standalone Replacement  │ Standalone Replacement  │
+ │                      │ WITH `kube-scheduler`)  │ Custom Scheduler        │ Custom Scheduler        │
+ │ **Target Workload**  │ AI/ML, PyTorch, Ray,    │ HPC, MPI, AI/ML,        │ Big Data, Apache Spark, │
+ │                      │ Batch Jobs, Slurm       │ Gene Sequencing         │ Apache Flink, Hadoop    │
+ │ **Scale-to-Zero**    │ YES (via `spec.suspend`)│ YES (Custom Job CRDs)   │ YES (Queue Management)  │
+ │ **Cohort Borrowing** │ YES (Dynamic lending)   │ YES (Overcommit plugins)│ YES (Hierarchical Fair) │
+ │ **Cluster Disruption**│ ZERO (Standard K8s API) │ High (Replaces core K8s)│ Medium (Replaces sched) │
+ │ **Ecosystem Support**│ KubeFlow, Ray, JobSet,  │ VolcanoJob, TensorFlow, │ Spark-on-K8s Operator,  │
+ │                      │ MPI Operator            │ MindSpore               │ Flink Kubernetes        │
+ └──────────────────────┴─────────────────────────┴─────────────────────────┴─────────────────────────┘
+```
+
+---
+
+## Deep Dive: CNCF Kueue Core Primitives
+
+Kueue has emerged as the CNCF standard for batch scheduling because it **does not replace the default Kubernetes scheduler**, ensuring 100% compatibility with all standard cluster tools, admission webhooks, and cloud providers.
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Kueue Primitive      │ Scope & Responsibility                                                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`ResourceFlavor`** │ Cluster-scoped. Models hardware variations: On-Demand vs Spot, A100 vs H100.│
+ │ **`ClusterQueue`**   │ Cluster-scoped. Manages shared pools of ResourceFlavors, quotas, and cohorts│
+ │ **`LocalQueue`**     │ Namespaced. The entry point where tenant developers submit Jobs.            │
+ │ **`Workload`**       │ Automatically generated object representing the Job's resource requirements.│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Cohorts & Dynamic Quota Borrowing in Kueue
+
+In enterprise clusters, different departments (e.g. `team-nlp` and `team-vision`) have dedicated GPU quotas. However, if `team-vision` is idle over the weekend, `team-nlp` should be permitted to **borrow their unused GPUs**:
+
+```text
+               Cohort Resource Borrowing Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Cohort: "ai-research-pool" (Total Shared Capacity: 64 GPUs)            │
+ │                                                                        │
+ │ ┌──────────────────────────────┐      ┌──────────────────────────────┐ │
+ │ │ ClusterQueue: "nlp-team"     │      │ ClusterQueue: "vision-team"  │ │
+ │ │ Nominal Quota: 32 GPUs       │      │ Nominal Quota: 32 GPUs       │ │
+ │ │ Current Demand: 50 GPUs      │      │ Current Demand: 0 GPUs (Idle)│ │
+ │ └──────────────┬───────────────┘      └──────────────┬───────────────┘ │
+ │                │                                     │                 │
+ │                └──────── Borrowing 18 GPUs ──────────┘                 │
+ │                                                                        │
+ │ Result: NLP team runs 50 GPU workloads immediately!                    │
+ │ (When Vision team wakes up, Kueue gracefully reclaims capacity).       │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Kueue Configuration
+
+```yaml
+# 1. Hardware ResourceFlavor
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: nvidia-h100-gpu
+spec:
+  nodeLabels:
+    instance-type: p5.48xlarge
+    accelerator: nvidia-h100
+---
+# 2. ClusterQueue with Cohort Sharing & Borrowing
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: nlp-research-queue
+spec:
+  cohort: "ai-research-cohort"      # Shared cohort for borrowing!
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+    flavors:
+    - name: nvidia-h100-gpu
+      resources:
+      - name: "nvidia.com/gpu"
+        nominalQuota: 32            # Guaranteed base quota
+        borrowingLimit: 32          # Can borrow up to 32 additional GPUs
+  preemption:
+    reclaimWithinCohort: Any
+    borrowWithinCohort:
+      policy: LowerPriority
+---
+# 3. LocalQueue in Developer Namespace
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: team-local-queue
+  namespace: nlp-dev
+spec:
+  clusterQueue: nlp-research-queue
+---
+# 4. Job Submitted to Kueue LocalQueue
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llama-finetune
+  namespace: nlp-dev
+  labels:
+    kueue.x-k8s.io/queue-name: team-local-queue    # Enqueues into Kueue!
+spec:
+  suspend: true                                    # Kueue manages activation!
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+        resources:
+          requests:
+            nvidia.com/gpu: "8"
+          limits:
+            nvidia.com/gpu: "8"
+```
+
+---
+
+## Decision Framework: Which Scheduler to Choose?
+
+```text
+ ┌────────────────────────────────────────────────────────┬─────────────────────────────┐
+ │ Enterprise Scenario & Requirements                    │ Recommended Technology      │
+ │────────────────────────────────────────────────────────┼─────────────────────────────┤
+ │ - Cloud-native AI/ML using Ray, PyTorch, or JobSet     │ **CNCF Kueue**              │
+ │ - Want multi-tenant queueing without replacing default │ (Recommended standard)      │
+ │   scheduler or breaking cloud managed control planes.  │                             │
+ │────────────────────────────────────────────────────────┼─────────────────────────────┤
+ │ - Pure on-premise High-Performance Computing (HPC)     │ **Volcano**                 │
+ │ - Require extreme NUMA node locality, MPI job plugins, │                             │
+ │   and custom bare-metal bin-packing.                   │                             │
+ │────────────────────────────────────────────────────────┼─────────────────────────────┤
+ │ - Running large Apache Spark, Apache Flink, or Hadoop  │ **Apache YuniKorn**         │
+ │   big data clusters migrating from YARN to Kubernetes. │                             │
+ └────────────────────────────────────────────────────────┴─────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Simulating Kueue Queue Management & Job Suspension
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace kueue-lab
+
+# Step 2: Deploy a suspended batch job (simulating queue management)
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: queued-ml-job
+  namespace: kueue-lab
+  labels:
+    kueue.x-k8s.io/queue-name: research-queue
+spec:
+  suspend: true    # <--- Created in suspended queue state!
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: processor
+        image: alpine:latest
+        command: ["sh", "-c", "echo 'Job admitted to cluster! Processing...'; sleep 10; echo 'Done!'"]
+EOF
+
+# Step 3: Verify the Job is SUSPENDED (0 Pods created!)
+kubectl get jobs -n kueue-lab
+kubectl get pods -n kueue-lab
+# Notice: COMPLETIONS is 0/1, and ZERO Pods are running!
+
+# Step 4: Simulate Kueue queue admission (Patch suspend: false)
+echo "Simulating Kueue quota clearance..."
+kubectl patch job queued-ml-job -n kueue-lab -p '{"spec":{"suspend":false}}'
+
+# Step 5: Watch the Job activate and execute its Pods
+kubectl get pods -n kueue-lab -w
+
+# Step 6: Verify successful completion
+kubectl get job queued-ml-job -n kueue-lab
+
+# Step 7: Clean up lab
+kubectl delete namespace kueue-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNCF Kueue, and how does its architecture differ from Volcano and YuniKorn?**
+
+Kueue is a cloud-native queue manager that operates **on top of the default `kube-scheduler`** rather than replacing it. It manages job admission, multi-tenant fair-share quotas, cohorts, and resource borrowing by holding batch Jobs in a suspended state (`spec.suspend: true`). Once quota is available, Kueue unsuspends the Job (`suspend: false`), delegating node placement to the standard `kube-scheduler`. Volcano and YuniKorn are standalone custom schedulers that completely replace the `kube-scheduler` binary.
+
+**Q2: What is a `ClusterQueue` in Kueue, and what are `Cohorts`?**
+
+A `ClusterQueue` is a cluster-scoped Kueue resource that defines resource quotas (CPU, memory, GPUs) across multiple `ResourceFlavors`. A `Cohort` groups multiple `ClusterQueues` into a shared resource-lending pool. If one queue underutilizes its nominal quota, other queues in the same cohort are permitted to borrow the unused capacity up to a configured `borrowingLimit`, maximizing overall cluster GPU/CPU utilization.
+
+**Q3: What is a `ResourceFlavor` in Kueue?**
+
+A `ResourceFlavor` models architectural variations and pricing tiers of identical computing resources within a cluster (for example, distinguishing between On-Demand instances vs Spot/Preemptible instances, or NVIDIA A100 vs H100 GPUs). A `ClusterQueue` can specify fallback tiers across flavors (e.g. *"Try to schedule on Spot instances first; if full, fall back to On-Demand with a lower borrowing limit"*).
+
+**Q4: When is Volcano preferred over other Kubernetes batch schedulers?**
+
+Volcano is preferred in pure High-Performance Computing (HPC), bioinformatics, and deep learning environments where workloads require specialized hardware-aware algorithms—such as NUMA node CPU core affinity, GPU NVLink topology awareness, task-topology co-location, and native MPI plugins. Volcano replaces `kube-scheduler` to provide ultra-low-latency, high-throughput gang scheduling on bare-metal clusters.
+
+**Q5: Why is Apache YuniKorn widely used for Apache Spark and Flink on Kubernetes?**
+
+Apache YuniKorn was designed specifically for big data analytics engines migrating from Apache Hadoop YARN to Kubernetes. It provides hierarchical nested queues (`root.engineering.data-science.spark`), fine-grained multi-tenant fair sharing, dynamic resource bin-packing, and native integration with the Spark-on-Kubernetes Operator, allowing data platform teams to replicate enterprise Hadoop multi-tenancy on Kubernetes.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Kueue is a queue manager layered atop `kube-scheduler`
+- [ ] Know that Volcano and YuniKorn are standalone replacement schedulers
+- [ ] Know the 4 Kueue primitives: `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, `Workload`
+- [ ] Know how Kueue uses `spec.suspend` to hold jobs until quotas clear
+- [ ] Know how Cohorts enable dynamic resource borrowing between teams
+- [ ] Know when to choose Kueue (Cloud AI), Volcano (HPC/NUMA), and YuniKorn (Spark/Big Data)
+- [ ] Can view Kueue queues using `kubectl get clusterqueue,localqueue -A`

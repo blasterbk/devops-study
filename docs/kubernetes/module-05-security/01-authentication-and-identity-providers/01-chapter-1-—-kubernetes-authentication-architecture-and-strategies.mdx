@@ -1,0 +1,260 @@
+---
+title: "Chapter 1 — Kubernetes Authentication Architecture"
+sidebar_position: 1
+module: "Module 5.1 — Authentication & Identity"
+description: "Master the Kubernetes API Server authentication architecture — user accounts vs ServiceAccounts, sequential authentication evaluation pipelines, and why Kubernetes has no User API resource in etcd."
+---
+
+# Chapter 1 — Kubernetes Authentication Architecture & Strategies
+
+> **Goal:** Master the core architecture of the Kubernetes API Server authentication subsystem — understanding how incoming HTTP requests are identified, the architectural decoupling between human Users and in-cluster ServiceAccounts, why Kubernetes intentionally lacks a native `User` resource in `etcd`, the sequential evaluation chain across authentication plugins, and how the `UserInfo` context flows into the authorization engine.
+>
+> By the end of this chapter, you will understand:
+> 1. The three-stage API request lifecycle: Authentication $\to$ Authorization $\to$ Admission Control
+> 2. The distinction between external Human Users and in-cluster ServiceAccounts
+> 3. Why Kubernetes does not store User objects inside `etcd`
+> 4. The 5 core authentication strategies: X.509 Certificates, OIDC, Webhook Tokens, Authenticating Proxy, and Anonymous
+> 5. How the API server evaluates multiple authentication modules sequentially
+> 6. How to diagnose authentication rejections and inspect `UserInfo` structures
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes API Server authentication as the **security checkpoint at an international border control gate**:
+
+- **Authentication (The Passport Control Officer):** When you approach the border booth (API Server), you present an identity document (Bearer Token, X.509 Client Certificate, or OIDC JWT). The officer inspects the document solely to answer one question: *"Who are you?"* (e.g. *"You are Alice from Engineering"*).
+- **No Citizen Database in City Hall (Why Kubernetes has no `User` object):** The border checkpoint does not maintain a local municipal birth registry for foreign tourists (`etcd`). It trusts third-party credentials signed by recognized certificate authorities or enterprise identity providers (Okta, Keycloak, Active Directory).
+- **ServiceAccounts (The Building Staff Security Badges):** Unlike external human tourists, the border facility's own maintenance robots and elevators (in-cluster Pods) have internal building badges (`ServiceAccounts`) issued and tracked directly by the facility manager.
+- **Authorization (The Customs Baggage Inspector):** Only after the passport officer confirms you are Alice does the customs inspector ask: *"Are you allowed to bring this container of cargo into Zone B?"* (**RBAC Authorization**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes API Server Request Authentication Pipeline
+
+ Incoming TLS HTTP Request (`kubectl`, CI/CD, Pod)
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: Authentication Pipeline (Evaluated Sequentially)       │
+ │                                                                        │
+ │ 1. X.509 Client Certificate Authenticator                              │
+ │    - Validates TLS client cert against cluster CA                      │
+ │    - Extracts CN=alice, O=devs, O=ops ──► SUCCESS!                     │
+ │                                                                        │
+ │ 2. OIDC Token Authenticator (If cert not provided)                     │
+ │    - Validates Bearer JWT signature against IdP JWKS endpoint          │
+ │                                                                        │
+ │ 3. Webhook Token Authenticator (If OIDC not provided)                  │
+ │    - Sends TokenReview API call to external auth service               │
+ │                                                                        │
+ │ 4. ServiceAccount Token Authenticator                                  │
+ │    - Validates bound JWT token signed by ServiceAccount issuer key     │
+ │                                                                        │
+ │ 5. Anonymous Authenticator (Fallback if enabled)                       │
+ │    - Assigns user: `system:anonymous`, group: `system:unauthenticated` │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Returns UserInfo Object:
+                                    │ { Username: "alice", Groups: ["devs"] }
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Step 2: Authorization Stage (RBAC / Webhook / Node Authorizer)         │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Step 3: Mutating & Validating Admission Controllers                    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Write to `etcd` (Success)                                              │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3-Stage API Request Lifecycle
+
+Every HTTP request sent to `kube-apiserver` must pass through three distinct gates in strict order:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Gate                 │ Question Answered & Operational Mechanism                                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Authentication**│ **"Who is making this request?"**                                           │
+ │                      │ Extracts and verifies credentials. Returns `UserInfo` (username, groups, UID│
+ │                      │ extra attributes). Returns HTTP `401 Unauthorized` if invalid.              │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Authorization** │ **"Is this identified user allowed to perform this action?"**               │
+ │                      │ Evaluates RBAC rules against the verb, resource, namespace, and subresource.│
+ │                      │ Returns HTTP `403 Forbidden` if denied.                                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Admission**     │ **"Is the requested object payload compliant and secure?"**                 │
+ │    **Control**       │ Executes Mutating webhooks (injects sidecars) and Validating webhooks       │
+ │                      │ (enforces Pod Security Standards / CEL policies).                           │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Human Users vs ServiceAccounts
+
+Kubernetes deliberately distinguishes between two categories of identities:
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Human User Accounts             │ ServiceAccounts                 │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Target Persona**        │ Human developers, SREs, admins  │ In-cluster software processes   │
+ │                           │ executing `kubectl` commands.   │ (Pods, Controllers, Operators). │
+ │ **API Object in `etcd`**  │ **NONE.** No `User` resource    │ **YES.** Managed via standard   │
+ │                           │ exists in Kubernetes.           │ `v1.ServiceAccount` API.        │
+ │ **Management Layer**      │ Delegated to external IdPs      │ Managed inside Kubernetes       │
+ │                           │ (Okta, Keycloak, Azure AD, PKI).│ namespaces by administrators.   │
+ │ **Credential Type**       │ X.509 Client Certs, OIDC JWTs.  │ Short-lived Bound JWT tokens.   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+```text
+ Why Kubernetes has no "User" Resource:
+ 1. Centralized Enterprise SSO: Enterprise companies already manage thousands of employees 
+    in LDAP, Active Directory, Okta, or Google Workspace. Duplicating user records inside etcd 
+    would create synchronization lag, stale accounts, and severe security liabilities.
+ 2. Ephemeral Cluster Architecture: Kubernetes clusters are disposable compute infrastructure; 
+    identity management belongs in an authoritative, external Identity Provider (IdP).
+```
+
+---
+
+## The Sequential Authentication Evaluation Pipeline
+
+When `kube-apiserver` receives an API request, it evaluates enabled authentication plugins in a **sequential chain**:
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ The Sequential Evaluation Rule:                                                                    │
+ ├────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1. The API server calls the first configured authenticator in the chain.                           │
+ │ 2. If the authenticator VALIDATES the credential: The chain immediately TERMINATES, the request    │
+ │    is marked authenticated, and its `UserInfo` payload is passed to the authorization engine.      │
+ │ 3. If the authenticator cannot identify the credential (e.g. no bearer token present): It PASSES   │
+ │    the request to the next authenticator in the chain.                                             │
+ │ 4. If ALL authenticators fail and anonymous authentication is ENABLED (`--anonymous-auth=true`):   │
+ │    The request is assigned user `system:anonymous` and group `system:unauthenticated`.             │
+ │ 5. If ALL authenticators fail and anonymous authentication is DISABLED: The API server returns     │
+ │    HTTP `401 Unauthorized`.                                                                        │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Overview of Authentication Strategies
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Strategy             │ Core Mechanism & Enterprise Recommendation                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **X.509 Client**     │ TLS handshake client certificate. `CN` maps to username, `O` maps to groups.│
+ │ **Certificates**     │ Standard for cluster bootstrap, admin break-glass, and internal control-plane│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **OpenID Connect**   │ OAuth2/OIDC JWT bearer tokens signed by external IdPs (Keycloak, Okta, Dex).│
+ │ **(OIDC)**           │ **Enterprise Standard for Human Developers.** Supports MFA and SSO.         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Webhook Token**    │ API server delegates token validation to a remote HTTP service via          │
+ │                      │ `TokenReview` API calls. Used by AWS IAM Authenticator and Azure AKS auth.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Authenticating**   │ API server trusts a reverse proxy (e.g. Envoy, Authelia). Proxy inspects    │
+ │ **Proxy**            │ auth headers (`X-Remote-User`, `X-Remote-Group`) and forwards to API server.│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **ServiceAccount**   │ Validates short-lived projected JWT tokens injected into Pods by Kubelet.   │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The `UserInfo` Internal Context Structure
+
+Once authenticated, the API server constructs an in-memory `UserInfo` object passed to RBAC:
+
+```go
+type UserInfo interface {
+    GetName() string              // e.g. "alice@company.com"
+    GetUID() string               // Unique ID string
+    GetGroups() []string          // e.g. ["system:authenticated", "dev-team", "billing-admins"]
+    GetExtra() map[string][]string// Custom claims from OIDC or Webhooks
+}
+```
+
+```text
+ Built-in Special Groups:
+ - `system:authenticated`: Automatically assigned to EVERY successfully authenticated request.
+ - `system:unauthenticated`: Assigned to requests that fail all authenticators (Anonymous).
+ - `system:masters`: Superuser group that hard-bypasses all RBAC rules with full cluster-admin rights!
+```
+
+---
+
+## Hands-On Lab: Testing Authentication & Anonymous Probes
+
+```bash
+# Step 1: Query API server version anonymously (Public endpoint)
+curl -k -s https://kubernetes.default.svc/version 2>/dev/null || kubectl get --raw /version
+
+# Step 2: Test self-authentication context via kubectl
+kubectl auth can-i --list
+
+# Step 3: Impersonate a non-existent user to verify RBAC rejection
+kubectl auth can-i create pods --as=fake-developer --namespace=default
+# Output should be 'no' because fake-developer has zero RBAC rolebindings!
+
+# Step 4: Verify built-in groups with impersonation
+kubectl auth can-i get pods --as=alice --as-group=system:authenticated -n default
+
+# Step 5: Test superuser group impersonation (system:masters)
+kubectl auth can-i "*" "*" --as=break-glass --as-group=system:masters
+# Output: 'yes' (system:masters bypasses all RBAC restrictions!)
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the three distinct processing stages an API request passes through in the Kubernetes API server?**
+
+The three stages are:
+1. **Authentication**: Verifies the identity of the caller (extracting username, groups, and UID from client certificates, bearer tokens, or OIDC JWTs) and returns a `UserInfo` context.
+2. **Authorization**: Evaluates whether the authenticated `UserInfo` has permission to execute the requested action (`verb`) against the target `resource` in the target `namespace` using RBAC, Node, or Webhook authorizers.
+3. **Admission Control**: Evaluates and optionally mutates the object payload against cluster policies (such as Pod Security Admission or validating CEL policies) before writing to `etcd`.
+
+**Q2: Why does Kubernetes have no `User` API resource stored in `etcd`?**
+
+Kubernetes intentionally omits a native `User` resource to avoid duplicating identity management. In enterprise environments, user lifecycles (provisioning, role changes, multi-factor authentication, deboarding) are managed centrally in authoritative Identity Providers (Active Directory, LDAP, Okta, Keycloak). Storing user records in `etcd` would create synchronization drift and security vulnerabilities. Kubernetes instead accepts externally signed, verifiable credentials (OIDC JWTs or X.509 certificates).
+
+**Q3: How does the Kubernetes API server handle multiple configured authentication plugins?**
+
+The API server evaluates authentication plugins **sequentially** in the order they are configured. When a request arrives, the first authenticator inspects the credentials. If it successfully validates the client, evaluation halts immediately, and the authenticated `UserInfo` is returned. If an authenticator does not recognize the credential, it passes the request down the chain to the next authenticator. If all authenticators fail and anonymous auth is disabled, the API server returns HTTP `401 Unauthorized`.
+
+**Q4: What is the difference between `system:authenticated` and `system:unauthenticated` groups?**
+
+- `system:authenticated`: A built-in group automatically appended by the API server to the `UserInfo` structure of **any request that successfully passes any authentication method**.
+- `system:unauthenticated`: A built-in group assigned to requests when all authentication methods fail or when no credentials are provided (if `--anonymous-auth=true` is enabled).
+
+**Q5: What is the `system:masters` group, and why is it considered dangerous in production?**
+
+`system:masters` is a hardcoded superuser group built into Kubernetes. By default, the `cluster-admin` ClusterRole is bound to `system:masters`. Members of `system:masters` bypass all RBAC authorization checks and have unrestricted root access across the entire cluster. It cannot be revoked via RBAC; access can only be restricted by carefully protecting the cluster root CA and avoiding issuing client certificates with `O=system:masters`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 3 request gates: Authentication $\to$ Authorization $\to$ Admission Control
+- [ ] Know why Kubernetes does not store `User` objects in `etcd`
+- [ ] Know the difference between external Human Users and in-cluster ServiceAccounts
+- [ ] Know that authentication plugins are evaluated sequentially until first success
+- [ ] Know that `system:authenticated` is automatically added to all valid identities
+- [ ] Know that `system:masters` is an unrestricted superuser group
+- [ ] Can test authorization for any user using `kubectl auth can-i <verb> <resource> --as=<user>`

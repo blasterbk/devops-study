@@ -1,0 +1,291 @@
+---
+title: "Chapter 2 — Linkerd"
+sidebar_position: 2
+module: "Module 2.9 — Service Mesh"
+description: "Deep dive into Linkerd — the lightweight, Rust-based service mesh. Covers its micro-proxy architecture (linkerd2-proxy), zero-config mTLS, HTTP/2 load balancing with EWMA, and how it differs from Istio in complexity and operational footprint."
+---
+
+# Chapter 2 — Linkerd
+
+> **Goal:** Understand Linkerd's design philosophy of simplicity and safety, how its Rust-based micro-proxy differs from Envoy, how it delivers zero-config mTLS for all meshed traffic, and when to choose Linkerd over Istio.
+>
+> By the end of this chapter, you will understand:
+> 1. Linkerd's design philosophy: simplicity, security, performance
+> 2. The linkerd2-proxy (Rust micro-proxy) vs Envoy — key differences
+> 3. Automatic mTLS for all meshed traffic — no configuration needed
+> 4. HTTP/2 and gRPC load balancing with EWMA (Exponential Weighted Moving Average)
+> 5. Linkerd's control plane: destination, identity, proxy-injector
+> 6. When to choose Linkerd vs Istio
+
+---
+
+## Real-Life Analogy
+
+If Istio is a **full diplomatic corps** (powerful, feature-rich, complex), Linkerd is a **specialized security escort service**:
+
+Every employee (Pod) gets a personal escort (linkerd2-proxy sidecar). The escort's job is narrow but done exceptionally well: authenticate every conversation (mTLS), route intelligently (EWMA load balancing), and report accurately (metrics). No speech writers, no protocol officers, no elaborate ceremony — just reliable, secure, efficient communication.
+
+The escort is also incredibly lightweight — barely noticeable, consuming minimal resources. You trust them completely because the code is simple enough to audit fully.
+
+---
+
+## Architecture Diagram
+
+```text
+              Linkerd Architecture
+
+  Control Plane (linkerd namespace):
+  ┌────────────────────────────────────────────────────────────┐
+  │  destination:   Service discovery, traffic policies        │
+  │  identity:      Certificate authority (SPIFFE certs)       │
+  │  proxy-injector: Webhook — injects linkerd2-proxy into Pods│
+  └──────────────────────────────┬─────────────────────────────┘
+                                 │ gRPC policy API
+  Data Plane:                    ▼
+  Pod A                         Pod B
+  ┌──────────────────────┐  ┌──────────────────────────────┐
+  │  App (port 8080)     │  │  App (port 8080)             │
+  │  ↕ (iptables)        │  │  ↕ (iptables)                │
+  │  linkerd2-proxy      │──│  linkerd2-proxy              │
+  │  (Rust, ~4MB binary) │  │  (mTLS + EWMA LB)            │
+  └──────────────────────┘  └──────────────────────────────┘
+
+  Key: linkerd2-proxy is written in Rust (not C++ like Envoy)
+       ~4MB binary, ~10MB memory footprint per proxy
+       (Envoy: ~70MB memory per proxy)
+```
+
+---
+
+## Installing Linkerd
+
+```bash
+# Install the Linkerd CLI
+curl --proto '=https' --tlsv1.2 -sSfL https://run.linkerd.io/install | sh
+export PATH=$HOME/.linkerd2/bin:$PATH
+
+# Pre-flight checks
+linkerd check --pre
+
+# Install CRDs
+linkerd install --crds | kubectl apply -f -
+
+# Install Linkerd control plane
+linkerd install | kubectl apply -f -
+
+# Wait and verify
+linkerd check
+
+# Install viz extension (Prometheus + dashboard)
+linkerd viz install | kubectl apply -f -
+linkerd viz check
+
+# Open dashboard
+linkerd viz dashboard
+```
+
+---
+
+## Sidecar Injection
+
+```bash
+# Option 1: Namespace-level injection annotation
+kubectl annotate namespace production linkerd.io/inject=enabled
+
+# Option 2: Per-deployment annotation
+kubectl annotate deployment api-deployment linkerd.io/inject=enabled
+
+# Option 3: Explicit in YAML
+metadata:
+  annotations:
+    linkerd.io/inject: enabled
+
+# Restart existing Deployments to inject proxies
+kubectl rollout restart deployment -n production
+
+# Verify injection (2 containers: app + linkerd-proxy)
+kubectl get pods -n production
+# api-xxx   2/2   Running
+```
+
+---
+
+## Zero-Config mTLS
+
+Linkerd's most celebrated feature — all meshed traffic is automatically mTLS encrypted and authenticated with **zero configuration**:
+
+```text
+How it works:
+  1. identity control plane acts as a Certificate Authority
+  2. Each linkerd2-proxy requests a SPIFFE certificate on startup:
+     SPIFFE URI: spiffe://cluster.local/ns/production/sa/api-service-account
+  3. Proxy presents this cert for every outbound connection
+  4. Receiving proxy verifies the cert against the trust anchor
+  5. If verified: mTLS connection established
+  6. If not verified: connection rejected
+
+No ServiceEntry, no PeerAuthentication, no DestinationRule.
+No YAML. Automatic. Always on.
+```
+
+```bash
+# Verify mTLS is active for a service
+linkerd viz edges -n production
+# SRC                    DST                    TLS
+# frontend               api-service            √ (mTLS)
+# api-service            postgres               √ (mTLS)
+# loadgenerator          frontend               √ (mTLS)
+
+# Check certificate identity for a Pod
+linkerd viz tap -n production deploy/api-deployment | grep tls
+# tls=true src_id=spiffe://cluster.local/ns/production/sa/api-sa
+```
+
+---
+
+## EWMA Load Balancing
+
+Linkerd uses **EWMA (Exponential Weighted Moving Average)** for latency-aware load balancing:
+
+```text
+Standard Kubernetes kube-proxy:
+  Round-robin at TCP connection level
+  No awareness of backend latency or queue depth
+
+Linkerd EWMA:
+  For each request, measures the backend's response latency
+  Maintains exponentially weighted moving average of latency per endpoint
+  Routes new requests to the endpoint with the LOWEST estimated latency
+  Adapts in real-time: if one Pod becomes slow, traffic shifts away immediately
+
+Effect:
+  - Better tail latency (P99, P999)
+  - Automatic "unhealthy" backend avoidance
+  - No need for explicit circuit breaker config for many cases
+```
+
+---
+
+## Linkerd ServiceProfile
+
+ServiceProfiles add route-level metrics and retries per service:
+
+```yaml
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: api-service.production.svc.cluster.local
+  namespace: production
+spec:
+  routes:
+  - name: GET /api/users
+    condition:
+      method: GET
+      pathRegex: /api/users(/.*)?
+    responseClasses:
+    - condition:
+        status:
+          min: 500
+          max: 599
+      isFailure: true   # Mark 5xx as failure for success rate metrics
+
+  - name: POST /api/orders
+    condition:
+      method: POST
+      pathRegex: /api/orders
+    isRetryable: true     # Retry on failure
+    timeout: 10s          # Per-request timeout
+    retryBudget:
+      retryRatio: 0.2     # At most 20% additional requests from retries
+      minRetriesPerSecond: 10
+      ttl: 10s
+```
+
+---
+
+## Linkerd vs Istio Comparison
+
+| Feature | Linkerd | Istio |
+|---------|---------|-------|
+| **Proxy** | linkerd2-proxy (Rust, ~4MB) | Envoy (C++, ~70MB) |
+| **Memory/proxy** | ~10-20MB | ~50-100MB |
+| **mTLS** | Automatic, zero-config | Requires PeerAuthentication |
+| **L7 traffic mgmt** | ServiceProfile (basic) | VirtualService (advanced) |
+| **L7 policy (HTTP method/path)** | Via ServiceProfile | Via VirtualService + CiliumNetworkPolicy |
+| **Complexity** | Low (simple mental model) | High (many CRDs, concepts) |
+| **Protocol support** | HTTP/1, HTTP/2, gRPC, TCP | All + WebSocket, MongoDB protocol |
+| **WebAssembly extensions** | Not supported | Supported (WASM plugins) |
+| **Multi-cluster** | Linkerd-multicluster | Istio multi-cluster (complex) |
+| **Best for** | Teams wanting simple, secure mesh | Teams needing full traffic mgmt |
+
+---
+
+## Hands-On: Linkerd Debugging
+
+```bash
+# 1. Check proxy status
+linkerd check -n production
+
+# 2. View live traffic (tap)
+linkerd viz tap -n production deploy/api-deployment
+# Streams all requests through the proxy in real-time
+
+# 3. Per-route metrics
+linkerd viz routes -n production deploy/api-deployment
+# ROUTE                  SUCCESS   RPS   LATENCY_P50   LATENCY_P99
+# GET /api/users          99.2%    45.2   12ms          89ms
+# POST /api/orders        98.1%    12.1   23ms          145ms
+
+# 4. Top — live traffic summary
+linkerd viz top -n production
+
+# 5. Check mTLS status
+linkerd viz edges -n production
+
+# 6. Stat — golden signals per deployment
+linkerd viz stat deploy -n production
+# NAME           MESHED   SUCCESS    RPS   LATENCY_P50   LATENCY_P99
+# api-service    3/3      99.5%     45.2     12ms          89ms
+
+# 7. Check proxy logs
+kubectl logs -n production api-xxx -c linkerd-proxy | tail -20
+
+# 8. Debug with debug container
+linkerd diagnostics proxy-metrics -n production pod/api-xxx
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is linkerd2-proxy and why was it written in Rust instead of using Envoy?**
+
+linkerd2-proxy is a purpose-built micro-proxy written in Rust, designed exclusively for the Linkerd service mesh. It was written in Rust (not using Envoy) for several reasons: (1) **Memory safety** — Rust's ownership model prevents entire classes of bugs (buffer overflows, use-after-free) without garbage collection overhead; (2) **Footprint** — the binary is ~4MB vs Envoy's ~70MB, using ~10-20MB RAM vs 50-100MB per proxy; (3) **Simplicity** — purpose-built for Linkerd's specific needs, with a simpler codebase that's easier to audit and maintain than Envoy's general-purpose architecture.
+
+**Q2: How does Linkerd implement mTLS without any YAML configuration?**
+
+Linkerd's identity control plane acts as a Certificate Authority. When a linkerd2-proxy starts, it automatically requests an X.509 certificate from the identity component using its Kubernetes ServiceAccount credential as proof of identity. The certificate uses SPIFFE URI format: `spiffe://cluster.local/ns/<ns>/sa/<serviceaccount>`. The proxy presents this certificate for all outbound connections. The receiving proxy verifies it against the trust anchor (the cluster's root CA). This entire process is automatic — no PeerAuthentication, no DestinationRule, no service-level config needed.
+
+**Q3: What is EWMA load balancing and why is it better than round-robin for microservices?**
+
+EWMA (Exponential Weighted Moving Average) load balancing routes each request to the backend with the lowest exponentially-weighted moving average response latency. Unlike round-robin (which ignores backend performance), EWMA continuously measures actual response latency per backend and shifts traffic away from slow or overloaded endpoints. This is especially valuable in microservices where backends can have high latency variability — EWMA automatically avoids the slow Pod in real-time, improving tail latency (P99/P999) without explicit circuit breaker configuration.
+
+**Q4: What is a Linkerd ServiceProfile and what does it add?**
+
+A ServiceProfile is a Linkerd CRD that adds per-route configuration for a Service. It enables: per-route metrics (success rate, latency broken down by route/method/path), retries (mark certain responses as failures and retry them), per-request timeouts, and a retry budget (limits total retry overhead as a percentage of original requests). Without a ServiceProfile, Linkerd tracks metrics at the service level only. With it, you get method+path-level visibility — useful for identifying which specific API endpoint has high error rates.
+
+**Q5: When would you choose Linkerd over Istio?**
+
+Choose Linkerd when: (1) you prioritize simplicity — Linkerd has fewer CRDs and a simpler mental model; (2) resource efficiency matters — Linkerd uses ~10x less memory per proxy than Istio/Envoy, critical for large clusters or resource-constrained nodes; (3) you primarily need mTLS and golden signal metrics with minimal configuration; (4) your team is small and maintaining complex Istio configuration is a burden. Choose Istio when: you need advanced L7 traffic management (VirtualService canary, fault injection, header-based routing), WASM extensions, or multi-protocol support beyond HTTP/gRPC.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know linkerd2-proxy is Rust-based (~4MB, ~10MB RAM) vs Envoy (C++, ~70MB RAM)
+- [ ] Know Linkerd's control plane: destination (discovery), identity (CA), proxy-injector (webhook)
+- [ ] Know mTLS is automatic — no PeerAuthentication/DestinationRule YAML needed
+- [ ] Know EWMA routes to lowest-latency backend (vs round-robin) — better tail latency
+- [ ] Know ServiceProfile adds per-route metrics, retries, timeouts, and retry budgets
+- [ ] Know when to choose Linkerd: simplicity, low resource overhead, automatic mTLS
+- [ ] Can debug with `linkerd viz tap`, `linkerd viz routes`, `linkerd viz stat`, `linkerd viz edges`

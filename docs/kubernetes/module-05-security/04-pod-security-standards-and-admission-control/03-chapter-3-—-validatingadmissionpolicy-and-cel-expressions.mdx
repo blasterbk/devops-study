@@ -1,0 +1,309 @@
+---
+title: "Chapter 3 — ValidatingAdmissionPolicy & CEL"
+sidebar_position: 3
+module: "Module 5.4 — Pod Security & Admission"
+description: "Master in-process Kubernetes admission control with ValidatingAdmissionPolicy (GA 1.30) — Common Expression Language (CEL) syntax, eliminating webhook latency, and parameterized policy bindings."
+---
+
+# Chapter 3 — ValidatingAdmissionPolicy & CEL Expressions
+
+> **Goal:** Master native, in-process admission control in Kubernetes using `ValidatingAdmissionPolicy` (GA in Kubernetes 1.30) — understanding how Common Expression Language (CEL) replaces complex out-of-process validating webhooks (OPA Gatekeeper, Kyverno), eliminating network latency and webhook failure outages, authoring powerful CEL validation rules, and configuring parameterized bindings.
+>
+> By the end of this chapter, you will understand:
+> 1. Why in-process `ValidatingAdmissionPolicy` is superior to out-of-process HTTP admission webhooks
+> 2. The structural anatomy of `ValidatingAdmissionPolicy` and `ValidatingAdmissionPolicyBinding`
+> 3. How to write Common Expression Language (CEL) validation expressions
+> 4. How to enforce policies: blocking `:latest` image tags, enforcing resource limits, and mandating labels
+> 5. How to parameterize policies using `paramKind` ConfigMaps or Custom Resources
+> 6. How to troubleshoot CEL syntax compilation errors and evaluation failures
+
+---
+
+## Real-Life Analogy
+
+Think of `ValidatingAdmissionPolicy` as an **in-house bouncer with a checklist versus calling an off-site legal firm for every nightclub guest**:
+
+- **Legacy Out-of-Process Webhooks (Calling the Remote Law Firm - OPA/Kyverno):** Every time a guest approaches the nightclub door (API request), the bouncer stops, picks up a telephone, dials an external legal consultant across town (`ValidatingWebhookConfiguration`), and waits 2 minutes for legal advice.
+  - If the phone line drops or the law firm server crashes, either **nobody enters the club (`failurePolicy: Fail` - Cluster Outage)** or everyone walks in unchecked (`failurePolicy: Ignore`).
+- **In-Process CEL Policy (The Bouncer's In-Memory Checklist - `ValidatingAdmissionPolicy`):** The nightclub owner gives the bouncer a laminated card with simple rules written in clear shorthand (**CEL Expressions**): *"No flip-flops (`!image.endsWith(':latest')`)"* and *"Must be over 21 (`replicas <= 5`)"*. The bouncer reads the card in **0.01 milliseconds inside their own brain**, with zero phone calls and zero network lag!
+
+---
+
+## Architecture Diagram
+
+```text
+       Out-of-Process Webhook Latency vs In-Process CEL Admission
+
+ 1. Legacy Out-of-Process Webhook (OPA Gatekeeper / Kyverno):
+ ┌──────────────────────┐   HTTP POST over Network (TLS)    ┌──────────────────────┐
+ │ kube-apiserver       │ ─────────────────────────────────►│ External Webhook Pod │
+ │ (API Request Paused!)│ ◄─────────────────────────────────│ (OPA / Kyverno Pod)  │
+ └──────────────────────┘   HTTP Response (20ms - 100ms Latency)└──────────────────────┘
+ ──► Risk: If Webhook Pod crashes ──► API Server blocks ALL deployments!
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. Modern In-Process ValidatingAdmissionPolicy (CEL Engine - GA 1.30):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER (Single Process Memory Space)                           │
+ │                                                                        │
+ │ 1. Ingests API Request Object (`object`)                               │
+ │ 2. Evaluates Embedded CEL Expression:                                  │
+ │    `object.spec.template.spec.containers.all(c, !c.image.endsWith(':latest'))`
+ │ 3. Sub-Millisecond In-Memory Execution (0.01ms Latency!)               │
+ │ 4. ZERO Network Traffic! ZERO Webhook Downtime Risk!                   │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Allowed / Denied immediately!
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Write to `etcd` (Success)                                              │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Out-of-Process Webhooks vs `ValidatingAdmissionPolicy`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Validating Webhooks (OPA/Kyverno│ `ValidatingAdmissionPolicy`     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Execution Location**    │ Out-of-process external Pod /   │ **In-process inside kube-api-** │
+ │                           │ HTTP service over network       │ **server binary memory**        │
+ │ **Latency Overhead**      │ 20ms – 100ms per API request    │ **< 0.1 milliseconds** (Instant)│
+ │ **Failure Mode**          │ Webhook crash locks cluster     │ **Zero availability risk**      │
+ │ **Language / Engine**     │ Rego (OPA) or Custom YAML DSL   │ **Common Expression Lang (CEL)**│
+ │ **Maintenance**           │ Complex TLS certificates,       │ **Native Kubernetes CRDs**      │
+ │                           │ CA bundles, webhook scaling     │ with zero extra controllers     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The 2-Resource Policy Architecture
+
+Validating Admission Policies are decoupled into two distinct API resources under `admissionregistration.k8s.io/v1`:
+
+```text
+ ┌──────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+ │ API Resource                                 │ Responsibility & Function                           │
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ **`ValidatingAdmissionPolicy`**              │ The policy definition. Declares matching resources  │
+ │                                              │ and CEL validation logic (`validations[].expression`│
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ **`ValidatingAdmissionPolicyBinding`**       │ The policy enforcement binding. Binds the policy to │
+ │                                              │ specific namespaces, actions, or parameters.        │
+ └──────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Common Expression Language (CEL) Syntax
+
+CEL is a fast, safe, non-Turing complete expression language created by Google:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Policy Requirement   │ Production CEL Expression Syntax                                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Block `:latest`**  │ `object.spec.template.spec.containers.all(c, !c.image.endsWith(':latest'))` │
+ │ **image tags**       │                                                                             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Mandate Resource** │ `object.spec.template.spec.containers.all(c, has(c.resources) &&            │
+ │ **Limits**           │  has(c.resources.limits) && has(c.resources.limits.memory))`                │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Enforce Maximum**  │ `object.spec.replicas <= 10`                                                │
+ │ **Replicas**         │                                                                             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Mandate Mandatory**│ `has(object.metadata.labels) && 'cost-center' in object.metadata.labels`    │
+ │ **Labels**           │                                                                             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Block Host Paths** │ `!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))` │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Manifest: Blocking `:latest` Tags
+
+```yaml
+# 1. Policy Definition
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: disallow-latest-tag-policy
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["deployments", "statefulsets"]
+  validations:
+  - expression: "object.spec.template.spec.containers.all(c, !c.image.endsWith(':latest') && c.image.contains(':'))"
+    message: "Production Deployments MUST NOT use the ':latest' image tag or unversioned images!"
+---
+# 2. Policy Binding to Production Namespaces
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: disallow-latest-binding
+spec:
+  policyName: disallow-latest-tag-policy
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        environment: production
+```
+
+---
+
+## Parameterized Policies with `paramKind`
+
+You can write a single generic policy (e.g. "Enforce Replicas Limit") and parameterize the limit per namespace using a custom ConfigMap:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: max-replicas-policy
+spec:
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  validations:
+  # Evaluates params from the bound ConfigMap!
+  - expression: "object.spec.replicas <= int(params.data.maxReplicas)"
+    messageExpression: "'Replicas ' + string(object.spec.replicas) + ' exceeds namespace limit of ' + params.data.maxReplicas"
+```
+
+---
+
+## Hands-On Lab: Deploying a CEL ValidatingAdmissionPolicy
+
+```bash
+# Step 1: Create lab namespace labeled with environment=production
+kubectl create namespace cel-policy-lab
+kubectl label namespace cel-policy-lab environment=production
+
+# Step 2: Deploy the ValidatingAdmissionPolicy and Binding
+cat <<EOF | kubectl apply -f -
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: demo-no-latest-policy
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["deployments"]
+  validations:
+  - expression: "object.spec.template.spec.containers.all(c, !c.image.endsWith(':latest'))"
+    message: "DEPLOYMENT REJECTED: Image tags ending in :latest are forbidden in production!"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: demo-no-latest-binding
+spec:
+  policyName: demo-no-latest-policy
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        environment: production
+EOF
+
+# Step 3: Attempt to deploy a Deployment with ':latest' image tag
+cat <<EOF | kubectl apply -f - -n cel-policy-lab 2>&1 || true
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bad-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bad
+  template:
+    metadata:
+      labels:
+        app: bad
+    spec:
+      containers:
+      - name: web
+        image: nginx:latest
+EOF
+# Observe: API server immediately rejects with our custom CEL error message!
+
+# Step 4: Deploy compliant Deployment with pinned version
+cat <<EOF | kubectl apply -f - -n cel-policy-lab
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: good-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: good
+  template:
+    metadata:
+      labels:
+        app: good
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.25.3-alpine
+EOF
+# Observe: Deployment created successfully!
+
+# Step 5: Clean up lab
+kubectl delete namespace cel-policy-lab
+kubectl delete validatingadmissionpolicybinding demo-no-latest-binding
+kubectl delete validatingadmissionpolicy demo-no-latest-policy
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is `ValidatingAdmissionPolicy` in Kubernetes, and what major problems does it solve?**
+
+`ValidatingAdmissionPolicy` (GA in Kubernetes 1.30) provides native, in-process declarative admission control using Common Expression Language (CEL). It solves the two biggest problems of traditional validating webhooks (OPA Gatekeeper, Kyverno):
+1. **Network Latency**: Executes directly in the `kube-apiserver` binary memory in sub-milliseconds ($<0.1\text{ms}$ vs $20\text{–}100\text{ms}$ HTTP round-trips).
+2. **Availability Failures**: Eliminates cluster-wide lockups when external webhook pods crash or become unreachable.
+
+**Q2: What is the relationship between `ValidatingAdmissionPolicy` and `ValidatingAdmissionPolicyBinding`?**
+
+- `ValidatingAdmissionPolicy`: Defines the matching rules (`matchConstraints`), parameter types (`paramKind`), and the core CEL validation logic (`validations[].expression`).
+- `ValidatingAdmissionPolicyBinding`: Instantiates and enforces the policy across the cluster, scoping it to specific namespaces via `namespaceSelector`, setting validation actions (`Deny`, `Warn`, `Audit`), and linking external parameter objects.
+
+**Q3: What happens if a CEL expression encounters a runtime evaluation error or null pointer?**
+
+CEL expressions are strongly typed and safe against panics. If a CEL expression attempts to access a field that does not exist on the object (for example, reading `object.spec.replicas` on a Pod where the field is not present), CEL returns an error. To prevent unintended policy rejections, policies must use safe accessor helpers like `has(object.spec.replicas)` or null-coalescing expressions before evaluating nested properties.
+
+**Q4: How do Parameterized Policies work with `paramKind`?**
+
+Parameterized policies allow writing generic validation templates whose thresholds are driven by separate Kubernetes resources (such as ConfigMaps or Custom Resources). The policy specifies `spec.paramKind` (e.g. `kind: ConfigMap`). Inside the CEL expression, the parameter object is accessible via the `params` variable (e.g. `object.spec.replicas <= int(params.data.maxReplicas)`), allowing different teams to set distinct limits without duplicating policy code.
+
+**Q5: Can `ValidatingAdmissionPolicy` mutate or modify incoming API objects?**
+
+No. `ValidatingAdmissionPolicy` is strictly a **validating admission gate**; it can only accept (`Allow`), reject (`Deny`), warn (`Warn`), or audit (`Audit`) requests. It does not perform mutations or object patching. For object mutation (such as injecting sidecar containers or setting default labels), Kubernetes continues to use Mutating Admission Webhooks.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `ValidatingAdmissionPolicy` provides in-process CEL admission control (GA 1.30)
+- [ ] Know that CEL eliminates the network latency and failure risks of external webhooks
+- [ ] Know the 2 API resources: `ValidatingAdmissionPolicy` and `ValidatingAdmissionPolicyBinding`
+- [ ] Know how to write CEL expressions (`all()`, `exists()`, `has()`, `endsWith()`)
+- [ ] Know how `validationActions` supports `Deny`, `Warn`, and `Audit`
+- [ ] Know how `paramKind` parameterizes policies using external ConfigMaps
+- [ ] Can view active policies using `kubectl get validatingadmissionpolicies`

@@ -1,0 +1,1450 @@
+---
+title: "Chapter 5 — Node Pressure & Eviction"
+sidebar_position: 5
+module: "Module 1.6 — kubelet Internals"
+description: "> **Goal:** Understand how the kubelet protects Node stability when system resources become scarce. Learn how **Node Pressure**, **Eviction Signals**, **Evictio..."
+---
+
+# Module 1.6 — kubelet Internals
+
+# Chapter 5 — Node Pressure & Eviction
+
+> **Goal:** Understand how the kubelet protects Node stability when system resources become scarce. Learn how **Node Pressure**, **Eviction Signals**, **Eviction Manager**, **QoS Classes**, **Graceful Termination**, and **Graceful Node Shutdown** work together to prevent complete Node failure.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Node Pressure conditions: MemoryPressure, DiskPressure, PIDPressure
+> 2. Eviction signals: how kubelet measures memory.available, nodefs.available, etc.
+> 3. Eviction thresholds: soft (with grace) vs hard (immediate)
+> 4. Eviction Manager: the kubelet component that selects Pods for eviction
+> 5. Pod selection order: QoS class (BestEffort -> Burstable -> Guaranteed)
+> 6. Graceful termination: SIGTERM -> terminationGracePeriodSeconds -> SIGKILL
+> 7. Graceful Node Shutdown: coordinated shutdown during OS maintenance
+> 8. Production practices: resource requests, limits, PodDisruptionBudgets
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Node Pressure & Eviction like a building fire safety system with priority zones.
+
+```text
+Fire Safety Priority Zones Analogy:
+
+Building (Node) has limited fire suppression water (memory/disk)
+Fire safety system (Eviction Manager) monitors water pressure continuously
+If pressure drops below warning level (soft threshold): issue warning, wait
+If pressure drops below critical level (hard threshold): begin evacuation now
+Evacuation priority: break room first (BestEffort Pods)
+Then open offices (Burstable Pods)
+Server room last (Guaranteed Pods: must not be disturbed)
+Graceful evacuation: staff get time to save work (terminationGracePeriodSeconds)
+```
+
+| Fire Safety System | Node Pressure & Eviction |
+| :--- | :--- |
+| Building water pressure | Node memory / disk availability |
+| Fire safety system | kubelet Eviction Manager |
+| Pressure drops below warning | Soft eviction threshold: grace period before eviction |
+| Pressure drops critically low | Hard eviction threshold: immediate eviction |
+| Break room evacuated first | BestEffort Pods evicted first (no requests/limits) |
+| Open offices evacuated next | Burstable Pods evicted next |
+| Server room evacuated last | Guaranteed Pods evicted last |
+| Staff save work before leaving | `terminationGracePeriodSeconds` |
+
+> **Important:** Pod eviction order is determined by **QoS class**: `BestEffort` Pods (no requests/limits) are evicted first, then `Burstable` (requests != limits), and finally `Guaranteed` (requests == limits) Pods are evicted last. Within the same QoS class, Pods consuming the **most resources above their request** are evicted first. Setting `resources.requests` and `limits` on all containers is the most effective way to protect your workloads from eviction.
+
+---
+
+# Prerequisites
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- kubelet Architecture
+- Pod Lifecycle
+- Pod Sync Loop
+- Restart Policies
+- Kubernetes Scheduler
+- Resource Requests & Limits (basic understanding)
+
+---
+
+# Why Node Pressure Exists
+
+A Kubernetes Node has finite resources.
+
+```text
+CPU
+
+Memory
+
+Disk
+
+PIDs
+```
+
+If these resources become exhausted, the entire Node may fail.
+
+Consider this situation:
+
+```text
+Node Memory
+
+64 GB
+  |
+  v
+Applications Allocate Memory
+  |
+  v
+63 GB
+  |
+  v
+63.8 GB
+  |
+  v
+63.95 GB
+  |
+  v
+64 GB
+```
+
+Eventually:
+
+```text
+Linux
+  |
+  v
+Out Of Memory
+  |
+  v
+OOM Killer
+  |
+  v
+Random Processes Killed
+```
+
+This may include:
+
+- kubelet
+- container runtime
+- system services
+- application containers
+
+Instead of allowing the operating system to fail unpredictably, Kubernetes proactively evicts Pods.
+
+---
+
+# What is Node Pressure?
+
+**Node Pressure** occurs when a Node experiences resource shortages severe enough that kubelet must take action.
+
+Examples include:
+
+```text
+Memory Pressure
+
+Disk Pressure
+
+PID Pressure
+```
+
+These conditions indicate that the Node cannot safely continue operating without intervention.
+
+---
+
+# High-Level Workflow
+
+```text
+Applications
+  |
+  v
+Consume Resources
+  |
+  v
+Node Pressure
+  |
+  v
+Eviction Manager
+  |
+  v
+Select Pods
+  |
+  v
+Gracefully Evict
+  |
+  v
+Node Healthy Again
+```
+
+---
+
+# Why Doesn't Linux Handle Everything?
+
+Linux has mechanisms like:
+
+```text
+OOM Killer
+```
+
+However, the Linux kernel:
+
+- Does not understand Kubernetes workloads.
+- Does not understand Pod priorities.
+- Does not understand QoS classes.
+
+Linux simply kills processes.
+
+Example:
+
+```text
+Random Process
+  |
+  v
+Killed
+  |
+  v
+Critical Application Lost
+```
+
+Kubernetes provides smarter workload-aware decisions.
+
+---
+
+# Kubernetes vs Linux
+
+Linux:
+
+```text
+Memory Exhausted
+  |
+  v
+OOM Killer
+  |
+  v
+Random Victim
+```
+
+Kubernetes:
+
+```text
+Memory Exhausted
+  |
+  v
+Eviction Manager
+  |
+  v
+Select Best Candidate
+  |
+  v
+Graceful Eviction
+```
+
+---
+
+# Types of Node Pressure
+
+Kubernetes currently recognizes several major pressure conditions.
+
+---
+
+## Memory Pressure
+
+Occurs when available memory becomes critically low.
+
+```text
+RAM
+  |
+  v
+Almost Full
+  |
+  v
+MemoryPressure=True
+```
+
+Memory is the most common cause of Pod evictions.
+
+---
+
+## Disk Pressure
+
+Occurs when storage becomes critically full.
+
+Examples:
+
+```text
+Container Images
+
+Logs
+
+Volumes
+
+EmptyDir
+
+Writable Layers
+```
+
+If storage fills completely:
+
+```text
+New Pods Cannot Start
+
+Logs Cannot Be Written
+
+Images Cannot Be Pulled
+```
+
+---
+
+## PID Pressure
+
+Linux limits the number of processes (PIDs).
+
+Example:
+
+```text
+Maximum PIDs
+
+32768
+  |
+  v
+32760 Used
+  |
+  v
+32767 Used
+  |
+  v
+No New Processes
+```
+
+Containers can no longer create processes.
+
+---
+
+# Node Conditions
+
+The kubelet reports these conditions through the Node object.
+
+```text
+Ready
+
+MemoryPressure
+
+DiskPressure
+
+PIDPressure
+```
+
+Each condition is continuously updated.
+
+Example:
+
+```text
+MemoryPressure
+  |
+  v
+True
+```
+
+The Scheduler avoids placing new Pods on a Node experiencing pressure.
+
+---
+
+# Eviction Signals
+
+The Eviction Manager continuously monitors resource usage.
+
+Examples of signals include:
+
+```text
+Available Memory
+
+Available Disk Space
+
+Available Inodes
+
+Available PIDs
+```
+
+These signals are compared against configured thresholds.
+
+---
+
+# Example
+
+Suppose:
+
+```text
+Memory Available
+  |
+  v
+10%
+  |
+  v
+8%
+  |
+  v
+5%
+  |
+  v
+3%
+```
+
+Eventually:
+
+```text
+Threshold Crossed
+  |
+  v
+Eviction Begins
+```
+
+---
+
+# Eviction Thresholds
+
+The kubelet supports configurable eviction thresholds.
+
+Conceptually:
+
+```text
+Available Memory
+
+< Threshold
+  |
+  v
+Evict Pods
+```
+
+Thresholds may be configured as:
+
+```text
+Hard
+
+or
+
+Soft
+```
+
+---
+
+# Hard Eviction Threshold
+
+Hard thresholds require immediate action.
+
+Example:
+
+```text
+Available Memory
+  |
+  v
+Critical
+  |
+  v
+Immediate Eviction
+```
+
+The kubelet begins evicting Pods without waiting for recovery.
+
+---
+
+# Soft Eviction Threshold
+
+Soft thresholds allow temporary resource shortages.
+
+Workflow:
+
+```text
+Pressure Detected
+  |
+  v
+Grace Period
+  |
+  v
+Still Under Pressure?
+
+|
+
++-- No
+
+|
+
+▼
+
+Continue Running
+
+|
+
++-- Yes
+
+     |
+
+     ▼
+
+Eviction
+```
+
+This prevents unnecessary evictions caused by brief resource spikes.
+
+---
+
+# Eviction Manager
+
+The **Eviction Manager** is an internal kubelet component responsible for protecting Node stability.
+
+Conceptually:
+
+```text
+Resource Monitor
+  |
+  v
+Eviction Manager
+  |
+  v
+Select Victim
+  |
+  v
+Evict Pod
+```
+
+---
+
+# Responsibilities of Eviction Manager
+
+The Eviction Manager:
+
+- Monitors Node resources
+- Evaluates eviction thresholds
+- Detects Node pressure
+- Chooses Pods for eviction
+- Performs graceful eviction
+- Updates Pod status
+
+---
+
+# Internal Architecture
+
+```text
+Node Metrics
+  |
+  v
+Eviction Manager
+  |
+  v
+Threshold Crossed?
+
+|
+
++-- No
+
+|
+
+▼
+
+Continue Monitoring
+
+|
+
++-- Yes
+
+     |
+
+     ▼
+
+Select Pod
+  |
+  v
+Graceful Eviction
+```
+
+---
+
+# Node Pressure Eviction
+
+Eviction is different from deletion.
+
+Deletion:
+
+```text
+User
+  |
+  v
+kubectl delete
+```
+
+Eviction:
+
+```text
+Node Resource Pressure
+  |
+  v
+kubelet
+  |
+  v
+Protect Node
+```
+
+Evictions are automatic.
+
+---
+
+# Node Pressure Eviction Workflow
+
+```text
+Low Memory
+  |
+  v
+MemoryPressure=True
+  |
+  v
+Eviction Manager
+  |
+  v
+Choose Victim
+  |
+  v
+Terminate Pod
+  |
+  v
+Free Resources
+```
+
+---
+
+# Pod Selection for Eviction
+
+Not every Pod has equal importance.
+
+The Eviction Manager evaluates several factors before selecting Pods.
+
+---
+
+# Primary Selection Criteria
+
+Generally, the kubelet prefers to evict Pods that:
+
+- Exceed their resource requests
+- Have lower QoS
+- Have lower priority
+- Help relieve the current resource pressure
+
+The goal is to free sufficient resources while minimizing impact on critical workloads.
+
+---
+
+# Resource Requests Matter
+
+Consider two Pods.
+
+Pod A:
+
+```text
+Request
+
+1 GB
+
+Usage
+
+900 MB
+```
+
+Pod B:
+
+```text
+Request
+
+1 GB
+
+Usage
+
+3 GB
+```
+
+Pod B is consuming significantly more memory than requested and is more likely to be selected.
+
+---
+
+# Pod Priority
+
+Higher-priority Pods receive stronger protection.
+
+Example:
+
+```text
+Critical DNS
+
+Priority
+
+1,000,000
+
+────────────
+
+Test Application
+
+Priority
+
+0
+```
+
+The test application is a more likely eviction candidate.
+
+---
+
+# QoS Classes
+
+Every Pod belongs to one of three Quality of Service (QoS) classes.
+
+```text
+Guaranteed
+
+Burstable
+
+BestEffort
+```
+
+QoS influences eviction order.
+
+---
+
+# Guaranteed
+
+Requirements:
+
+```text
+Requests
+
+=
+
+Limits
+
+For Every Container
+```
+
+Example:
+
+```yaml
+requests:
+
+  memory: 2Gi
+
+limits:
+
+  memory: 2Gi
+```
+
+These Pods receive the strongest protection.
+
+---
+
+# Burstable
+
+Requests are specified,
+
+but requests and limits differ.
+
+Example:
+
+```yaml
+requests:
+
+  memory: 1Gi
+
+limits:
+
+  memory: 4Gi
+```
+
+Burstable Pods receive medium protection.
+
+---
+
+# BestEffort
+
+No CPU or memory requests or limits are defined.
+
+Example:
+
+```yaml
+resources: {}
+```
+
+These Pods receive the lowest protection.
+
+---
+
+# QoS Eviction Order
+
+Under memory pressure, Kubernetes generally prefers this order:
+
+```text
+BestEffort
+  |
+  v
+Burstable
+  |
+  v
+Guaranteed
+```
+
+This is a **general priority**, not an absolute rule. Other factors such as actual resource usage, requests, and Pod Priority are also considered.
+
+---
+
+# Example
+
+Node Memory:
+
+```text
+64 GB
+```
+
+Pods:
+
+```text
+BestEffort
+
+4 GB
+
+────────────
+
+Burstable
+
+10 GB
+
+────────────
+
+Guaranteed
+
+20 GB
+```
+
+The BestEffort Pod is generally the first eviction candidate.
+
+---
+
+# Eviction Timeline
+
+```text
+Memory Usage
+  |
+  v
+Threshold Crossed
+  |
+  v
+Eviction Manager
+  |
+  v
+BestEffort Removed
+  |
+  v
+Memory Still Low?
+
+|
+
++-- No
+
+|
+
+▼
+
+Done
+
+|
+
++-- Yes
+
+     |
+
+     ▼
+
+Burstable Removed
+```
+
+---
+
+# Graceful Termination
+
+Eviction does not immediately kill containers.
+
+Instead, kubelet performs graceful shutdown.
+
+Workflow:
+
+```text
+Eviction
+  |
+  v
+SIGTERM
+  |
+  v
+Grace Period
+  |
+  v
+Container Exits
+  |
+  v
+SIGKILL
+
+(If Necessary)
+```
+
+Applications receive an opportunity to clean up.
+
+---
+
+# Why Graceful Termination Matters
+
+Applications may need to:
+
+- Finish requests
+- Flush logs
+- Commit transactions
+- Close database connections
+
+Without graceful shutdown:
+
+```text
+Application
+  |
+  v
+Killed Immediately
+  |
+  v
+Data Loss
+```
+
+---
+
+# Grace Period
+
+Each Pod may specify:
+
+```text
+terminationGracePeriodSeconds
+```
+
+Example:
+
+```text
+30 Seconds
+```
+
+Timeline:
+
+```text
+SIGTERM
+  |
+  v
+Application Shutdown
+  |
+  v
+Exit
+  |
+  v
+Complete
+```
+
+If the process is still running after the grace period:
+
+```text
+SIGKILL
+```
+
+---
+
+# Graceful Termination Workflow
+
+```text
+Eviction
+  |
+  v
+Mark Pod Terminating
+  |
+  v
+Run preStop Hook (if configured)
+  |
+  v
+Send SIGTERM
+  |
+  v
+Wait
+  |
+  v
+Exited?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Delete Pod
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+SIGKILL
+  |
+  v
+Delete Pod
+```
+
+---
+
+# Graceful Node Shutdown
+
+Modern kubelet versions support **Graceful Node Shutdown**.
+
+Suppose:
+
+```text
+Machine Shutdown
+  |
+  v
+Power Off
+```
+
+Without coordination:
+
+```text
+Containers
+  |
+  v
+Killed Immediately
+```
+
+Instead:
+
+```text
+Shutdown Event
+  |
+  v
+kubelet
+  |
+  v
+Gracefully Terminate Pods
+  |
+  v
+Operating System Shutdown
+```
+
+---
+
+# Shutdown Workflow
+
+```text
+Operating System
+  |
+  v
+Shutdown Signal
+  |
+  v
+kubelet
+  |
+  v
+Evict Pods
+  |
+  v
+Graceful Termination
+  |
+  v
+Node Power Off
+```
+
+---
+
+# Priority During Shutdown
+
+During shutdown, kubelet can terminate Pods in stages.
+
+Conceptually:
+
+```text
+Normal Pods
+  |
+  v
+Critical Pods
+  |
+  v
+Shutdown Complete
+```
+
+Critical system Pods are given additional time where configured.
+
+---
+
+# Difference Between Eviction and Deletion
+
+| Eviction | Deletion |
+|-----------|----------|
+| Triggered automatically | Triggered by a user or controller |
+| Caused by Node pressure | Caused by API operations |
+| Protects Node health | Removes workload intentionally |
+| Managed by Eviction Manager | Managed through Kubernetes API |
+| Includes graceful termination | Also supports graceful termination |
+
+---
+
+# Complete Internal Workflow
+
+```text
+Applications
+  |
+  v
+Consume Resources
+  |
+  v
+Memory Available Falls
+  |
+  v
+Threshold Crossed
+  |
+  v
+Eviction Manager
+  |
+  v
+Evaluate QoS
+  |
+  v
+Evaluate Priority
+  |
+  v
+Select Victim
+  |
+  v
+SIGTERM
+  |
+  v
+Grace Period
+  |
+  v
+SIGKILL (If Needed)
+  |
+  v
+Resources Freed
+  |
+  v
+Node Healthy
+```
+
+---
+
+# Production Example 1
+
+Memory Leak
+
+```text
+Application
+  |
+  v
+Memory Leak
+  |
+  v
+Node Memory
+  |
+  v
+3% Free
+  |
+  v
+Eviction Manager
+  |
+  v
+BestEffort Pod Removed
+  |
+  v
+Node Stable
+```
+
+---
+
+# Production Example 2
+
+Disk Full
+
+```text
+Container Logs
+  |
+  v
+Disk Usage
+  |
+  v
+95%
+  |
+  v
+DiskPressure
+  |
+  v
+Eviction
+  |
+  v
+Space Recovered
+```
+
+---
+
+# Production Example 3
+
+PID Exhaustion
+
+```text
+Fork Bomb
+  |
+  v
+No Available PIDs
+  |
+  v
+PIDPressure
+  |
+  v
+Evict Pod
+  |
+  v
+Processes Available
+```
+
+---
+
+# Production Example 4
+
+Graceful Shutdown
+
+```text
+Cloud VM
+  |
+  v
+Shutdown Event
+  |
+  v
+kubelet
+  |
+  v
+SIGTERM
+  |
+  v
+Application Saves State
+  |
+  v
+Shutdown Complete
+```
+
+---
+
+# Production Best Practices
+
+✔ Always configure CPU and memory requests.
+
+✔ Avoid BestEffort Pods for production workloads.
+
+✔ Set realistic resource limits.
+
+✔ Monitor Node Pressure conditions.
+
+✔ Configure appropriate eviction thresholds.
+
+✔ Use meaningful Pod PriorityClasses for critical services.
+
+✔ Implement graceful application shutdown using SIGTERM.
+
+✔ Use `preStop` hooks only when necessary and keep them fast.
+
+✔ Monitor memory leaks before they trigger evictions.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Linux OOM Killer performs Kubernetes evictions.
+
+**Correct:** Kubernetes attempts to evict Pods before the Linux OOM Killer must terminate processes.
+
+---
+
+### ❌ Misconception 2
+
+Guaranteed Pods can never be evicted.
+
+**Correct:** Guaranteed Pods have the strongest protection but can still be evicted if necessary to preserve Node stability.
+
+---
+
+### ❌ Misconception 3
+
+Readiness failures trigger eviction.
+
+**Correct:** Readiness only affects traffic routing. Evictions occur because of Node pressure.
+
+---
+
+### ❌ Misconception 4
+
+BestEffort Pods are always evicted first.
+
+**Correct:** BestEffort Pods are generally preferred candidates, but the Eviction Manager also considers actual resource usage, resource requests, and Pod Priority.
+
+---
+
+### ❌ Misconception 5
+
+Eviction immediately kills containers.
+
+**Correct:** The kubelet first performs graceful termination using SIGTERM and the configured grace period.
+
+---
+
+### ❌ Misconception 6
+
+Node shutdown always kills Pods immediately.
+
+**Correct:** With Graceful Node Shutdown enabled, kubelet coordinates orderly Pod termination before the operating system powers off.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is Node Pressure?
+
+A condition where a Node experiences resource shortages such as low memory, disk space, or available PIDs.
+
+---
+
+### Q2. What is the purpose of the Eviction Manager?
+
+To monitor Node resources, detect pressure conditions, select Pods for eviction, and protect overall Node stability.
+
+---
+
+### Q3. What are the major Node pressure conditions?
+
+MemoryPressure, DiskPressure, and PIDPressure.
+
+---
+
+### Q4. What is the difference between hard and soft eviction thresholds?
+
+Hard thresholds trigger immediate eviction, while soft thresholds allow a grace period before eviction if the condition persists.
+
+---
+
+### Q5. Which QoS class receives the highest protection?
+
+Guaranteed.
+
+---
+
+### Q6. What generally happens first during memory pressure?
+
+BestEffort Pods are usually preferred for eviction before Burstable and Guaranteed Pods, assuming other factors are comparable.
+
+---
+
+### Q7. Does eviction delete Pods immediately?
+
+No. The kubelet performs graceful termination before forcefully killing containers if required.
+
+---
+
+### Q8. What is Graceful Node Shutdown?
+
+A kubelet feature that gracefully terminates Pods when the operating system initiates a shutdown.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pods frequently evicted | Memory, disk, or PID pressure on the Node |
+| Node reports MemoryPressure | Memory usage exceeded configured thresholds |
+| DiskPressure remains True | Logs, images, or writable layers consuming excessive storage |
+| Critical application evicted | Missing PriorityClass, inappropriate QoS, or severe Node pressure |
+| Applications terminate abruptly | `terminationGracePeriodSeconds` too short or application ignores SIGTERM |
+| Node becomes unstable before evictions occur | Eviction thresholds configured too aggressively or kubelet unable to reclaim resources quickly |
+
+---
+
+# Knowledge Check
+
+Before moving to the next module, you should be able to answer:
+
+1. What is Node Pressure?
+2. What resources can trigger Node Pressure?
+3. What are eviction signals?
+4. What is the purpose of the Eviction Manager?
+5. How do hard and soft eviction thresholds differ?
+6. How does kubelet choose Pods for eviction?
+7. What are the three QoS classes?
+8. Why are Guaranteed Pods better protected?
+9. What happens during graceful termination?
+10. How does Graceful Node Shutdown protect workloads?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the kubelet protects Kubernetes Nodes from resource exhaustion using **Node Pressure Detection** and the **Eviction Manager**.
+
+You learned:
+
+- How Node Pressure develops when memory, disk, or PID resources become scarce
+- How the kubelet monitors eviction signals and evaluates configurable thresholds
+- How the Eviction Manager proactively selects Pods for eviction to maintain Node stability
+- How QoS Classes, resource requests, and Pod Priority influence eviction decisions
+- How graceful termination allows applications to shut down cleanly before forced termination
+- How Graceful Node Shutdown coordinates Pod termination during operating system shutdown
+- Production practices for preventing unnecessary evictions
+
+Rather than waiting for the Linux kernel to terminate random processes, Kubernetes uses kubelet's Eviction Manager to make intelligent, workload-aware decisions. This proactive approach improves cluster reliability, protects critical workloads, and enables Kubernetes to recover gracefully from resource pressure while minimizing application disruption.
+
+---
+
+# Module 1.6 Complete
+
+You have completed **Module 1.6 — kubelet Internals**.
+
+You now have a production-level understanding of:
+
+```text
+Chapter 1   kubelet Architecture & Node Registration
+            -- the only control plane component on worker Nodes
+            -- self-registration, Node Lease heartbeat, CRI/CNI/CSI
+
+Chapter 2   Pod Lifecycle & Pod Sync Loop
+            -- Watch -> PLEG -> PodWorker -> SyncPod() -> status patch
+            -- kubelet writes to API Server, not etcd directly
+
+Chapter 3   Static Pods
+            -- manifest files on disk, managed entirely by kubelet
+            -- kubectl delete has no permanent effect; delete the file
+
+Chapter 4   Health Probes
+            -- Startup -> Readiness -> Liveness
+            -- Liveness restarts container, not Pod; Readiness removes from Endpoints
+
+Chapter 5   Node Pressure & Eviction
+            -- BestEffort -> Burstable -> Guaranteed eviction order
+            -- soft vs hard thresholds; graceful termination window
+```
+
+You now understand not just **what the kubelet does** but **why every design decision exists** — from the per-Pod PodWorker goroutines to the three-tier QoS eviction model to the disconnect between Static Pods and the API Server.
+
+---
+
+# Next Module
+
+## Module 1.7 — Container Runtime Internals
+
+The next module explores **how kubelet communicates with the underlying container runtime** to actually create and manage containers.
+
+Topics include CRI (Container Runtime Interface), OCI standards, containerd architecture, runc, image pull workflow, Pod sandbox (pause container), and RuntimeClass for workload-specific runtime selection.

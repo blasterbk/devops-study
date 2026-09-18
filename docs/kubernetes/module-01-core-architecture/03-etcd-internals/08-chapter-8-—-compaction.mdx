@@ -1,0 +1,1481 @@
+---
+title: "Chapter 8 — Compaction"
+sidebar_position: 8
+module: "Module 1.3 — etcd Internals"
+description: "> **Goal:** Understand how etcd manages the continuously growing MVCC history using Compaction. Learn why compaction exists, how automatic and manual compaction..."
+---
+
+# Module 1.3 — etcd Internals
+
+# Chapter 8 — Compaction
+
+> **Goal:** Understand how etcd manages the continuously growing MVCC history using Compaction. Learn why compaction exists, how automatic and manual compaction work, how historical revisions are cleaned up, how compaction affects Watches, why clients receive **410 Gone**, and how Kubernetes Informers recover automatically after compaction.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why MVCC history grows unbounded without compaction
+> 2. What compaction removes (old revisions) and what it keeps (latest)
+> 3. Automatic compaction (periodic and revision-based modes)
+> 4. Manual compaction with etcdctl
+> 5. How compaction causes Watch 410 Gone errors
+> 6. How Kubernetes Informers recover automatically from 410 Gone
+> 7. Production compaction strategy and etcd quota management
+> 8. Compaction vs defragmentation — what each solves
+> ```
+
+---
+
+# Why Should You Learn Compaction?
+
+One of the most common Kubernetes interview questions is:
+
+> **Why do Kubernetes watches sometimes fail with "410 Gone"?**
+
+Or,
+
+> **Why can't etcd keep every revision forever?**
+
+Or,
+
+> **What happens to old MVCC revisions?**
+
+The answer is:
+
+```text
+Compaction
+```
+
+Compaction is one of the most important maintenance mechanisms inside etcd.
+
+Without compaction:
+
+- Database size grows forever.
+- Memory usage increases.
+- Disk usage continuously grows.
+- Watch recovery becomes slower.
+- Storage performance degrades.
+
+Compaction keeps etcd healthy.
+
+---
+
+> **Important:** Compaction is **irreversible**. Once a revision has been compacted, the historical state of all keys at that revision is permanently deleted from etcd. Any Watch client that tries to resume from a compacted revision will receive HTTP 410 Gone. Design Watch retry logic (Informer pattern) to handle this gracefully.
+
+---
+
+# Review: MVCC History
+
+From the previous chapter,
+
+every successful write creates:
+
+```text
+New Revision
+```
+
+Example:
+
+```text
+Revision 1
+
+v
+
+Create Pod
+
+v
+
+Revision 2
+
+Update Pod
+
+v
+
+Revision 3
+
+Update Deployment
+
+v
+
+Revision 4
+
+Delete ConfigMap
+
+v
+
+Revision 5
+
+Create Secret
+```
+
+Nothing is immediately removed.
+
+History accumulates.
+
+---
+
+# Every Update Creates History
+
+Imagine one Pod.
+
+```text
+Version 1
+
+v
+
+Version 2
+
+v
+
+Version 3
+
+v
+
+Version 4
+
+v
+
+Version 5
+```
+
+MVCC stores all versions.
+
+Not just the newest one.
+
+---
+
+# Why Keep Old Versions?
+
+Because old versions enable:
+
+- Watches
+- Historical Reads
+- Optimistic Concurrency
+- Transactions
+- Recovery after temporary disconnects
+
+Without history,
+
+these features would not work.
+
+---
+
+# The Problem
+
+Imagine a busy Kubernetes cluster.
+
+Every second:
+
+```text
+Pods Created
+
+v
+
+Deployments Updated
+
+v
+
+Secrets Changed
+
+v
+
+Leases Renewed
+
+v
+
+Node Heartbeats
+
+v
+
+Controllers Updating Status
+```
+
+Each operation creates:
+
+```text
+New Revision
+```
+
+Now imagine:
+
+```text
+10 Million Revisions
+```
+
+Then:
+
+```text
+100 Million Revisions
+```
+
+Then:
+
+```text
+1 Billion Revisions
+```
+
+The history never stops growing.
+
+---
+
+# Why Compaction Exists
+
+Compaction removes:
+
+```text
+Old
+
+Unused
+
+Historical Versions
+```
+
+while preserving:
+
+```text
+Latest State
+```
+
+Think of it as:
+
+```text
+Archive
+
+v
+
+Discard Old Drafts
+
+v
+
+Keep Final Copy
+```
+
+---
+
+# Real-Life Analogy
+
+Suppose you edit a document.
+
+Versions:
+
+```text
+Draft 1
+
+v
+
+Draft 2
+
+v
+
+Draft 3
+
+v
+
+Draft 4
+
+v
+
+Final Version
+```
+
+After publication,
+
+you may decide:
+
+```text
+Delete
+
+Old Drafts
+
+Keep Final
+```
+
+Compaction works similarly.
+
+---
+
+# Before Compaction
+
+Database:
+
+```text
+Revision
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10
+```
+
+All revisions remain available.
+
+---
+
+# After Compaction
+
+Suppose:
+
+Compaction Revision:
+
+```text
+7
+```
+
+History becomes:
+
+```text
+7
+
+8
+
+9
+
+10
+```
+
+Revisions:
+
+```text
+1-6
+```
+
+can no longer be used for historical reads or watch recovery.
+
+The latest state remains intact.
+
+---
+
+# Important Clarification
+
+Compaction **does not** delete current objects.
+
+Example:
+
+Before:
+
+```text
+Pod
+
+Version 5
+
+Current
+```
+
+After compaction:
+
+```text
+Pod
+
+Version 5
+
+Still Exists
+```
+
+Only obsolete historical versions are removed.
+
+---
+
+# Current State vs History
+
+Compaction removes:
+
+```text
+Historical Versions
+```
+
+It does **not** remove:
+
+```text
+Current Keys
+```
+
+Example:
+
+```text
+Pod Exists
+
+v
+
+Compaction
+
+v
+
+Pod Still Exists
+```
+
+---
+
+# Internal View
+
+Before:
+
+```text
+Revision 10
+
+Revision 11
+
+Revision 12
+
+Revision 13
+
+Revision 14
+
+Revision 15
+```
+
+Current revision:
+
+```text
+15
+```
+
+Compaction at:
+
+```text
+12
+```
+
+Results:
+
+```text
+13
+
+14
+
+15
+```
+
+Only newer history remains accessible.
+
+---
+
+# Snapshot vs Compaction
+
+These two concepts are often confused.
+
+Snapshot:
+
+```text
+Creates Backup
+```
+
+Compaction:
+
+```text
+Deletes Old MVCC History
+```
+
+Snapshot protects data.
+
+Compaction reduces history.
+
+---
+
+# Relationship
+
+```text
+Writes
+
+v
+
+MVCC History Grows
+
+v
+
+Compaction
+
+v
+
+History Shrinks
+
+v
+
+Database Remains Healthy
+```
+
+---
+
+# Automatic Compaction
+
+Most production clusters use:
+
+```text
+Automatic Compaction
+```
+
+The server periodically removes old revisions according to its configured retention policy.
+
+No administrator intervention is required.
+
+---
+
+# Automatic Workflow
+
+```text
+Cluster Running
+
+v
+
+History Growing
+
+v
+
+Retention Limit Reached
+
+v
+
+Compaction Triggered
+
+v
+
+Old History Removed
+
+v
+
+Cluster Continues
+```
+
+Everything happens in the background.
+
+---
+
+# Manual Compaction
+
+Administrators may also trigger compaction manually.
+
+Reasons include:
+
+- Testing
+- Immediate cleanup
+- Storage maintenance
+- Operational procedures
+
+Workflow:
+
+```text
+Administrator
+
+v
+
+Choose Revision
+
+v
+
+Compaction
+
+v
+
+Old History Removed
+```
+
+---
+
+# Choosing the Revision
+
+Suppose:
+
+Current revision:
+
+```text
+5000
+```
+
+Administrator chooses:
+
+```text
+4500
+```
+
+Result:
+
+History before:
+
+```text
+4500
+```
+
+is discarded.
+
+Revisions:
+
+```text
+4501
+
+v
+
+5000
+```
+
+remain available.
+
+---
+
+# Revision Cleanup
+
+Remember:
+
+Each key has:
+
+```text
+Create Revision
+
+Mod Revision
+
+Version
+```
+
+Compaction removes:
+
+```text
+Historical Values
+```
+
+It does not change:
+
+```text
+Current Metadata
+```
+
+Example:
+
+Current object:
+
+```text
+Version = 8
+
+Mod Revision = 600
+```
+
+Still remains valid.
+
+---
+
+# Internal Cleanup
+
+Conceptually:
+
+```text
+Old Version
+
+v
+
+Old Version
+
+v
+
+Old Version
+
+v
+
+Latest Version
+```
+
+After compaction:
+
+```text
+Latest Version
+```
+
+Older inaccessible revisions are removed from the historical view.
+
+---
+
+# MVCC Timeline
+
+```text
+Revision
+
+100
+
+v
+
+101
+
+v
+
+102
+
+v
+
+103
+
+v
+
+104
+
+v
+
+105
+
+v
+
+106
+```
+
+Compaction:
+
+```text
+104
+```
+
+Accessible:
+
+```text
+105
+
+106
+```
+
+Older revisions:
+
+```text
+100
+
+101
+
+102
+
+103
+```
+
+are no longer available.
+
+---
+
+# Impact on Historical Reads
+
+Suppose:
+
+Client asks:
+
+```text
+Read Revision
+
+101
+```
+
+But:
+
+Compaction happened at:
+
+```text
+104
+```
+
+Result:
+
+```text
+History Gone
+```
+
+The server cannot return that historical state.
+
+---
+
+# Impact on Watches
+
+Now consider a Watch.
+
+Client disconnects.
+
+Last revision processed:
+
+```text
+100
+```
+
+Meanwhile:
+
+Current revision:
+
+```text
+500
+```
+
+Automatic compaction removes:
+
+```text
+101
+
+v
+
+450
+```
+
+Client reconnects.
+
+Requests:
+
+```text
+Watch
+
+Revision 101
+```
+
+Problem:
+
+```text
+Revision
+
+No Longer Exists
+```
+
+---
+
+# Watch Recovery Failure
+
+Workflow:
+
+```text
+Watch
+
+v
+
+Disconnect
+
+v
+
+Compaction
+
+v
+
+Reconnect
+
+v
+
+Requested Revision Gone
+```
+
+The Watch cannot continue.
+
+---
+
+# Server Response
+
+Instead of silently failing,
+
+etcd returns:
+
+```text
+Compacted
+```
+
+Kubernetes API clients typically observe this condition as an HTTP:
+
+```text
+410 Gone
+```
+
+---
+
+# What is 410 Gone?
+
+HTTP:
+
+```text
+410 Gone
+```
+
+means:
+
+> **The requested historical resource is no longer available.**
+
+In Kubernetes,
+
+this usually means:
+
+```text
+Requested Watch Revision
+
+Has Been Compacted
+```
+
+It is **not** an indication that the object itself has been deleted.
+
+---
+
+# Why Not Return Empty Data?
+
+Suppose:
+
+Watch requested:
+
+```text
+Revision 100
+```
+
+Current:
+
+```text
+1000
+```
+
+History removed.
+
+Returning:
+
+```text
+No Changes
+```
+
+would be dangerous.
+
+The client would incorrectly believe:
+
+```text
+Nothing Happened
+```
+
+Instead,
+
+the server forces recovery.
+
+---
+
+# Recovery After 410 Gone
+
+Workflow:
+
+```text
+Watch Fails
+
+v
+
+410 Gone
+
+v
+
+Perform LIST
+
+v
+
+Build Fresh Cache
+
+v
+
+Start New Watch
+
+v
+
+Continue Normally
+```
+
+This guarantees a correct view of cluster state.
+
+---
+
+# Kubernetes Informer Recovery
+
+Remember the Informer lifecycle.
+
+```text
+LIST
+
+v
+
+Local Cache
+
+v
+
+WATCH
+
+v
+
+Disconnect
+
+v
+
+410 Gone
+
+v
+
+LIST Again
+
+v
+
+New WATCH
+
+v
+
+Continue
+```
+
+This is normal behavior.
+
+Production clusters experience it regularly.
+
+---
+
+# Complete Recovery Flow
+
+```text
+Informer
+
+v
+
+Watch
+
+v
+
+Network Failure
+
+v
+
+Reconnect
+
+v
+
+History Exists?
+
+v
+
+Yes
+
+v
+
+Resume Watch
+
+----------------------
+
+No
+
+v
+
+410 Gone
+
+v
+
+LIST
+
+v
+
+New Watch
+```
+
+---
+
+# Why Compaction Does NOT Break Kubernetes
+
+People often worry:
+
+```text
+Compaction
+
+v
+
+Watches Fail
+
+v
+
+Cluster Broken
+```
+
+Wrong.
+
+Kubernetes clients are designed for this.
+
+They automatically:
+
+```text
+LIST
+
+v
+
+WATCH
+
+v
+
+LIST
+
+v
+
+WATCH
+```
+
+when necessary.
+
+---
+
+# Internal Architecture
+
+```text
+                 RAFT
+
+                   |
+
+                   ▼
+
+                 MVCC
+
+                   |
+
+        Historical Revisions
+
+                   |
+
+         ┌─────────┴─────────┐
+
+         ▼                   ▼
+
+    Current State       Old History
+
+                              |
+
+                              ▼
+
+                        Compaction
+
+                              |
+
+                              ▼
+
+                     Historical Cleanup
+```
+
+---
+
+# Relationship with Snapshots
+
+Suppose:
+
+Snapshot:
+
+```text
+Revision 1000
+```
+
+Compaction later removes:
+
+```text
+1-900
+```
+
+The snapshot is unaffected.
+
+Because:
+
+```text
+Snapshot
+
+=
+
+Independent Backup
+```
+
+Compaction only affects the live database history.
+
+---
+
+# Relationship with Defragmentation
+
+Compaction:
+
+```text
+Logical Cleanup
+```
+
+It marks historical MVCC revisions as no longer needed.
+
+However,
+
+disk space is not immediately reclaimed.
+
+Physical storage cleanup requires:
+
+```text
+Defragmentation
+```
+
+We'll study that in a later chapter.
+
+---
+
+# Complete Lifecycle
+
+```text
+Write
+
+v
+
+New Revision
+
+v
+
+History Grows
+
+v
+
+Compaction
+
+v
+
+Old History Removed
+
+v
+
+Watch Requests Old Revision
+
+v
+
+410 Gone
+
+v
+
+LIST
+
+v
+
+WATCH
+
+v
+
+Normal Operation
+```
+
+---
+
+# Production Compaction Strategy
+
+Production clusters typically:
+
+- Run automatic compaction.
+- Retain enough history for normal watch recovery.
+- Monitor watch failures.
+- Ensure Informers correctly handle relisting.
+- Balance storage usage against historical retention.
+
+Choosing an extremely short retention period may increase watch restarts.
+
+Choosing an extremely long retention period increases storage requirements.
+
+---
+
+# Benefits of Compaction
+
+✓ Prevents unlimited MVCC growth
+
+✓ Improves storage efficiency
+
+✓ Reduces historical metadata
+
+✓ Keeps watch recovery manageable
+
+✓ Maintains predictable performance
+
+✓ Enables long-running production clusters
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Compaction deletes Kubernetes objects.
+
+Wrong.
+
+It removes historical revisions, not current objects.
+
+---
+
+### ❌ Misconception 2
+
+Compaction is the same as a snapshot.
+
+Wrong.
+
+Snapshots create backups.
+
+Compaction removes old MVCC history.
+
+---
+
+### ❌ Misconception 3
+
+410 Gone means the object was deleted.
+
+Wrong.
+
+It usually means the requested historical revision has been compacted.
+
+---
+
+### ❌ Misconception 4
+
+Compaction immediately frees disk space.
+
+Wrong.
+
+Compaction removes obsolete MVCC history logically.
+
+Physical disk reclamation requires defragmentation.
+
+---
+
+### ❌ Misconception 5
+
+Watches permanently fail after compaction.
+
+Wrong.
+
+Clients perform a fresh LIST and establish a new WATCH.
+
+---
+
+### ❌ Misconception 6
+
+Historical reads always work.
+
+Wrong.
+
+Only revisions newer than the compaction point remain available.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does etcd need compaction?
+
+Because MVCC continuously creates new revisions, and without compaction the database history would grow indefinitely.
+
+---
+
+### Q2. What does compaction remove?
+
+Historical MVCC revisions that are older than the chosen compaction revision.
+
+---
+
+### Q3. Does compaction delete current Kubernetes objects?
+
+No.
+
+It removes only obsolete historical versions.
+
+---
+
+### Q4. What is automatic compaction?
+
+A background process where etcd periodically removes old revisions according to its retention policy.
+
+---
+
+### Q5. What is manual compaction?
+
+A maintenance operation initiated by an administrator to compact history up to a specified revision.
+
+---
+
+### Q6. Why do watches sometimes fail after compaction?
+
+Because the client requested a revision that no longer exists in the retained MVCC history.
+
+---
+
+### Q7. What causes HTTP 410 Gone?
+
+The requested watch revision has already been compacted and cannot be replayed.
+
+---
+
+### Q8. How do Kubernetes Informers recover from 410 Gone?
+
+They perform a fresh LIST to rebuild their cache and then establish a new WATCH from the latest state.
+
+---
+
+### Q9. Is compaction enough to reduce disk usage?
+
+No.
+
+Compaction removes obsolete history logically, while defragmentation is required to reclaim physical storage space.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Frequent `410 Gone` responses | Watch clients are reconnecting after revisions have already been compacted |
+| Historical reads fail | Requested revision is older than the compaction point |
+| Database continues growing after compaction | Physical storage has not yet been defragmented |
+| Informers repeatedly relist | Long disconnections, slow processing, or aggressive compaction settings |
+| High storage consumption | Compaction retention too long or defragmentation not performed |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is MVCC history?
+2. Why does etcd require compaction?
+3. What does compaction remove?
+4. Does compaction delete current objects?
+5. What is automatic compaction?
+6. What is manual compaction?
+7. Why are historical reads affected by compaction?
+8. Why can watches fail after compaction?
+9. What does HTTP 410 Gone mean in Kubernetes watches?
+10. How do Informers recover after receiving 410 Gone?
+11. What is the difference between snapshots and compaction?
+12. Why is defragmentation still needed after compaction?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned:
+
+- How MVCC history continuously grows as revisions accumulate
+- Why compaction is essential for long-running etcd clusters
+- The difference between automatic and manual compaction
+- How obsolete historical revisions are removed while preserving the latest state
+- Why historical reads are limited after compaction
+- How compaction affects watches and leads to HTTP 410 Gone responses
+- How Kubernetes Informers automatically recover by performing a fresh LIST followed by a new WATCH
+- Why compaction is a logical cleanup and does not immediately reclaim disk space
+
+Compaction is the housekeeping mechanism that prevents MVCC history from growing forever. It balances historical retention with performance, enabling etcd to remain fast and efficient while still supporting Kubernetes watches, optimistic concurrency, and large-scale production workloads.
+
+---
+
+# Next Chapter
+
+**Chapter 9 — Defragmentation**
+
+In the previous chapter, you learned that compaction removes obsolete MVCC history.
+
+However, many administrators are surprised to discover that:
+
+- Database files often remain the same size.
+- Disk space is not immediately returned to the operating system.
+- Storage usage may continue to appear high.
+
+In the next chapter, we'll explore:
+
+- Why Compaction Doesn't Free Disk Space
+- BoltDB Page Allocation
+- Internal Fragmentation
+- Defragmentation Process
+- Online vs Offline Defragmentation
+- Performance Impact
+- Production Maintenance Strategy
+
+You'll learn why **Compaction** is a logical cleanup operation, while **Defragmentation** is the physical storage optimization that actually reclaims disk space.
+```

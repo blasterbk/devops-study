@@ -1,0 +1,1141 @@
+---
+title: "Chapter 2 — Built-in Admission Controllers"
+sidebar_position: 2
+module: "Module 1.10 — Admission Controllers"
+description: "> **Goal:** Understand Kubernetes **Built-in Admission Controllers**, how they are integrated into the API Server, how they execute in the admission chain, and ..."
+---
+
+# Module 1.10 — Admission Controllers
+
+# Chapter 2 — Built-in Admission Controllers
+
+> **Goal:** Understand Kubernetes **Built-in Admission Controllers**, how they are integrated into the API Server, how they execute in the admission chain, and how they enforce security, resource governance, storage protection, and default behaviors before objects are persisted into etcd.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What built-in admission plugins are and how they are compiled into kube-apiserver
+> 2. The recommended default admission plugins list and execution ordering
+> 3. NamespaceLifecycle: preventing new object creation in terminating namespaces
+> 4. ServiceAccount: automounting API tokens and verifying account existence
+> 5. LimitRanger and ResourceQuota: enforcing pod resource requests, limits, and namespace quotas
+> 6. Defaulting controllers: DefaultStorageClass, DefaultIngressClass, DefaultTolerationSeconds
+> 7. Storage protection plugins: PersistentVolumeLabel and StorageObjectInUseProtection
+> 8. PodSecurity admission plugin: Privileged, Baseline, and Restricted standard enforcement
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Built-in Admission Controllers like municipal building code compliance checkpoints.
+
+```text
+Building Code Checkpoints Analogy:
+
+Builder submits construction plan (Pod creation request)
+City inspector executes built-in mandatory checks in fixed order:
+  - Check 1 (NamespaceLifecycle): Is this building lot currently scheduled for demolition? If yes -> REJECT
+  - Check 2 (LimitRanger): Does the plan allocate minimum required fire escape dimensions? If missing -> INJECT DEFAULTS
+  - Check 3 (ResourceQuota): Has the neighborhood exceeded total permitted building density? If yes -> REJECT
+  - Check 4 (ServiceAccount): Does the contractor hold a registered municipal license? If yes -> ATTACH BADGE
+All inspectors work directly inside city hall (in-process) without external network delay
+```
+
+| Building Code Checkpoint | Built-in Admission Controller |
+| :--- | :--- |
+| Check if lot is being demolished | `NamespaceLifecycle` |
+| Verify and attach contractor badge | `ServiceAccount` |
+| Ensure minimum room dimensions / ceilings | `LimitRanger` (defaults requests/limits) |
+| Check neighborhood total density cap | `ResourceQuota` |
+| Assign standard default city water utility | `DefaultStorageClass` / `DefaultIngressClass` |
+| Enforce fire safety construction standards | `PodSecurity` (Privileged/Baseline/Restricted) |
+
+> **Important:** Built-in admission controllers run **in-process inside the `kube-apiserver` binary** with near-zero latency ($<1$ ms). Their execution order is statically determined in Go source code. Crucially, `NamespaceLifecycle` runs first in the chain to immediately reject requests targeted at namespaces undergoing deletion, preventing race conditions before any other plugins execute.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- API Server
+- Authentication
+- Authorization
+- Admission Controllers Fundamentals
+- Kubernetes Resources
+- Namespaces
+- Persistent Volumes
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapter, we learned that every request follows this pipeline.
+
+```text
+Client
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Admission
+  |
+  v
+Persist
+  |
+  v
+etcd
+```
+
+We also learned that Admission consists of:
+
+```text
+Mutating
+  |
+  v
+Validating
+```
+
+Now we'll look at the **built-in admission plugins** that ship with Kubernetes.
+
+---
+
+# What are Built-in Admission Controllers?
+
+Built-in Admission Controllers are plugins compiled directly into the Kubernetes API Server.
+
+Unlike webhooks,
+
+they do not require:
+
+- External services
+- HTTP requests
+- Separate deployments
+
+They execute inside the API Server process.
+
+---
+
+# High-Level Architecture
+
+```text
+            API Server
+
+                 |
+
+     ┌───────────┼────────────┐
+
+     v           v            v
+
+Authentication Authorization Admission
+
+                              |
+
+        ┌─────────────────────┼─────────────────────┐
+
+        v                     v                     v
+
+NamespaceLifecycle      LimitRanger        ResourceQuota
+  |
+  v
+                           Persist
+```
+
+---
+
+# Why Built-in Admission Controllers Exist
+
+Some functionality is fundamental to Kubernetes.
+
+Examples:
+
+- Namespace validation
+- Resource quotas
+- Default Service Accounts
+- Storage protection
+
+These features should always be:
+
+- Fast
+- Reliable
+- Available
+
+Embedding them inside the API Server avoids external dependencies.
+
+---
+
+# Built-in vs Dynamic Admission
+
+| Built-in Admission | Dynamic Admission |
+|--------------------|-------------------|
+| Runs inside API Server | Runs as external webhook |
+| Compiled into Kubernetes | User deployed |
+| No network call | HTTP request required |
+| Lower latency | Higher latency |
+| Used for core functionality | Used for organization-specific policies |
+
+---
+
+# Admission Plugin Chain
+
+Built-in Admission Controllers execute in sequence.
+
+```text
+Incoming Request
+  |
+  v
+Plugin 1
+  |
+  v
+Plugin 2
+  |
+  v
+Plugin 3
+  |
+  v
+Plugin 4
+  |
+  v
+Persist
+```
+
+Every plugin receives the output of the previous plugin.
+
+---
+
+# Why Ordering Matters
+
+Imagine this sequence:
+
+```text
+ResourceQuota
+  |
+  v
+LimitRanger
+```
+
+Quota checks happen before default limits are applied.
+
+This could reject valid requests.
+
+Correct ordering is critical because plugins may modify objects before later plugins evaluate them.
+
+---
+
+# Admission Execution Pipeline
+
+```text
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Mutating Plugins
+  |
+  v
+Mutating Webhooks
+  |
+  v
+Built-in Validating Plugins
+  |
+  v
+Validating Webhooks
+  |
+  v
+API Validation
+  |
+  v
+Persist
+```
+
+---
+
+# Default Enabled Admission Controllers
+
+Modern Kubernetes clusters typically enable numerous admission plugins by default.
+
+Some of the most important are:
+
+- NamespaceLifecycle
+- ServiceAccount
+- LimitRanger
+- ResourceQuota
+- DefaultStorageClass
+- DefaultIngressClass
+- DefaultTolerationSeconds
+- Priority
+- PodSecurity
+- PersistentVolumeClaimProtection
+- PersistentVolumeProtection
+- StorageObjectInUseProtection
+
+The exact default set varies slightly between Kubernetes releases.
+
+---
+
+# NamespaceLifecycle
+
+One of the first admission controllers.
+
+Purpose:
+
+Prevent invalid namespace usage.
+
+---
+
+# Problem
+
+Suppose a user creates:
+
+```yaml
+namespace: production
+```
+
+But the namespace does not exist.
+
+Without validation,
+
+objects could reference invalid namespaces.
+
+---
+
+# Solution
+
+```text
+Incoming Request
+  |
+  v
+Namespace Exists?
+  |
+  v
+Yes → Continue
+  |
+  v
+No → Reject
+```
+
+---
+
+# Namespace Deletion Protection
+
+Suppose a namespace is terminating.
+
+```text
+Namespace
+  |
+  v
+Terminating
+```
+
+Should new Pods be created?
+
+No.
+
+NamespaceLifecycle rejects new object creation while the namespace is terminating.
+
+---
+
+# Workflow
+
+```text
+Create Pod
+  |
+  v
+NamespaceLifecycle
+  |
+  v
+Namespace Active?
+  |
+  v
+Yes
+  |
+  v
+Continue
+
+------------
+
+No
+  |
+  v
+Reject
+```
+
+---
+
+# ServiceAccount Admission Controller
+
+Every Pod requires a Service Account.
+
+Suppose the user omits:
+
+```yaml
+serviceAccountName:
+```
+
+Should the Pod fail?
+
+No.
+
+The ServiceAccount admission controller assigns the default Service Account when appropriate.
+
+---
+
+# Workflow
+
+```text
+Incoming Pod
+  |
+  v
+serviceAccountName Missing?
+  |
+  v
+Yes
+  |
+  v
+Assign Default ServiceAccount
+  |
+  v
+Continue
+```
+
+---
+
+# Additional Responsibilities
+
+The ServiceAccount admission controller can also:
+
+- Verify referenced Service Accounts exist
+- Automatically mount ServiceAccount tokens when configured
+- Populate image pull secrets referenced by the Service Account
+
+---
+
+# LimitRanger
+
+Purpose:
+
+Apply default resource requests and limits.
+
+---
+
+# Problem
+
+Developer creates:
+
+```yaml
+resources: {}
+```
+
+Without defaults,
+
+the scheduler cannot accurately plan resources.
+
+Clusters may also experience resource starvation.
+
+---
+
+# Solution
+
+Namespace administrators define defaults.
+
+Incoming Pod:
+
+```yaml
+resources: {}
+```
+
+After mutation:
+
+```yaml
+requests:
+  cpu: 100m
+
+limits:
+  cpu: 500m
+```
+
+---
+
+# LimitRanger Workflow
+
+```text
+Incoming Pod
+  |
+  v
+Resources Missing?
+  |
+  v
+Apply Defaults
+  |
+  v
+Continue
+```
+
+---
+
+# Additional LimitRanger Responsibilities
+
+Besides defaults,
+
+LimitRanger also validates:
+
+- Minimum resource limits
+- Maximum resource limits
+- Request-to-limit ratios
+- Object count limits (depending on LimitRange configuration)
+
+---
+
+# ResourceQuota
+
+Purpose:
+
+Prevent one namespace from consuming unlimited resources.
+
+---
+
+# Example Quota
+
+```text
+Pods = 20
+
+CPU = 20
+
+Memory = 64Gi
+```
+
+Namespace currently has:
+
+```text
+20 Pods
+```
+
+New request:
+
+```text
+Create Pod
+```
+
+---
+
+# ResourceQuota Decision
+
+```text
+Incoming Request
+  |
+  v
+Quota Available?
+  |
+  v
+No
+  |
+  v
+Reject
+```
+
+The object is never stored.
+
+---
+
+# ResourceQuota Evaluation
+
+ResourceQuota evaluates:
+
+- Pods
+- Services
+- PVCs
+- Secrets
+- ConfigMaps
+- CPU
+- Memory
+- Storage
+- Object counts
+
+---
+
+# DefaultStorageClass
+
+Suppose a PVC is created.
+
+```yaml
+storageClassName:
+```
+
+is missing.
+
+Which StorageClass should Kubernetes use?
+
+---
+
+# Solution
+
+DefaultStorageClass automatically assigns the cluster's default StorageClass.
+
+Workflow:
+
+```text
+PVC
+  |
+  v
+No StorageClass
+  |
+  v
+Assign Default
+  |
+  v
+Continue
+```
+
+---
+
+# DefaultIngressClass
+
+Similarly,
+
+if an Ingress lacks:
+
+```yaml
+ingressClassName:
+```
+
+the default IngressClass may be assigned.
+
+This avoids repetitive configuration.
+
+---
+
+# DefaultTolerationSeconds
+
+Nodes sometimes become temporarily unavailable.
+
+Without default tolerations,
+
+Pods could be evicted immediately.
+
+This admission controller injects default toleration values for specific node conditions unless explicitly provided.
+
+---
+
+# Workflow
+
+```text
+Pod
+  |
+  v
+Missing Default Tolerations
+  |
+  v
+Inject Defaults
+  |
+  v
+Continue
+```
+
+---
+
+# Priority Admission
+
+Pods may specify:
+
+```yaml
+priorityClassName:
+```
+
+The Priority admission controller validates that the referenced PriorityClass exists and resolves the associated priority value.
+
+This priority influences scheduling and preemption later.
+
+---
+
+# Pod Security Admission
+
+Modern Kubernetes uses **Pod Security Admission** to enforce Pod Security Standards.
+
+Policies include:
+
+- Privileged
+- Baseline
+- Restricted
+
+---
+
+# Example
+
+Incoming Pod:
+
+```yaml
+privileged: true
+```
+
+Namespace policy:
+
+```text
+Restricted
+```
+
+Decision:
+
+```text
+Reject
+```
+
+---
+
+# PersistentVolumeClaimProtection
+
+Suppose a PVC is currently in use.
+
+Application:
+
+```text
+Running
+  |
+  v
+Using PVC
+```
+
+User deletes the PVC.
+
+Without protection,
+
+running workloads could fail.
+
+---
+
+# Solution
+
+PVC Protection prevents deletion while the claim is still referenced.
+
+Workflow:
+
+```text
+Delete PVC
+  |
+  v
+Still In Use?
+  |
+  v
+Yes
+  |
+  v
+Reject/Delay Deletion
+```
+
+The controller adds a protection finalizer; deletion completes only after the PVC is no longer in use.
+
+---
+
+# PersistentVolumeProtection
+
+Similarly,
+
+Persistent Volumes cannot be removed while still bound or actively used.
+
+This prevents accidental storage loss.
+
+---
+
+# StorageObjectInUseProtection
+
+This admission controller enables protection mechanisms for storage objects by ensuring appropriate protection finalizers are added.
+
+Purpose:
+
+Prevent accidental deletion of storage resources still in use.
+
+---
+
+# Complete Built-in Admission Flow
+
+```text
+Incoming Request
+  |
+  v
+NamespaceLifecycle
+  |
+  v
+ServiceAccount
+  |
+  v
+LimitRanger
+  |
+  v
+DefaultStorageClass
+  |
+  v
+DefaultIngressClass
+  |
+  v
+DefaultTolerationSeconds
+  |
+  v
+Priority
+  |
+  v
+ResourceQuota
+  |
+  v
+Pod Security
+  |
+  v
+Storage Protection
+  |
+  v
+Continue
+  |
+  v
+Persist
+```
+
+The exact ordering depends on Kubernetes configuration and version, but the conceptual flow remains the same.
+
+---
+
+# Internal API Server View
+
+```text
+HTTP Request
+  |
+  v
+Decode Object
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Admission Plugins
+  |
+  v
+Dynamic Admission Webhooks
+  |
+  v
+API Validation
+  |
+  v
+Store in etcd
+```
+
+---
+
+# Production Example 1 — Multi-Tenant Cluster
+
+Namespace:
+
+```text
+Team A
+```
+
+Policies:
+
+- CPU quota
+- Memory quota
+- Default requests
+- Restricted security
+
+Every Pod automatically complies with organizational standards.
+
+---
+
+# Production Example 2 — Platform Engineering
+
+Developer creates:
+
+```yaml
+Pod
+```
+
+Admission automatically adds:
+
+- Default ServiceAccount
+- Default requests
+- Default StorageClass
+- Default tolerations
+
+The developer writes less configuration while the platform maintains consistency.
+
+---
+
+# Production Example 3 — Resource Governance
+
+One application attempts to create:
+
+```text
+500 Pods
+```
+
+Quota:
+
+```text
+100 Pods
+```
+
+ResourceQuota rejects the request,
+
+protecting the rest of the cluster.
+
+---
+
+# Production Example 4 — Storage Safety
+
+Application:
+
+```text
+Using PVC
+```
+
+Administrator:
+
+```text
+Delete PVC
+```
+
+Admission and protection mechanisms ensure the storage resource is not accidentally removed while still in use.
+
+---
+
+# Production Considerations
+
+Large production clusters rely heavily on built-in admission plugins because they are:
+
+- Fast
+- Reliable
+- Consistent
+- Well-tested
+- Integrated with the API Server
+
+They should be preferred over custom webhooks whenever they satisfy the requirement.
+
+---
+
+# Performance Considerations
+
+Built-in Admission Controllers:
+
+✔ Execute in-process
+
+✔ No network latency
+
+✔ No TLS handshake
+
+✔ No external dependency
+
+✔ Low overhead
+
+This makes them significantly faster than webhook-based admission.
+
+---
+
+# Best Practices
+
+✔ Use built-in admission plugins whenever possible.
+
+✔ Configure ResourceQuota for every production namespace.
+
+✔ Configure LimitRanges for sensible defaults.
+
+✔ Use Pod Security Admission to enforce workload security.
+
+✔ Define default StorageClasses and IngressClasses.
+
+✔ Monitor admission failures.
+
+✔ Test policy changes before production rollout.
+
+✔ Understand admission ordering when troubleshooting.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Built-in Admission Controllers are Controllers.
+
+**Correct:** They are API Server plugins, not reconciliation controllers.
+
+---
+
+### ❌ Misconception 2
+
+ResourceQuota schedules Pods.
+
+**Correct:** ResourceQuota only allows or rejects API requests. Scheduling happens later.
+
+---
+
+### ❌ Misconception 3
+
+LimitRanger only validates resources.
+
+**Correct:** It can also mutate requests by applying default values.
+
+---
+
+### ❌ Misconception 4
+
+DefaultStorageClass creates storage.
+
+**Correct:** It only assigns a StorageClass. Provisioning happens later.
+
+---
+
+### ❌ Misconception 5
+
+Pod Security Admission starts containers securely.
+
+**Correct:** It validates Pod specifications before persistence.
+
+---
+
+### ❌ Misconception 6
+
+Storage protection permanently blocks deletion.
+
+**Correct:** It delays deletion until the resource is no longer in use.
+
+---
+
+### ❌ Misconception 7
+
+Built-in Admission Controllers replace webhooks.
+
+**Correct:** They provide core Kubernetes functionality. Webhooks extend Kubernetes with custom organization-specific policies.
+
+---
+
+# Common Interview Questions
+
+### Q1. What are Built-in Admission Controllers?
+
+Plugins integrated into the Kubernetes API Server that mutate or validate requests before persistence.
+
+---
+
+### Q2. Why are they compiled into the API Server?
+
+To provide low-latency, reliable, core Kubernetes functionality without external dependencies.
+
+---
+
+### Q3. What is the purpose of NamespaceLifecycle?
+
+To ensure resources are created only in valid, active namespaces.
+
+---
+
+### Q4. What does the ServiceAccount admission controller do?
+
+It defaults and validates Service Accounts for Pods.
+
+---
+
+### Q5. What is the difference between LimitRanger and ResourceQuota?
+
+LimitRanger applies and validates resource defaults per object, while ResourceQuota limits total namespace resource consumption.
+
+---
+
+### Q6. What does DefaultStorageClass do?
+
+It assigns the default StorageClass to PVCs that omit `storageClassName`.
+
+---
+
+### Q7. What is Pod Security Admission?
+
+A built-in validating admission controller that enforces Pod Security Standards.
+
+---
+
+### Q8. Why is StorageObjectInUseProtection important?
+
+It helps prevent deletion of storage resources that are still actively referenced.
+
+---
+
+### Q9. Why are built-in admission plugins faster than webhooks?
+
+Because they execute inside the API Server process and do not require network communication.
+
+---
+
+### Q10. Should built-in admission plugins or webhooks be preferred?
+
+Prefer built-in plugins whenever they satisfy the requirement; use webhooks for custom organizational policies.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod rejected immediately | NamespaceLifecycle or Pod Security policy |
+| CPU limits unexpectedly appear | LimitRanger applied defaults |
+| PVC received StorageClass automatically | DefaultStorageClass admission |
+| Quota exceeded errors | ResourceQuota limits reached |
+| ServiceAccount automatically assigned | ServiceAccount admission |
+| PVC cannot be deleted | Protection finalizer because the PVC is still in use |
+| Pod scheduling priority unexpected | Priority admission resolved PriorityClass |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What are Built-in Admission Controllers?
+2. Why do they execute inside the API Server?
+3. What is the role of NamespaceLifecycle?
+4. How does the ServiceAccount admission controller work?
+5. What is the difference between LimitRanger and ResourceQuota?
+6. What does DefaultStorageClass do?
+7. What is Pod Security Admission?
+8. Why are storage protection admission plugins needed?
+9. Why are built-in plugins generally faster than webhooks?
+10. When should you use built-in admission plugins instead of custom webhooks?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how **Built-in Admission Controllers** provide Kubernetes' core policy enforcement before objects are stored in etcd.
+
+You learned:
+
+- What built-in admission plugins are
+- Why they execute inside the API Server
+- How admission ordering affects request processing
+- The responsibilities of NamespaceLifecycle, ServiceAccount, LimitRanger, ResourceQuota, DefaultStorageClass, DefaultIngressClass, DefaultTolerationSeconds, Priority, Pod Security Admission, and storage protection plugins
+- How these plugins enforce security, governance, and resource management
+- Why built-in plugins are preferred for standard Kubernetes functionality
+
+Built-in Admission Controllers form the first layer of Kubernetes policy enforcement. They provide secure defaults, protect cluster resources, and ensure requests satisfy fundamental platform rules before custom webhooks are ever invoked.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — Mutating Admission Webhooks**
+
+Topics include:
+
+- What are Mutating Admission Webhooks?
+- AdmissionReview API
+- MutatingWebhookConfiguration
+- JSON Patch
+- Namespace & Object Selectors
+- Failure Policy
+- Reinvocation Policy
+- Sidecar Injection
+- Production Architecture
+- Performance & Troubleshooting
+```

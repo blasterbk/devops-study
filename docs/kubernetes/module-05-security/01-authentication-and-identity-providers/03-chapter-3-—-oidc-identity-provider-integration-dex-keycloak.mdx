@@ -1,0 +1,241 @@
+---
+title: "Chapter 3 — OIDC Identity Provider Integration"
+sidebar_position: 3
+module: "Module 5.1 — Authentication & Identity"
+description: "Master enterprise OIDC authentication in Kubernetes — kube-apiserver OIDC configuration, Dex & Keycloak federated brokers, JWKS public key validation, and kubelogin SSO flows."
+---
+
+# Chapter 3 — OIDC Identity Provider Integration (Dex, Keycloak & Okta)
+
+> **Goal:** Master enterprise OpenID Connect (OIDC) authentication in Kubernetes — understanding how `kube-apiserver` validates cryptographically signed JSON Web Tokens (JWTs) using public JWKS endpoints, configuring API server OIDC flags (`--oidc-issuer-url`, `--oidc-client-id`), deploying federated identity brokers (Dex and Keycloak), and configuring developer Single Sign-On (SSO) with multi-factor authentication using the `kubelogin` plugin.
+>
+> By the end of this chapter, you will understand:
+> 1. The OAuth 2.0 / OpenID Connect (OIDC) JWT ID token architecture
+> 2. How `kube-apiserver` discovers and caches public signing keys from `/.well-known/openid-configuration`
+> 3. The 6 core API server OIDC flags and group-prefix safety rules
+> 4. How Dex acts as a multi-protocol identity broker connecting LDAP, SAML, GitHub, and Okta
+> 5. The developer SSO workflow using the `kubelogin` (`oidc-login`) CLI plugin
+> 6. How to troubleshoot token expiration, audience mismatch, and clock skew errors
+
+---
+
+## Real-Life Analogy
+
+Think of OIDC authentication as **using a driver's license with a digital hologram to enter a secured office building**:
+
+- **The Government DMV (The Identity Provider - Keycloak / Okta):** You visit the DMV in person, provide your biometric passport, and complete multi-factor verification (SSO login + MFA). The DMV hands you a plastic driver's license with a digitally signed cryptographic hologram (**The OIDC ID Token - JWT**).
+- **The Building Security Turnstile (The Kubernetes API Server):** You tap your driver's license at the office turnstile. The turnstile does **not** call the DMV on the telephone for every single employee tap (zero network lag). Instead, the turnstile downloaded the DMV's public hologram verification key once this morning (**JWKS Public Key Caching**). It verifies the hologram locally in 0.1 milliseconds.
+- **The License Data (JWT Claims):** The license clearly reads: `email: alice@company.com`, `roles: [devops-admin]`. The turnstile lets Alice pass directly into the building and hands her clearance record to the security desk (**RBAC Engine**).
+- **The Identity Broker (Dex - The Universal Translator):** If your company uses 5 different old legacy building badges (LDAP, SAML, GitHub, Google), Dex translates all of them into one standard OIDC driver's license that Kubernetes understands.
+
+---
+
+## Architecture Diagram
+
+```text
+               OIDC Authentication & JWKS Verification Flow
+
+ 1. Developer runs `kubectl get pods`:
+    `kubelogin` opens browser ──► User logs in via Enterprise SSO (MFA)
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Enterprise Identity Provider (Keycloak / Okta / Dex)                   │
+ │ Issues signed ID Token (JWT):                                          │
+ │ {                                                                      │
+ │   "iss": "https://auth.company.com/realms/k8s",                        │
+ │   "sub": "usr-12345",                                                  │
+ │   "email": "alice@company.com",                                        │
+ │   "groups": ["platform-engineers", "sre-oncall"],                      │
+ │   "aud": "kubernetes-cluster",                                         │
+ │   "exp": 1723987200                                                    │
+ │ }                                                                      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ 2. Returns ID Token to kubectl
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `kubectl` sends request with Header:                                   │
+ │ `Authorization: Bearer <JWT_ID_TOKEN>`                                 │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ 3. Evaluates Bearer Token
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: OIDC Authenticator                                     │
+ │                                                                        │
+ │ 1. Checks `iss` matches `--oidc-issuer-url`                            │
+ │ 2. Checks `aud` matches `--oidc-client-id`                             │
+ │ 3. Cryptographically validates JWT signature using cached JWKS keys:   │
+ │    `https://auth.company.com/realms/k8s/.well-known/openid-configuration`
+ │ 4. Extracts User: `alice@company.com` & Groups: `["platform-engineers"]│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ Authenticated UserInfo passed to RBAC!
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ RBAC Authorization Engine (Grants/Denies API Action)                   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 6 API Server OIDC Configuration Flags
+
+Configured inside `/etc/kubernetes/manifests/kube-apiserver.yaml`:
+
+```text
+ ┌──────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+ │ Flag Name                    │ Purpose & Example Configuration                                     │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ `--oidc-issuer-url`          │ The HTTPS URL of the IdP (e.g. `https://keycloak.corp/realms/k8s`). │
+ │                              │ API server fetches `/.well-known/openid-configuration` from here.   │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ `--oidc-client-id`           │ Expected audience string matching `aud` in the JWT                  │
+ │                              │ (e.g. `kubernetes-cluster`). Prevents token reuse across apps.      │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ `--oidc-username-claim`      │ The JWT claim mapped to the Kubernetes Username                     │
+ │                              │ (e.g. `email`, `sub`, or `preferred_username`).                    │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ `--oidc-groups-claim`        │ The JWT array claim mapped to Kubernetes RBAC Groups                │
+ │                              │ (e.g. `groups` or `roles`).                                         │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ `--oidc-groups-prefix`       │ String prefixed to all IdP groups (e.g. `oidc:`). Prevents collision│
+ │                              │ with internal system groups (like `system:masters`).                │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ `--oidc-ca-file`             │ Path to custom CA cert bundle trusting the IdP's HTTPS certificate. │
+ └──────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Dex: The Cloud-Native Federated Identity Broker
+
+In enterprise clusters, different teams authenticate via different backend systems (Google Workspace, Active Directory LDAP, GitHub, SAML).
+
+**Dex** is a CNCF-incubated OpenID Connect identity broker that unifies all authentication protocols behind a single OIDC interface:
+
+```text
+ ┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐
+ │ Active Directory  │  │ GitHub Enterprise │  │ Google Workspace  │
+ │ (LDAP Protocol)   │  │ (OAuth2 Protocol) │  │ (SAML 2.0)        │
+ └─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘
+           │                      │                      │
+           └──────────────────────┼──────────────────────┘
+                                  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ DEX Identity Broker (Exposes unified OIDC endpoint: https://dex:5556)  │
+ └────────────────────────────────┬───────────────────────────────────────┘
+                                  │ Standard OIDC JWTs
+                                  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes API Server (--oidc-issuer-url=https://dex:5556)            │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Client-Side Authentication: The `kubelogin` Plugin
+
+`kubectl` does not have an embedded web browser to execute OAuth2 authorization code flows. Developers use the standard **`kubelogin` (oidc-login)** plugin:
+
+```yaml
+# ~/.kube/config
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority: /path/to/ca.crt
+    server: https://k8s-api.company.com:6443
+  name: production-cluster
+contexts:
+- context:
+    cluster: production-cluster
+    user: oidc-developer
+  name: production
+current-context: production
+users:
+- name: oidc-developer
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: kubectl
+      args:
+      - oidc-login
+      - get-token
+      - --oidc-issuer-url=https://keycloak.company.com/realms/k8s
+      - --oidc-client-id=kubernetes-cluster
+      - --oidc-client-secret=SECRET_KEY_HERE
+```
+
+```text
+ The Developer Experience:
+ 1. Developer types: `kubectl get pods`
+ 2. `kubelogin` opens their default browser to Keycloak/Okta.
+ 3. Developer approves Okta Push / YubiKey MFA on their phone.
+ 4. Browser redirects to localhost, and `kubectl` executes the command seamlessly!
+```
+
+---
+
+## Hands-On Lab: Inspecting & Decoding an OIDC JWT Token
+
+```bash
+# Step 1: Create a mock JWT payload representing an OIDC ID Token
+HEADER='{"alg":"RS256","typ":"JWT"}'
+PAYLOAD='{
+  "iss": "https://accounts.google.com",
+  "sub": "10982347109283",
+  "email": "developer@company.com",
+  "groups": ["oidc:frontend-team", "oidc:developers"],
+  "aud": "k8s-prod-cluster",
+  "exp": 1893456000
+}'
+
+# Step 2: Encode Header and Payload to Base64URL
+B64_HEADER=$(echo -n "$HEADER" | base64 | tr -d '\n' | tr '/+' '_-' | tr -d '=')
+B64_PAYLOAD=$(echo -n "$PAYLOAD" | base64 | tr -d '\n' | tr '/+' '_-' | tr -d '=')
+MOCK_JWT="${B64_HEADER}.${B64_PAYLOAD}.MOCK_SIGNATURE"
+
+echo "Generated Mock OIDC Token: $MOCK_JWT"
+
+# Step 3: Decode and inspect the JWT payload (simulating API server claim extraction)
+echo "$MOCK_JWT" | cut -d'.' -f2 | base64 --decode | jq .
+
+# Step 4: Verify how Kubernetes RBAC maps the claims
+# Username mapped from 'email' claim: developer@company.com
+# Groups mapped from 'groups' claim: ["oidc:frontend-team", "oidc:developers"]
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does OpenID Connect (OIDC) authentication work in Kubernetes?**
+
+OIDC is an identity layer built on top of OAuth 2.0. The developer authenticates against an external Identity Provider (Okta, Keycloak, Google) using Single Sign-On and MFA. The IdP returns a cryptographically signed JSON Web Token (JWT) called an **ID Token**. The developer CLI passes this token as a `Bearer` token in the HTTP `Authorization` header to `kube-apiserver`. The API server validates the JWT signature against the IdP's public JSON Web Key Set (JWKS) and extracts the username and groups into a `UserInfo` struct for RBAC evaluation.
+
+**Q2: Does `kube-apiserver` contact the OIDC Identity Provider on every single API request?**
+
+No. Contacting the IdP over the network for every HTTP request would introduce massive latency and create a single point of failure. Instead, `kube-apiserver` queries the IdP's `/.well-known/openid-configuration` and `jwks_uri` endpoints upon startup and caches the public signing keys in memory. Subsequent incoming JWT signatures are verified **locally in memory in sub-milliseconds** using public key cryptography.
+
+**Q3: What is the purpose of `--oidc-groups-prefix`, and why is it a critical security best practice?**
+
+`--oidc-groups-prefix` prepends a fixed string (e.g. `oidc:`) to all group names extracted from the OIDC token before passing them to the RBAC engine. This prevents **privilege escalation attacks**: without a prefix, an attacker who compromises an external IdP or creates a group named `system:masters` in Active Directory could automatically gain unrestricted superuser permissions over the entire Kubernetes cluster.
+
+**Q4: What is Dex, and what problem does it solve in Kubernetes identity architecture?**
+
+Dex is an open-source, federated OpenID Connect identity broker. Many enterprise environments rely on non-OIDC protocols (such as LDAP, Active Directory, SAML 2.0, or GitHub Enterprise OAuth). Because `kube-apiserver` only natively supports OpenID Connect, Dex acts as an intermediary bridge: it connects to multiple disparate upstream identity sources and exposes a single standard OIDC endpoint for Kubernetes.
+
+**Q5: What happens when an OIDC ID Token expires while a developer is using `kubectl`?**
+
+An ID Token is short-lived (typically 15–60 minutes). When it expires, `kube-apiserver` rejects requests with HTTP `401 Unauthorized`. When using the `kubelogin` plugin with `kubectl`, `kubelogin` detects the expiration and uses the stored **OAuth2 Refresh Token** to automatically fetch a fresh ID Token from the IdP in the background without prompting the developer to re-enter their password.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that OIDC authenticates human users via signed JSON Web Tokens (JWTs)
+- [ ] Know the 6 core API server flags (`issuer-url`, `client-id`, `username-claim`, `groups-claim`, `groups-prefix`, `ca-file`)
+- [ ] Know that `kube-apiserver` validates JWT signatures locally using cached JWKS keys
+- [ ] Know that `--oidc-groups-prefix` prevents group collision with `system:masters`
+- [ ] Know that Dex acts as a federated broker bridging LDAP/SAML to OIDC
+- [ ] Know how `kubelogin` handles automated token refresh and browser SSO flows
+- [ ] Can decode and inspect OIDC JWT payloads using `jq` and `base64`

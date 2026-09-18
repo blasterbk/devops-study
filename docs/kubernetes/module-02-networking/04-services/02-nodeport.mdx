@@ -1,0 +1,322 @@
+---
+title: "Chapter 2 — NodePort Services"
+sidebar_position: 2
+module: "Module 2.4 — Services"
+description: "Deep dive into NodePort — how Kubernetes exposes Services on a static port on every node, how traffic is routed to backends across nodes, the NodePort range, source IP preservation, and when to use NodePort vs LoadBalancer."
+---
+
+# Chapter 2 — NodePort Services
+
+> **Goal:** Understand how NodePort allocates a cluster-wide static port on every node, how kube-proxy routes incoming NodePort traffic to backend Pods (potentially on different nodes), and the trade-offs of using NodePort in production.
+>
+> By the end of this chapter, you will understand:
+> 1. What a NodePort Service is and how it extends ClusterIP
+> 2. The NodePort port range (30000-32767) and how ports are allocated
+> 3. How traffic arriving at any node's NodePort reaches a backend Pod
+> 4. Source IP behavior and the `externalTrafficPolicy` setting
+> 5. The limitations of NodePort for production external traffic
+> 6. When to use NodePort vs LoadBalancer vs Ingress
+
+---
+
+## Real-Life Analogy
+
+A NodePort Service is like **posting the same phone extension on every floor of a building**:
+
+Every floor (node) has a phone panel. The same extension number (NodePort: e.g., 30080) appears on every floor's panel. When someone in the building dials that extension from any floor, the building's internal routing system connects them to the right department (backend Pod) — which might actually be located on a completely different floor than where they called from.
+
+External callers can also dial in: they call the building's main number (any node's IP) + the extension (NodePort). The receptionist on that floor routes them to the right department.
+
+---
+
+## Architecture Diagram
+
+```text
+              NodePort Service — External Access
+
+External Client (203.0.113.5)
+      │
+      │  connects to Node A: 192.168.1.10:30080
+      ▼
+  Node A NIC (192.168.1.10)
+      │
+      ▼
+  iptables PREROUTING:
+  ┌───────────────────────────────────────────────┐
+  │ dst 30080 (any IP on this node)               │
+  │  → DNAT to one of:                            │
+  │    10.244.1.5:8080  (Pod A, local)            │
+  │    10.244.2.3:8080  (Pod B, Node B) ← chosen │
+  └───────────────────────────────────────────────┘
+      │
+      │  If backend is on Node B:
+      ▼
+  Node B (192.168.1.11)
+      │  (SNAT: src rewritten to Node A's IP to ensure return path)
+      ▼
+  Pod B (10.244.2.3:8080)
+      │
+      ▼  Response path:
+  Pod B → Node B → Node A (SNAT reverse) → Client
+```
+
+---
+
+## Creating a NodePort Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: web
+  ports:
+  - name: http
+    protocol: TCP
+    port: 80              # ClusterIP port (still created)
+    targetPort: 8080      # Pod port
+    nodePort: 30080       # External port on every node (30000-32767)
+                          # Omit to let Kubernetes auto-assign
+```
+
+```bash
+kubectl apply -f web-service.yaml
+kubectl get svc web-service
+
+# Output:
+# NAME          TYPE       CLUSTER-IP     EXTERNAL-IP  PORT(S)         AGE
+# web-service   NodePort   10.96.120.45   <none>       80:30080/TCP    5s
+
+# Access from outside the cluster:
+curl http://192.168.1.10:30080  # Node A
+curl http://192.168.1.11:30080  # Node B (same result)
+curl http://192.168.1.12:30080  # Node C (same result)
+```
+
+---
+
+## The NodePort Range
+
+By default, NodePort allocates from the range **30000–32767**. This range:
+- Is above the ephemeral port range (doesn't conflict with client ports)
+- Must be opened in firewalls for external access
+
+```bash
+# Change the NodePort range (kube-apiserver flag):
+# --service-node-port-range=20000-40000
+
+# Check current range
+kubectl get configmap kube-apiserver -n kube-system -o yaml | grep node-port
+
+# List all used NodePorts
+kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="NodePort")]}{.metadata.name}{"\t"}{.spec.ports[*].nodePort}{"\n"}{end}'
+```
+
+Auto-assignment picks the next available port from the range. You can specify a specific port (ensure it's not in use):
+
+```bash
+# Check if a NodePort is already in use
+kubectl get svc -A | grep 30080
+```
+
+---
+
+## How Traffic Flows: Cross-Node Details
+
+When traffic arrives at Node A's port 30080 but the selected backend Pod is on Node B:
+
+```text
+1. External client → Node A (192.168.1.10:30080)
+
+2. Node A iptables PREROUTING:
+   - Match: dst port 30080
+   - DNAT: dst → 10.244.2.3:8080 (Pod B on Node B)
+
+3. Node A iptables POSTROUTING (SNAT):
+   - MASQUERADE: src IP rewritten from client IP (203.0.113.5)
+     to Node A's IP (192.168.1.10)
+   - WHY: Pod B is on Node B. When Pod B responds to
+     10.244.2.3:8080 → 203.0.113.5, Node B doesn't know
+     how to route back to 203.0.113.5.
+   - With SNAT: Pod B responds to 10.244.2.3:8080 → 192.168.1.10
+     Node B routes back to Node A (it knows Node A).
+     Node A reverses the NAT → sends back to 203.0.113.5.
+
+4. Pod B sees: src=192.168.1.10 (Node A's IP), dst=10.244.2.3
+   ← Client's real IP is HIDDEN
+```
+
+---
+
+## `externalTrafficPolicy`: Controlling Source IP Behavior
+
+### `Cluster` (Default)
+
+- Traffic can go to any backend Pod in the cluster (even on other nodes)
+- Source IP is SNATed to the receiving node's IP
+- Load distributed across all backends regardless of location
+- Client's real IP **not visible** at the Pod level
+
+### `Local`
+
+```yaml
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local    # Only route to local backends
+```
+
+With `externalTrafficPolicy: Local`:
+- Traffic arriving at Node A only goes to Pods **on Node A**
+- If Node A has no Pods: connection refused (no DNAT)
+- **No SNAT** — client's real IP is preserved at the Pod
+- Uneven load distribution (nodes with more Pods get less traffic per Pod)
+
+```text
+externalTrafficPolicy: Local — Packet flow:
+
+External → Node A:30080
+  Node A has Pod A: route to Pod A (no SNAT)
+  Pod A sees: src=203.0.113.5 (real client IP!)
+
+External → Node B:30080
+  Node B has no Pods: connection refused / timeout
+  (or if Node B has Pod B: route to Pod B)
+```
+
+**When to use `Local`:**
+- You need the client's real IP for logging, rate limiting, or geo-routing
+- You're using a cloud load balancer with health checks (it will only route to healthy nodes)
+- Combined with a load balancer that distributes across nodes with running Pods
+
+---
+
+## Firewall Configuration for NodePort
+
+```bash
+# On each node, open the NodePort range:
+
+# iptables
+iptables -A INPUT -p tcp --dport 30000:32767 -j ACCEPT
+
+# firewalld (CentOS/RHEL)
+firewall-cmd --add-port=30080/tcp --permanent
+firewall-cmd --reload
+
+# AWS Security Groups — add inbound rule:
+# TCP 30000-32767 from 0.0.0.0/0 (or specific CIDR)
+
+# GCP Firewall rules:
+gcloud compute firewall-rules create allow-nodeport \
+  --allow tcp:30000-32767 \
+  --target-tags kubernetes-node
+
+# Azure NSG:
+az network nsg rule create --nsg-name k8s-nsg \
+  --name allow-nodeport \
+  --priority 1000 \
+  --destination-port-ranges 30000-32767 \
+  --protocol Tcp
+```
+
+---
+
+## NodePort Limitations
+
+| Limitation | Detail |
+|-----------|--------|
+| **Port range restricted** | Only 30000-32767 (2768 ports total) |
+| **Requires open firewall** | All nodes' NodePorts must be accessible |
+| **No TLS termination** | Client connects directly to port — no SSL offloading |
+| **No hostname routing** | Can't route `api.example.com` vs `web.example.com` to different Services |
+| **All nodes exposed** | Even nodes without running Pods receive traffic (then routing cross-node) |
+| **Not production-ready** | Typically used for dev/test or as a building block for LoadBalancer |
+
+---
+
+## NodePort as a Building Block
+
+Cloud LoadBalancer Services are built on top of NodePort:
+
+```text
+LoadBalancer Service:
+  Cloud LB (203.0.113.100) → Node A:30080 → NodePort routing → Pod
+
+The cloud controller creates:
+  1. A NodePort Service (30080)
+  2. A cloud load balancer (AWS ALB, GCP LB, Azure LB)
+  3. Load balancer targets: all cluster nodes on port 30080
+  4. Optional: health check to detect when a node has no local Pods
+```
+
+---
+
+## Hands-On: NodePort Debugging
+
+```bash
+# 1. Find all NodePort Services
+kubectl get svc -A --field-selector spec.type=NodePort
+
+# 2. Test NodePort from outside the cluster
+# Replace with your actual node IPs
+for NODE_IP in 192.168.1.10 192.168.1.11 192.168.1.12; do
+  echo -n "Node $NODE_IP: "
+  curl -s -o /dev/null -w "%{http_code}" http://$NODE_IP:30080/
+  echo
+done
+
+# 3. Verify iptables rules for NodePort
+iptables -t nat -L KUBE-NODEPORTS -n
+# TARGET          PROT  OPT  SOURCE       DESTINATION
+# KUBE-SVC-XXXXX  tcp  --  0.0.0.0/0    0.0.0.0/0    tcp dpt:30080
+
+# 4. Check if a node's NodePort is reachable
+nc -zv 192.168.1.10 30080  # Should succeed if port is open and Pods exist
+
+# 5. Verify externalTrafficPolicy
+kubectl get svc web-service -o jsonpath='{.spec.externalTrafficPolicy}'
+
+# 6. Watch for source IP (when using externalTrafficPolicy: Local)
+kubectl exec -it backend-pod -- cat /var/log/nginx/access.log
+# With Cluster: 192.168.1.10 (Node IP)
+# With Local: 203.0.113.5 (real client IP)
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a NodePort Service and how does it differ from ClusterIP?**
+
+A NodePort Service extends ClusterIP by additionally opening a static port (30000-32767) on every node's network interface. This makes the Service accessible from outside the cluster via `<any-node-ip>:<nodePort>`. ClusterIP creates a virtual IP only reachable within the cluster; NodePort makes the Service externally reachable on a dedicated port. Internally, NodePort traffic is still routed through the same ClusterIP mechanism.
+
+**Q2: Why is SNAT applied to NodePort traffic by default and what is the downside?**
+
+When traffic arrives at Node A's NodePort and is routed to a Pod on Node B, SNAT (masquerade) rewrites the client's source IP to Node A's IP. This is necessary because Pod B on Node B responds to the client IP directly — but if the client is external (Internet), Node B may not have a route to it. By SNATing to Node A's IP, Pod B's response goes back to Node A (which does have the client's conntrack state), and Node A reverse-NATTs to the real client. The downside: the Pod loses the client's real IP.
+
+**Q3: What does `externalTrafficPolicy: Local` do and when is it used?**
+
+With `Local`, NodePort traffic is only routed to backend Pods **on the same node** that received the traffic. No SNAT is applied, so backend Pods see the real client IP. If a node has no local backend Pods, connections to its NodePort are refused. Use `Local` when: (1) you need real client IP at the Pod (for logging, rate limiting), (2) with a cloud load balancer that performs health checks per node (it avoids routing to node without Pods), or (3) when you need to eliminate the extra network hop for cross-node routing.
+
+**Q4: Can two Services share the same NodePort?**
+
+No. Each NodePort is uniquely allocated per cluster. If you try to create a Service with a NodePort already in use, the API server rejects it with a conflict error. To check available ports, you'd list all Services and their NodePorts. The total available space is 2,768 ports (30000-32767) — for very large clusters with many services, this can be a limiting factor.
+
+**Q5: What happens when a NodePort Service is updated (e.g., backend Pods change)?**
+
+kube-proxy watches EndpointSlices for the Service. When a Pod matching the Service selector starts or stops, kube-proxy automatically updates the iptables/IPVS rules on every node. New connections after the update route to the current set of healthy Pods. Existing connections (conntrack entries) continue until the TCP session ends, regardless of iptables changes.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know NodePort opens the same static port (30000-32767) on every node's NIC
+- [ ] Understand NodePort builds on ClusterIP — ClusterIP is still created
+- [ ] Know the SNAT behavior (client IP replaced by receiving node IP) and why it happens
+- [ ] Understand `externalTrafficPolicy: Local` — no SNAT, no cross-node routing, real client IP visible
+- [ ] Know NodePort limitations: no TLS, no hostname routing, port range limit, security concerns
+- [ ] Know NodePort is the building block for cloud LoadBalancer Services
+- [ ] Can verify NodePort with `iptables -t nat -L KUBE-NODEPORTS` and test with `curl <node-ip>:<port>`

@@ -1,0 +1,269 @@
+---
+title: "Chapter 2 — Pod Security Admission (PSA) Modes"
+sidebar_position: 2
+module: "Module 5.4 — Pod Security & Admission"
+description: "Master Kubernetes Pod Security Admission (PSA) — the 3 control modes (enforce, audit, warn), namespace labeling syntax, version pinning, and cluster-wide AdmissionConfiguration."
+---
+
+# Chapter 2 — Pod Security Admission (PSA) Controller Modes
+
+> **Goal:** Master the built-in Pod Security Admission (PSA) controller in Kubernetes — understanding how the three operational modes (`enforce`, `audit`, and `warn`) enable safe, zero-downtime security rollouts, mastering namespace labeling conventions, configuring version-pinned profiles (`v1.30` vs `latest`), and authoring cluster-wide `PodSecurityConfiguration` admission files with system namespace exemptions.
+>
+> By the end of this chapter, you will understand:
+> 1. How the built-in Pod Security Admission (PSA) controller evaluates Pods at admission time
+> 2. The distinct responsibilities of the 3 PSA modes: `enforce`, `audit`, and `warn`
+> 3. The Enterprise Golden Standard: Combining `enforce: baseline` with `warn: restricted`
+> 4. Why version pinning (`pod-security.kubernetes.io/enforce-version`) prevents unexpected breaking upgrades
+> 5. How to write a cluster-wide `AdmissionConfiguration` with exemptions for `kube-system`
+> 6. How to audit an entire cluster's PSS compliance before turning on enforcement
+
+---
+
+## Real-Life Analogy
+
+Think of the three PSA modes as **different enforcement stages at a highway vehicle inspection weigh station**:
+
+- **`warn` Mode (The Digital Warning Billboard):** As a commercial truck drives past the weigh station, an overhead electronic billboard flashes yellow: *"Warning: Your rear axle exceeds the upcoming 2027 safety standard by 500 lbs (`warn: restricted`)."* The driver is **not stopped or fined**; they continue driving, but they are notified to fix their vehicle soon.
+- **`audit` Mode (The Silent Traffic Enforcement Camera):** A camera silently photographs the truck's license plate and logs a report into the state Department of Transportation database (**API Server Audit Log**). The driver proceeds uninterrupted, but fleet safety auditors review the logs every Monday morning.
+- **`enforce` Mode (The Heavy Steel Toll Gate):** The hydraulic steel barrier drops across the highway (`enforce: baseline`). If a truck does not have working brakes or lacks a commercial license (`hostNetwork: true`, `privileged: true`), the barrier refuses to lift (**Request Rejected with HTTP 403**).
+- **The Phased Rollout (Zero-Accident Transition):** You don't drop the steel barrier on Day 1. For 30 days, you turn on **Warn & Audit** so trucking companies can upgrade their vehicles without shutting down global commerce.
+
+---
+
+## Architecture Diagram
+
+```text
+               Pod Security Admission (PSA) Multi-Mode Interceptor
+
+ Developer submits: `kubectl apply -f deployment.yaml` (Namespace: production)
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: Pod Security Admission (PSA) Controller Interceptor    │
+ │ Reads Namespace Labels on `namespace: production`:                     │
+ │   1. pod-security.kubernetes.io/enforce: baseline                      │
+ │   2. pod-security.kubernetes.io/warn:    restricted                    │
+ │   3. pod-security.kubernetes.io/audit:   restricted                    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           ▼                                                 ▼
+ ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+ │ 1. ENFORCE Check (Baseline)      │     │ 2. WARN & AUDIT Check (Restricted│
+ │    - Does pod violate Baseline?  │     │    - Does pod run as non-root?   │
+ │    - Result: COMPLIANT!          │     │    - Result: VIOLATION! (Root)   │
+ │    - Action: ALLOW POD CREATION! │     │    - Action:                     │
+ │                                  │     │      a) Return WARNING to user!  │
+ │                                  │     │      b) Write AUDIT LOG event!   │
+ └──────────────────────────────────┘     └──────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Result: POD IS CREATED! User sees warning message in terminal:         │
+ │ "Warning: would violate PodSecurity 'restricted:latest': runAsNonRoot" │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 PSA Control Modes
+
+The PSA admission controller evaluates three parallel control channels:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ PSA Mode             │ Operational Behavior & Impact                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`enforce`**        │ **Hard Rejection Gate.** Any Pod violating the assigned profile is rejected │
+ │                      │ immediately with an HTTP `403 Forbidden` admission error.                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`audit`**          │ **Silent Telemetry.** Violations do NOT block pod creation; instead, they   │
+ │                      │ add an `audit.k8s.io/podsecurity.kubernetes.io/audit-violations` annotation │
+ │                      │ directly into the API Server audit logs.                                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`warn`**           │ **User-Facing Feedback.** Violations do NOT block pod creation; instead, the│
+ │                      │ API server returns an interactive warning string displayed by `kubectl`.    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Namespace Labeling Conventions
+
+PSA is configured per namespace using standardized Kubernetes metadata labels:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payment-production
+  labels:
+    # 1. Enforce Baseline to block critical privilege escalations
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: v1.30
+
+    # 2. Warn developers if their manifests do not meet Restricted standards
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: v1.30
+
+    # 3. Audit all non-Restricted pods for security compliance dashboards
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: v1.30
+```
+
+---
+
+## Why Version Pinning is Mandatory
+
+Kubernetes Pod Security Standards evolve over time as new Linux kernel security features are released.
+
+```text
+ The Danger of "latest":
+ If you set `pod-security.kubernetes.io/enforce: restricted` without a version, it defaults to `latest`.
+ 
+ When your cluster is upgraded from Kubernetes 1.28 to 1.30:
+ - The definition of "restricted" in 1.30 may introduce a new mandatory security check!
+ - Existing running Deployments will fail rolling updates during pod recreation!
+ 
+ ──► ALWAYS PIN VERSIONS: `pod-security.kubernetes.io/enforce-version: v1.30`
+```
+
+---
+
+## Cluster-Wide `PodSecurityConfiguration` File
+
+For multi-tenant clusters, administrators configure global defaults and namespace exemptions via an `AdmissionConfiguration` file:
+
+```yaml
+apiVersion: pod-security.admission.config.k8s.io/v1
+kind: PodSecurityConfiguration
+defaults:
+  enforce: "baseline"
+  enforce-version: "v1.30"
+  warn: "restricted"
+  warn-version: "v1.30"
+  audit: "restricted"
+  audit-version: "v1.30"
+exemptions:
+  # Exempt critical system namespaces from admission checks
+  namespaces:
+    - "kube-system"
+    - "cilium-system"
+    - "rook-ceph"
+  # Exempt break-glass cluster admins
+  usernames:
+    - "system:admin"
+  # Exempt specific runtime classes (e.g. Kata Containers VM sandboxes)
+  runtimeClasses:
+    - "kata-qemu"
+```
+
+Passed to `kube-apiserver` via:
+`--admission-control-config-file=/etc/kubernetes/psa-config.yaml`
+
+---
+
+## Complete Golden Standard Rollout Workflow
+
+```text
+ Step-by-Step Enterprise Rollout Strategy:
+ 1. Phase 1 (Audit & Discovery - Month 1):
+    Label all namespaces with `audit: restricted` and `warn: restricted`.
+    Inspect audit logs with SIEM (Elasticsearch/Splunk) to identify non-compliant workloads.
+ 
+ 2. Phase 2 (Developer Remediation - Month 2):
+    Developers see `kubectl` warnings during CI/CD deployments and update `securityContext` 
+    (adding `runAsNonRoot: true`, `capabilities.drop: ["ALL"]`).
+ 
+ 3. Phase 3 (Enforce Baseline - Month 3):
+    Promote `enforce: baseline`. All dangerous host access is locked down.
+ 
+ 4. Phase 4 (Enforce Restricted - Month 4):
+    Promote `enforce: restricted`. Cluster achieves 100% Zero-Trust compliance!
+```
+
+---
+
+## Hands-On Lab: Testing PSA Enforce, Warn & Audit Modes
+
+```bash
+# Step 1: Create a test namespace configured with Enforce Baseline + Warn Restricted
+kubectl create namespace psa-demo-ns
+
+kubectl label namespace psa-demo-ns \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/audit=restricted \
+  --overwrite
+
+# Step 2: Attempt to deploy a Pod violating ENFORCE (hostNetwork: true)
+cat <<EOF | kubectl apply -f - -n psa-demo-ns 2>&1 || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: baseline-violator
+spec:
+  hostNetwork: true
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+# Observe: API server REJECTS the pod with HTTP 403 Forbidden!
+
+# Step 3: Deploy a Pod that satisfies Baseline but violates RESTRICTED (runs as root)
+cat <<EOF | kubectl apply -f - -n psa-demo-ns
+apiVersion: v1
+kind: Pod
+metadata:
+  name: restricted-violator
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+# Observe: Pod is CREATED successfully, but kubectl outputs a yellow WARNING message!
+
+# Step 4: Clean up lab
+kubectl delete namespace psa-demo-ns
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the three operational modes of the Pod Security Admission (PSA) controller?**
+
+The three PSA modes are:
+1. `enforce`: Hard admission gate; any Pod violating the specified PSS profile is immediately rejected with HTTP `403 Forbidden`.
+2. `warn`: Soft notification; the Pod is admitted and scheduled, but the API server returns an interactive warning string displayed to the user in their `kubectl` terminal or CI/CD console.
+3. `audit`: Silent security logging; the Pod is admitted, but violation metadata is recorded in the API Server audit log for compliance monitoring.
+
+**Q2: What is the recommended strategy for rolling out Pod Security Standards to an existing production cluster?**
+
+The recommended strategy is a phased multi-month migration: (1) Start by configuring namespaces with `audit: restricted` and `warn: restricted` without any `enforce` mode; (2) Monitor API server audit logs to build an inventory of non-compliant workloads; (3) Allow engineering teams to remediate their manifests based on `kubectl` warnings; (4) Introduce `enforce: baseline` to prevent catastrophic privilege escalations; (5) Once all workloads are updated, promote `enforce: restricted`.
+
+**Q3: Why is version pinning (`pod-security.kubernetes.io/enforce-version`) critical?**
+
+Version pinning locks the Pod Security Standard rules to a specific Kubernetes minor version (e.g. `v1.30`). As the Kubernetes project evolves, future minor releases may introduce stricter security checks under the `restricted` profile. If `latest` is used, upgrading the Kubernetes control plane could cause existing, previously working Deployments to be rejected during subsequent Pod restarts.
+
+**Q4: How do you exempt system namespaces like `kube-system` from Pod Security Admission?**
+
+Namespace exemptions are configured in the cluster-wide `PodSecurityConfiguration` admission configuration file under `.exemptions.namespaces: ["kube-system", "monitoring"]`. Alternatively, administrators can explicitly label the namespace with `pod-security.kubernetes.io/enforce: privileged`.
+
+**Q5: Can you configure different PSS profiles for `enforce`, `audit`, and `warn` on the same namespace?**
+
+Yes. Combining different profiles across the three modes is the industry best practice. For example, a namespace can enforce `baseline` to guarantee that no pods can use `privileged: true` or `hostPath`, while simultaneously configuring `warn: restricted` and `audit: restricted` to encourage developers to adopt non-root and capability-dropping best practices without breaking current deployments.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 3 PSA modes: `enforce` (blocks), `warn` (alerts user), and `audit` (logs)
+- [ ] Know the namespace labeling syntax: `pod-security.kubernetes.io/<mode>: <profile>`
+- [ ] Know why version pinning (`enforce-version: v1.30`) prevents upgrade outages
+- [ ] Know the Golden Standard: `enforce: baseline` + `warn: restricted` + `audit: restricted`
+- [ ] Know how `PodSecurityConfiguration` defines cluster-wide defaults and exemptions
+- [ ] Know to exempt `kube-system` and CNI plugins from restrictive profiles
+- [ ] Can label namespaces using `kubectl label namespace <name> pod-security...`

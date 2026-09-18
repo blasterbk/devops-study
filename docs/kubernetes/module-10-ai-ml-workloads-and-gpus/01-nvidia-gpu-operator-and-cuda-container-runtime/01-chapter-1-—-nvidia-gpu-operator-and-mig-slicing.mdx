@@ -1,0 +1,220 @@
+---
+title: "Chapter 1 — NVIDIA GPU Operator & MIG Slicing"
+sidebar_position: 1
+module: "Module 10.1 — GPU Operator & CUDA"
+description: "Master NVIDIA GPU Operator architecture — Driver container injection, Device Plugin, DCGM metrics, and hardware Multi-Instance GPU (MIG) slicing on A100/H100 GPUs."
+---
+
+# Chapter 1 — NVIDIA GPU Operator & MIG Slicing Architecture
+
+> **Goal:** Master automated enterprise GPU provisioning, lifecycle management, and hardware partitioning in Kubernetes using the **NVIDIA GPU Operator** and **Multi-Instance GPU (MIG)** — understanding how the **`ClusterPolicy`** controller orchestrates the containerized driver daemon hierarchy (**Driver Container**, **Container Toolkit**, **K8s Device Plugin**, **GPU Feature Discovery**, and **DCGM Exporter**), and slicing physical A100/H100 80GB GPUs into up to 7 hardware-isolated MIG instances with guaranteed memory and compute bandwidth QoS.
+>
+> By the end of this chapter, you will understand:
+> 1. How the NVIDIA GPU Operator eliminates manual Linux kernel driver installations across GPU worker nodes
+> 2. The structural responsibilities of all 6 GPU Operator daemon components
+> 3. How the K8s Device Plugin advertises `nvidia.com/gpu` extended resources to the Kubelet
+> 4. How Multi-Instance GPU (MIG) provides true physical compute and memory bandwidth isolation
+> 5. How to configure standard MIG slicing profiles (`1g.10gb`, `2g.20gb`, `3g.40gb`, `7g.80gb`)
+> 6. How to author production `ClusterPolicy` and MIG-sliced workload Pod specifications
+
+---
+
+## Real-Life Analogy
+
+Think of the NVIDIA GPU Operator and MIG Slicing as **an automated Formula 1 racing pit crew combined with a precision modular luxury vehicle chassis divider**:
+
+- **The Manual Driver Nightmare (The Hand-Welded Engine Trap):** In the past, provisioning 50 GPU worker nodes required engineers to manually SSH into each server, install Linux kernel headers, run gcc compilers, and install proprietary NVIDIA `.run` driver binaries (**Fragile, Imperative, and Error-Prone**). If the Linux kernel auto-updated from version `5.15` to `6.5`, all GPU drivers broke, and the entire AI cluster went down.
+- **The NVIDIA GPU Operator (The Automated Robotic Pit Crew):** The GPU Operator says: *"Leave the host Linux OS 100% clean and un-modified."* A single master controller (**`ClusterPolicy`**) rolls in, detects the physical GPU hardware, compiles the kernel modules inside a secure container (**Driver Container**), hooks up the fuel lines (**NVIDIA Container Toolkit**), registers the horsepower with the race registry (**Device Plugin**), and mounts temperature telemetry gauges on the dashboard (**DCGM Exporter**).
+- **The MIG Hardware Slicing (The Armored 7-Room Limousine):** You have a colossal \$30,000 NVIDIA A100 (80GB VRAM) GPU (**The Super-Limo**).
+  - Instead of letting one tiny Python script monopolize the entire 80GB GPU, **MIG installs physical soundproof titanium walls** inside the chip.
+  - You divide the GPU into **7 independent, fully isolated mini-limousines** (**`mig-1g.10gb`**).
+  - Each mini-instance gets its own dedicated compute cores, its own private memory controllers, and its own isolated DRAM.
+  - If Tenant #1 runs a buggy PyTorch script that triggers a catastrophic `CUDA Out of Memory` crash, **Tenant #2, #3, and #7 are 100% unharmed and continue training at full speed!**
+
+---
+
+## Architecture Diagram
+
+```text
+               NVIDIA GPU Operator Daemon Hierarchy & MIG Hardware Slicing
+
+ HOST LINUX WORKER NODE (NVIDIA A100 / H100 GPU 80GB VRAM)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES KUBELET (Node Extended Resources: `nvidia.com/gpu: 8`)      │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ NVIDIA GPU OPERATOR (`ClusterPolicy` Orchestrated Daemons):            │
+ │ ├── 1. DRIVER CONTAINER:   Compiles `nvidia.ko` / `nvidia-uvm.ko`      │
+ │ ├── 2. CONTAINER TOOLKIT:  Configures containerd with NVIDIA OCI Hook  │
+ │ ├── 3. DEVICE PLUGIN:      Advertises GPU socket endpoints to Kubelet  │
+ │ ├── 4. GPU DISCOVERY (GFD):Labels node: `gpu.product=A100-SXM4-80GB`   │
+ │ ├── 5. DCGM EXPORTER:      Prometheus Metrics on `:9400/metrics`       │
+ │ └── 6. MIG MANAGER:        Dynamically applies hardware slice profiles │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Slices physical GPU into 7 Hardware Instances!
+                    ▼
+ PHYSICAL NVIDIA A100 80GB SILICON DIE (MIG Hardware Partitioning):
+ ┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+ │ Slice 01 │ Slice 02 │ Slice 03 │ Slice 04 │ Slice 05 │ Slice 06 │ Slice 07 │
+ │ 1g.10gb  │ 1g.10gb  │ 1g.10gb  │ 1g.10gb  │ 1g.10gb  │ 1g.10gb  │ 1g.10gb  │
+ │ 10GB RAM │ 10GB RAM │ 10GB RAM │ 10GB RAM │ 10GB RAM │ 10GB RAM │ 10GB RAM │
+ │ Pod: LLM │ Pod: Bert│ Pod: Dev │ Pod: Test│ Pod: Web │ Pod: OCR │ Pod: Embed
+ └──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+ (Guaranteed Memory Bandwidth & Zero Cross-Tenant Interference!)
+```
+
+---
+
+## The 6 Core GPU Operator Daemon Components
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Daemon Component     │ Deployment Mechanism    │ Technical Responsibility                          │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Driver**        │ DaemonSet (Init / Host) │ Dynamically compiles and loads kernel modules     │
+ │ **Container**        │                         │ (`nvidia.ko`, `nvidia-uvm.ko`) into Linux kernel. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. Container**     │ DaemonSet               │ Configures containerd/CRI-O runtime with the      │
+ │ **Toolkit**          │                         │ NVIDIA OCI Hook to inject CUDA drivers into pods. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. K8s Device**    │ DaemonSet               │ Discovers `/dev/nvidia*` devices and registers    │
+ │ **Plugin**           │                         │ allocatable `nvidia.com/gpu` capacity with Kubelet│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. GPU Feature**   │ DaemonSet               │ Discovers GPU architecture, family, and VRAM size;│
+ │ **Discovery (GFD)**  │                         │ labels Node metadata for affinity scheduling.     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **5. DCGM Exporter** │ DaemonSet               │ Scrapes Data Center GPU Manager hardware counters;│
+ │                      │                         │ exports GPU power, temp, and compute metrics.     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **6. MIG Manager**   │ DaemonSet               │ Dynamically partitions Ampere/Hopper GPUs into    │
+ │                      │                         │ physical MIG slices matching node ConfigMaps.     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Multi-Instance GPU (MIG) Slicing Profiles
+
+On NVIDIA Ampere (A100/A30) and Hopper (H100/H200) architectures, a single GPU can be partitioned into **GPU Instances (GI)** and **Compute Instances (CI)**:
+
+```text
+ ┌──────────────────────┬───────────────────┬───────────────────┬─────────────────────────────────────┐
+ │ MIG Profile Name     │ GPU Compute (SMs) │ Dedicated VRAM    │ Maximum Slices per 80GB A100        │
+ │──────────────────────┼───────────────────┼───────────────────┼─────────────────────────────────────┤
+ │ **`1g.10gb`**        │ 1/7th Compute     │ **10 GB VRAM**    │ **7 Slices** (Microservices / Infer)│
+ │ **`2g.20gb`**        │ 2/7th Compute     │ **20 GB VRAM**    │ **3 Slices** (Mid-sized Embeddings) │
+ │ **`3g.40gb`**        │ 3/7th Compute     │ **40 GB VRAM**    │ **2 Slices** (Fine-tuning / Vision) │
+ │ **`4g.40gb`**        │ 4/7th Compute     │ **40 GB VRAM**    │ **1 Slice**                         │
+ │ **`7g.80gb`**        │ 7/7th (Full GPU)  │ **80 GB VRAM**    │ **1 Slice** (Full Hardware Instance)│
+ └──────────────────────┴───────────────────┴───────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## 1. Production `ClusterPolicy` Custom Resource Manifest
+
+The `ClusterPolicy` CRD declares the desired state of all GPU daemons across the entire cluster:
+
+```yaml
+apiVersion: nvidia.com/v1
+kind: ClusterPolicy
+metadata:
+  name: gpu-cluster-policy
+spec:
+  operator:
+    defaultRuntime: containerd
+  driver:
+    enabled: true
+    version: "550.54.14"               # Pinned enterprise production driver!
+  toolkit:
+    enabled: true
+  devicePlugin:
+    enabled: true
+  gfd:
+    enabled: true
+  dcgmExporter:
+    enabled: true
+    serviceMonitor:
+      enabled: true                    # Auto-scrapes GPU metrics for Prometheus!
+  migManager:
+    enabled: true
+  mig:
+    strategy: single                   # Or 'mixed' for heterogeneous slicing profiles
+```
+
+---
+
+## 2. Requesting a Hardware-Isolated MIG GPU Slice in a Pod Spec
+
+When MIG is enabled, workloads request sliced resources directly by profile name:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: embedding-service-pod
+  namespace: ai-inference
+spec:
+  containers:
+  - name: embedding-server
+    image: ghcr.io/enterprise-org/text-embeddings:v2.1
+    resources:
+      limits:
+        # Requests exactly one hardware-isolated 10GB GPU slice!
+        nvidia.com/mig-1g.10gb: 1
+        memory: "16Gi"
+        cpu: "4"
+```
+
+---
+
+## Hands-On Lab: Querying GPU Operator & MIG Slices
+
+```bash
+# Step 1: Query all GPU Operator daemon pods in the gpu-operator namespace
+kubectl get pods -n gpu-operator -o wide 2>/dev/null || echo "GPU Operator active / simulated"
+
+# Step 2: Query GPU hardware labels discovered by GPU Feature Discovery (GFD)
+kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU_MODEL:.metadata.labels.nvidia\.com/gpu\.product,GPU_COUNT:.metadata.labels.nvidia\.com/gpu\.count,MIG_CAPABLE:.metadata.labels.nvidia\.com/mig\.capable
+
+# Step 3: Query allocatable MIG capacity across the cluster
+kubectl get nodes -o custom-columns=NAME:.metadata.name,MIG_1G_10GB:.status.allocatable.nvidia\.com/mig-1g\.10gb
+
+# Step 4: Query real-time GPU utilization metrics from DCGM Exporter
+# curl -s http://<dcgm-exporter-pod-ip>:9400/metrics | grep "DCGM_FI_DEV_GPU_UTIL"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the NVIDIA GPU Operator, and why is it preferred over manual driver installation on worker nodes?**
+
+The NVIDIA GPU Operator uses the Kubernetes Operator pattern to **automate the complete lifecycle of all software components required to run GPU workloads on Kubernetes**. In traditional setups, installing drivers on the host OS causes severe kernel version mismatch outages during node patching. The GPU Operator runs the driver inside a container (`nvidia-driver-daemonset`), dynamically compiling kernel modules using DKMS matching the running node's kernel. When the host OS upgrades its kernel, the operator automatically recompiles and loads the matching driver without human intervention.
+
+**Q2: What is Multi-Instance GPU (MIG), and how does it differ from software GPU Time-Slicing?**
+
+- **Multi-Instance GPU (MIG)**: A physical **hardware-level partitioning** technology available on NVIDIA Ampere (A100) and Hopper (H100) GPUs. MIG slices the physical silicon into up to 7 distinct GPU instances, each with dedicated compute cores (Streaming Multiprocessors), dedicated memory controllers, and isolated high-bandwidth VRAM. It provides **100% hardware Quality of Service (QoS) and memory isolation**.
+- **GPU Time-Slicing**: A **software-level scheduling hack**. Multiple pods share the same GPU by taking turns in time windows. There is **zero memory isolation**: if one pod exhausts VRAM, all co-located pods crash with `CUDA Out of Memory`.
+
+**Q3: What is the role of the NVIDIA K8s Device Plugin?**
+
+The Kubernetes Device Plugin framework allows third-party hardware vendors to advertise custom resources to the `kube-apiserver`. The NVIDIA Device Plugin runs as a DaemonSet, discovers all physical and MIG GPU devices (`/dev/nvidia*`) on the node, monitors device health, and advertises extended allocatable resources (such as `nvidia.com/gpu: 8` or `nvidia.com/mig-1g.10gb: 7`) to the Kubelet. When a pod requests a GPU, the Device Plugin assigns specific device UUIDs to the container runtime.
+
+**Q4: How does NVIDIA GPU Feature Discovery (GFD) assist the Kubernetes Scheduler?**
+
+GPU Feature Discovery (GFD) runs alongside the Device Plugin. It queries the GPU hardware via NVML (NVIDIA Management Library) and **automatically labels the Kubernetes Node** with rich hardware metadata (e.g. `nvidia.com/gpu.family: ampere`, `nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB`, `nvidia.com/gpu.memory: 81920`). This allows AI engineers to write precise `nodeSelector` and `affinity` rules to schedule large LLM training jobs specifically onto A100/H100 nodes while routing lightweight inference jobs to T4 or L4 nodes.
+
+**Q5: What happens if a pod requests `nvidia.com/mig-1g.10gb: 1` on a node where MIG mode is disabled?**
+
+If MIG mode is disabled on the physical GPU, the K8s Device Plugin will not advertise any `nvidia.com/mig-*` allocatable resources in `Node.status.allocatable`. The `kube-scheduler` will inspect the pending pod, find zero nodes capable of fulfilling the `nvidia.com/mig-1g.10gb` request, and leave the pod in a **`Pending`** state with the event `0/N nodes available: Insufficient nvidia.com/mig-1g.10gb`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that the GPU Operator automates driver compilation, runtime injection, and monitoring
+- [ ] Know the 6 components: Driver, Toolkit, Device Plugin, GFD, DCGM, MIG Manager
+- [ ] Know that MIG provides true hardware-isolated compute cores and memory bandwidth QoS
+- [ ] Know the standard MIG slicing profiles (`1g.10gb`, `2g.20gb`, `3g.40gb`, `7g.80gb`)
+- [ ] Know how GFD labels nodes with GPU model, memory, and architecture metadata
+- [ ] Can view allocatable GPU resources using `kubectl get nodes -o yaml`

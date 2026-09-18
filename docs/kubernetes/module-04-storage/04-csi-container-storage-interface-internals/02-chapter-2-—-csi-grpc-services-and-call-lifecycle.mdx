@@ -1,0 +1,259 @@
+---
+title: "Chapter 2 — CSI gRPC Services & Call Lifecycle"
+sidebar_position: 2
+module: "Module 4.4 — CSI Internals"
+description: "Master the CSI gRPC specification — Identity, Controller, and Node services, the complete 9-step volume call lifecycle from CreateVolume to DeleteVolume, and gRPC idempotency."
+---
+
+# Chapter 2 — CSI gRPC Services & Call Lifecycle
+
+> **Goal:** Master the formal Container Storage Interface (CSI) gRPC protocol — understanding the 3 core gRPC service definitions (`Identity`, `Controller`, and `Node`), tracing the complete 9-step call lifecycle from volume creation to final destruction, evaluating method idempotency requirements, and debugging low-level storage protocol errors.
+>
+> By the end of this chapter, you will understand:
+> 1. The 3 core CSI gRPC Services: `Identity`, `Controller`, and `Node`
+> 2. The full 9-step end-to-end CSI call sequence across the control plane and Kubelet
+> 3. Why `ControllerPublishVolume` means "Attach" and `NodePublishVolume` means "Mount"
+> 4. The strict idempotency contract enforced by the CSI specification
+> 5. How CSI capability flags negotiate supported features (snapshots, expansion, raw block)
+> 6. How to trace gRPC request-response cycles using `csictl` and driver debug logs
+
+---
+
+## Real-Life Analogy
+
+Think of the CSI gRPC call lifecycle as **shipping, assembling, and returning a rented grand piano for a concert**:
+
+- **`Identity` Service (Checking the Piano Company's Credentials):** Before doing business, the concert hall verifies the company's business license, name, and service menu (`GetPluginInfo`, `GetPluginCapabilities`).
+- **`Controller` Service (Factory Warehouse & Delivery Truck):**
+  - **`CreateVolume`:** The company builds a grand piano in their central warehouse.
+  - **`ControllerPublishVolume` (Attach):** The company loads the piano onto a flatbed truck and drives it to the loading dock of the concert hall (attaching the disk to the worker node VM).
+- **`Node` Service (Stage Crew & Roadies):**
+  - **`NodeStageVolume`:** The roadies uncrate the piano, tune the strings, and place it in the backstage holding area (`/globalmount`).
+  - **`NodePublishVolume` (Mount):** The roadies roll the piano out onto the center stage where the pianist (Container) sits down and plays music.
+- **Teardown & Return (The Reverse Order):** When the concert ends, the piano is rolled backstage (`NodeUnpublish`), packed into its wooden crate (`NodeUnstage`), driven away on the truck (`ControllerUnpublish`), and dismantled at the warehouse (`DeleteVolume`).
+
+---
+
+## Architecture Diagram
+
+```text
+               End-to-End CSI gRPC 9-Step Lifecycle
+
+ User / K8s Event                                CSI gRPC Call Invoked
+  │
+  ├─► 1. PVC Created (Pending) ───────────────► CreateVolume()
+  │                                             [csi-provisioner ──► Cloud API]
+  │
+  ├─► 2. Pod Scheduled to Node ───────────────► ControllerPublishVolume() (ATTACH)
+  │                                             [csi-attacher ──► Cloud API]
+  │
+  ├─► 3. Node detects Attached Disk ──────────► NodeStageVolume() (FORMAT & STAGE)
+  │                                             [Kubelet ──► Global Staging Dir]
+  │
+  ├─► 4. Container Initializing ──────────────► NodePublishVolume() (BIND-MOUNT)
+  │                                             [Kubelet ──► Container MountPath]
+  │
+  │   ═════════════════════════════════════════════════════════════════════
+  │   5. CONTAINER RUNS & EXECUTES READ/WRITE I/O TRANSACTIONS
+  │   ═════════════════════════════════════════════════════════════════════
+  │
+  ├─► 6. Pod Terminated ──────────────────────► NodeUnpublishVolume() (UNBIND)
+  │                                             [Kubelet ──► Detaches Bind-Mount]
+  │
+  ├─► 7. Volume Unused on Node ───────────────► NodeUnstageVolume() (UNSTAGE)
+  │                                             [Kubelet ──► Unmounts Global Dir]
+  │
+  ├─► 8. VolumeAttachment Deleted ────────────► ControllerUnpublishVolume() (DETACH)
+  │                                             [csi-attacher ──► Cloud API]
+  │
+  └─► 9. PVC Deleted (reclaimPolicy: Delete) ─► DeleteVolume()
+                                                [csi-provisioner ──► Cloud API]
+```
+
+---
+
+## The 3 CSI gRPC Service Definitions
+
+The CSI specification divides responsibilities across three distinct Protocol Buffer services:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ CSI gRPC Service     │ Key RPC Methods & Purpose                                                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. `Identity`**    │ - `GetPluginInfo()`: Returns plugin name (`ebs.csi.aws.com`) & version.     │
+ │                      │ - `GetPluginCapabilities()`: Declares Controller/Node service support.      │
+ │                      │ - `Probe()`: Health check called by `livenessprobe` sidecar.                │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. `Controller`**  │ - `CreateVolume()` / `DeleteVolume()`: Cloud disk lifecycle.                │
+ │ (Cluster-Scoped)     │ - `ControllerPublishVolume()` / `ControllerUnpublishVolume()`: Attach/Detach│
+ │                      │ - `ControllerExpandVolume()`: Online disk resizing.                         │
+ │                      │ - `CreateSnapshot()` / `DeleteSnapshot()`: Storage snapshots.               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. `Node`**        │ - `NodeStageVolume()` / `NodeUnstageVolume()`: Format & global stage.       │
+ │ (Node-Scoped)        │ - `NodePublishVolume()` / `NodeUnpublishVolume()`: Bind-mount to Pod.      │
+ │                      │ - `NodeGetVolumeStats()`: Usage capacity metrics (inodes, bytes).           │
+ │                      │ - `NodeExpandVolume()`: Filesystem expansion (resize2fs/xfs_growfs).        │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The CSI Naming Disambiguation: Publish vs Stage
+
+CSI terminology differs slightly from standard Kubernetes vocabulary:
+
+```text
+ ┌──────────────────────────────────┬──────────────────────┬──────────────────────────────────────────┐
+ │ CSI Specification Term           │ Kubernetes Term      │ Physical Action                          │
+ │──────────────────────────────────┼──────────────────────┼──────────────────────────────────────────┤
+ │ **`ControllerPublishVolume`**    │ **Attach Volume**    │ Attaches virtual disk to VM instance.    │
+ │ **`ControllerUnpublishVolume`**  │ **Detach Volume**    │ Detaches virtual disk from VM instance.  │
+ │ **`NodeStageVolume`**            │ **Format & Stage**   │ Formats disk (ext4) & mounts to host dir.│
+ │ **`NodePublishVolume`**          │ **Mount Volume**     │ Bind-mounts from host dir into Pod.      │
+ │ **`NodeUnpublishVolume`**        │ **Unmount Volume**   │ Unbinds mount point from Pod.            │
+ └──────────────────────────────────┴──────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+## The Strict Idempotency Contract
+
+> [!IMPORTANT]
+> **Every single CSI gRPC call MUST be strictly idempotent.**
+
+In distributed cloud networks, API calls frequently time out or get retried due to transient network drops:
+
+```text
+ Idempotency Rules:
+ 1. If `CreateVolume(name: "pvc-123")` is called and the volume ALREADY EXISTS with identical 
+    parameters, the driver MUST return HTTP/gRPC `OK` with the existing Volume ID!
+ 2. If `ControllerPublishVolume()` is called on a disk that is ALREADY ATTACHED to that node, 
+    the driver MUST return `OK` immediately without throwing an error.
+ 3. If `DeleteVolume()` is called on a volume that has ALREADY BEEN DELETED, the driver MUST 
+    return `OK` (Not an error!).
+```
+
+---
+
+## Detailed Step-by-Step Call Lifecycle Walkthrough
+
+### Phase 1: Provisioning
+1. User submits PVC.
+2. `csi-provisioner` calls `CreateVolume(name: "pvc-uid", capacity: 100Gi, parameters: {type: gp3})`.
+3. Cloud provider provisions the disk and returns `VolumeID: vol-0987654321`.
+
+### Phase 2: Attachment & Mounting
+4. Scheduler places Pod on `worker-01`.
+5. `csi-attacher` calls `ControllerPublishVolume(volume_id: "vol-0987654321", node_id: "i-012345678")`. Cloud attaches EBS to EC2 VM.
+6. Kubelet on `worker-01` detects new block device `/dev/xvdf`.
+7. Kubelet calls `NodeStageVolume(staging_path: "/var/lib/kubelet/plugins/.../globalmount", fs_type: "ext4")`. Driver formats disk with `mkfs.ext4` and mounts to staging path.
+8. Kubelet calls `NodePublishVolume(target_path: "/var/lib/kubelet/pods/.../volumes/data")`. Driver bind-mounts staging path into Pod directory.
+
+### Phase 3: Teardown
+9. Pod terminates. Kubelet calls `NodeUnpublishVolume()` to release bind-mount.
+10. If no other Pods on the node use the disk, Kubelet calls `NodeUnstageVolume()` to unmount the global staging directory.
+11. `csi-attacher` calls `ControllerUnpublishVolume()` to detach the disk from the VM.
+12. If PVC is deleted, `csi-provisioner` calls `DeleteVolume()` to destroy the cloud disk.
+
+---
+
+## Hands-On Lab: Tracing CSI Volume Metrics & gRPC Stats
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace csi-grpc-lab
+
+# Step 2: Deploy a PVC and Pod to trigger the full CSI call lifecycle
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grpc-demo-pvc
+  namespace: csi-grpc-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: grpc-demo-pod
+  namespace: csi-grpc-lab
+spec:
+  volumes:
+  - name: storage
+    persistentVolumeClaim:
+      claimName: grpc-demo-pvc
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "echo 'CSI Transaction Active' > /mnt/data/log.txt; sleep 3600"]
+    volumeMounts:
+    - name: storage
+      mountPath: /mnt/data
+EOF
+
+# Step 3: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/grpc-demo-pod -n csi-grpc-lab --timeout=45s
+
+# Step 4: Verify VolumeAttachment object created by ControllerPublishVolume
+kubectl get volumeattachment
+
+# Step 5: Inspect volume stats gathered by CSI NodeGetVolumeStats
+kubectl get --raw "/api/v1/nodes/$(kubectl get pod grpc-demo-pod -n csi-grpc-lab -o jsonpath='{.spec.nodeName}')/proxy/stats/summary" | jq '.pods[] | select(.podRef.name=="grpc-demo-pod") | .volume'
+
+# Step 6: Delete the Pod to trigger NodeUnpublish and NodeUnstage
+kubectl delete pod grpc-demo-pod -n csi-grpc-lab
+
+# Step 7: Delete the PVC to trigger ControllerUnpublish and DeleteVolume
+kubectl delete pvc grpc-demo-pvc -n csi-grpc-lab
+
+# Step 8: Clean up lab
+kubectl delete namespace csi-grpc-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the three core gRPC services defined by the CSI specification?**
+
+The CSI specification standardizes three gRPC services:
+1. `Identity Service`: Exposes plugin metadata, health probes, and supported capabilities.
+2. `Controller Service`: Implemented by the centralized CSI Controller Plugin to execute cluster-wide operations (e.g. `CreateVolume`, `DeleteVolume`, `ControllerPublishVolume` [Attach], and `CreateSnapshot`).
+3. `Node Service`: Implemented by the CSI Node DaemonSet on each worker node to execute node-level operations (e.g. `NodeStageVolume` [Format/Stage], `NodePublishVolume` [Bind-Mount], and `NodeGetVolumeStats`).
+
+**Q2: What is the difference between `ControllerPublishVolume` and `NodePublishVolume`?**
+
+In CSI terminology:
+- `ControllerPublishVolume` corresponds to **Attaching** a storage volume to a virtual machine (e.g. issuing an AWS API call to attach an EBS volume to an EC2 instance).
+- `NodePublishVolume` corresponds to **Mounting** the volume into a specific container (e.g. creating a Linux kernel bind-mount from the node's local filesystem into the container's private mount namespace at `mountPath`).
+
+**Q3: What does `NodeGetVolumeStats` do in the CSI specification?**
+
+`NodeGetVolumeStats` is a node-level gRPC RPC called periodically by Kubelet to gather storage utilization metrics for a mounted volume. The CSI driver queries the filesystem and returns: (1) Total capacity in bytes; (2) Used capacity in bytes; (3) Available capacity in bytes; and (4) Inode usage metrics (total, used, free). These metrics are surfaced in Kubernetes via the `/stats/summary` Kubelet API and Prometheus metrics (`kubelet_volume_stats_used_bytes`).
+
+**Q4: Why does the CSI specification strictly mandate that all RPC calls be idempotent?**
+
+In distributed cloud environments, transient network partitions, timeouts, and controller restarts frequently cause API calls to be retried. If calls were not idempotent, retrying `CreateVolume` could allocate multiple duplicate cloud disks, and retrying `ControllerPublishVolume` could throw fatal attachment conflict errors. Idempotency guarantees that issuing the exact same RPC with identical parameters multiple times yields the exact same successful result without side effects.
+
+**Q5: What is the role of `NodeExpandVolume` versus `ControllerExpandVolume` during volume resizing?**
+
+Volume expansion requires a two-step process:
+1. `ControllerExpandVolume` is called by the `csi-resizer` sidecar to increase the size of the underlying cloud block device (e.g. expanding an AWS EBS volume from 50GB to 100GB in the AWS cloud).
+2. `NodeExpandVolume` is called by the local Kubelet on the worker node to expand the filesystem (invoking `resize2fs` for ext4 or `xfs_growfs` for XFS) across the newly resized block device online.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 3 CSI gRPC services: `Identity`, `Controller`, and `Node`
+- [ ] Know the 9-step volume lifecycle from `CreateVolume` to `DeleteVolume`
+- [ ] Know that `ControllerPublishVolume` means Attach and `NodePublishVolume` means Mount
+- [ ] Know that all CSI gRPC methods must be strictly idempotent
+- [ ] Know how `NodeGetVolumeStats` feeds disk utilization metrics to Prometheus
+- [ ] Know the distinction between `ControllerExpandVolume` (cloud disk) and `NodeExpandVolume` (filesystem)
+- [ ] Can view active storage attachments using `kubectl get volumeattachment`

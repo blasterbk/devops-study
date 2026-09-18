@@ -1,0 +1,340 @@
+---
+title: "Chapter 3 — subPath, subPathExpr & Mount Options"
+sidebar_position: 3
+module: "Module 4.1 — Volumes & Mounts"
+description: "Master Kubernetes subPath and mount configurations — non-destructive file injection, dynamic subPathExpr directory partitioning, StorageClass mountOptions, and symlink security hardening."
+---
+
+# Chapter 3 — subPath, subPathExpr & Mount Options
+
+> **Goal:** Master advanced volume mounting techniques in Kubernetes — understanding how `subPath` mounts specific files and subfolders without shadowing existing container directories, how `subPathExpr` dynamically partitions shared storage using environment variables, how `mountOptions` tune low-level filesystem performance, and how Kubernetes hardened `subPath` against symlink privilege escalation vulnerabilities.
+>
+> By the end of this chapter, you will understand:
+> 1. How standard volume mounts shadow parent directories and how `subPath` prevents file deletion
+> 2. How to inject custom configuration files (like `nginx.conf`) into populated directories
+> 3. How `subPathExpr` uses the Downward API to create per-pod directory isolation on shared volumes
+> 4. How to pass kernel filesystem mount flags (`noexec`, `nosuid`, `nfsvers=4.1`) via `mountOptions`
+> 5. The historical symlink vulnerabilities (CVE-2017-1002101, CVE-2021-25741) and Linux file descriptor pinning
+> 6. How to diagnose mount permission failures and stale subPath mount points
+
+---
+
+## Real-Life Analogy
+
+Think of volume mounting as **placing a picture on a crowded office desk**:
+
+- **Standard Volume Mount (Placing a Giant Blanket over the Desk):** You have a desk covered in essential pens, staplers, and monitors (`/etc/nginx/`). If you drop a regular volume on the desk (`mountPath: /etc/nginx`), it is like throwing a giant blanket over the entire desk. All your pens and monitors disappear (**Directory Shadowing**), and you can only see what was on top of the blanket.
+- **`subPath` (Placing a Single Framed Photo on the Corner of the Desk):** Instead of covering the whole desk, you carefully place **one single file** (`subPath: nginx.conf`) onto the corner of the desk (`mountPath: /etc/nginx/nginx.conf`). All original pens, staplers, and default modules remain completely visible and untouched!
+- **`subPathExpr` (Personal Assigned Desk Drawers):** 5 employees share one giant communal filing cabinet (`ReadWriteMany` shared volume). Each employee is handed an envelope with their personal employee ID (`subPathExpr: $(POD_NAME)`). When Employee #3 opens the cabinet, they only see and write to Drawer #3, preventing coworkers from overwriting each other's work.
+
+---
+
+## Architecture Diagram
+
+```text
+               Standard Mount vs subPath Overlay Comparison
+
+ 1. Standard Volume Mount (Shadows existing /etc/nginx directory)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Image RootFS: /etc/nginx/                                    │
+ │   ├── mime.types (ORIGINAL - SHADOWED/HIDDEN!)                         │
+ │   ├── conf.d/    (ORIGINAL - SHADOWED/HIDDEN!)                         │
+ │   └── fastcgi.conf (ORIGINAL - SHADOWED/HIDDEN!)                       │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ mountPath: /etc/nginx (Wipes visibility!)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Mounted ConfigMap Volume: Only contains `nginx.conf`                   │
+ │ (Result: Nginx crashes because mime.types and conf.d disappeared!)     │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. subPath Mount (Non-Destructive Single-File Injection)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Image RootFS: /etc/nginx/                                    │
+ │   ├── mime.types (PRESERVED & ACCESSIBLE)                              │
+ │   ├── conf.d/    (PRESERVED & ACCESSIBLE)                              │
+ │   └── nginx.conf ◄── OVERWRITTEN SPECIFICALLY BY subPath!             │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Directory Shadowing Problem & `subPath`
+
+When you mount a volume to a path in a container that already exists in the container image (e.g. `/etc/nginx` or `/var/www/html`), Linux kernel mount mechanics **shadow (hide)** all existing files in that target directory.
+
+### The `subPath` Solution:
+`subPath` specifies a relative path *inside* the referenced volume to be mounted *directly* to the container's `mountPath`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-custom-config
+spec:
+  containers:
+  - name: web
+    image: nginx:1.25-alpine
+    volumeMounts:
+    # Injects ONLY nginx.conf without shadowing /etc/nginx/mime.types or /etc/nginx/conf.d!
+    - name: config-volume
+      mountPath: /etc/nginx/nginx.conf
+      subPath: nginx.conf
+
+  volumes:
+  - name: config-volume
+    configMap:
+      name: custom-nginx-conf
+```
+
+> [!WARNING]
+> **ConfigMap Live Updates Caveat:** ConfigMaps mounted as full directory volumes are automatically updated in real time by Kubelet when the ConfigMap changes in `etcd`. However, files mounted using **`subPath` do NOT receive live updates**! To pick up changes to a `subPath` mounted file, the Pod must be restarted.
+
+---
+
+## Dynamic Path Partitioning: `subPathExpr`
+
+When multiple Pods share a single persistent volume (e.g. a shared AWS EFS or NFS share), each Pod needs its own isolated subdirectory.
+
+`subPathExpr` evaluates environment variables (typically injected via the Downward API) to construct the directory path dynamically at boot:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: log-collector
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: log-collector
+  template:
+    metadata:
+      labels:
+        app: log-collector
+    spec:
+      containers:
+      - name: collector
+        image: fluent/fluent-bit:latest
+        env:
+        # Ingest Pod name from Downward API
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        volumeMounts:
+        # Generates dynamic path: /shared-nfs/production/log-collector-0/
+        - name: shared-nfs-storage
+          mountPath: /var/log/app
+          subPathExpr: $(POD_NAMESPACE)/$(POD_NAME)
+
+      volumes:
+      - name: shared-nfs-storage
+        persistentVolumeClaim:
+          claimName: enterprise-nfs-pvc
+```
+
+---
+
+## Tuning Low-Level Storage with `mountOptions`
+
+Under `.spec.mountOptions` in a `StorageClass` or `PersistentVolume`, administrators can pass low-level flags directly to the Linux `mount -o` syscall:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Storage Backend      │ Critical Production `mountOptions`                                          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **NFS / AWS EFS**    │ `nfsvers=4.1`, `rsize=1048576`, `wsize=1048576`, `hard`, `timeo=600`, `retrans=2`│
+ │                      │ Optimizes TCP packet throughput and network retry timeouts.                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Security Hardening**│ `noexec`, `nosuid`, `nodev`                                                │
+ │                      │ Prevents executing binary scripts or escalating SUID privileges from disks. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Ext4 / XFS Block** │ `noatime`, `data=ordered`, `barrier=1`                                      │
+ │                      │ Eliminates file access-time write overhead for high-IOPS databases.         │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: high-throughput-nfs
+provisioner: nfs.csi.k8s.io
+mountOptions:
+- nfsvers=4.1
+- rsize=1048576
+- wsize=1048576
+- hard
+- noatime
+- noexec    # Security: Disallow executing binaries from this volume!
+```
+
+---
+
+## The Symlink Vulnerability & Kernel Pinning
+
+Historically, `subPath` was vulnerable to severe symlink race condition vulnerabilities (**CVE-2017-1002101** and **CVE-2021-25741**):
+1. A malicious container would create a symlink inside a volume pointing to `/etc/shadow` or `/root` on the host node.
+2. When Kubelet resolved the `subPath` on the host, it followed the symlink outside the container sandbox, allowing attackers to access host root files.
+
+### The Modern Kubernetes Fix:
+Modern Kubelet versions resolve `subPath` paths inside the host kernel using **file descriptor pinning (`openat()`)** and `/proc/self/fd/` traversal, strictly validating that the target path does not escape the boundary of the designated volume directory.
+
+---
+
+## Complete Production Manifest with subPath & subPathExpr
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php-fpm-web
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: php-web
+  template:
+    metadata:
+      labels:
+        app: php-web
+    spec:
+      volumes:
+      - name: shared-nfs
+        persistentVolumeClaim:
+          claimName: shared-assets-pvc
+      - name: custom-config
+        configMap:
+          name: fpm-pool-config
+
+      containers:
+      - name: php-fpm
+        image: php:8.2-fpm-alpine
+        env:
+        - name: POD_IDENTIFIER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        # 1. Non-destructive single config file injection
+        - name: custom-config
+          mountPath: /usr/local/etc/php-fpm.d/zz-custom.conf
+          subPath: custom-pool.conf
+
+        # 2. Dynamic directory isolation per Pod replica
+        - name: shared-nfs
+          mountPath: /var/log/php-fpm
+          subPathExpr: logs/$(POD_IDENTIFIER)
+```
+
+---
+
+## Hands-On Lab: Verifying subPath Injection & subPathExpr
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace subpath-lab
+
+# Step 2: Create a custom configuration in a ConfigMap
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: custom-motd
+  namespace: subpath-lab
+data:
+  motd: "=== WELCOME TO ENTERPRISE KUBERNETES LAB ==="
+EOF
+
+# Step 3: Deploy a Pod injecting only /etc/motd without wiping out /etc/
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: subpath-tester
+  namespace: subpath-lab
+spec:
+  volumes:
+  - name: config-vol
+    configMap:
+      name: custom-motd
+  - name: scratch-storage
+    emptyDir: {}
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    env:
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    volumeMounts:
+    # subPath: Injects only /etc/motd
+    - name: config-vol
+      mountPath: /etc/motd
+      subPath: motd
+    # subPathExpr: Creates /mnt/scratch/subpath-tester/
+    - name: scratch-storage
+      mountPath: /mnt/data
+      subPathExpr: $(POD_NAME)/workdir
+EOF
+
+# Step 4: Wait for Pod to enter Running state
+kubectl wait --for=condition=Ready pod/subpath-tester -n subpath-lab --timeout=30s
+
+# Step 5: Verify that /etc/ still contains all standard files (shadowing was prevented!)
+kubectl exec -n subpath-lab subpath-tester -- ls -la /etc | grep -E "(passwd|hosts|motd)"
+
+# Step 6: Verify the content of the injected /etc/motd
+kubectl exec -n subpath-lab subpath-tester -- cat /etc/motd
+
+# Step 7: Verify subPathExpr directory creation
+kubectl exec -n subpath-lab subpath-tester -- ls -la /mnt/data
+
+# Step 8: Clean up lab
+kubectl delete namespace subpath-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What problem does `subPath` solve in Kubernetes volume mounts?**
+
+When a volume is mounted directly to a directory path that already exists in the container image (e.g. `/etc/nginx`), the Linux kernel shadows and completely hides all pre-existing files inside that folder. `subPath` allows mounting a specific subfolder or single individual file from the volume directly to a specific container path without overwriting or shadowing the surrounding files in that directory.
+
+**Q2: What is the operational difference between `subPath` and `subPathExpr`?**
+
+`subPath` is a static string representing a fixed relative path inside the volume (e.g. `subPath: config.json`). `subPathExpr` dynamically constructs the relative volume path at runtime using environment variables (e.g. `subPathExpr: $(POD_NAMESPACE)/$(POD_NAME)`). `subPathExpr` is widely used with shared `ReadWriteMany` volumes (NFS, EFS) to provide isolated directory partitioning for each Pod replica in a StatefulSet or Deployment.
+
+**Q3: Do ConfigMaps and Secrets mounted via `subPath` receive live updates?**
+
+No. When a ConfigMap or Secret is mounted as a standard directory volume, Kubelet continuously updates the files using atomic symlink swaps whenever the resource changes in `etcd`. However, when a file is mounted using `subPath`, the file is bind-mounted directly at container initialization; Kubelet **cannot propagate live updates** to `subPath` mounts, requiring the Pod to be restarted to pick up new configuration values.
+
+**Q4: What are `mountOptions`, and where are they defined?**
+
+`mountOptions` is an array of filesystem-level mount flags passed directly to the Linux kernel `mount()` command when attaching volumes to worker nodes. They are defined either in a `StorageClass` (for dynamically provisioned volumes) or directly in a `PersistentVolume` spec. Common examples include tuning NFS parameters (`nfsvers=4.1`, `rsize=1048576`), database optimizations (`noatime`), and security hardening (`noexec`, `nosuid`).
+
+**Q5: What was the symlink vulnerability associated with `subPath` (CVE-2017-1002101), and how did Kubernetes remediate it?**
+
+The vulnerability occurred because Kubelet resolved `subPath` paths on the host node without verifying symlink targets. A malicious container could place a symlink inside a volume pointing to arbitrary host directories (like `/etc/shadow`), tricking Kubelet into bind-mounting sensitive host files into the container. Kubernetes resolved this by implementing file descriptor pinning using `openat()` and resolving paths within `/proc/self/fd/` to ensure paths never traverse outside the intended volume boundary.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `subPath` prevents directory shadowing when injecting single files
+- [ ] Know that `subPath` mounts do NOT receive live ConfigMap/Secret updates
+- [ ] Know how `subPathExpr` uses Downward API env vars for dynamic directory partitioning
+- [ ] Know that `mountOptions` passes flags (`noexec`, `nfsvers=4.1`, `noatime`) to `mount -o`
+- [ ] Know how Kubernetes hardened `subPath` against symlink breakouts via `openat()`
+- [ ] Can inject single configuration files using `mountPath: /etc/app.conf` with `subPath: app.conf`

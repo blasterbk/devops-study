@@ -1,0 +1,229 @@
+---
+title: "Chapter 1 — ResourceQuotas & Multi-Tenancy"
+sidebar_position: 1
+module: "Module 7.7 — Quotas & LimitRanges"
+description: "Master Kubernetes ResourceQuotas for multi-tenant governance — compute/storage/object quotas, quota scopes (BestEffort, Terminating), and admission plugin enforcement."
+---
+
+# Chapter 1 — ResourceQuotas & Namespace Multi-Tenancy Isolation
+
+> **Goal:** Master multi-tenant cluster governance and resource partitioning in Kubernetes using **`ResourceQuota`** — understanding how to restrict cumulative compute (`cpu`, `memory`), storage (`requests.storage`, `persistentvolumeclaims`), and object counts (`pods`, `services.loadbalancers`) across namespaces, mastering **Quota Scopes** (`Terminating`, `BestEffort`, `PriorityClass`), and dissecting the strict admission control enforcement rules that reject unconstrained workloads.
+>
+> By the end of this chapter, you will understand:
+> 1. How ResourceQuotas provide hard financial and architectural guardrails in shared clusters
+> 2. The 3 categories of quotas: Compute Resources, Storage Capacities, and Object Counts
+> 3. Why applying a compute quota mandates that **every single Pod declare requests and limits**
+> 4. How to use Quota Scopes to separate batch jobs from long-running production workloads
+> 5. How PriorityClass-based ResourceQuotas allocate dedicated compute budgets to tier-1 services
+> 6. How to diagnose and resolve `403 Forbidden: exceeded quota` admission rejections
+
+---
+
+## Real-Life Analogy
+
+Think of a `ResourceQuota` as **a corporate expense card credit limit and monthly office supply quota assigned to individual departments in a shared corporate headquarters**:
+
+- **The Problem (The Noisy Neighbor Tragedy):** A company has 50 engineering teams sharing one massive 500-node Kubernetes cluster. If a junior developer in the Marketing department accidentally deploys a rogue script that spawns 10,000 pods (**The Noisy Neighbor**), they could consume all 2,000 CPU cores in the cluster, starving the mission-critical Billing and Checkout teams.
+- **The Department Credit Limit (`ResourceQuota`):** The CFO sets a hard monthly cap for the Marketing department's floor (**Namespace: `marketing`**):
+  - Max Compute: At most 20 CPU cores and 40 GiB of RAM (**`requests.cpu: 20`, `requests.memory: 40Gi`**).
+  - Max Expensive Cloud Resources: At most 2 external Cloud Load Balancers (**`services.loadbalancers: 2`**).
+- **The Mandatory Itemized Receipt Rule:** You cannot swipe the corporate card for an unlabelled mystery box (**A Pod without resource requests**). The cashier (**Admission Controller**) will reject your transaction at the register: *"You must write down the exact price on the receipt before we process it!"*
+- **The Priority VIP Budget (`scopeSelector: PriorityClass`):** The emergency cybersecurity response team is granted an independent VIP credit line that is completely immune to normal department spending limits.
+
+---
+
+## Architecture Diagram
+
+```text
+               ResourceQuota Admission Control Enforcement Flow
+
+ DEVELOPER: Submits Deployment manifest to Namespace `marketing`
+ Spec: 5 Replicas (Each requesting 2 CPU cores = 10 Cores Total)
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: Validates Authentication & RBAC                        │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Invokes Admission Plugin Chain:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `ResourceQuota` MUTATING & VALIDATING ADMISSION PLUGIN                 │
+ │                                                                        │
+ │ Evaluates Namespace `marketing` ResourceQuota:                         │
+ │ ├── Current Namespace Usage: 14 Cores                                  │
+ │ ├── Quota Hard Limit:        20 Cores                                  │
+ │ └── Requested Addition:     +10 Cores                                  │
+ │                                                                        │
+ │ New Proposed Sum: 14 + 10 = 24 Cores (EXCEEDS HARD LIMIT OF 20!)       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ ADMISSION REJECTED (HTTP 403 Forbidden!)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ERROR RETURNED TO DEVELOPER:                                           │
+ │ `Error from server (Forbidden): pods "api-7b8f" is forbidden:          │
+ │  exceeded quota: marketing-quota, requested: requests.cpu=10,          │
+ │  used: requests.cpu=14, limited: requests.cpu=20`                      │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 Categories of ResourceQuotas
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Quota Category       │ Tracked Resources & Syntax Examples                                         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Compute**       │ - `requests.cpu`: Cumulative sum of CPU requests across all namespace pods. │
+ │ **Resources**        │ - `limits.cpu`: Cumulative sum of CPU limits across all namespace pods.     │
+ │                      │ - `requests.memory`: Cumulative sum of Memory requests.                     │
+ │                      │ - `limits.memory`: Cumulative sum of Memory limits.                         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Storage**       │ - `requests.storage`: Total storage capacity across all PVCs (e.g. `500Gi`). │
+ │ **Capacities**       │ - `persistentvolumeclaims`: Maximum number of PVC objects allowed.          │
+ │                      │ - `<storageclass>.storage.k8s.io/requests.storage`: Storage per class.      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Object**        │ - `count/pods`, `count/services`, `count/secrets`, `count/configmaps`       │
+ │ **Counts**           │ - `services.loadbalancers`: Caps expensive Cloud Load Balancers ($18/mo ea)!│
+ │                      │ - `services.nodeports`: Caps NodePort allocation.                           │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Mandatory Resource Specification Rule
+
+> [!CRITICAL]
+> **The Golden Rule of ResourceQuotas:** When a compute quota (`requests.cpu` or `requests.memory`) is applied to a namespace, **every single container submitted to that namespace MUST explicitly specify resource requests and limits!**
+
+```text
+ If a developer submits a Pod without `resources.requests.cpu`:
+ The API Server cannot compute the new namespace sum.
+ ──► The API Server rejects the Pod immediately with:
+     `Error: pods "my-pod" is forbidden: failed quota: must specify requests.cpu, memory`
+ ──► Solution: Pair every ResourceQuota with a `LimitRange` to inject defaults automatically!
+```
+
+---
+
+## Quota Scopes & PriorityClass Partitioning
+
+ResourceQuotas can be filtered to track only specific subsets of workloads using **`scopes`** or **`scopeSelector`**:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Quota Scope          │ Matching Criteria & Typical Use Case                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Terminating`**    │ Matches Pods where `.spec.activeDeadlineSeconds >= 0` (e.g. batch Jobs).    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`NotTerminating`** │ Matches long-running Pods (Deployments, StatefulSets, DaemonSets).          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`BestEffort`**     │ Matches Pods that have ZERO requests and limits configured.                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`NotBestEffort`**  │ Matches Pods that have at least one request/limit configured.               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`PriorityClass`**  │ Tracks resource consumption strictly for pods with a specific PriorityClass │
+ │ (via `scopeSelector`)│ (e.g. reserving 50 cores exclusively for `high-priority` workloads).        │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `ResourceQuota` Manifest
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: enterprise-tenant-quota
+  namespace: production
+spec:
+  hard:
+    # 1. Compute Resource Guardrails
+    requests.cpu: "32"                 # Max 32 CPU Cores requested
+    limits.cpu: "64"                   # Max 64 CPU Cores limit
+    requests.memory: "64Gi"            # Max 64 GiB RAM requested
+    limits.memory: "128Gi"             # Max 128 GiB RAM limit
+
+    # 2. Storage Guardrails
+    requests.storage: "1Ti"            # Max 1 TiB cumulative storage
+    persistentvolumeclaims: "20"       # Max 20 PVCs
+    gp3-sc.storageclass.storage.k8s.io/requests.storage: "500Gi"
+
+    # 3. Object Count Guardrails (Cost & Control Plane Protection)
+    count/pods: "100"                  # At most 100 running Pods
+    services.loadbalancers: "3"        # At most 3 Cloud Load Balancers
+    count/secrets: "200"
+    count/configmaps: "200"
+```
+
+---
+
+## Hands-On Lab: Testing ResourceQuota Enforcement
+
+```bash
+# Step 1: Create a test quota namespace
+kubectl create namespace quota-lab
+
+# Step 2: Apply a restrictive compute and pod count ResourceQuota
+cat <<EOF | kubectl apply -f - -n quota-lab
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: lab-quota
+spec:
+  hard:
+    count/pods: "2"
+    requests.cpu: "500m"
+    requests.memory: "512Mi"
+EOF
+
+# Step 3: Inspect the quota status
+kubectl describe resourcequota lab-quota -n quota-lab
+
+# Step 4: Deploy a pod that satisfies the quota
+kubectl run pod-1 --image=nginx:alpine --requests='cpu=200m,memory=128Mi' -n quota-lab
+
+# Step 5: Deploy a second pod that EXCEEDS the CPU quota
+kubectl run pod-2 --image=nginx:alpine --requests='cpu=400m,memory=128Mi' -n quota-lab 2>&1 || echo "Quota rejected as expected!"
+
+# Step 6: Clean up lab
+kubectl delete namespace quota-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the primary purpose of a `ResourceQuota` in Kubernetes?**
+
+A `ResourceQuota` provides declarative multi-tenant resource governance across an entire namespace. It sets hard constraints on the cumulative amount of compute capacity (CPU and Memory requests/limits), storage capacity (total PVC storage and StorageClass allocations), and Kubernetes API object counts (Pods, Services, Cloud Load Balancers, Secrets) that a single team or tenant is permitted to consume, preventing noisy-neighbor starvation and controlling cloud infrastructure spend.
+
+**Q2: What happens when a developer attempts to create a Pod without resource requests in a quota-restricted namespace?**
+
+If a namespace contains a compute `ResourceQuota` (e.g. `requests.cpu` or `requests.memory`), the API server's `ResourceQuota` admission controller will **immediately reject any Pod that does not declare explicit resource requests and limits** with a `403 Forbidden` error. Because the API server cannot compute the new cumulative namespace resource sum without knowing the pod's requirements, explicit resource declarations are mandatory.
+
+**Q3: How do you prevent developers from getting `403 Forbidden` errors when a ResourceQuota is applied?**
+
+DevOps teams pair every `ResourceQuota` with a **`LimitRange`** in the same namespace. The `LimitRange` defines `defaultRequest` and `defaultLimit` parameters. When a developer submits a Pod without resource specifications, the `LimitRange` mutating admission controller automatically injects the default CPU and memory values into the Pod spec *before* the `ResourceQuota` validating admission plugin evaluates the namespace total.
+
+**Q4: How do `scopes` in a ResourceQuota enable separate quotas for batch jobs versus web services?**
+
+By configuring `spec.scopes`, administrators can split quotas:
+- A `ResourceQuota` with `scopes: ["Terminating"]` restricts resources strictly for ephemeral, short-lived batch workloads (`activeDeadlineSeconds >= 0`, such as CronJobs and CI/CD runners).
+- A second `ResourceQuota` with `scopes: ["NotTerminating"]` restricts long-running web microservices (Deployments and StatefulSets), ensuring batch jobs cannot consume compute budget reserved for customer-facing APIs.
+
+**Q5: How does a PriorityClass-based ResourceQuota work using `scopeSelector`?**
+
+In enterprise clusters running mixed workloads, platform teams define `scopeSelector.matchExpressions` targeting specific `PriorityClass` names. For example, a quota can reserve a guaranteed budget of 100 CPU cores exclusively for pods matching `priorityClassName: mission-critical`, while placing a tight 20-core limit on pods running with `priorityClassName: low-priority`, enforcing strict quality-of-service guarantees.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that ResourceQuotas restrict cumulative resources across an entire namespace
+- [ ] Know the 3 categories: Compute (`cpu`/`memory`), Storage (PVC bytes), and Object Counts
+- [ ] Know why compute quotas mandate that ALL pods specify requests and limits
+- [ ] Know how `services.loadbalancers` caps expensive cloud load balancer provisioning
+- [ ] Know how `Terminating` vs `NotTerminating` scopes separate batch jobs from services
+- [ ] Can inspect active quota usage using `kubectl describe resourcequota <name>`

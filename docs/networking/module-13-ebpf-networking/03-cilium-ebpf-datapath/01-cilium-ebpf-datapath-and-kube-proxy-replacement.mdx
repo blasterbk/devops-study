@@ -1,0 +1,147 @@
+---
+title: "Chapter 3 — Cilium eBPF Datapath: kube-proxy Replacement, Socket LB & Hubble"
+sidebar_position: 1
+module: "Module 13.3 — Cilium eBPF Datapath"
+description: "Master Cilium's cloud-native eBPF networking architecture — complete kube-proxy replacement, socket-level load balancing (cgroup/connect4), direct server return (DSR), and Hubble observability."
+---
+
+# Chapter 3 — Cilium eBPF Datapath: kube-proxy Replacement, Socket LB & Hubble
+
+> **Goal:** Master the internal networking architecture of **Cilium**, the premier eBPF-powered Kubernetes CNI and service mesh datapath. Understand how Cilium completely replaces `kube-proxy` (eliminating iptables and IPVS), intercepts TCP/UDP socket calls at the system call layer (`cgroup/connect4`), routes packets across virtual ethernet pairs with BPF Map lookups, implements Direct Server Return (DSR), and provides deep L3/L4/L7 observability via Cilium Hubble.
+>
+> By the end of this chapter, you will understand:
+> 1. The limitations of legacy `kube-proxy` (iptables linear scans, connection tracking table exhaustion)
+> 2. How Cilium eBPF replaces `kube-proxy` with in-kernel BPF Maps (`cilium_lb4_services_v2`, `cilium_lb4_backends_v2`)
+> 3. Socket-Level Load Balancing (Host-Reachable Services via `sock_ops` / `cgroup/connect4` eBPF hooks)
+> 4. Fast inter-Pod forwarding (bypassing the host TCP/IP stack via `bpf_redirect_peer`)
+> 5. Direct Server Return (DSR) and Maglev consistent hashing in Cilium
+> 6. Observability and security telemetry with Cilium Hubble CLI
+
+---
+
+## Real-Life Analogy
+
+Think of Cilium eBPF vs standard `kube-proxy` as **replacing a maze of security turnstiles with an automated teleporter**:
+
+- **Standard `kube-proxy` with iptables (The Maze of Turnstiles):**
+  - Every time a container sends a request to a Kubernetes Service VIP (`10.96.0.10:80`), the packet must leave the pod namespace, climb up the Linux network stack, traverse 1,000 iptables turnstiles, create an entry in the conntrack memory ledger, get rewritten (**DNAT**), and traverse back down to the destination pod.
+- **Cilium Socket-Level Load Balancing (The Instant Teleporter):**
+  - When the container application calls the C library function `connect("10.96.0.10", 80)` (**Syscall level**), Cilium's eBPF program hooks the syscall directly inside the application's socket.
+  - Before the packet is even created, Cilium rewrites the destination IP inside the socket to the backend Pod IP (`10.244.2.15:8080`).
+  - When the packet is transmitted, it bypasses the entire host networking stack and travels directly to the target Pod in **zero hops**!
+
+---
+
+## Architecture Diagram
+
+```text
+                  Cilium Socket-Level Load Balancing vs Standard kube-proxy
+                  
+ 1. STANDARD KUBE-PROXY (IPtables / Netfilter Overhead):
+   [Pod App] ──► [veth] ──► [Host Netfilter: 10,000 iptables rules] ──► [conntrack] ──► [Dest Pod]
+                               (Slow $O(N)$ packet rewriting & NAT overhead)
+ 
+ 2. CILIUM SOCKET-LEVEL LOAD BALANCING (eBPF System Call Interception):
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ APPLICATION CONTAINER (Pod A)                                               │
+ │                                                                             │
+ │    Client code: `connect(Service_VIP: 10.96.0.10:80)`                       │
+ │         │                                                                   │
+ │         ▼ (eBPF `cgroup/connect4` hook intercepts socket syscall)           │
+ │    ┌───────────────────────────────────────────────────────────────────┐    │
+ │    │ eBPF Program: BPF Map lookup (`cilium_lb4_services_v2`)           │    │
+ │    │ Rewrites Socket Destination directly to Pod B IP: `10.244.1.50:8080`│    │
+ │    └─────────────────────────────────┬─────────────────────────────────┘    │
+ │                                      │ (Socket is pre-translated!)          │
+ │                                      ▼                                      │
+ │    Packet transmitted directly targeting Pod B: `10.244.1.50:8080`          │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ `bpf_redirect_peer()` (Bypasses Host Stack)
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ DESTINATION POD B (`10.244.1.50:8080`)                                      │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Cilium BPF Maps for Kubernetes Services
+
+Instead of 100,000 iptables rules, Cilium maintains two in-kernel BPF Hash Maps:
+1. **`cilium_lb4_services_v2`:** Maps `(Service VIP, Port, Protocol)` $\to$ `(Backend ID, Count, Flags)`.
+2. **`cilium_lb4_backends_v2`:** Maps `(Backend ID)` $\to$ `(Real Pod IP, Real Port)`.
+
+Looking up a Kubernetes Service takes **1 hash table lookup ($O(1)$ time)** regardless of whether the cluster has 10 Services or 100,000 Services!
+
+---
+
+### 2. Fast Inter-Pod Redirection (`bpf_redirect_peer`)
+
+In traditional Linux bridge/veth networking, a packet crossing from Pod A to Pod B crosses the Linux TCP/IP network stack **twice** (traversing routing tables, firewall chains, and socket allocations on the host).
+- **Cilium Fast Datapath:** Attaches a TC eBPF program to the host end of Pod A's veth interface. When a packet arrives, the eBPF program resolves Pod B's veth interface in a BPF Map and calls the kernel helper `bpf_redirect_peer()`. The packet is injected **directly into Pod B's receive queue**, bypassing the entire host network stack.
+
+---
+
+### 3. Cilium Hubble Observability Layer
+
+Cilium Hubble taps into the eBPF datapath hooks to capture flow logs with zero user-space packet copying:
+- **Layer 3 / Layer 4:** IP source/dest, ports, packet drops, TCP flags, latency metrics.
+- **Layer 7:** HTTP method, URI path, status codes, gRPC service/method, DNS queries and NXDOMAIN errors.
+
+---
+
+## Hands-On Lab: Inspecting Cilium & Hubble via CLI
+
+```bash
+# Step 1: Query Cilium agent status and kube-proxy replacement mode
+# cilium status
+
+# Step 2: List all Kubernetes Services registered inside Cilium BPF Maps
+# cilium service list
+
+# Step 3: Inspect active BPF Maps managed by Cilium on a worker node
+sudo bpftool map list | grep -i "cilium"
+
+# Step 4: Stream real-time Hubble L3/L4/L7 network flows in the terminal
+# hubble observe --follow --namespace default
+
+# Step 5: Filter Hubble flows for dropped packets and DNS queries
+# hubble observe --verdict DROPPED
+# hubble observe --protocol dns
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Cilium's Socket-Level Load Balancing eliminate the need for `kube-proxy`?**
+
+In standard Kubernetes, `kube-proxy` configures iptables/IPVS to translate the Service ClusterIP to a Pod IP at the network packet layer (in the `PREROUTING` or `OUTPUT` hook). Cilium attaches an eBPF program to the **`cgroup/connect4` hook**. When an application process inside a container issues a `connect()` system call to a ClusterIP, Cilium intercepts the syscall and rewrites the socket's destination IP/Port to a healthy backend Pod IP **before the packet is even created in memory**. This eliminates all packet-level NAT and connection tracking overhead.
+
+**Q2: What is the performance difference between Cilium eBPF Service Routing and `kube-proxy` IPVS mode?**
+
+While IPVS improved on iptables by using hash tables ($O(1)$ lookup), IPVS still operates inside the standard Linux kernel network stack and requires `iptables` for SNAT/masquerading. Furthermore, IPVS creates significant lock contention during frequent pod churn. Cilium eBPF executes outside the standard IP stack, avoids conntrack lock contention, performs translation at the socket layer, and achieves up to **$6\times$ higher throughput with $80\%$ lower CPU utilization**.
+
+**Q3: How does Cilium Direct Server Return (DSR) handle node-to-node return traffic?**
+
+In standard NodePort / LoadBalancer routing, when traffic hits Node 1 and is forwarded to Node 2 (where the backend pod runs), Node 2 must send the reply back to Node 1 so Node 1 can reverse the SNAT before sending to the client (**2 network hops**). With **Cilium DSR**, Node 1 encodes the original client IP and Service VIP inside the packet (using a custom IP option or Geneve header). Node 2 decodes the metadata and transmits the response **directly back to the client**, cutting network latency in half.
+
+**Q4: How does Cilium enforce Layer 7 (HTTP/gRPC/Kafka) NetworkPolicies using eBPF and Envoy?**
+
+eBPF operates at Layers 3 and 4. When a Cilium NetworkPolicy specifies Layer 7 rules (e.g. `allow HTTP GET /api/v1/orders`), Cilium uses eBPF (via `sockmap`) to parse L3/L4 headers. If an L7 rule applies, the eBPF program dynamically redirects the TCP payload to an embedded **in-kernel Envoy proxy instance**. Envoy parses the HTTP headers and applies RBAC policy; approved traffic is passed back to eBPF for fast socket delivery.
+
+**Q5: What is Cilium ClusterMesh and how does it route cross-cluster Pod traffic?**
+
+**Cilium ClusterMesh** connects multiple independent Kubernetes clusters into a unified service mesh. ClusterMesh synchronizes Pod CIDRs and Service Endpoints across clusters using etcd/BGP. Pods in Cluster A can talk directly to Pods in Cluster B via native VPC routing or WireGuard encryption with standard Kubernetes Service discovery (`service.default.svc.cluster.local`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Cilium complete `kube-proxy` replacement (`cilium_lb4_services_v2`)
+- [ ] Understand Socket-Level Load Balancing (`cgroup/connect4` syscall hook)
+- [ ] Understand fast inter-pod forwarding with `bpf_redirect_peer()`
+- [ ] Explain Cilium Direct Server Return (DSR) and Maglev hashing
+- [ ] Master Cilium Hubble L3/L4/L7 flow observability

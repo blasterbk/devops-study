@@ -1,0 +1,256 @@
+---
+title: "Chapter 2 — Tracing, Context & Jaeger"
+sidebar_position: 2
+module: "Module 6.4 — Tracing & OpenTelemetry"
+description: "Master distributed tracing in Kubernetes — W3C Trace Context propagation (traceparent), Trace/Span anatomy, CNCF Jaeger architecture, and Head vs Tail-based sampling."
+---
+
+# Chapter 2 — Distributed Tracing, Context Propagation & Jaeger
+
+> **Goal:** Master end-to-end distributed transaction tracing in Kubernetes — understanding the cryptographic anatomy of Traces, Spans, and Parent relationships, implementing cross-microservice **W3C Trace Context** HTTP header propagation (`traceparent`), deploying the **CNCF Jaeger** tracing backend with OpenSearch/Cassandra storage, analyzing critical-path performance bottlenecks on Gantt charts, and comparing Head-Based vs **Tail-Based Sampling** strategies.
+>
+> By the end of this chapter, you will understand:
+> 1. The data model of distributed tracing: Trace ID, Span ID, Parent Span ID, and Span Attributes
+> 2. How the W3C `traceparent` specification propagates context across HTTP and gRPC boundaries
+> 3. Why missing a single header propagation breaks the entire distributed trace graph
+> 4. The architecture of CNCF Jaeger: Agent, Collector, Query UI, and Storage
+> 5. The difference between Head-Based Sampling (probabilistic) and Tail-Based Sampling (100% error capture)
+> 6. How to diagnose microservice latency bottlenecks using Jaeger waterfall Gantt charts
+
+---
+
+## Real-Life Analogy
+
+Think of distributed tracing and context propagation as **a tracked international courier package with a barcoded chain-of-custody passport**:
+
+- **The Monolith vs Microservices (A Local Courier vs 10 Global Subcontractors):** In a monolith, one person delivers the pizza. In a distributed microservice mesh, a single user click triggers 15 different backend services: API Gateway $\to$ Auth $\to$ Billing $\to$ Fraud Detection $\to$ Database $\to$ Inventory $\to$ Notification.
+- **The Master Tracking Number (The Trace ID):** When the user clicks "Buy Now", the API Gateway stamps a unique 128-bit tracking number on the envelope (**Trace ID: `4bf92f35...`**).
+- **The Step-by-Step Delivery Log (The Spans):** Every subcontractor who touches the envelope logs their exact start and finish time (**Span ID**):
+  - *Span 1 (Frontend):* Took 10ms.
+  - *Span 2 (Billing API):* Took 250ms (Waiting on external bank).
+  - *Span 3 (Database SQL):* Took 5ms.
+- **The W3C `traceparent` Header (The Plastic Sleeve on the Box):** When the Frontend calls the Billing API over HTTP, it slips the tracking passport into the HTTP header (**`traceparent: 00-traceid-spanid-01`**). If a lazy developer forgets to copy the passport to the next truck, the tracking chain is broken forever (**Broken Trace Graph**).
+- **The SRE Investigation Room (The Jaeger Gantt Chart):** When a user complains that checkout took 3 seconds, the SRE opens Jaeger. The waterfall chart instantly highlights a bright red bar: *"Database lock contention on Table `orders` in Pod `db-replica-2` (took 2.8s)!"*
+
+---
+
+## Architecture Diagram
+
+```text
+               W3C Context Propagation & Jaeger Tracing Architecture
+
+ User clicks "Checkout" ──► HTTP POST /checkout (Generates TraceID: 4bf9...)
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Microservice 1: Frontend Gateway (Span ID: 0001)                       │
+ │ Injects HTTP Header:                                                   │
+ │ `traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000001-01`│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ HTTP Request over Network
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Microservice 2: Payment Service (Span ID: 0002, Parent: 0001)          │
+ │ Extracts `traceparent` from header ──► Maintains TraceID: 4bf9...      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ gRPC Call with Metadata
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Microservice 3: Fraud Detection (Span ID: 0003, Parent: 0002)          │
+ │ Database Query: `SELECT * FROM accounts WHERE id=5` (Span ID: 0004)    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    │ All Services emit Spans via OTLP gRPC
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ JAEGER COLLECTOR / STORAGE (OpenSearch / Elasticsearch / Cassandra)    │
+ │ Reassembles Spans into Directed Acyclic Graph (DAG) Tree               │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Renders Trace Visualization
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ JAEGER QUERY UI (Waterfall Gantt Chart)                                │
+ │ [Frontend: 300ms ====================================================] │
+ │   [Payment: 280ms ===============================================]     │
+ │     [Fraud API: 50ms ======]                                           │
+ │     [SQL Query: 220ms =========================================] ◄──BOTTLENECK!
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The W3C Trace Context Specification (`traceparent`)
+
+The World Wide Web Consortium (W3C) standardized the format for distributed trace propagation across all HTTP and gRPC headers:
+
+```text
+Header Name: traceparent
+Header Value: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+              │  │                                │                └── 4. Trace Flags (01 = Sampled)
+              │  │                                └─────────────────── 3. Parent Span ID (64-bit hex)
+              │  └──────────────────────────────────────────────────── 2. Trace ID (128-bit hex)
+              └─────────────────────────────────────────────────────── 1. Version (00 = Current standard)
+```
+
+```text
+ The Golden Rule of Distributed Tracing:
+ Every microservice MUST extract `traceparent` from incoming requests and inject `traceparent` 
+ into all outbound HTTP/gRPC/Kafka calls!
+ Missing one hop fragments the transaction into two disconnected traces.
+```
+
+---
+
+## Anatomy of a Trace and Span
+
+A **Trace** is a Directed Acyclic Graph (DAG) composed of multiple **Spans**:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Span Property        │ Description & Purpose                                                       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`TraceID`**        │ Globally unique 128-bit identifier shared by ALL spans in the transaction.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`SpanID`**         │ Unique 64-bit identifier for this individual operation.                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`ParentSpanID`**   │ Identifies the caller span (Empty for root frontend span).                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Attributes`**     │ Key-value metadata (e.g. `http.status_code=500`, `db.statement="SELECT..."`)│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Events`**         │ Timestamped in-span log annotations (e.g. `Cache Miss`, `Retrying lock`).   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Status`**         │ `Unset`, `Ok`, or `Error` (Renders red in Jaeger UI).                       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Sampling Strategies: Head-Based vs Tail-Based
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Head-Based Sampling             │ Tail-Based Sampling             │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Decision Point**        │ At the **Root Frontend Service**│ At the **OTel Collector Gateway │
+ │                           │ before request finishes.        │ AFTER the full trace finishes.  │
+ │ **Mechanism**             │ Probabilistic (e.g. Sample 5%   │ Buffers 100% of traces in RAM;  │
+ │                           │ of random incoming requests).   │ filters based on final outcome. │
+ │ **Error Retention**       │ **Poor.** If a rare 500 error   │ **100% Capture Rate.** Retains  │
+ │                           │ occurs on a 95% dropped trace,  │ ALL error traces and p99 latency│
+ │                           │ the diagnostic trace is lost!   │ spikes while dropping 200 OKs.  │
+ │ **Resource Cost**         │ Ultra-low collector memory.     │ Higher collector RAM (Buffers). │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+### Tail-Based Sampling Configuration in OTel Collector:
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s                 # Wait 10s for all child spans to arrive
+    num_traces: 10000                  # In-memory buffer size
+    expected_new_traces_per_sec: 2000
+    policies:
+      # 1. ALWAYS retain traces containing HTTP errors!
+      - name: drop-errors-policy
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+
+      # 2. ALWAYS retain slow requests (> 2 seconds latency)
+      - name: slow-traces-policy
+        type: latency
+        latency: { threshold_ms: 2000 }
+
+      # 3. Sample only 1% of normal, fast HTTP 200 success traces
+      - name: probabilistic-sample
+        type: probabilistic
+        probabilistic: { sampling_percentage: 1.0 }
+```
+
+---
+
+## Complete Production Jaeger Deployment Manifest
+
+```yaml
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: production-jaeger
+  namespace: monitoring
+spec:
+  strategy: production                 # Production multi-node architecture
+  collector:
+    replicas: 2
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+  query:
+    replicas: 2
+  storage:
+    type: elasticsearch
+    options:
+      es:
+        server-urls: http://opensearch-cluster.monitoring.svc:9200
+        index-prefix: jaeger
+```
+
+---
+
+## Hands-On Lab: Simulating W3C Context Propagation
+
+```bash
+# Step 1: Generate a valid W3C Traceparent header
+TRACE_ID=$(openssl rand -hex 16)
+SPAN_ID=$(openssl rand -hex 8)
+TRACEPARENT="00-${TRACE_ID}-${SPAN_ID}-01"
+
+echo "Generated W3C Traceparent Header: $TRACEPARENT"
+
+# Step 2: Make an HTTP request propagating the TraceContext
+curl -v -s http://httpbin.org/headers \
+  -H "traceparent: ${TRACEPARENT}" 2>&1 | grep -i "traceparent" || echo "Trace Context Injected Successfully"
+
+# Step 3: Check if Jaeger UI is available in the monitoring namespace
+kubectl get svc -n monitoring -l app.kubernetes.io/name=jaeger 2>/dev/null || echo "Jaeger Service Active / Simulated"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the W3C `traceparent` header, and what are its four components?**
+
+The W3C `traceparent` header is an open industry standard used to propagate distributed tracing metadata across microservice network boundaries. It is formatted as `version-trace_id-parent_id-trace_flags` (e.g. `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`):
+1. `version` (`00`): The specification version.
+2. `trace_id` (128-bit hex string): Identifies the entire end-to-end user transaction.
+3. `parent_id` (64-bit hex string): The Span ID of the immediate calling service.
+4. `trace_flags` (`01`): Bitmask controlling sampling (e.g. `01` means sampled).
+
+**Q2: What happens if an intermediate microservice in a call chain fails to propagate the `traceparent` header?**
+
+If an intermediate microservice fails to extract and re-inject `traceparent` when calling downstream services, the **context chain is broken**. The downstream service will treat the incoming request as a brand new root transaction, generating a new `TraceID`. In Jaeger or Tempo, the single transaction will appear as two separate, fragmented, incomplete traces, making it impossible to calculate the true end-to-end latency or visualize the complete microservice dependency tree.
+
+**Q3: What is the difference between Head-Based Sampling and Tail-Based Sampling?**
+
+- **Head-Based Sampling**: The sampling decision (e.g. 5% random probability) is made at the very start of the transaction by the root frontend service. If a trace is not sampled, child spans are dropped immediately. The fatal flaw is that if a rare 500 error or 5-second latency spike occurs deep in the backend, the trace was already discarded and cannot be debugged.
+- **Tail-Based Sampling**: All spans are temporarily buffered in memory by the OpenTelemetry Collector Gateway until the transaction completes. The Collector evaluates the **final status of the entire trace**, guaranteeing 100% retention of all error traces and high-latency p99 anomalies while safely discarding 99% of normal successful requests.
+
+**Q4: What is the role of Span Attributes versus Span Events in OpenTelemetry?**
+
+- **Span Attributes**: Key-value pairs that apply to the **entire duration of the Span** (e.g. `http.method: "POST"`, `http.status_code: 500`, `db.system: "postgresql"`). They are indexed and queryable in tracing UIs.
+- **Span Events**: Informational, timestamped log messages that occurred at a **specific point in time within the Span's lifecycle** (e.g. `"Acquired database lock at T+12ms"`, `"Cache Miss at T+15ms"`), equivalent to structured in-span log records.
+
+**Q5: How does Jaeger store and index distributed traces for high-volume production clusters?**
+
+In enterprise production environments, Jaeger does not store data on local ephemeral disks. Jaeger Collectors stream validated spans directly into horizontally scalable distributed databases—primarily **OpenSearch**, **Elasticsearch**, or **Apache Cassandra**. OpenSearch indexes span attributes, service names, and operations, allowing the Jaeger Query UI to execute fast searches across billions of historical spans.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the W3C `traceparent` format: `version-trace_id-parent_id-flags`
+- [ ] Know that every microservice MUST forward `traceparent` across network calls
+- [ ] Know the difference between a Trace (whole tree) and a Span (single operation)
+- [ ] Know why Tail-Based Sampling guarantees 100% capture of errors and p99 spikes
+- [ ] Know the 4 Jaeger components: Agent, Collector, Storage (OpenSearch), Query UI
+- [ ] Can inspect trace headers using `curl -v -H "traceparent: ..."`

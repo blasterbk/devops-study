@@ -1,0 +1,1356 @@
+---
+title: "Chapter 4 — Pod Sandbox"
+sidebar_position: 4
+module: "Module 1.7 — Container Runtime Internals"
+description: "> **Goal:** Understand how Kubernetes creates a **Pod Sandbox** before starting application containers. Learn why every Pod has a **Pause Container**, how Linux..."
+---
+
+# Module 1.7 — Container Runtime Internals
+
+# Chapter 4 — Pod Sandbox
+
+> **Goal:** Understand how Kubernetes creates a **Pod Sandbox** before starting application containers. Learn why every Pod has a **Pause Container**, how Linux namespaces are shared inside a Pod, how the sandbox is created and destroyed, and why the sandbox is the foundation of Kubernetes networking.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What a Pod Sandbox is: the shared environment for all containers in a Pod
+> 2. Pause container: the sandbox's init process that holds the namespaces
+> 3. Sandbox creation sequence: RunPodSandbox -> CNI -> pause container
+> 4. Network namespace: created by pause, shared by all containers in the Pod
+> 5. Other shared namespaces: UTS (hostname), IPC (inter-process communication)
+> 6. How application containers join the sandbox namespaces
+> 7. Sandbox lifecycle: created before any containers, destroyed last
+> 8. Why killing the pause container destroys the entire Pod network
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Pod Sandbox like a walled apartment building with a shared lobby.
+
+```text
+Apartment Building Analogy:
+
+Builder (containerd) first constructs the lobby and shared utilities (sandbox)
+Lobby has a doorman (pause container) who holds the building's address
+Building address (Pod IP) is registered with the city (CNI / routing tables)
+Each apartment (container) moves into the building sharing the lobby
+Apartments share: front door address (network), building name (hostname)
+If doorman leaves (pause dies): building loses its address; all apartments affected
+If one apartment is emptied (container removed): building and address still exist
+```
+
+| Apartment Building | Pod Sandbox |
+| :--- | :--- |
+| Building lobby construction | `RunPodSandbox` CRI call |
+| Doorman (holds the building address) | Pause container |
+| Building street address | Pod IP (assigned by CNI) |
+| Building name / mailbox | UTS namespace (hostname = Pod name) |
+| Apartment residents | Application containers |
+| Shared lobby and utilities | Shared network + IPC namespaces |
+| Doorman leaves -> building loses address | Pause dies -> Pod network destroyed |
+
+> **Important:** The `pause` container (also called the "sandbox container" or "infra container") exists **only to hold the network namespace**. It runs no application code, has no meaningful process, and consumes almost zero CPU and memory. Its sole purpose is to act as the PID 1 process that keeps the namespace alive so that application containers can join and leave without the namespace being destroyed.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- CRI (Container Runtime Interface)
+- containerd & runc Internals
+- Linux Namespaces (basic understanding)
+- Pod Lifecycle
+- Image Pull Workflow
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapter we learned:
+
+```text
+Pull Image
+  |
+  v
+Create Container
+```
+
+However, Kubernetes does **not** immediately start your application container.
+
+Instead, it first creates something else:
+
+```text
+Pod
+  |
+  v
+Sandbox
+  |
+  v
+Application Containers
+```
+
+Understanding the Pod Sandbox is one of the most important Kubernetes internals topics.
+
+---
+
+# The Fundamental Question
+
+Consider this Pod:
+
+```yaml
+Pod
+
++-- nginx
+
++-- sidecar
+```
+
+Question:
+
+How do these two containers share:
+
+- IP Address?
+- localhost?
+- Network Ports?
+- Shared Volumes?
+
+The answer is:
+
+```text
+Pod Sandbox
+```
+
+---
+
+# Why a Pod Needs a Sandbox
+
+Suppose Kubernetes started containers independently.
+
+```text
+Container A
+  |
+  v
+Network Namespace A
+
+────────────
+
+Container B
+  |
+  v
+Network Namespace B
+```
+
+Result:
+
+```text
+Different IPs
+
+Different localhost
+
+Different Routing Tables
+```
+
+This violates the Kubernetes networking model.
+
+---
+
+# Kubernetes Networking Model
+
+Kubernetes guarantees:
+
+> Every Pod receives **one IP address**.
+
+Not:
+
+```text
+Container
+  |
+  v
+One IP
+```
+
+Instead:
+
+```text
+Pod
+  |
+  v
+One IP
+  |
+  v
+All Containers Share It
+```
+
+To make this possible,
+
+Kubernetes creates a shared environment before starting containers.
+
+---
+
+# What is a Pod Sandbox?
+
+A **Pod Sandbox** is the infrastructure environment that hosts all containers inside a Pod.
+
+Think of it as:
+
+```text
+Empty House
+  |
+  v
+Containers Move In
+```
+
+The sandbox provides:
+
+- Network namespace
+- Shared Linux namespaces
+- Pod identity
+- Infrastructure for all containers
+
+---
+
+# High-Level Architecture
+
+```text
+                Pod
+
+        ┌───────────────────┐
+
+        |   Pod Sandbox     |
+
+        |                   |
+
+        |  Shared Network   |
+
+        |  Shared IPC       |
+
+        |  Shared UTS       |
+
+        |                   |
+
+        +--─────┬───────────┘
+
+                |
+
+      ┌─────────┴─────────┐
+
+      ▼                   ▼
+
+ Application A     Application B
+```
+
+Containers live **inside** the sandbox.
+
+---
+
+# Why It Is Called a Sandbox
+
+The sandbox isolates the Pod from the rest of the system.
+
+Conceptually:
+
+```text
+Node
+  |
+  v
+Sandbox
+  |
+  v
+Containers
+```
+
+Everything inside the sandbox belongs to one Pod.
+
+---
+
+# Pod Sandbox Responsibilities
+
+The sandbox provides:
+
+- Pod networking
+- Shared namespaces
+- Container grouping
+- Infrastructure lifecycle
+- Pod identity
+
+Application containers depend on it.
+
+---
+
+# CRI Perspective
+
+The kubelet does **not** ask the runtime to create containers first.
+
+Instead, the first request is:
+
+```text
+RunPodSandbox()
+```
+
+Only after the sandbox exists does kubelet create application containers.
+
+---
+
+# Pod Creation Order
+
+Correct sequence:
+
+```text
+Scheduler
+  |
+  v
+kubelet
+  |
+  v
+RunPodSandbox()
+  |
+  v
+CreateContainer()
+  |
+  v
+StartContainer()
+```
+
+This order is extremely important.
+
+---
+
+# Sandbox Creation Workflow
+
+Let's follow the complete process.
+
+---
+
+# Step 1
+
+Scheduler assigns Pod.
+
+```text
+worker-01
+```
+
+---
+
+# Step 2
+
+kubelet receives Pod.
+
+---
+
+# Step 3
+
+SyncPod() begins reconciliation.
+
+---
+
+# Step 4
+
+kubelet sends:
+
+```text
+RunPodSandbox()
+```
+
+through CRI.
+
+---
+
+# Step 5
+
+containerd prepares:
+
+```text
+Pod Metadata
+  |
+  v
+Network Namespace
+  |
+  v
+Sandbox Configuration
+```
+
+---
+
+# Step 6
+
+OCI runtime creates:
+
+```text
+Pause Container
+```
+
+---
+
+# Step 7
+
+CNI Plugin configures networking.
+
+```text
+IP Address
+  |
+  v
+Routes
+  |
+  v
+Interfaces
+```
+
+---
+
+# Step 8
+
+Sandbox becomes Ready.
+
+---
+
+# Step 9
+
+Application containers are created.
+
+---
+
+# Complete Workflow
+
+```text
+Pod
+  |
+  v
+kubelet
+  |
+  v
+RunPodSandbox()
+  |
+  v
+containerd
+  |
+  v
+Pause Container
+  |
+  v
+Network Namespace
+  |
+  v
+CNI
+  |
+  v
+IP Assigned
+  |
+  v
+Create Application Containers
+  |
+  v
+Running Pod
+```
+
+---
+
+# What is the Pause Container?
+
+The **Pause Container** is a tiny infrastructure container created for every Pod.
+
+It performs almost no application work.
+
+Its purpose is to **own the Pod's shared namespaces**.
+
+---
+
+# Why Pause Container Exists
+
+Suppose Kubernetes skipped it.
+
+```text
+Application Container
+  |
+  v
+Owns Network Namespace
+```
+
+Now suppose:
+
+```text
+Application Crashes
+```
+
+The namespace disappears.
+
+Every remaining container loses:
+
+- Network
+- localhost
+- Shared identity
+
+This would break the Pod.
+
+---
+
+# Solution
+
+Move namespace ownership into a dedicated infrastructure container.
+
+```text
+Pause Container
+  |
+  v
+Owns Namespace
+  |
+  v
+Applications Can Restart
+```
+
+The shared environment survives application restarts.
+
+---
+
+# Pause Container Architecture
+
+```text
+Pod
+
+|
+
++-- Pause Container
+
+|
+
++-- nginx
+
+|
+
++-- log-agent
+```
+
+The Pause Container starts first.
+
+---
+
+# Responsibilities of the Pause Container
+
+The Pause Container:
+
+- Owns the network namespace
+- Owns IPC namespace (by default)
+- Owns UTS namespace (hostname)
+- Keeps namespaces alive
+- Serves as the parent infrastructure container
+
+It does **not** process application traffic.
+
+---
+
+# Why is it Called "Pause"?
+
+Historically,
+
+the container simply:
+
+```text
+Start
+  |
+  v
+Sleep Forever
+```
+
+It keeps namespaces alive by remaining running.
+
+Its resource usage is extremely small.
+
+---
+
+# Network Namespace
+
+The Network Namespace is the most important shared resource.
+
+Without namespaces:
+
+```text
+All Containers
+  |
+  v
+One Global Network
+```
+
+This would be insecure.
+
+---
+
+# Namespace Isolation
+
+Linux allows:
+
+```text
+Namespace A
+  |
+  v
+Virtual Network Stack
+
+────────────
+
+Namespace B
+  |
+  v
+Virtual Network Stack
+```
+
+Each namespace has:
+
+- Interfaces
+- Routes
+- IP addresses
+- Firewall rules
+
+---
+
+# Pod Network Namespace
+
+Inside Kubernetes:
+
+```text
+Pause Container
+  |
+  v
+Network Namespace
+  |
+  v
+Application A
+  |
+  v
+Application B
+```
+
+Every container joins the same namespace.
+
+---
+
+# Result
+
+Both containers see:
+
+```text
+localhost
+
+127.0.0.1
+```
+
+and:
+
+```text
+Same Pod IP
+```
+
+---
+
+# Example
+
+Pod:
+
+```text
+nginx
+  |
+  v
+Port 80
+
+────────────
+
+log-agent
+```
+
+The sidecar can connect to:
+
+```text
+localhost:80
+```
+
+No Service required.
+
+---
+
+# Shared IP
+
+All containers share:
+
+```text
+10.244.1.15
+```
+
+Not:
+
+```text
+Container A
+  |
+  v
+10.244.1.15
+
+────────────
+
+Container B
+  |
+  v
+10.244.1.16
+```
+
+The Pod owns the IP.
+
+---
+
+# CNI Interaction
+
+After sandbox creation:
+
+```text
+RunPodSandbox()
+  |
+  v
+containerd
+  |
+  v
+CNI Plugin
+  |
+  v
+Create Interface
+  |
+  v
+Assign IP
+  |
+  v
+Configure Routes
+```
+
+The network namespace is ready before application containers start.
+
+---
+
+# Shared Namespaces
+
+Besides networking,
+
+containers can share several Linux namespaces.
+
+---
+
+# Network Namespace
+
+Shared.
+
+```text
+IP
+
+Interfaces
+
+Routes
+
+Ports
+```
+
+---
+
+# IPC Namespace
+
+Shared by default.
+
+Provides:
+
+```text
+Shared Memory
+
+Semaphores
+
+Message Queues
+```
+
+Useful for tightly coupled applications.
+
+---
+
+# UTS Namespace
+
+Shared.
+
+Provides:
+
+```text
+Hostname
+
+Domain Name
+```
+
+Containers in the same Pod see the same hostname.
+
+---
+
+# PID Namespace
+
+By default:
+
+```text
+Separate
+```
+
+Optionally:
+
+```yaml
+shareProcessNamespace: true
+```
+
+When enabled:
+
+```text
+Container A
+  |
+  v
+See Processes
+  |
+  v
+Container B
+```
+
+Useful for debugging and sidecars.
+
+---
+
+# Mount Namespace
+
+Each container has its own mount namespace.
+
+However,
+
+volumes can be mounted into multiple containers.
+
+Conceptually:
+
+```text
+Container A
+  |
+  v
+/data
+
+────────────
+
+Container B
+  |
+  v
+/data
+```
+
+through a shared volume.
+
+---
+
+# Shared Namespace Summary
+
+| Namespace | Shared by Default? | Purpose |
+|------------|-------------------|----------|
+| Network | Yes | IP address, interfaces, routes, ports |
+| IPC | Yes | Shared memory and IPC objects |
+| UTS | Yes | Hostname and domain name |
+| PID | No (optional) | Process visibility |
+| Mount | No | Filesystem view; shared data is provided through mounted volumes |
+
+---
+
+# Pod Sandbox Lifecycle
+
+The sandbox has its own lifecycle.
+
+```text
+Create Sandbox
+  |
+  v
+Configure Network
+  |
+  v
+Run Containers
+  |
+  v
+Containers Exit
+  |
+  v
+Sandbox Removed
+```
+
+---
+
+# Important Rule
+
+Application containers depend on the sandbox.
+
+```text
+No Sandbox
+  |
+  v
+No Containers
+```
+
+---
+
+# Application Restart
+
+Suppose:
+
+```text
+nginx
+  |
+  v
+Crash
+```
+
+Does Kubernetes recreate the sandbox?
+
+No.
+
+Workflow:
+
+```text
+Pause Container
+  |
+  v
+Still Running
+  |
+  v
+Restart nginx
+  |
+  v
+Same IP
+  |
+  v
+Same localhost
+```
+
+The sandbox survives.
+
+---
+
+# Sandbox Failure
+
+Suppose:
+
+```text
+Pause Container
+  |
+  v
+Crash
+```
+
+Now:
+
+```text
+Network Namespace Lost
+  |
+  v
+Sandbox Invalid
+  |
+  v
+Pod Recreated
+```
+
+The sandbox is fundamental to the Pod.
+
+---
+
+# Container Addition
+
+New container:
+
+```text
+Debug Container
+```
+
+joins:
+
+```text
+Existing Sandbox
+  |
+  v
+Same IP
+  |
+  v
+Same localhost
+```
+
+This is how ephemeral containers work.
+
+---
+
+# Pod Deletion Workflow
+
+Suppose:
+
+```text
+kubectl delete pod
+```
+
+Workflow:
+
+```text
+API Server
+  |
+  v
+kubelet
+  |
+  v
+SIGTERM Containers
+  |
+  v
+Containers Exit
+  |
+  v
+Stop Sandbox
+  |
+  v
+Remove Network
+  |
+  v
+Delete Pause Container
+  |
+  v
+Release IP
+```
+
+The sandbox is removed last.
+
+---
+
+# Why Remove Sandbox Last?
+
+If Kubernetes removed the sandbox first:
+
+```text
+Network Gone
+  |
+  v
+Containers Still Running
+```
+
+Applications would fail unexpectedly.
+
+Instead:
+
+```text
+Containers Stop
+  |
+  v
+Sandbox Removed
+```
+
+This preserves graceful shutdown.
+
+---
+
+# Complete Internal Workflow
+
+```text
+Pod Assigned
+  |
+  v
+RunPodSandbox()
+  |
+  v
+Pause Container
+  |
+  v
+Create Network Namespace
+  |
+  v
+CNI Assigns IP
+  |
+  v
+Create Application Containers
+  |
+  v
+Containers Running
+  |
+  v
+Application Restart?
+  |
+  v
+Reuse Sandbox
+  |
+  v
+Pod Deleted
+  |
+  v
+Stop Containers
+  |
+  v
+Delete Sandbox
+  |
+  v
+Release Resources
+```
+
+---
+
+# Production Example 1
+
+Sidecar Pattern
+
+```text
+Pod
+
++-- Pause
+
++-- API
+
++-- Envoy
+```
+
+Envoy communicates with the API over:
+
+```text
+localhost
+```
+
+because both share the same network namespace.
+
+---
+
+# Production Example 2
+
+Log Collector
+
+```text
+Pod
+
++-- Pause
+
++-- Application
+
++-- Fluent Bit
+```
+
+Both containers share the same Pod identity and can access shared mounted volumes for logs.
+
+---
+
+# Production Example 3
+
+Application Restart
+
+```text
+Application Crash
+  |
+  v
+Pause Alive
+  |
+  v
+Restart Container
+  |
+  v
+Same IP
+  |
+  v
+No Network Recreation
+```
+
+---
+
+# Production Example 4
+
+Ephemeral Debug Container
+
+```text
+Running Pod
+  |
+  v
+kubectl debug
+  |
+  v
+New Container
+  |
+  v
+Join Existing Sandbox
+  |
+  v
+Inspect localhost
+```
+
+The debug container immediately shares the Pod's network namespace.
+
+---
+
+# Production Best Practices
+
+✔ Design applications assuming the **Pod**, not the container, owns the IP address.
+
+✔ Use `localhost` for communication between containers in the same Pod.
+
+✔ Keep sidecars lightweight because they share the Pod lifecycle.
+
+✔ Do not assume containers have independent network stacks inside a Pod.
+
+✔ Use `shareProcessNamespace` only when process visibility is required.
+
+✔ Troubleshoot Pod networking by understanding the sandbox before debugging application containers.
+
+✔ Remember that restarting an application container does not normally recreate the Pod Sandbox.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Every container gets its own IP address.
+
+**Correct:** The Pod receives one IP address, and all containers inside the Pod share it.
+
+---
+
+### ❌ Misconception 2
+
+Application containers create the Pod network.
+
+**Correct:** The network namespace is created during `RunPodSandbox()` before application containers start.
+
+---
+
+### ❌ Misconception 3
+
+The Pause Container performs application work.
+
+**Correct:** Its primary purpose is to own and maintain the Pod's shared namespaces.
+
+---
+
+### ❌ Misconception 4
+
+Restarting a container recreates the sandbox.
+
+**Correct:** If the Pause Container and sandbox remain healthy, only the application container is restarted.
+
+---
+
+### ❌ Misconception 5
+
+All Linux namespaces are shared inside a Pod.
+
+**Correct:** Network, IPC, and UTS are shared by default. PID sharing is optional, and mount namespaces remain separate even though volumes can be shared.
+
+---
+
+### ❌ Misconception 6
+
+The sandbox is deleted before containers stop.
+
+**Correct:** Kubernetes first terminates application containers, then removes the sandbox and releases networking resources.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is a Pod Sandbox?
+
+The infrastructure environment that provides shared namespaces and networking for all containers in a Pod.
+
+---
+
+### Q2. Why does Kubernetes create a Pause Container?
+
+To own the Pod's shared namespaces so they remain available even if application containers restart.
+
+---
+
+### Q3. What is the first CRI request when creating a Pod?
+
+`RunPodSandbox()`.
+
+---
+
+### Q4. Why do containers in the same Pod share `localhost`?
+
+Because they all join the same network namespace owned by the Pod Sandbox.
+
+---
+
+### Q5. Which namespaces are shared by default?
+
+Network, IPC, and UTS.
+
+---
+
+### Q6. Does every container receive its own IP address?
+
+No. The Pod receives a single IP address shared by all containers.
+
+---
+
+### Q7. What happens if an application container crashes?
+
+The kubelet restarts the container while reusing the existing Pod Sandbox, assuming the sandbox remains healthy.
+
+---
+
+### Q8. What happens if the Pause Container fails?
+
+The Pod Sandbox becomes invalid, requiring the Pod to be recreated.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod stuck in `ContainerCreating` | Sandbox creation, CNI, or image issues |
+| Containers cannot communicate over `localhost` | Containers are not in the same Pod or sandbox creation failed |
+| Pod has no IP address | CNI plugin failed during sandbox setup |
+| Application restart changed Pod IP | The entire Pod (sandbox) was recreated, not just the container |
+| Ephemeral container cannot inspect workload | Failed to join the existing sandbox or Pod not running |
+| Pod networking broken after sandbox failure | Pause Container or network namespace lost |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is a Pod Sandbox?
+2. Why is a Pause Container required?
+3. What happens during `RunPodSandbox()`?
+4. Why do all containers in a Pod share one IP address?
+5. Which namespaces are shared by default?
+6. What role does the CNI plugin play during sandbox creation?
+7. What happens when an application container restarts?
+8. What happens if the Pause Container exits?
+9. Why is the sandbox deleted after application containers?
+10. How do sidecars communicate with the main application without using a Service?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes builds the shared execution environment that every Pod depends on.
+
+You learned:
+
+- Why Kubernetes creates a Pod Sandbox before application containers
+- How the Pause Container owns and preserves shared namespaces
+- The complete sandbox creation workflow from `RunPodSandbox()` through CNI network configuration
+- How Linux network, IPC, UTS, PID, and mount namespaces are used inside a Pod
+- Why all containers in a Pod share a single IP address and `localhost`
+- How the sandbox lifecycle differs from the lifecycle of individual containers
+- Why Kubernetes removes the sandbox only after all application containers have terminated
+
+The Pod Sandbox is the foundation of the Kubernetes Pod abstraction. It provides the stable networking and shared namespace environment that allows multiple containers to behave as a single logical application, even as individual containers start, stop, or restart.
+
+---
+
+# Next Chapter
+
+**Chapter 5 — RuntimeClass**
+
+Topics include:
+
+- What is RuntimeClass?
+- Runtime Handlers
+- RuntimeClass Architecture
+- Multiple Runtimes
+- Kata Containers
+- gVisor
+- Runtime Selection
+- Production Use Cases
+
+You'll learn how Kubernetes can choose different OCI runtimes for different Pods, enabling stronger isolation, sandboxed execution, and specialized runtime environments without changing application manifests.
+```

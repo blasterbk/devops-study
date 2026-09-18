@@ -1,0 +1,308 @@
+---
+title: "Chapter 1 — Gang Scheduling & Coscheduling Patterns"
+sidebar_position: 1
+module: "Module 3.10 — Batch & HPC Scheduling"
+description: "Master Gang Scheduling and Coscheduling in Kubernetes — All-or-Nothing batch semantics, distributed PyTorch/MPI training deadlock prevention, PodGroup CRDs, and scheduler Permit plugins."
+---
+
+# Chapter 1 — Gang Scheduling & Coscheduling Patterns
+
+> **Goal:** Master Gang Scheduling and Coscheduling patterns for High-Performance Computing (HPC) and distributed Machine Learning workloads on Kubernetes — understanding the "All-or-Nothing" scheduling contract, eliminating distributed training deadlocks in PyTorch DDP and MPI, utilizing the `PodGroup` CRD with `minMember` thresholds, and tracing the scheduler framework's `Permit` plugin lifecycle.
+>
+> By the end of this chapter, you will understand:
+> 1. Why distributed ML training (PyTorch DDP, Horovod, Ray, MPI) requires All-or-Nothing scheduling
+> 2. The multi-job resource starvation deadlock scenario in standard `kube-scheduler`
+> 3. How the `PodGroup` Custom Resource defines collective scheduling boundaries
+> 4. How the Kubernetes Scheduling Framework `Permit` extension point coordinates atomic pod binding
+> 5. How timeout and backoff policies prevent gang scheduling deadlocks from blocking cluster queues
+> 6. How to configure coscheduling manifests for large-scale GPU clusters
+
+---
+
+## Real-Life Analogy
+
+Think of Gang Scheduling as **boarding a roller coaster at an amusement park**:
+
+- **Standard Kubernetes Scheduling (Single Rider Line):** The roller coaster requires 4 passengers to operate safely (`minMember: 4`). The ride operator lets 2 riders from Group A sit down. Then 2 riders from Group B sit down. Group A refuses to ride without their other 2 friends, and Group B refuses to ride without their friends. Nobody rides, nobody gets off the coaster, and the entire amusement park line freezes (**Deadlock**).
+- **Gang Scheduling (Group Party Wristband):** The ride operator checks the ticket: *"Group A has 4 members (`minMember: 4`). Group B has 4 members."*
+  - The operator does **not** let anyone sit on the coaster until all 4 members of Group A are standing at the front of the gate together (**All-or-Nothing**).
+  - All 4 members sit down simultaneously, the coaster launches, finishes its run, and vacates the seats cleanly for Group B.
+
+---
+
+## Architecture Diagram
+
+```text
+               Distributed ML Deadlock vs Gang Scheduling
+
+ 1. The Standard Scheduler Deadlock (Without Gang Scheduling):
+ 
+ Cluster Capacity: 8 GPUs total
+ Job 1 (Needs 8 GPUs): Scheduler places 4 Pods on Node 1 (Holds 4 GPUs, waiting for 4 more)
+ Job 2 (Needs 8 GPUs): Scheduler places 4 Pods on Node 2 (Holds 4 GPUs, waiting for 4 more)
+ 
+ ──► RESULT: DEADLOCK! Both jobs wait forever; 0% GPU compute utilized!
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. Gang Scheduling with PodGroup (All-or-Nothing):
+ 
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PodGroup: pytorch-training-job (minMember: 8 GPUs)                     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes Scheduler Framework (Coscheduling Plugin)                   │
+ │                                                                        │
+ │ 1. Evaluates Cluster Capacity: 8 GPUs Available                        │
+ │ 2. Permit Plugin: HOLDS Pods 1 through 7 in `WaitOnPermit` state       │
+ │ 3. Pod 8 arrives: Quorum (minMember = 8) ACHIEVED!                     │
+ │ 4. Atomic Binding: ALL 8 PODS BOUND SIMULTANEOUSLY!                    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ All 8 PyTorch workers launch, form NCCL Ring, train model, and exit!
+```
+
+---
+
+## Why Distributed AI/ML Requires Gang Scheduling
+
+Modern deep learning architectures (Large Language Models, Vision Transformers) train across dozens or hundreds of GPUs using distributed frameworks like **PyTorch DistributedDataParallel (DDP)**, **DeepSpeed**, or **MPI (Message Passing Interface)**:
+
+```text
+ The All-Reduce Network Topology:
+ During backpropagation, all worker GPUs must synchronize weight gradients across a 
+ collective communication ring (e.g. NVIDIA NCCL All-Reduce).
+ 
+ If 31 out of 32 workers are running, but worker #32 is pending:
+ ──► The 31 running workers sit 100% IDLE, burning expensive GPU power waiting for #32.
+ ──► If #32 cannot schedule due to resource fragmentation, the job hangs indefinitely.
+```
+
+---
+
+## The `PodGroup` Custom Resource
+
+Gang scheduling controllers (such as the Kubernetes SIG Scheduling `coscheduling` plugin, Volcano, or Kueue) define a `PodGroup` CRD:
+
+```yaml
+apiVersion: scheduling.x-k8s.io/v1alpha1
+kind: PodGroup
+metadata:
+  name: llama-70b-training
+  namespace: ml-workloads
+spec:
+  # Minimum number of Pods that MUST be schedulable concurrently
+  minMember: 8
+  # Maximum time to wait for all members to assemble before canceling
+  scheduleTimeoutSeconds: 120
+```
+
+### Binding Pods to a `PodGroup`:
+Pods declare membership in the gang by adding a label or annotation:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pytorch-worker-0
+  namespace: ml-workloads
+  labels:
+    scheduling.x-k8s.io/pod-group: llama-70b-training    # Links to PodGroup!
+spec:
+  schedulerName: coscheduling-scheduler                  # Targets Gang Scheduler
+  containers:
+  - name: trainer
+    image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+```
+
+---
+
+## The Scheduler Framework: The `Permit` Plugin Stage
+
+The native Kubernetes Scheduler Framework exposes several extension points (`PreFilter`, `Filter`, `PreScore`, `Score`, `Reserve`, `Permit`, `PreBind`, `Bind`).
+
+The **`Permit` plugin** is the core engine behind Gang Scheduling:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Plugin Stage         │ Gang Scheduling Action                                                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`PreFilter`**      │ Checks if total cluster capacity can satisfy `minMember`. If not, rejects.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Permit`**         │ When Pod $K$ of a PodGroup passes Filter/Score, the Permit plugin **holds** │
+ │                      │ the Pod in memory (`WaitOnPermit`) for up to `scheduleTimeoutSeconds`.      │
+ │                      │ It does NOT bind to the node yet.                                           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Permit Approval**  │ When the final Pod ($\text{Count} == \text{minMember}$) arrives at Permit,  │
+ │                      │ the plugin sends an **Approval Signal** to all held Pods.                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Bind`**           │ All $N$ Pods are bound to their respective worker nodes simultaneously!      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Permit Timeout**   │ If timeout expires before all members arrive, the Permit plugin **rejects   │
+ │                      │ all waiting pods**, releasing reserved resources back to the cluster queue. │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Distributed ML Manifest with Gang Scheduling
+
+```yaml
+# 1. PodGroup Definition for 4-GPU Distributed PyTorch Training
+apiVersion: scheduling.x-k8s.io/v1alpha1
+kind: PodGroup
+metadata:
+  name: distributed-bert-finetune
+  namespace: ai-training
+spec:
+  minMember: 4
+  minResources:
+    cpu: "16"
+    memory: "64Gi"
+    nvidia.com/gpu: "4"
+  scheduleTimeoutSeconds: 180
+---
+# 2. PyTorch Distributed Job (Indexed Batch Job)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-bert-finetune
+  namespace: ai-training
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: bert-finetune
+        scheduling.x-k8s.io/pod-group: distributed-bert-finetune
+    spec:
+      schedulerName: coscheduling-scheduler
+      restartPolicy: Never
+      containers:
+      - name: pytorch
+        image: huggingface/transformers-pytorch-gpu:latest
+        command:
+        - "python"
+        - "-m"
+        - "torch.distributed.run"
+        - "--nnodes=4"
+        - "--nproc_per_node=1"
+        - "train_model.py"
+        resources:
+          requests:
+            cpu: "4"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+```
+
+---
+
+## Hands-On Lab: Simulating Gang Scheduling Deadlock Prevention
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace gang-lab
+
+# Step 2: Create a mock PodGroup resource
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-podgroup-manifest
+  namespace: gang-lab
+data:
+  podgroup.yaml: |
+    apiVersion: scheduling.x-k8s.io/v1alpha1
+    kind: PodGroup
+    metadata:
+      name: mock-gang-job
+    spec:
+      minMember: 3
+      scheduleTimeoutSeconds: 60
+EOF
+
+# Step 3: Deploy an indexed Job with 3 workers simulating all-or-nothing requirement
+cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gang-simulation-job
+  namespace: gang-lab
+spec:
+  completions: 3
+  parallelism: 3
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        job: gang-simulation
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: worker
+        image: alpine:latest
+        command:
+        - "sh"
+        - "-c"
+        - |
+          echo "Worker \$JOB_COMPLETION_INDEX initializing..."
+          echo "Simulating NCCL Ring synchronization..."
+          sleep 10
+          echo "Worker \$JOB_COMPLETION_INDEX finished training!"
+          exit 0
+EOF
+
+# Step 4: Verify all 3 pods start and run in parallel
+kubectl get pods -n gang-lab -w
+
+# Step 5: Clean up lab
+kubectl delete namespace gang-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Gang Scheduling (Coscheduling), and why is it essential for Distributed Machine Learning?**
+
+Gang Scheduling is an "All-or-Nothing" scheduling paradigm where a collection of dependent Pods (a gang) is treated as a single atomic scheduling unit. In distributed AI training (such as PyTorch DDP or Horovod), workers synchronize model gradients using collective all-reduce communication algorithms that require **all $N$ worker nodes to run concurrently**. Without gang scheduling, running $N-1$ workers while the last worker is pending causes running workers to sit idle, wasting expensive GPU hours and causing cluster-wide deadlocks.
+
+**Q2: What is the classic distributed training deadlock scenario in standard Kubernetes?**
+
+Suppose Job A and Job B both require 8 GPUs, but the cluster only has 8 GPUs total. The default `kube-scheduler` schedules pods individually. It places 4 Pods of Job A (occupying 4 GPUs) and 4 Pods of Job B (occupying 4 GPUs). Job A cannot start training because it needs 4 more GPUs, and Job B cannot start because it needs 4 more GPUs. Neither job can proceed, and neither job terminates or releases its GPUs, causing a permanent cluster deadlock.
+
+**Q3: How does the `Permit` plugin in the Kubernetes Scheduler Framework implement Gang Scheduling?**
+
+When candidate Pods of a `PodGroup` pass the Filter and Score stages, the `Permit` plugin intercepts them and places them in a `WaitOnPermit` holding state. It reserves the node capacity without executing the binding API call. Once the total number of held Pods for that `PodGroup` reaches `minMember`, the Permit plugin issues an approval signal, allowing all Pods to proceed to the `Bind` stage simultaneously.
+
+**Q4: What happens if a `PodGroup` times out before reaching its `minMember` quota?**
+
+If the `scheduleTimeoutSeconds` expires before all `minMember` Pods can be scheduled (for example, due to insufficient cluster capacity), the `Permit` plugin rejects all currently waiting Pods in the gang. The Pods are moved out of the waiting queue and back into the scheduling backlog with exponential backoff, releasing their reserved node allocations so other smaller workloads can proceed without being starved.
+
+**Q5: What is the purpose of `minMember` in a `PodGroup` specification?**
+
+`minMember` specifies the absolute minimum number of Pods that must be simultaneously schedulable before any single Pod from that group is allowed to bind to a node. For strict distributed training (PyTorch), `minMember` equals total replicas ($N$). For elastic distributed workloads (like Spark or Ray), `minMember` can be set to a quorum floor (e.g. 5 out of 10), allowing the cluster to start processing with a subset of workers while expanding later.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Gang Scheduling enforces All-or-Nothing batch scheduling
+- [ ] Know why PyTorch DDP and MPI require all workers running simultaneously
+- [ ] Know how `kube-scheduler` can deadlock without gang scheduling on multi-GPU jobs
+- [ ] Know that `PodGroup` defines the `minMember` threshold and `scheduleTimeoutSeconds`
+- [ ] Know that the `Permit` scheduler plugin holds Pods until full quorum is reached
+- [ ] Know that Permit timeouts reject waiting pods to prevent resource starvation
+- [ ] Can link Pods to a `PodGroup` via the `scheduling.x-k8s.io/pod-group` label

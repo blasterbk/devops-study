@@ -1,0 +1,1205 @@
+---
+title: "Chapter 1 — Admission Controllers Fundamentals"
+sidebar_position: 1
+module: "Module 1.10 — Admission Controllers"
+description: "> **Goal:** Understand how every Kubernetes API request passes through the Admission Control pipeline before being stored in etcd. By the end of this chapter, y..."
+---
+
+# Module 1.10 — Admission Controllers
+
+> **Deep Learning Guide (University-Level + Interview-Oriented)**
+
+---
+
+## Why We Study This Module
+
+Module 1.9 taught you how to extend Kubernetes with CRDs and Operators. Module 1.10—the final module in the Core Architecture track—teaches you how to **govern, secure, mutate, and validate** every incoming Kubernetes API request at the gateway before it is committed to etcd.
+
+---
+
+## Learning Roadmap
+
+```text
+Module 1.10 — Admission Controllers
+
+Chapter 1   Admission Controllers Fundamentals
+Chapter 2   Built-in Admission Controllers
+Chapter 3   Mutating Admission Webhooks
+Chapter 4   Validating Admission Webhooks & ValidatingAdmissionPolicy
+Chapter 5   Dynamic Admission Control
+Chapter 6   Module Summary & Production Patterns
+```
+
+---
+
+# Chapter 1 — Admission Controllers Fundamentals
+
+> **Goal:** Understand how every Kubernetes API request passes through the Admission Control pipeline before being stored in etcd. By the end of this chapter, you'll understand where Admission Controllers fit in the Kubernetes request lifecycle, why they exist, how they work internally, and how they form the foundation for Kubernetes security, governance, and policy enforcement.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. The complete 4-stage write pipeline: Authentication -> Authorization -> Mutation -> Validation -> etcd
+> 2. What Admission Controllers are and why RBAC alone is insufficient for cluster governance
+> 3. Two distinct phases: Mutating Phase (Phase 1) vs Validating Phase (Phase 2)
+> 4. Built-in controllers (compiled in-process) vs Dynamic Webhooks (HTTP over TLS)
+> 5. Object mutation: defaulting fields, injecting sidecars, applying security contexts
+> 6. Object validation: enforcing organizational compliance, quotas, and security boundaries
+> 7. Why read operations (GET, LIST, WATCH) bypass admission control entirely
+> 8. Production use cases: Istio, Kyverno, Gatekeeper/OPA, cert-manager
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Admission Control like an international airport customs and security checkpoint.
+
+```text
+Airport Security Analogy:
+
+1. Authentication: Passport control verifies who you are (User / ServiceAccount)
+2. Authorization: Boarding pass check verifies if you have permission to board (RBAC)
+3. Mutating Admission: Baggage handling attaches baggage tags and applies safety wraps (Mutations)
+4. Schema Validation: Physical dimensions check verifies luggage fits in standard overhead bins
+5. Validating Admission: Security scanner checks for prohibited items (Validations)
+6. Persistence: Luggage is loaded into the cargo hold (Committed to etcd)
+Note: Looking at flight schedule monitors (Read-only GET/LIST) requires no security scan
+```
+
+| Airport Security Stage | Kubernetes API Pipeline |
+| :--- | :--- |
+| Passport verification | Authentication (TLS certs, Bearer Tokens) |
+| Boarding pass check | Authorization (RBAC, Webhook, ABAC) |
+| Baggage auto-tagging / wrapping | **Mutating Admission** (defaults, sidecar injection) |
+| Luggage dimension check | OpenAPI Schema Validation |
+| Security scanner / metal detector | **Validating Admission** (OPA, Kyverno, CEL policies) |
+| Loaded into airplane cargo | Written into etcd key-value store |
+| Looking at flight monitors | Read-only requests (`GET`, `LIST`, `WATCH`) |
+
+> **Important:** Admission controllers **only intercept write/modifying requests** (`CREATE`, `UPDATE`, `DELETE`, `CONNECT`). Read-only operations (`GET`, `LIST`, `WATCH`) completely bypass the admission control pipeline and are served directly from the API Server cache or etcd after authentication and authorization. You cannot use Admission Webhooks to restrict or audit read-only data access.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes API Server
+- Kubernetes Objects
+- etcd
+- Authentication
+- Authorization
+- CRDs
+- Controllers
+
+---
+
+# Where This Chapter Fits
+
+Throughout previous modules we learned:
+
+```text
+kubectl
+  |
+  v
+API Server
+  |
+  v
+etcd
+```
+
+But something important is missing.
+
+When a user creates a Pod,
+
+does the API Server immediately store it?
+
+**No.**
+
+Before the object reaches etcd, Kubernetes performs several security and policy checks.
+
+These checks are performed by the **Admission Control Pipeline**.
+
+---
+
+# The Problem
+
+Suppose a developer creates the following Pod.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+spec:
+  containers:
+  - image: nginx
+```
+
+Questions Kubernetes must answer:
+
+- Is the user authenticated?
+- Is the user authorized?
+- Should defaults be added?
+- Does it violate ResourceQuota?
+- Does it violate Pod Security?
+- Should labels be added?
+- Should sidecars be injected?
+- Should the request be rejected?
+
+Without answering these questions,
+
+the cluster would be insecure.
+
+---
+
+# Kubernetes Solution
+
+Every API request passes through multiple stages.
+
+```text
+kubectl
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Admission Controllers
+  |
+  v
+Persist to etcd
+```
+
+Admission Controllers are responsible for the third stage.
+
+---
+
+# Complete Kubernetes API Request Lifecycle
+
+Every request follows this pipeline.
+
+```text
+Client
+  |
+  v
+kubectl
+  |
+  v
+API Server
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Admission Controllers
+  |
+  v
+Validation
+  |
+  v
+Persist Object
+  |
+  v
+etcd
+  |
+  v
+Watch Events
+  |
+  v
+Controllers
+```
+
+Notice that Controllers never participate in Admission.
+
+Admission happens **before** persistence.
+
+Controllers react **after** persistence.
+
+---
+
+# Where Admission Fits
+
+```text
+Request
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Admission
+  |
+  v
+Storage
+  |
+  v
+Controller Watches
+```
+
+Admission is the final gate before storage.
+
+---
+
+# What are Admission Controllers?
+
+Admission Controllers are plugins executed by the Kubernetes API Server.
+
+Their responsibility is to:
+
+- Inspect requests
+- Modify requests
+- Validate requests
+- Approve or reject requests
+
+They execute **before** objects are written to etcd.
+
+---
+
+# Simple Definition
+
+Think of Admission Controllers as:
+
+```text
+API Request
+  |
+  v
+Security Guard
+  |
+  v
+Policy Checker
+  |
+  v
+Object Modifier
+  |
+  v
+Approval Gate
+```
+
+If every check succeeds,
+
+the object is stored.
+
+Otherwise,
+
+the request is rejected.
+
+---
+
+# Why Admission Controllers Exist
+
+Imagine a cluster without Admission Controllers.
+
+Developer creates:
+
+```yaml
+privileged: true
+```
+
+API Server accepts it.
+
+Developer creates:
+
+```yaml
+cpu: 500
+memory: 10Ti
+```
+
+API Server accepts it.
+
+Developer forgets:
+
+```yaml
+namespace
+```
+
+API Server accepts it.
+
+Eventually:
+
+- Nodes run out of memory
+- Security policies are bypassed
+- Resource limits disappear
+- Organization policies are violated
+
+Admission Controllers prevent these problems.
+
+---
+
+# Responsibilities of Admission Controllers
+
+Admission Controllers can:
+
+✔ Modify objects
+
+✔ Reject invalid objects
+
+✔ Apply defaults
+
+✔ Enforce security
+
+✔ Enforce quotas
+
+✔ Apply organization policies
+
+✔ Inject sidecars
+
+✔ Add labels
+
+✔ Add annotations
+
+---
+
+# What Admission Controllers Cannot Do
+
+Admission Controllers do **not**:
+
+❌ Schedule Pods
+
+❌ Start Containers
+
+❌ Watch Resources
+
+❌ Reconcile Objects
+
+❌ Execute Workloads
+
+Those responsibilities belong to other Kubernetes components.
+
+---
+
+# Admission Pipeline
+
+The Admission phase itself consists of two stages.
+
+```text
+Admission
+
++--────── Mutating
+
++--────── Validating
+```
+
+Mutation always happens before validation.
+
+---
+
+# Internal Admission Flow
+
+```text
+Incoming Request
+  |
+  v
+Mutating Admission
+  |
+  v
+Modified Object
+  |
+  v
+Validating Admission
+  |
+  v
+Approved?
+  |
+  v
+Store in etcd
+```
+
+---
+
+# Why Mutation Happens First
+
+Imagine validation occurred first.
+
+User creates:
+
+```yaml
+metadata:
+  labels: {}
+```
+
+A Mutating Admission Controller would later add:
+
+```yaml
+team: platform
+```
+
+Validation already happened.
+
+The new label was never validated.
+
+To prevent this inconsistency,
+
+Kubernetes always mutates first,
+
+then validates.
+
+---
+
+# Authentication
+
+Admission Controllers assume the user has already been authenticated.
+
+Authentication answers:
+
+```text
+Who Are You?
+```
+
+Example:
+
+```text
+Alice
+  |
+  v
+Authenticated
+```
+
+If authentication fails,
+
+Admission Controllers are never reached.
+
+---
+
+# Authorization
+
+After authentication,
+
+Kubernetes verifies permissions.
+
+Authorization answers:
+
+```text
+Can You Perform This Action?
+```
+
+Example:
+
+```text
+Alice
+  |
+  v
+Create Pod?
+  |
+  v
+Allowed
+```
+
+Only then does Admission begin.
+
+---
+
+# Admission
+
+Admission answers:
+
+```text
+Should This Request Be Allowed?
+```
+
+Unlike Authorization,
+
+Admission evaluates:
+
+- Object contents
+- Policies
+- Organization rules
+- Security requirements
+
+---
+
+# Complete Decision Flow
+
+```text
+Create Pod
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Admission
+  |
+  v
+Persist
+```
+
+Failure at any stage rejects the request.
+
+---
+
+# Mutating Admission
+
+Mutating Admission Controllers modify requests.
+
+Examples:
+
+```text
+Incoming Pod
+  |
+  v
+Add Labels
+  |
+  v
+Add Sidecar
+  |
+  v
+Add Defaults
+  |
+  v
+Continue
+```
+
+The original request changes.
+
+---
+
+# Example Mutation
+
+User submits:
+
+```yaml
+containers:
+- image: nginx
+```
+
+Admission adds:
+
+```yaml
+imagePullPolicy: IfNotPresent
+```
+
+The stored object differs from the original request.
+
+---
+
+# More Mutation Examples
+
+Mutating Admission may:
+
+```text
+Add Labels
+  |
+  v
+Add Annotations
+  |
+  v
+Inject Sidecars
+  |
+  v
+Set Defaults
+  |
+  v
+Modify Resources
+```
+
+These changes happen transparently.
+
+---
+
+# Validating Admission
+
+Validation does **not** modify objects.
+
+Instead,
+
+it answers:
+
+```text
+Allowed?
+
+or
+
+Rejected?
+```
+
+---
+
+# Example Validation
+
+Request:
+
+```yaml
+privileged: true
+```
+
+Policy:
+
+```text
+Privileged Pods Forbidden
+```
+
+Result:
+
+```text
+Rejected
+```
+
+Nothing is stored.
+
+---
+
+# Mutation vs Validation
+
+| Mutating | Validating |
+|-----------|------------|
+| Can modify object | Cannot modify object |
+| Runs first | Runs after mutation |
+| Returns updated object | Returns allow/deny |
+| Adds defaults | Enforces policies |
+| May inject sidecars | May reject requests |
+
+---
+
+# Built-in Admission Controllers
+
+Kubernetes includes many built-in Admission Controllers.
+
+Examples:
+
+- NamespaceLifecycle
+- LimitRanger
+- ResourceQuota
+- ServiceAccount
+- DefaultStorageClass
+- PodSecurity
+
+These are compiled into the API Server.
+
+---
+
+# Dynamic Admission
+
+Organizations often require custom policies.
+
+Instead of modifying Kubernetes source code,
+
+dynamic admission allows external components to participate.
+
+Examples:
+
+```text
+API Server
+  |
+  v
+Webhook
+  |
+  v
+Decision
+  |
+  v
+Continue
+```
+
+These external components are called Admission Webhooks.
+
+---
+
+# Admission Chain
+
+Internally,
+
+the API Server executes an admission chain.
+
+```text
+Request
+  |
+  v
+Built-in Mutating
+  |
+  v
+Mutating Webhooks
+  |
+  v
+Built-in Validating
+  |
+  v
+Validating Webhooks
+  |
+  v
+Persist
+```
+
+Each plugin executes in sequence.
+
+---
+
+# Why Multiple Admission Controllers?
+
+One controller cannot solve every problem.
+
+Different controllers focus on different responsibilities.
+
+Example:
+
+```text
+LimitRanger
+  |
+  v
+ResourceQuota
+  |
+  v
+PodSecurity
+  |
+  v
+Mutating Webhook
+  |
+  v
+Validating Webhook
+```
+
+Together they enforce cluster policies.
+
+---
+
+# API Server Integration
+
+Admission Controllers are tightly integrated into the API Server.
+
+```text
+API Server
+
++--────── Authentication
+
++--────── Authorization
+
++--────── Admission
+
++--────── Storage
+```
+
+Admission is not a separate Kubernetes component.
+
+It is part of the API Server request pipeline.
+
+---
+
+# Internal API Server Flow
+
+```text
+HTTP Request
+  |
+  v
+Decode Object
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Mutating Admission
+  |
+  v
+Validating Admission
+  |
+  v
+API Validation
+  |
+  v
+Store in etcd
+```
+
+Notice that Kubernetes performs built-in API validation before persistence as well. Admission complements—not replaces—schema and API validation.
+
+---
+
+# Example 1 — ResourceQuota
+
+Namespace quota:
+
+```text
+Maximum Pods = 20
+```
+
+Current:
+
+```text
+20 Pods
+```
+
+New request:
+
+```text
+Create Pod
+```
+
+Admission:
+
+```text
+Reject
+```
+
+The Pod never reaches etcd.
+
+---
+
+# Example 2 — Sidecar Injection
+
+Developer creates:
+
+```text
+Application Pod
+```
+
+Mutating Admission:
+
+```text
+Inject Envoy Sidecar
+```
+
+Stored object:
+
+```text
+Application
+
++
+
+Envoy
+```
+
+This is how service meshes such as Istio automatically inject sidecars.
+
+---
+
+# Example 3 — Default Namespace
+
+User omits:
+
+```yaml
+serviceAccountName
+```
+
+Admission automatically assigns:
+
+```text
+default
+```
+
+The object stored in etcd contains the default value.
+
+---
+
+# Example 4 — Pod Security
+
+Request:
+
+```yaml
+hostNetwork: true
+```
+
+Cluster policy:
+
+```text
+Forbidden
+```
+
+Admission rejects the request.
+
+---
+
+# End-to-End Request Flow
+
+```text
+Developer
+  |
+  v
+kubectl apply
+  |
+  v
+API Server
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Mutating Admission
+  |
+  v
+Validating Admission
+  |
+  v
+API Validation
+  |
+  v
+Persist
+  |
+  v
+etcd
+  |
+  v
+Controllers Watch
+  |
+  v
+Reconciliation
+```
+
+---
+
+# Real Production Flow
+
+A Database Operator creates:
+
+```text
+StatefulSet
+```
+
+The request passes through:
+
+```text
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+LimitRanger
+  |
+  v
+ResourceQuota
+  |
+  v
+Pod Security
+  |
+  v
+Mutating Webhooks
+  |
+  v
+Validating Webhooks
+  |
+  v
+Persist
+  |
+  v
+Controller Watches
+```
+
+Every Kubernetes object follows this process.
+
+---
+
+# Production Best Practices
+
+✔ Keep admission logic fast.
+
+✔ Prefer built-in Admission Controllers whenever possible.
+
+✔ Use Mutating Admission only for defaulting and controlled transformations.
+
+✔ Use Validating Admission for policy enforcement.
+
+✔ Ensure admission decisions are deterministic.
+
+✔ Avoid unnecessary external webhook calls.
+
+✔ Monitor admission latency.
+
+✔ Fail securely when enforcing critical policies.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Admission Controllers are Controllers.
+
+**Correct:** Admission Controllers run inside the API Server before persistence. Controllers watch objects after they are stored.
+
+---
+
+### ❌ Misconception 2
+
+Admission happens after objects are stored.
+
+**Correct:** Admission happens before persistence to etcd.
+
+---
+
+### ❌ Misconception 3
+
+Authentication and Admission are the same.
+
+**Correct:** Authentication verifies identity. Admission evaluates the request itself.
+
+---
+
+### ❌ Misconception 4
+
+Validation happens before mutation.
+
+**Correct:** Kubernetes performs mutation before validation.
+
+---
+
+### ❌ Misconception 5
+
+Admission Controllers schedule Pods.
+
+**Correct:** Scheduling is performed later by the Kubernetes Scheduler.
+
+---
+
+### ❌ Misconception 6
+
+Admission Controllers can reconcile resources.
+
+**Correct:** Reconciliation is performed by Controllers, not Admission Controllers.
+
+---
+
+### ❌ Misconception 7
+
+Every Admission Controller can modify objects.
+
+**Correct:** Only Mutating Admission Controllers can modify objects. Validating Admission Controllers only allow or deny requests.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is an Admission Controller?
+
+A plugin that intercepts Kubernetes API requests before objects are stored in etcd to mutate or validate them.
+
+---
+
+### Q2. Where do Admission Controllers execute?
+
+Inside the Kubernetes API Server.
+
+---
+
+### Q3. When does Admission occur?
+
+After Authentication and Authorization, but before persistence to etcd.
+
+---
+
+### Q4. Why are Admission Controllers needed?
+
+To enforce policies, apply defaults, validate requests, and improve cluster security and governance.
+
+---
+
+### Q5. What is the difference between Authentication, Authorization, and Admission?
+
+- Authentication verifies identity.
+- Authorization verifies permissions.
+- Admission evaluates and optionally modifies the request.
+
+---
+
+### Q6. Why does mutation occur before validation?
+
+So validators evaluate the final object that will actually be stored.
+
+---
+
+### Q7. What is the difference between Mutating and Validating Admission?
+
+Mutating Admission can modify objects, while Validating Admission can only allow or reject them.
+
+---
+
+### Q8. Are Admission Controllers Controllers?
+
+No. Admission Controllers execute during API request processing, whereas Controllers continuously reconcile stored resources.
+
+---
+
+### Q9. Can Admission Controllers watch Kubernetes resources?
+
+No. Watching resources is the responsibility of Controllers and Informers.
+
+---
+
+### Q10. What happens if an Admission Controller rejects a request?
+
+The API Server returns an error to the client, and the object is never persisted to etcd.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod creation rejected | Admission policy denied the request |
+| Default values missing | Mutating Admission Controller not configured or disabled |
+| ResourceQuota errors | Namespace quota exceeded |
+| Sidecar not injected | Mutating webhook not invoked or namespace excluded |
+| Admission latency is high | Slow webhook or overloaded API Server |
+| Object accepted unexpectedly | Missing validating policy or webhook |
+| API request never reaches Controllers | Admission rejected the request before persistence |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Where do Admission Controllers fit in the Kubernetes request lifecycle?
+2. Why are Admission Controllers necessary?
+3. What is the difference between Authentication, Authorization, and Admission?
+4. Why does mutation happen before validation?
+5. What is the difference between Mutating and Validating Admission?
+6. What is the Admission Chain?
+7. How are Built-in Admission Controllers different from Dynamic Admission?
+8. Can Admission Controllers modify Kubernetes objects?
+9. Why do Controllers never participate in Admission?
+10. What happens if an Admission Controller rejects a request?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how **Admission Controllers** act as the final decision-making stage before Kubernetes persists an object to etcd.
+
+You learned:
+
+- The complete Kubernetes API request lifecycle
+- Where Admission Controllers fit within the API Server
+- The responsibilities and limitations of Admission Controllers
+- The difference between Authentication, Authorization, and Admission
+- Why mutation always occurs before validation
+- The distinction between Built-in and Dynamic Admission
+- How Admission Controllers integrate with the API Server
+- Real-world examples such as ResourceQuota, Pod Security, and sidecar injection
+
+Admission Controllers are a foundational part of Kubernetes security, governance, and policy enforcement. They ensure that every object entering the cluster complies with organizational rules before it becomes part of the cluster state.
+
+---
+
+# Next Chapter
+
+**Chapter 2 — Built-in Admission Controllers**
+
+Topics include:
+
+- What are Built-in Admission Controllers?
+- Default Enabled Controllers
+- Admission Chain Ordering
+- NamespaceLifecycle
+- ServiceAccount
+- ResourceQuota
+- LimitRanger
+- DefaultStorageClass
+- Pod Security
+- Storage Protection Controllers
+- Production Use Cases
+- Performance & Troubleshooting
+```

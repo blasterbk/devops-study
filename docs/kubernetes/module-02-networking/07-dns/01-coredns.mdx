@@ -1,0 +1,331 @@
+---
+title: "Chapter 1 — CoreDNS"
+sidebar_position: 1
+module: "Module 2.7 — DNS"
+description: "Deep dive into CoreDNS — Kubernetes' built-in DNS server. Covers the Corefile plugin pipeline, how CoreDNS resolves Service and Pod names, the kubernetes plugin, custom stub zones, caching, and troubleshooting DNS failures."
+---
+
+# Chapter 1 — CoreDNS
+
+> **Goal:** Understand CoreDNS as Kubernetes' DNS engine — how the plugin pipeline works, how Service and Pod names are resolved, how to customize DNS behavior with stub zones and rewrites, and how to troubleshoot the most common DNS failures in clusters.
+>
+> By the end of this chapter, you will understand:
+> 1. What CoreDNS is and how it replaced kube-dns
+> 2. The Corefile plugin pipeline — ordered processing chain
+> 3. The `kubernetes` plugin and how it serves cluster DNS (Services, Pods, headless)
+> 4. DNS search domains and NDOTS — why `curl api-svc` works without FQDN
+> 5. Custom DNS: stub zones, rewrites, and conditional forwarding
+> 6. How to debug DNS failures: logs, dig commands, dnspolicy troubleshooting
+
+---
+
+## Real-Life Analogy
+
+CoreDNS is the **internal telephone directory system** of your Kubernetes cluster:
+
+When someone in the office dials "api-service" (short name), the directory system automatically expands it to the full extension ("api-service.production.svc.cluster.local") — because every desk in the "production" department knows to look in their own department directory first.
+
+The directory has layers: first look in the internal office directory (the `kubernetes` plugin — knows all Services and Pods), then look in regional directories (stub zones for specific domains), then if not found, call the national directory assistance (external DNS forwarder, typically your VPC's DNS or 8.8.8.8).
+
+---
+
+## Architecture Diagram
+
+```text
+                CoreDNS Architecture in Kubernetes
+
+  Pod's /etc/resolv.conf:
+  nameserver 10.96.0.10      ← CoreDNS ClusterIP (kube-dns Service)
+  search default.svc.cluster.local svc.cluster.local cluster.local
+  options ndots:5
+
+  DNS query from Pod: "api-service"
+        │
+        │  /etc/resolv.conf search path expansion:
+        │  1. api-service.default.svc.cluster.local   ← MATCH
+        ▼
+  CoreDNS Pod (10.96.0.10)
+  ┌──────────────────────────────────────────────────────────┐
+  │  Plugin pipeline (Corefile):                             │
+  │  errors → health → ready → kubernetes → prometheus       │
+  │           → forward → cache → loop → reload → loadbalance│
+  │                                                          │
+  │  kubernetes plugin:                                      │
+  │  - Watches Services → returns ClusterIP                  │
+  │  - Watches headless Services → returns Pod IPs           │
+  │  - Returns per-Pod A records for StatefulSets            │
+  │                                                          │
+  │  forward plugin:                                         │
+  │  - For non-cluster domains → forward to 8.8.8.8          │
+  └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CoreDNS as a Kubernetes Service
+
+```bash
+# CoreDNS runs as a Deployment in kube-system
+kubectl get deployment coredns -n kube-system
+# NAME      READY  UP-TO-DATE  AVAILABLE  AGE
+# coredns   2/2    2           2          30d
+
+# kube-dns Service is the stable ClusterIP for all DNS queries
+kubectl get svc kube-dns -n kube-system
+# NAME       TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)         AGE
+# kube-dns   ClusterIP   10.96.0.10   <none>        53/UDP,53/TCP   30d
+
+# Configuration is stored in a ConfigMap
+kubectl get configmap coredns -n kube-system -o yaml
+```
+
+---
+
+## The Corefile: Plugin Pipeline
+
+The Corefile is CoreDNS's configuration file — it defines one or more **server blocks** each containing an ordered **plugin pipeline**:
+
+```
+# Default Kubernetes Corefile
+.:53 {
+    errors                    # Log errors
+    health {                  # Health check endpoint (:8080/health)
+        lameduck 5s           # Delay shutdown for graceful termination
+    }
+    ready                     # Readiness endpoint (:8181/ready)
+    kubernetes cluster.local in-addr.arpa ip6.arpa {   # Cluster DNS
+        pods insecure         # Enable Pod A record lookups
+        fallthrough in-addr.arpa ip6.arpa
+        ttl 30               # TTL for cluster DNS records
+    }
+    prometheus :9153          # Metrics endpoint
+    forward . /etc/resolv.conf {   # Forward external queries to host DNS
+        max_concurrent 1000
+    }
+    cache 30                  # Cache TTL for external responses
+    loop                      # Detect DNS forwarding loops
+    reload                    # Auto-reload Corefile on change
+    loadbalance               # Round-robin A/AAAA/MX records
+}
+```
+
+---
+
+## The `kubernetes` Plugin
+
+The `kubernetes` plugin is what makes CoreDNS "cluster-aware". It watches the Kubernetes API for Services, Endpoints/EndpointSlices, and Pods, and serves DNS answers for `cluster.local` domains:
+
+```text
+Records served by the kubernetes plugin:
+
+Service A record:
+  <service>.<namespace>.svc.cluster.local → ClusterIP
+
+Service SRV record (named ports):
+  _<port-name>._<protocol>.<service>.<namespace>.svc.cluster.local
+
+Headless Service (all Pod IPs):
+  <service>.<namespace>.svc.cluster.local → [IP1, IP2, IP3]
+
+StatefulSet Pod A record:
+  <pod-name>.<service>.<namespace>.svc.cluster.local → Pod IP
+
+Pod A record (when pods insecure):
+  <pod-ip-dashes>.<namespace>.pod.cluster.local → Pod IP
+  e.g. 10-244-1-5.default.pod.cluster.local → 10.244.1.5
+```
+
+---
+
+## DNS Search Domains and NDOTS
+
+Every Pod gets a `/etc/resolv.conf` with search domains:
+
+```bash
+kubectl exec -it my-pod -- cat /etc/resolv.conf
+# nameserver 10.96.0.10
+# search production.svc.cluster.local svc.cluster.local cluster.local
+# options ndots:5
+```
+
+**How short names resolve** (using search domains):
+
+```text
+Query: "api-service" (no dots — ndots:5 threshold not met)
+  Attempt 1: api-service.production.svc.cluster.local ← MATCH (resolved)
+  → Returns ClusterIP
+
+Query: "api-service.production" (1 dot — still < 5, ndots not met)
+  Attempt 1: api-service.production.production.svc.cluster.local ← FAIL
+  Attempt 2: api-service.production.svc.cluster.local ← MATCH
+  → Returns ClusterIP
+
+Query: "google.com" (1 dot — still < 5)
+  Attempt 1: google.com.production.svc.cluster.local ← FAIL
+  Attempt 2: google.com.svc.cluster.local ← FAIL
+  Attempt 3: google.com.cluster.local ← FAIL
+  Attempt 4: google.com ← external lookup via forward plugin ← MATCH
+```
+
+> [!IMPORTANT]
+> The `ndots:5` setting causes 3 failed DNS queries before reaching external DNS for names with fewer than 5 dots. This is a common performance issue for external DNS lookups. Mitigation: use FQDNs with trailing dots (`google.com.`) for external domains in application configs.
+
+---
+
+## Customizing CoreDNS
+
+### Adding a Custom Stub Zone
+
+Route queries for a specific domain to a different DNS server:
+
+```yaml
+# Edit the coredns ConfigMap
+kubectl edit configmap coredns -n kube-system
+```
+
+```
+.:53 {
+    # ... existing config ...
+    
+    # Custom stub zone: internal company domain → company DNS server
+    forward internal.company.com 10.0.1.53 10.0.1.54
+}
+
+# Or as a separate server block for more control:
+internal.company.com:53 {
+    errors
+    forward . 10.0.1.53 10.0.1.54 {
+        policy round_robin
+        health_check 5s
+    }
+    cache 60
+}
+```
+
+### DNS Rewriting
+
+```
+.:53 {
+    # Rewrite: old-service → new-service (same namespace)
+    rewrite name old-api.production.svc.cluster.local new-api.production.svc.cluster.local
+    
+    # Rewrite external domain to internal
+    rewrite name db.example.com postgres.production.svc.cluster.local
+    
+    # ... other plugins ...
+}
+```
+
+### Per-Namespace Configuration
+
+```yaml
+# Custom DNS for specific namespaces using DNSConfig
+apiVersion: v1
+kind: Pod
+spec:
+  dnsPolicy: None    # Override cluster DNS
+  dnsConfig:
+    nameservers:
+    - 10.0.1.53     # Custom DNS server
+    searches:
+    - production.svc.cluster.local
+    - svc.cluster.local
+    - cluster.local
+    options:
+    - name: ndots
+      value: "2"    # Reduce ndots (fewer failed queries for external domains)
+```
+
+---
+
+## DNSPolicy Options
+
+| Policy | Behavior |
+|--------|---------|
+| `ClusterFirst` (default) | Use CoreDNS; fall through to node DNS for unknowns |
+| `ClusterFirstWithHostNet` | Like ClusterFirst but for hostNetwork Pods |
+| `Default` | Use the node's DNS (same as kube-proxy node's /etc/resolv.conf) |
+| `None` | No automatic DNS config; must specify `dnsConfig` |
+
+---
+
+## Hands-On: Debugging DNS
+
+```bash
+# 1. Test DNS resolution from inside a Pod
+kubectl run dnstools --image=infoblox/dnstools --rm -it --restart=Never
+
+# Inside the pod:
+host kubernetes.default.svc.cluster.local
+# kubernetes.default.svc.cluster.local has address 10.96.0.1
+
+dig api-service.production.svc.cluster.local
+# Shows full DNS response with TTL, A records
+
+# 2. Test external DNS resolution
+dig google.com
+# Should return external IPs via forwarding
+
+# 3. Check CoreDNS logs (enable query logging)
+kubectl edit configmap coredns -n kube-system
+# Add to the plugin chain (before forward):
+# log
+
+kubectl logs -n kube-system -l k8s-app=kube-dns -f | grep "api-service"
+
+# 4. Check CoreDNS metrics
+kubectl port-forward -n kube-system svc/kube-dns 9153:9153
+curl http://localhost:9153/metrics | grep -E "coredns_dns_requests|coredns_dns_responses"
+
+# 5. Check /etc/resolv.conf in a Pod
+kubectl exec my-pod -- cat /etc/resolv.conf
+
+# 6. Test NDOTS behavior
+kubectl exec my-pod -- time nslookup google.com
+# Slow? It's running 3 cluster DNS searches before reaching external
+
+# 7. Fix with FQDN (trailing dot = no search expansion)
+kubectl exec my-pod -- nslookup google.com.
+# Immediately goes external — much faster
+
+# 8. Debug CoreDNS itself (is it healthy?)
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl describe pod coredns-<id> -n kube-system
+kubectl logs coredns-<id> -n kube-system | tail -50
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CoreDNS and what replaced it in Kubernetes?**
+
+CoreDNS replaced kube-dns as the default DNS server starting in Kubernetes 1.13. kube-dns was a multi-container Pod running dnsmasq, kubedns, and sidecar — complex and hard to extend. CoreDNS is a single Go binary with a plugin-based architecture — each DNS feature is a plugin. CoreDNS is more extensible, easier to configure (single Corefile), and has better performance characteristics. It serves the same `cluster.local` DNS records but via a cleaner, maintainable codebase.
+
+**Q2: What DNS records does CoreDNS create for a Kubernetes Service?**
+
+For a ClusterIP Service: an A record `<service>.<namespace>.svc.cluster.local → ClusterIP`. For SRV records on named ports: `_<port>._<proto>.<service>.<namespace>.svc.cluster.local`. For headless Services (`clusterIP: None`): multiple A records, one per ready Pod IP. For StatefulSet Pods via a headless Service: per-Pod A records `<pod-name>.<service>.<namespace>.svc.cluster.local → Pod IP`. For ExternalName Services: a CNAME record pointing to the external hostname.
+
+**Q3: What is `ndots:5` and why can it be a performance problem?**
+
+`ndots:5` means: if the queried name has fewer than 5 dots, apply search domain expansion before trying as an absolute name. For `google.com` (1 dot), the resolver first tries `google.com.default.svc.cluster.local`, `google.com.svc.cluster.local`, `google.com.cluster.local` — all fail — before trying `google.com` externally. This means **3 unnecessary DNS queries** for every external lookup, adding 10-50ms of latency per request. Mitigation: configure `ndots:2` for Pods that make many external DNS lookups, or use FQDNs with trailing dots in application configs.
+
+**Q4: How do you add a custom DNS stub zone for an internal domain to CoreDNS?**
+
+Edit the `coredns` ConfigMap in `kube-system`. Either add a `forward internal.domain.com <dns-server-ip>` line inside the existing `.:53` block, or add a separate named server block: `internal.domain.com:53 { forward . <dns-server-ip>; cache 60 }`. After saving, CoreDNS reloads automatically (via the `reload` plugin) — no restart needed. DNS queries for `*.internal.domain.com` will be forwarded to the specified server instead of going external.
+
+**Q5: What is the difference between DNSPolicy `ClusterFirst` and `Default`?**
+
+`ClusterFirst` (default): the Pod uses CoreDNS (`kube-dns` Service IP) as its nameserver. Cluster DNS names resolve to ClusterIPs; external names are forwarded through CoreDNS to the host's upstream DNS. `Default`: the Pod inherits the node's `/etc/resolv.conf` directly — bypassing CoreDNS. Cluster DNS names (`*.svc.cluster.local`) won't resolve. Use `Default` for system Pods that need to avoid the cluster DNS dependency, or for debugging node-level DNS. Never use `Default` for application Pods that need to discover Kubernetes Services.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know CoreDNS replaced kube-dns in Kubernetes 1.13 — single binary, plugin pipeline
+- [ ] Know the `kubernetes` plugin serves cluster DNS: Service ClusterIPs, headless Pod IPs, StatefulSet per-Pod records
+- [ ] Understand `ndots:5` causes search domain expansion — performance impact for external DNS
+- [ ] Know the 4 DNSPolicy options: ClusterFirst, ClusterFirstWithHostNet, Default, None
+- [ ] Know how to add custom stub zones via the CoreDNS ConfigMap
+- [ ] Know the `log` plugin enables per-query logging for DNS debugging
+- [ ] Can debug with `kubectl run dnstools`, `dig`, `host`, and CoreDNS pod logs

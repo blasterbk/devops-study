@@ -1,0 +1,1627 @@
+---
+title: "Chapter 8 — StatefulSet Controller"
+sidebar_position: 8
+module: "Module 1.5 — Controller Manager Internals"
+description: "> **Goal:** Understand how the Kubernetes **StatefulSet Controller** manages stateful applications that require stable identities, persistent storage, and order..."
+---
+
+# Module 1.5 — Kubernetes Controller Manager Internals
+
+# Chapter 8 — StatefulSet Controller
+
+> **Goal:** Understand how the Kubernetes **StatefulSet Controller** manages stateful applications that require stable identities, persistent storage, and ordered lifecycle management. Learn why StatefulSets exist, how they differ from Deployments, how they provide stable network identities and persistent volumes, and how they safely manage databases and distributed systems in production.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why StatefulSets exist: stable identity, stable storage, ordered lifecycle
+> 2. Stable Pod names: {name}-0, {name}-1, {name}-2 (never random)
+> 3. Headless Service: stable DNS entry per Pod
+> 4. PersistentVolumeClaim templates: one PVC per Pod, retained on delete
+> 5. Ordered creation: Pod-0 must be Running before Pod-1 is created
+> 6. Ordered deletion: Pod-2 is deleted before Pod-1 (reverse order)
+> 7. Rolling updates: ordered by pod index, waiting for readiness
+> 8. podManagementPolicy: OrderedReady vs Parallel
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the StatefulSet Controller like a numbered locker assignment system.
+
+```text
+Numbered Locker Analogy:
+
+Gym assigns locker #1, #2, #3 to members (Pod-0, Pod-1, Pod-2)
+Each member always gets the SAME numbered locker (stable identity)
+Each locker has a fixed combination (stable storage: PVC per Pod)
+Lockers are assigned in order (Pod-0 before Pod-1 before Pod-2)
+If member leaves, their locker is locked but NOT reassigned (PVC retained)
+New member gets the next number, same locker (rescheduled Pod keeps PVC)
+```
+
+| Numbered Lockers | StatefulSet Controller |
+| :--- | :--- |
+| Numbered locker assignment | Stable Pod names: `{name}-0`, `{name}-1` |
+| Always same locker per member | Stable identity: same DNS name on reschedule |
+| Locker combination | PersistentVolumeClaim bound to that Pod |
+| Assigning in sequence | Ordered creation: Pod-0 Running before Pod-1 |
+| Locker retained if member leaves | PVC is NOT deleted when Pod is deleted |
+
+> **Important:** StatefulSet Pods are created **strictly in order** (0, 1, 2) and each Pod must be `Running` and `Ready` before the next is created. Deletion happens in **reverse order** (2, 1, 0). This is not a preference — it is the default enforcement of `podManagementPolicy: OrderedReady`. Setting `Parallel` removes this guarantee.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Deployment Controller
+- ReplicaSet Controller
+- Pods
+- Persistent Volumes (basic concepts)
+- Services
+- Labels and Selectors
+- Kubernetes Scheduler
+
+---
+
+# Where Does the StatefulSet Controller Fit?
+
+So far we have learned:
+
+```text
+Deployment
+
+v
+
+ReplicaSet
+
+v
+
+Pods
+```
+
+This works perfectly for:
+
+- Web Servers
+- REST APIs
+- Frontend Applications
+- Stateless Microservices
+
+The next question is:
+
+> **How do we manage databases?**
+
+Examples:
+
+- PostgreSQL
+- MySQL
+- MongoDB
+- Cassandra
+- ZooKeeper
+- Kafka
+- Redis Sentinel
+
+These applications require:
+
+- Stable identities
+- Persistent storage
+- Predictable startup order
+
+Deployment cannot guarantee these properties.
+
+---
+
+# Why StatefulSets Exist
+
+Imagine a Deployment running:
+
+```text
+MongoDB Cluster
+
+3 Pods
+```
+
+Pods:
+
+```text
+mongodb-a
+
+mongodb-b
+
+mongodb-c
+```
+
+Now one Pod crashes.
+
+Deployment creates:
+
+```text
+mongodb-x7k9z
+```
+
+Problem:
+
+```text
+New Name
+
+v
+
+New Identity
+
+v
+
+Database Cluster Confused
+```
+
+Distributed databases often identify peers by stable hostnames.
+
+---
+
+# Stateless vs Stateful
+
+Stateless Application
+
+```text
+Pod Dies
+
+v
+
+Create New Pod
+
+v
+
+No Problem
+```
+
+Stateful Application
+
+```text
+Database Pod Dies
+
+v
+
+New Identity
+
+v
+
+Replication Breaks
+
+v
+
+Cluster Recovery Required
+```
+
+---
+
+# Kubernetes Solution
+
+Kubernetes introduces:
+
+```text
+StatefulSet
+```
+
+which guarantees:
+
+- Stable Pod identity
+- Stable hostname
+- Stable storage
+- Ordered lifecycle
+
+---
+
+# High-Level Architecture
+
+```text
+                StatefulSet
+
+                     |
+
+       StatefulSet Controller
+
+                     |
+
+        ┌────────────┼────────────┐
+
+        ▼            ▼            ▼
+
+ Database-0    Database-1    Database-2
+
+        |            |            |
+
+      PVC-0        PVC-1        PVC-2
+
+        |            |            |
+
+       PV-0         PV-1         PV-2
+```
+
+Every Pod owns its own storage.
+
+---
+
+# What is a StatefulSet?
+
+A StatefulSet is:
+
+> **A Kubernetes workload resource that manages Pods requiring stable identities, persistent storage, ordered deployment, and ordered termination.**
+
+Unlike Deployments,
+
+StatefulSets treat every Pod as unique.
+
+---
+
+# StatefulSet Responsibilities
+
+The StatefulSet Controller is responsible for:
+
+- Stable Pod names
+- Stable network identity
+- Persistent storage association
+- Ordered Pod creation
+- Ordered Pod deletion
+- Ordered updates
+- PVC management
+
+It is **not** responsible for scheduling Pods.
+
+---
+
+# Deployment vs StatefulSet
+
+| Deployment | StatefulSet |
+|------------|-------------|
+| Stateless workloads | Stateful workloads |
+| Pods are interchangeable | Every Pod is unique |
+| Random Pod names | Stable Pod names |
+| Shared application identity | Individual Pod identity |
+| Parallel scaling by default | Ordered scaling by default |
+| Ephemeral storage by default | Persistent storage integration |
+
+---
+
+# Stable Identity
+
+The most important StatefulSet feature is:
+
+```text
+Stable Identity
+```
+
+---
+
+# Why Identity Matters
+
+Distributed systems identify peers using:
+
+- Hostnames
+- DNS
+- Member IDs
+- Replication configuration
+
+Changing identity may require:
+
+- Reconfiguration
+- Cluster election
+- Replica synchronization
+
+---
+
+# Example
+
+StatefulSet:
+
+```yaml
+replicas: 3
+```
+
+Pods become:
+
+```text
+mysql-0
+
+mysql-1
+
+mysql-2
+```
+
+These names remain stable.
+
+---
+
+# Pod Naming
+
+StatefulSet naming follows:
+
+```text
+<StatefulSet Name>-<Ordinal>
+```
+
+Example:
+
+```text
+redis-0
+
+redis-1
+
+redis-2
+```
+
+Ordinals begin at:
+
+```text
+0
+```
+
+and increase sequentially.
+
+---
+
+# Identity Persistence
+
+Suppose:
+
+```text
+mysql-1
+
+Crash
+```
+
+Controller recreates:
+
+```text
+mysql-1
+```
+
+Not:
+
+```text
+mysql-abcd
+```
+
+Identity remains constant.
+
+---
+
+# Stable Network Identity
+
+Every StatefulSet Pod receives a predictable DNS name.
+
+Conceptually:
+
+```text
+mysql-0
+
+v
+
+Stable Hostname
+```
+
+Applications can reliably communicate using these stable names.
+
+Typically this is achieved through a **Headless Service**.
+
+---
+
+# Headless Service
+
+StatefulSets are commonly paired with:
+
+```yaml
+clusterIP: None
+```
+
+This creates a Headless Service.
+
+Instead of one virtual IP,
+
+DNS returns individual Pod addresses.
+
+---
+
+# Example
+
+```text
+mysql-0.database.default.svc.cluster.local
+
+mysql-1.database.default.svc.cluster.local
+
+mysql-2.database.default.svc.cluster.local
+```
+
+Each Pod has its own DNS record.
+
+---
+
+# Why Stable DNS Matters
+
+Example:
+
+```text
+PostgreSQL Primary
+
+v
+
+postgres-0
+```
+
+Replicas connect to:
+
+```text
+postgres-0
+```
+
+If the Pod restarts,
+
+the hostname remains unchanged.
+
+---
+
+# Stable Storage
+
+Databases cannot lose data whenever Pods restart.
+
+Therefore,
+
+StatefulSets integrate with:
+
+```text
+Persistent Storage
+```
+
+---
+
+# Why Stable Storage?
+
+Without persistent storage:
+
+```text
+Pod Deleted
+
+v
+
+Empty Filesystem
+
+v
+
+Database Lost
+```
+
+Not acceptable.
+
+---
+
+# Stateful Storage Model
+
+```text
+Pod
+
+v
+
+PVC
+
+v
+
+PV
+
+v
+
+Storage Backend
+```
+
+Every Pod owns dedicated storage.
+
+---
+
+# VolumeClaimTemplates
+
+StatefulSets automatically create storage using:
+
+```yaml
+volumeClaimTemplates
+```
+
+Each replica receives its own PersistentVolumeClaim (PVC).
+
+---
+
+# Example
+
+StatefulSet:
+
+```text
+mysql
+
+3 Replicas
+```
+
+Automatically creates:
+
+```text
+data-mysql-0
+
+data-mysql-1
+
+data-mysql-2
+```
+
+Each PVC is unique.
+
+---
+
+# Storage Persistence
+
+Suppose:
+
+```text
+mysql-1
+
+Deleted
+```
+
+Controller recreates:
+
+```text
+mysql-1
+```
+
+The Pod reconnects to:
+
+```text
+data-mysql-1
+```
+
+The data remains available.
+
+---
+
+# Stable Storage Architecture
+
+```text
+mysql-0
+
+v
+
+PVC
+
+v
+
+PV
+
+v
+
+Disk A
+
+------------------
+
+mysql-1
+
+v
+
+PVC
+
+v
+
+PV
+
+v
+
+Disk B
+
+------------------
+
+mysql-2
+
+v
+
+PVC
+
+v
+
+PV
+
+v
+
+Disk C
+```
+
+Every Pod has independent storage.
+
+---
+
+# Ordered Deployment
+
+Deployments may create Pods in parallel.
+
+StatefulSets default to:
+
+```text
+Ordered Deployment
+```
+
+---
+
+# Why Order Matters
+
+Suppose:
+
+```text
+ZooKeeper
+
+3 Nodes
+```
+
+Starting all simultaneously may:
+
+- Delay quorum formation
+- Increase recovery complexity
+
+Ordered startup provides predictable initialization.
+
+---
+
+# Startup Order
+
+Pods start sequentially.
+
+```text
+app-0
+
+v
+
+Ready
+
+v
+
+app-1
+
+v
+
+Ready
+
+v
+
+app-2
+```
+
+The next Pod is created only after the previous one becomes Ready.
+
+---
+
+# Ordered Deployment Workflow
+
+```text
+Need 3 Pods
+
+v
+
+Create
+
+pod-0
+
+v
+
+Ready
+
+v
+
+Create
+
+pod-1
+
+v
+
+Ready
+
+v
+
+Create
+
+pod-2
+
+v
+
+Ready
+```
+
+---
+
+# Scaling Up
+
+Current:
+
+```text
+3 Pods
+```
+
+User:
+
+```yaml
+replicas: 5
+```
+
+Controller creates:
+
+```text
+pod-3
+
+v
+
+Ready
+
+v
+
+pod-4
+```
+
+Existing Pods remain unchanged.
+
+---
+
+# Ordered Termination
+
+Scaling down also follows an order.
+
+Suppose:
+
+```text
+5 Pods
+```
+
+Scale to:
+
+```text
+2 Pods
+```
+
+Deletion order:
+
+```text
+pod-4
+
+v
+
+pod-3
+
+v
+
+Remaining
+
+pod-0
+
+pod-1
+
+pod-2
+```
+
+Highest ordinal is removed first.
+
+---
+
+# Why Reverse Order?
+
+Databases often expect:
+
+```text
+Newest Replica
+
+v
+
+Shutdown First
+```
+
+This minimizes disruption and preserves predictable membership.
+
+---
+
+# Ordered Termination Workflow
+
+```text
+Scale Down
+
+v
+
+Delete pod-4
+
+v
+
+Wait
+
+v
+
+Delete pod-3
+
+v
+
+Wait
+
+v
+
+Finished
+```
+
+---
+
+# Rolling Updates
+
+StatefulSets also support:
+
+```text
+Rolling Updates
+```
+
+However,
+
+updates are more conservative than Deployments.
+
+---
+
+# Rolling Update Order
+
+Suppose:
+
+```text
+Pods
+
+0
+
+1
+
+2
+```
+
+Update proceeds in reverse ordinal order:
+
+```text
+pod-2
+
+v
+
+Ready
+
+v
+
+pod-1
+
+v
+
+Ready
+
+v
+
+pod-0
+```
+
+This preserves cluster stability for many stateful systems.
+
+---
+
+# Why Reverse Order?
+
+The highest ordinal is usually considered the safest replica to update first.
+
+Primary members or lower ordinals often remain available until later in the rollout, depending on the application's architecture.
+
+---
+
+# Update Strategy
+
+StatefulSets support strategies such as:
+
+```text
+RollingUpdate
+
+OnDelete
+```
+
+---
+
+# RollingUpdate
+
+Controller automatically updates Pods according to StatefulSet rules.
+
+---
+
+# OnDelete
+
+Pods are **not** automatically updated.
+
+Instead:
+
+```text
+Administrator
+
+v
+
+Delete Pod
+
+v
+
+Controller Recreates
+
+v
+
+New Version
+```
+
+Useful for applications requiring manual coordination.
+
+---
+
+# Pod Management Policy
+
+StatefulSets provide:
+
+```text
+podManagementPolicy
+```
+
+Possible values:
+
+```text
+OrderedReady
+
+Parallel
+```
+
+---
+
+# OrderedReady
+
+Default behavior.
+
+Pods are:
+
+```text
+Created
+
+One By One
+
+v
+
+Ready
+
+v
+
+Next Pod
+```
+
+---
+
+# Parallel
+
+Pods may be created or deleted concurrently during scaling operations.
+
+Important:
+
+Stable identities and stable storage are **still preserved**.
+
+Only creation/deletion ordering changes.
+
+Parallel does **not** change rolling update ordering.
+
+---
+
+# Persistent Volumes
+
+StatefulSets rely heavily on:
+
+```text
+Persistent Volumes (PV)
+
+PersistentVolumeClaims (PVC)
+```
+
+---
+
+# Relationship
+
+```text
+StatefulSet
+
+v
+
+PVC
+
+v
+
+PV
+
+v
+
+Storage
+
+v
+
+Disk
+```
+
+The Controller creates PVCs.
+
+The storage system provides PVs.
+
+---
+
+# PVC Lifecycle
+
+```text
+Create StatefulSet
+
+v
+
+Create PVC
+
+v
+
+Bind PV
+
+v
+
+Start Pod
+
+v
+
+Mount Volume
+```
+
+Storage is available before the application starts.
+
+---
+
+# Scaling Down and Storage
+
+Suppose:
+
+```text
+Scale
+
+5
+
+v
+
+3
+```
+
+Pods:
+
+```text
+4
+
+3
+
+Deleted
+```
+
+Their PVCs are **not automatically deleted by default**.
+
+This preserves application data for future recovery or scale-up.
+
+Recent Kubernetes versions support configurable PVC retention policies, but the default behavior preserves data.
+
+---
+
+# Scaling Back Up
+
+Suppose:
+
+```text
+Scale Back
+
+3
+
+v
+
+5
+```
+
+Controller recreates:
+
+```text
+pod-3
+
+v
+
+Reuse PVC
+
+v
+
+pod-4
+
+v
+
+Reuse PVC
+```
+
+Data remains intact.
+
+---
+
+# Relationship with Scheduler
+
+StatefulSet Controller:
+
+```text
+Create Pod
+
+v
+
+Create PVC
+```
+
+Scheduler:
+
+```text
+Assign Node
+```
+
+The Scheduler does not manage storage identity.
+
+---
+
+# Relationship with Deployment Controller
+
+Deployment:
+
+```text
+Manage Stateless Workloads
+```
+
+StatefulSet:
+
+```text
+Manage Stateful Workloads
+```
+
+Each Controller targets a different application model.
+
+---
+
+# Relationship with ReplicaSet Controller
+
+ReplicaSets:
+
+```text
+Interchangeable Pods
+```
+
+StatefulSets:
+
+```text
+Unique Pods
+```
+
+StatefulSets do **not** use ReplicaSets internally.
+
+The StatefulSet Controller manages Pods directly.
+
+---
+
+# Complete Production Workflow
+
+```text
+User
+
+v
+
+Create StatefulSet
+
+v
+
+StatefulSet Informer
+
+v
+
+WorkQueue
+
+v
+
+StatefulSet Worker
+
+v
+
+Reconcile
+
+v
+
+Create PVC
+
+v
+
+Bind PV
+
+v
+
+Create pod-0
+
+v
+
+Scheduler
+
+v
+
+Node
+
+v
+
+kubelet
+
+v
+
+Ready
+
+v
+
+Create pod-1
+
+v
+
+Repeat
+```
+
+---
+
+# Production Example 1
+
+PostgreSQL Cluster
+
+```text
+postgres-0
+
+Primary
+
+v
+
+postgres-1
+
+Replica
+
+v
+
+postgres-2
+
+Replica
+```
+
+Stable hostnames preserve replication.
+
+---
+
+# Production Example 2
+
+MongoDB Replica Set
+
+```text
+mongo-0
+
+v
+
+mongo-1
+
+v
+
+mongo-2
+```
+
+Each Pod always reconnects to its original storage volume after restart.
+
+---
+
+# Production Example 3
+
+Kafka Brokers
+
+```text
+broker-0
+
+v
+
+broker-1
+
+v
+
+broker-2
+```
+
+Broker IDs remain stable because Pod identities remain stable.
+
+---
+
+# Production Example 4
+
+Scaling Database Cluster
+
+```text
+Current
+
+3 Nodes
+
+v
+
+Scale
+
+5 Nodes
+
+v
+
+Create
+
+db-3
+
+v
+
+Ready
+
+v
+
+Create
+
+db-4
+```
+
+Sequential startup preserves cluster stability.
+
+---
+
+# Production Example 5
+
+Node Failure
+
+```text
+Node Fails
+
+v
+
+pod-1 Lost
+
+v
+
+Controller
+
+v
+
+Recreate pod-1
+
+v
+
+Reconnect PVC
+
+v
+
+Database Recovery
+```
+
+Identity and storage remain consistent.
+
+---
+
+# Performance Considerations
+
+StatefulSet Controllers prioritize:
+
+- Data integrity
+- Stable identity
+- Predictable ordering
+- Storage consistency
+
+They intentionally trade some rollout speed for correctness.
+
+---
+
+# Production Best Practices
+
+✔ Use StatefulSets for databases, message queues, and distributed storage systems.
+
+✔ Always pair StatefulSets with a Headless Service.
+
+✔ Use Persistent Volumes for durable data.
+
+✔ Configure appropriate StorageClasses.
+
+✔ Use readiness probes so Pods join the cluster only when fully initialized.
+
+✔ Avoid manually renaming StatefulSet Pods.
+
+✔ Understand your application's quorum requirements before scaling or updating.
+
+✔ Monitor PVC capacity and storage health.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+StatefulSets are just Deployments with storage.
+
+Wrong.
+
+StatefulSets provide stable identities, ordered lifecycle management, and direct Pod management in addition to storage integration.
+
+---
+
+### ❌ Misconception 2
+
+StatefulSet Pods receive random names after restart.
+
+Wrong.
+
+Pods keep the same ordinal-based identity.
+
+---
+
+### ❌ Misconception 3
+
+Scaling down deletes application data.
+
+Wrong.
+
+By default, PVCs are retained even when Pods are removed.
+
+---
+
+### ❌ Misconception 4
+
+StatefulSets use ReplicaSets internally.
+
+Wrong.
+
+The StatefulSet Controller manages Pods directly.
+
+---
+
+### ❌ Misconception 5
+
+Rolling updates occur in parallel.
+
+Wrong.
+
+By default, StatefulSets update Pods sequentially, typically from the highest ordinal to the lowest.
+
+---
+
+### ❌ Misconception 6
+
+Parallel Pod Management removes stable identities.
+
+Wrong.
+
+`podManagementPolicy: Parallel` changes only scaling order. Stable identities and storage remain unchanged.
+
+---
+
+### ❌ Misconception 7
+
+Every application should use StatefulSets.
+
+Wrong.
+
+Most stateless web applications are better served by Deployments.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why do StatefulSets exist?
+
+To manage stateful applications requiring stable identities, persistent storage, and ordered lifecycle operations.
+
+---
+
+### Q2. What makes a StatefulSet Pod different from a Deployment Pod?
+
+StatefulSet Pods have stable names, stable storage, and stable network identities.
+
+---
+
+### Q3. Why are Headless Services commonly used with StatefulSets?
+
+They provide stable DNS records for each individual Pod instead of a single virtual IP.
+
+---
+
+### Q4. What is `volumeClaimTemplates`?
+
+A template used by the StatefulSet Controller to automatically create a unique PVC for each Pod.
+
+---
+
+### Q5. Why does StatefulSet use ordered deployment?
+
+To support applications that require sequential startup, such as databases and quorum-based systems.
+
+---
+
+### Q6. What happens to a StatefulSet PVC after scaling down?
+
+By default, it is retained so data can be reused if the Pod is recreated.
+
+---
+
+### Q7. Do StatefulSets use ReplicaSets?
+
+No. StatefulSet Controllers manage Pods directly.
+
+---
+
+### Q8. What is the difference between `OrderedReady` and `Parallel` Pod Management?
+
+`OrderedReady` creates/deletes Pods sequentially, while `Parallel` allows concurrent creation/deletion during scaling without changing Pod identities or rolling update behavior.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| StatefulSet Pod stuck in Pending | PVC not bound, insufficient storage, or scheduling constraints |
+| Pod recreated but data missing | Incorrect storage configuration or a different PVC was used |
+| Rollout stops at one Pod | Previous Pod has not become Ready, blocking ordered updates |
+| Scaling takes longer than expected | Ordered startup is waiting for earlier Pods to become Ready |
+| DNS name not resolving | Headless Service missing or incorrectly configured |
+| Database replication broken after restart | Application configuration issue rather than StatefulSet identity loss |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why were StatefulSets introduced?
+2. How do StatefulSets differ from Deployments?
+3. What is a stable Pod identity?
+4. Why are Headless Services commonly used?
+5. How does stable storage work?
+6. What is `volumeClaimTemplates`?
+7. Why is ordered deployment important?
+8. Why does ordered termination occur in reverse ordinal order?
+9. What is the difference between `RollingUpdate` and `OnDelete`?
+10. What does `podManagementPolicy` control?
+11. Why are PVCs retained after scale-down by default?
+12. Why do databases typically require StatefulSets?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the **StatefulSet Controller** enables Kubernetes to manage stateful workloads safely and predictably.
+
+You learned:
+
+- Why StatefulSets exist and the problems they solve
+- How stable Pod identities are maintained using ordinal-based names
+- How stable network identities are provided through Headless Services
+- How `volumeClaimTemplates` automatically create dedicated storage for each Pod
+- Why StatefulSets provide ordered deployment and ordered termination
+- How rolling updates are performed conservatively for stateful workloads
+- The purpose of `podManagementPolicy`
+- How Persistent Volumes and PersistentVolumeClaims integrate with StatefulSets
+- The complete production workflow for creating, scaling, updating, and recovering stateful applications
+
+Unlike Deployments, which treat Pods as interchangeable, the **StatefulSet Controller** manages each Pod as a unique member of a distributed system. By combining **stable identities**, **persistent storage**, **ordered lifecycle management**, and **predictable networking**, StatefulSets provide the foundation for running production databases, distributed message queues, consensus systems, and other stateful applications reliably on Kubernetes.
+
+---
+
+# Next Chapter
+
+**Chapter 9 — DaemonSet Controller**
+
+In the next chapter, we'll explore how Kubernetes ensures that exactly one (or a specified) Pod runs on every eligible Node.
+
+Topics include:
+
+- Why DaemonSets Exist
+- DaemonSet Architecture
+- Node Selection
+- Taints and Tolerations
+- Node Affinity
+- Automatic Pod Placement
+- Rolling Updates
+- Node Join/Leave Handling
+- Production DaemonSet Workflows
+
+You'll learn how Kubernetes deploys cluster-wide agents such as log collectors, monitoring agents, CNI plugins, CSI drivers, and security agents using the DaemonSet Controller.
+```

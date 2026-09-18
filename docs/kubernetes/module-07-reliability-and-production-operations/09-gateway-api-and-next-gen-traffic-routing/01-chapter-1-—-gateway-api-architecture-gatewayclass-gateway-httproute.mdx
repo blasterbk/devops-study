@@ -1,0 +1,233 @@
+---
+title: "Chapter 1 — Gateway API: GatewayClass & HTTPRoute"
+sidebar_position: 1
+module: "Module 7.9 — Gateway API & Routing"
+description: "Master Kubernetes Gateway API architecture — role-oriented persona design, GatewayClass vs Gateway vs HTTPRoute, eliminating Ingress annotation sprawl, and typed routing specs."
+---
+
+# Chapter 1 — Gateway API Architecture: GatewayClass, Gateway & HTTPRoute
+
+> **Goal:** Master the next-generation service networking standard in Kubernetes with the **Gateway API** (`gateway.networking.k8s.io`) — understanding why Gateway API supersedes the legacy Ingress specification, analyzing the **Role-Oriented Persona Architecture** separating Infrastructure Providers (`GatewayClass`), Cluster Operators (`Gateway`), and Application Developers (`HTTPRoute`), eliminating proprietary annotation sprawl with strongly typed YAML schemas, and routing traffic with multi-vendor portable conformance (Envoy Gateway, Cilium, Istio).
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural limitations of the legacy Ingress API that led to Gateway API
+> 2. The 3 Role-Oriented Personas: Infrastructure Provider, Cluster Operator, and App Developer
+> 3. The declarative schema and lifecycle of `GatewayClass`, `Gateway`, and `HTTPRoute`
+> 4. How typed API fields replace unstructured Ingress annotations (URL rewrites, headers, filters)
+> 5. How `parentRefs` bind application routes to shared infrastructure gateways
+> 6. How to verify Gateway status conditions and listener readiness
+
+---
+
+## Real-Life Analogy
+
+Think of the Gateway API as **the modern commercial airport runway, terminal gate, and airline flight assignment system**:
+
+- **The Monolithic Ingress Problem (One Single Paper Form for Everyone):** In the past, the Ingress API tried to make one person write down the concrete runway specifications, the security checkpoint rules, and the gate boarding announcements on a single sheet of paper. To make it work, everyone scribbled hundreds of conflicting, vendor-specific sticky notes all over the margins (**Proprietary Annotations Sprawl**).
+- **The Role-Oriented Solution (Gateway API Personas):**
+  - **1. The Airport Architect (Infrastructure Provider - `GatewayClass`):** Installs the high-speed radar and concrete runways (**Envoy Gateway, Cilium, Istio Controller**).
+  - **2. The Airport Terminal Manager (Cluster Operator - `Gateway`):** Provisions Terminal 1, manages the main security checkpoint, assigns power plugs, and binds official TLS certificates (**`Gateway` on Port 443**).
+  - **3. The Airline Flight Dispatcher (Application Developer - `HTTPRoute`):** Delta Airlines or United Airlines (**The Payments Team or Search Team**) simply declares: *"Our flight arrives at Gate 4B; route passengers matching `/v1/orders` to our airplane (**`HTTPRoute` binding to `parentRefs`**)."* Delta cannot accidentally change the airport's runway lights or steal United's gate!
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Gateway API: Role-Oriented Architecture
+
+ INFRASTRUCTURE PROVIDER (Cloud Platform Team)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GatewayClass (`kind: GatewayClass`)                                    │
+ │ Controller: `gateway.envoyproxy.io/gatewayclass-controller`            │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Instantiates Gateway Implementation
+                                    ▼
+ CLUSTER OPERATOR / SRE (Platform Engineering Team)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Gateway (`kind: Gateway`, Namespace: `gateway-infra`)                  │
+ │ - Binds Cloud NLB & Public IP Address                                  │
+ │ - Listeners: HTTPS (Port 443), Hostname: `*.company.com`               │
+ │ - Binds Wildcard TLS Secret: `company-wildcard-tls`                    │
+ │ - Declares `allowedRoutes`: Permits routes from `production` namespace │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ `parentRefs` Attachment
+ APPLICATION DEVELOPERS (Product Microservice Teams)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HTTPRoute (`kind: HTTPRoute`, Namespace: `production`)                 │
+ │ parentRefs: Name: `production-gateway`, Namespace: `gateway-infra`     │
+ │                                                                        │
+ │ Rules:                                                                 │
+ │ ├── Match: `/v1/orders` ──► Backend: `order-service:8080`              │
+ │ └── Match: `/v1/auth`   ──► Backend: `auth-service:8080`               │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why Gateway API Replaced the Ingress API
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Legacy Ingress API              │ Modern Gateway API              │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Persona Separation**    │ **Monolithic.** Devs and Ops    │ **Role-Oriented.** Clean split  │
+ │                           │ fight over the same file.       │ between Infra, Ops, and Devs.   │
+ │ **Feature Set**           │ Basic host/path only. Advanced  │ **Rich & Native.** Rewrites,    │
+ │                           │ features require annotations.   │ traffic splits, headers in spec!│
+ │ **Portability**           │ NGINX annotations break if      │ **100% Portable Conformance.**  │
+ │                           │ switched to Traefik or Envoy.   │ Identical YAML across vendors.  │
+ │ **Protocol Support**      │ HTTP/HTTPS only.                │ **HTTP, gRPC, TCP, UDP, TLS**.  │
+ │ **Cross-Namespace**       │ Fragile or unsupported.         │ **Native & Secure** via         │
+ │                           │                                 │ `ReferenceGrant` API.           │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The 3 Gateway API Personas & CRDs
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Resource Kind        │ Primary Owner Persona   │ Responsibilities                                  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`GatewayClass`**   │ **Infrastructure**      │ Defines the underlying data-plane technology      │
+ │                      │ **Provider**            │ (Envoy Gateway, Cilium eBPF, Istio, Kong).        │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Gateway`**        │ **Cluster Operator**    │ Provisions physical entry points, ports (80/443), │
+ │                      │ (Platform / SRE)        │ TLS certificates, IP addresses, and route policies│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`HTTPRoute`**      │ **Application**         │ Defines request matching (paths, headers),        │
+ │ (Also `GRPCRoute`)   │ **Developer**           │ canary traffic splitting weights, and filters.    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Gateway API Manifests
+
+### 1. `Gateway` Manifest (Managed by Platform Team in `infra` namespace):
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: external-https-gateway
+  namespace: gateway-infra
+spec:
+  gatewayClassName: envoy-gateway      # Binds to cluster GatewayClass
+  listeners:
+  - name: https-prod
+    protocol: HTTPS
+    port: 443
+    hostname: "api.company.com"
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: company-wildcard-tls
+    allowedRoutes:
+      namespaces:
+        from: All                      # Allows cross-namespace HTTPRoute attachments!
+```
+
+---
+
+### 2. `HTTPRoute` Manifest (Managed by Application Team in `production` namespace):
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: payment-api-route
+  namespace: production
+spec:
+  # 1. Attaches route to the central Gateway in gateway-infra!
+  parentRefs:
+  - name: external-https-gateway
+    namespace: gateway-infra
+
+  hostnames:
+  - "api.company.com"
+
+  rules:
+  # Rule A: Orders API with Native URL Rewrite Filter!
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1/orders
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /api/orders
+    backendRefs:
+    - name: order-service
+      port: 8080
+
+  # Rule B: Authentication Service with Exact Match
+  - matches:
+    - path:
+        type: Exact
+        value: /v1/auth
+    backendRefs:
+    - name: auth-service
+      port: 8080
+```
+
+---
+
+## Hands-On Lab: Querying Gateway API Resources
+
+```bash
+# Step 1: Query installed Gateway API CRDs
+kubectl get crd | grep gateway.networking.k8s.io 2>/dev/null || echo "Gateway API CRDs active"
+
+# Step 2: Query active GatewayClasses
+kubectl get gatewayclasses
+
+# Step 3: Query Gateways and listener status conditions
+kubectl get gateways -A
+
+# Step 4: Query all attached HTTPRoutes across all namespaces
+kubectl get httproutes -A
+
+# Step 5: Check detailed listener status and parentRef binding conditions
+# kubectl describe gateway external-https-gateway -n gateway-infra
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why was the Gateway API created to replace the Kubernetes Ingress API?**
+
+The Ingress API suffered from three fundamental design flaws: (1) **Lack of Role Separation**: A single `Ingress` manifest mixed infrastructure concerns (TLS certs, IP addresses) with application concerns (path routing), preventing self-service in multi-tenant environments; (2) **Annotation Sprawl**: Ingress lacked typed fields for basic features like URL rewriting, rate limiting, and header injection, forcing vendors to invent thousands of incompatible proprietary annotations; and (3) **Limited Protocols**: Ingress supported only HTTP/1 and HTTP/2, with no native support for gRPC, TCP, UDP, or TLS pass-through.
+
+**Q2: What are the three primary personas in the Gateway API, and what resources do they own?**
+
+1. **Infrastructure Provider** (owns `GatewayClass`): Configures the underlying ingress controller implementation (e.g. Envoy Gateway, Cilium, Istio).
+2. **Cluster Operator / Platform SRE** (owns `Gateway`): Provisions network entry points, configures listening ports (80, 443), attaches TLS certificates, and declares which namespaces are allowed to attach routes.
+3. **Application Developer** (owns `HTTPRoute`, `GRPCRoute`): Authors path matching, header routing, URL rewrites, and traffic splitting rules, attaching their route to the shared `Gateway` via `parentRefs`.
+
+**Q3: How does the Gateway API eliminate vendor-specific annotations?**
+
+Gateway API replaces annotations with **strongly typed, standardized API fields and Filters** inside the core specification. Common capabilities—such as `URLRewrite`, `RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestRedirect`, and `RequestMirror`—are first-class schema elements defined in `spec.rules[].filters`. A Gateway API manifest works identically across Envoy Gateway, Cilium, Istio, and Traefik without changing a single line of YAML.
+
+**Q4: How does an `HTTPRoute` in namespace A attach to a `Gateway` in namespace B?**
+
+The `HTTPRoute` declares a `spec.parentRefs` block specifying the name and namespace of the target Gateway (e.g. `name: shared-gateway`, `namespace: gateway-infra`). For the attachment to succeed, the `Gateway`'s listener must explicitly permit cross-namespace attachments via `allowedRoutes.namespaces.from: All` (or `from: Selector`).
+
+**Q5: What status reporting capabilities does Gateway API provide compared to Ingress?**
+
+The Ingress API provides almost zero status visibility. Gateway API provides rich, bidirectional **Condition Reporting** on all objects (`Programmed: True`, `Accepted: True`, `ResolvedRefs: True`, `Conflicted: False`). If an `HTTPRoute` contains an invalid backend service reference or an invalid certificate name, the controller updates the route's `.status.conditions` array with detailed error explanations instantly.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why Gateway API replaces Ingress: Role separation, typed fields, protocol diversity
+- [ ] Know the 3 personas: Infrastructure (`GatewayClass`), Operator (`Gateway`), Developer (`HTTPRoute`)
+- [ ] Know how `parentRefs` binds application routes to shared infrastructure Gateways
+- [ ] Know that native Filters replace annotations for URL rewrites and header modifications
+- [ ] Know that Gateway API supports HTTP, gRPC, TCP, UDP, and TLS natively
+- [ ] Can view active HTTPRoutes using `kubectl get httproutes -A`

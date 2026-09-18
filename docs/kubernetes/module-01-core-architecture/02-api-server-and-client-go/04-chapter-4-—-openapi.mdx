@@ -1,0 +1,380 @@
+---
+title: "Chapter 4 — OpenAPI"
+sidebar_position: 4
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand how Kubernetes describes every API using the OpenAPI Specification, how schema validation works, and how clients use OpenAPI for autocomplete, documentation, and SDK generation."
+---
+
+# Chapter 4 — OpenAPI
+
+> **Goal:** Understand how Kubernetes describes every API using the OpenAPI Specification, how schemas are generated and served, how requests are validated against them, and how client tools use OpenAPI automatically.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. What OpenAPI is
+> 2. How Kubernetes publishes its OpenAPI schema
+> 3. How schema validation uses OpenAPI
+> 4. How kubectl explain works
+> 5. How IDE autocomplete is powered by OpenAPI
+> 6. How CRDs define custom validation schemas
+> 7. OpenAPI v2 vs OpenAPI v3 in Kubernetes
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Common interview questions include:
+
+> **How does `kubectl explain deployment.spec.template.spec.containers` know every field?**
+
+> **How does Kubernetes know that `replicas` must be an integer and not a string?**
+
+> **How does a YAML plugin in VS Code give you autocomplete for Kubernetes manifests?**
+
+The answer is **OpenAPI** — the machine-readable blueprint that describes every Kubernetes API resource, its fields, types, and validation rules.
+
+Without OpenAPI:
+- Kubernetes could not validate manifests before storing them
+- `kubectl explain` could not exist
+- IDE plugins could not provide YAML autocomplete
+- Client SDKs (`client-go`, Python client) would have to be hand-written
+- CRDs could not define custom validation schemas
+
+---
+
+# Real-Life Analogy
+
+Think of OpenAPI as a building blueprint.
+
+```text
+Building Construction Analogy:
+
+Architect creates blueprint
+  |
+  v
+Blueprint specifies:
+  - Room dimensions
+  - Wall materials
+  - Electrical positions
+
+Builders follow blueprint strictly
+  |
+  v
+Inspector validates against blueprint
+```
+
+| Construction | Kubernetes |
+| :--- | :--- |
+| Architect | Kubernetes API designers |
+| Blueprint | OpenAPI Specification |
+| Builder | Client submitting YAML |
+| Inspector | API Server schema validator |
+| Building code | Validation rules (required fields, data types) |
+
+Just as a building inspector rejects walls that violate the blueprint, the API Server rejects manifests that violate the OpenAPI schema.
+
+---
+
+# What is OpenAPI?
+
+OpenAPI is an **industry-standard specification** for machine-readably describing REST APIs.
+
+It defines for each API resource:
+- URL endpoints and HTTP methods
+- Request body schemas (field names, types, required/optional)
+- Response schemas
+- Validation constraints (minimum/maximum, enum values, patterns)
+- Field descriptions
+
+Kubernetes uses OpenAPI to publish a complete, machine-readable description of all its resources.
+
+---
+
+# How Kubernetes Serves OpenAPI
+
+The API Server publishes the OpenAPI schema at well-known endpoints:
+
+```text
+OpenAPI v2 (legacy):
+  GET /openapi/v2
+  Returns JSON — the complete schema for all APIs
+
+OpenAPI v3 (Kubernetes 1.24+):
+  GET /openapi/v3
+  Returns per-group schemas (more efficient, spec-compliant)
+  Example: GET /openapi/v3/apis/apps/v1
+```
+
+> **Important:** OpenAPI v3 was introduced in Kubernetes 1.24 as a more complete and spec-compliant alternative to the legacy v2 endpoint. Both are served by the API Server simultaneously.
+
+---
+
+# Schema Structure
+
+Each resource in the OpenAPI spec looks like:
+
+```json
+{
+  "io.k8s.api.apps.v1.Deployment": {
+    "description": "Deployment enables declarative updates for Pods.",
+    "properties": {
+      "apiVersion": { "type": "string" },
+      "kind":       { "type": "string" },
+      "metadata":   { "$ref": "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta" },
+      "spec": {
+        "$ref": "#/definitions/io.k8s.api.apps.v1.DeploymentSpec"
+      }
+    }
+  },
+  "io.k8s.api.apps.v1.DeploymentSpec": {
+    "properties": {
+      "replicas": {
+        "description": "Number of desired pods.",
+        "type":        "integer",
+        "format":      "int32"
+      }
+    }
+  }
+}
+```
+
+This schema is the source of truth that enables:
+- Validation (must be `integer`)
+- Documentation (`kubectl explain`)
+- Autocomplete (IDE plugins read this spec)
+
+---
+
+# Schema Validation
+
+When you submit a manifest, the API Server validates it against the OpenAPI schema:
+
+```text
+kubectl apply -f deployment.yaml
+  |
+  v
+API Server decodes YAML to JSON
+  |
+  v
+Schema Validation against OpenAPI spec
+        |
+        +-- Field type check: replicas must be integer
+        |
+        +-- Required field check: spec.template required
+        |
+        +-- Enum validation: imagePullPolicy must be Always/IfNotPresent/Never
+  |
+  v
+[Pass] -> Continue to Admission
+[Fail] -> HTTP 422 Unprocessable Entity
+```
+
+### Example Validation Error
+
+You submit:
+```yaml
+spec:
+  replicas: "three"
+```
+
+The API Server returns:
+```json
+{
+  "reason": "Invalid",
+  "message": "spec.replicas: Invalid value: \"three\": must be integer"
+}
+```
+
+---
+
+# kubectl explain
+
+`kubectl explain` reads the OpenAPI schema and presents it in human-readable format.
+
+```bash
+kubectl explain deployment.spec.replicas
+```
+
+Output:
+```text
+KIND:     Deployment
+VERSION:  apps/v1
+
+FIELD:    replicas <integer>
+
+DESCRIPTION:
+     Number of desired pods. This is a pointer to distinguish between explicit
+     zero and not specified. Defaults to 1.
+```
+
+Drill deeper:
+```bash
+kubectl explain deployment.spec.template.spec.containers.resources
+```
+
+> **Important:** `kubectl explain` works entirely from the OpenAPI spec — it does not require a live cluster query for field descriptions.
+
+---
+
+# IDE Autocomplete and Validation
+
+YAML plugins (VS Code Kubernetes extension, IntelliJ YAML) download the OpenAPI spec and use it to:
+
+```text
+User types: spec:
+  |
+  v
+Plugin reads OpenAPI spec for Deployment
+  |
+  v
+Shows available fields: replicas, selector, template, strategy
+  |
+  v
+User selects: template:
+  |
+  v
+Shows nested fields: metadata, spec
+  |
+  v
+Highlights invalid values with red underline
+```
+
+This means YAML validation happens **before** you even apply the manifest.
+
+---
+
+# CRD Custom Schemas
+
+Custom Resource Definitions (CRDs) use OpenAPI v3 schemas to define validation for custom resources:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required: ["replicas"]
+            properties:
+              replicas:
+                type: integer
+                minimum: 1
+                maximum: 100
+```
+
+The API Server enforces this schema exactly the same way it enforces built-in resource schemas.
+
+---
+
+# Server-Side Validation
+
+In Kubernetes 1.25+, server-side validation was strengthened with **strict schema enforcement**:
+
+```text
+Old behavior: Unknown fields silently ignored
+New behavior: Unknown fields cause a validation warning or error
+             (depending on fieldValidation parameter)
+```
+
+```bash
+kubectl apply -f deployment.yaml --validate=strict
+```
+
+Options for `--validate`:
+- `strict` — Unknown and duplicate fields cause errors
+- `warn` — Unknown fields generate warnings but apply succeeds
+- `ignore` — No field validation (legacy behavior)
+
+---
+
+# Complete OpenAPI Request Flow
+
+```text
+kubectl explain deployment.spec.replicas
+  |
+  v
+kubectl fetches /openapi/v3 schema (cached locally)
+  |
+  v
+kubectl parses Deployment schema
+  |
+  v
+kubectl finds spec.replicas field definition
+  |
+  v
+Displays type, description, defaults
+
+kubectl apply -f manifest.yaml
+  |
+  v
+API Server decodes request body
+  |
+  v
+Validates against OpenAPI schema (type, required, enum)
+  |
+  v
+[Pass] -> Admission -> Storage
+[Fail] -> HTTP 422 with field-level error message
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. What is OpenAPI in Kubernetes?
+OpenAPI is the machine-readable specification that describes every Kubernetes API resource — its fields, types, required/optional status, and validation constraints. `kube-apiserver` publishes it at `/openapi/v2` and `/openapi/v3`.
+
+### Q2. How does `kubectl explain` know field descriptions?
+`kubectl explain` reads the OpenAPI spec served by the API Server (cached locally) and presents the schema for the requested field in human-readable format.
+
+### Q3. How does Kubernetes know `replicas` must be an integer?
+The OpenAPI schema for `DeploymentSpec` declares `replicas` as type `integer`. When a manifest is submitted, the API Server validates the field against this schema and returns HTTP 422 if the type is wrong.
+
+### Q4. What is the difference between OpenAPI v2 and v3 in Kubernetes?
+OpenAPI v2 (the legacy `/openapi/v2` endpoint) returns a single combined schema for all APIs. OpenAPI v3 (available since Kubernetes 1.24 at `/openapi/v3`) is more spec-compliant and returns per-group schemas, which is more efficient for clients that only need specific APIs.
+
+### Q5. How do CRDs use OpenAPI schemas?
+CRDs define an `openAPIV3Schema` block in their spec that declares the structure, types, required fields, and constraints for the custom resource. The API Server enforces this schema identically to built-in resources.
+
+### Q6. What does `--validate=strict` do in kubectl?
+It enables strict server-side schema validation: unknown fields and duplicate fields cause an error rather than being silently ignored or generating warnings.
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| `HTTP 422 Unprocessable Entity` | Schema validation failure | Read the error message for the offending field |
+| `kubectl explain` shows "not found" | Typo in field path or resource not installed | Check `kubectl api-resources` and field spelling |
+| IDE autocomplete not working | Kubernetes schema plugin not installed/updated | Install `YAML` + `Kubernetes` extension in VS Code |
+| CRD resource accepts invalid data | Missing `openAPIV3Schema` in CRD definition | Add schema validation to the CRD spec |
+| Unknown fields silently ignored | Old client with `--validate=ignore` | Use `--validate=strict` or `--validate=warn` |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain what OpenAPI is and why Kubernetes uses it.
+2. Describe the endpoints where Kubernetes serves its OpenAPI schema.
+3. Explain how schema validation works when `kubectl apply` is run.
+4. Explain how `kubectl explain` reads and displays field information.
+5. Explain how CRDs define custom validation using OpenAPI v3 schemas.
+6. Distinguish between OpenAPI v2 and OpenAPI v3 in Kubernetes.
+7. Describe what `--validate=strict` enforces and why it matters.
+
+---
+
+# Next Chapter
+
+**Chapter 5 — Discovery API**
+
+In the next chapter, you'll learn how Kubernetes clients dynamically discover which API groups, versions, and resources are available on a given cluster — enabling `kubectl`, operators, and dynamic clients to work without hardcoded resource lists.

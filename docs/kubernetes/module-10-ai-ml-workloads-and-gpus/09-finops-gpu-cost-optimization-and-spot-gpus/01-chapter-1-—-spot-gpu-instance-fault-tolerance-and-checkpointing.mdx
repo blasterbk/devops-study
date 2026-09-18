@@ -1,0 +1,233 @@
+---
+title: "Chapter 1 — Spot GPU Fault Tolerance & Checkpointing"
+sidebar_position: 1
+module: "Module 10.9 — FinOps & GPU Optimization"
+description: "Master FinOps GPU cost optimization on Kubernetes — saving 70% with Spot GPU instances, 2-minute interruption handling, automated PyTorch S3 checkpointing, and elastic training resumption."
+---
+
+# Chapter 1 — Spot GPU Fault Tolerance & Checkpointing
+
+> **Goal:** Master cloud GPU cost reduction, interruption resilience, and automated disaster recovery for deep learning workloads using **Spot / Preemptible GPU Instances** — slashing multi-GPU training infrastructure costs by **60% to 75%**, capturing cloud **2-Minute Node Termination Warnings**, executing rapid in-flight **PyTorch / TorchElastic Checkpointing** to Amazon S3, and orchestrating zero-loss training resumption.
+>
+> By the end of this chapter, you will understand:
+> 1. The FinOps financial economics: On-Demand ($32/hr) vs Spot ($9/hr) 8x H100 GPU compute
+> 2. How AWS Node Termination Handler and Karpenter intercept 120-second eviction notices
+> 3. How PyTorch `SIGTERM` handlers flush active training optimizer states to S3 in under 60 seconds
+> 4. How TorchElastic (`torchrun`) coordinates elastic worker rendezvous and state resumption
+> 5. How to mix On-Demand head nodes with 100% Spot worker node pools in KubeRay
+> 6. How to author production Spot-tolerant PyTorchJob and RayCluster manifests
+
+---
+
+## Real-Life Analogy
+
+Think of running distributed AI training on Spot GPU instances as **booking 75% discounted standby first-class airline seats with an automated parachute and luggage ejection system**:
+
+- **The Expensive On-Demand Ticket (The \$10,000 Guaranteed Seat):** You book a private jet to fly from New York to London (**An On-Demand 8x H100 GPU instance at \$32.00/hour = \$23,000/month**). It is guaranteed never to be interrupted, but your company burns through its entire annual AI budget in 2 months.
+- **The Spot Instance Standby Seat (The \$2,500 Discount Ticket - 75% Savings):** The airline sells you the exact same first-class seat for **\$8.00/hour (75% discount!)**.
+  - The catch: If a full-paying VIP passenger arrives at the gate, the airline gives you a **2-minute warning** before they take your seat (**Cloud Spot Interruption Notice**).
+- **The 2-Minute Automated Checkpoint & Ejection Protocol:**
+  - When the 2-minute siren sounds (**AWS EC2 Metadata: `instance-action: terminate`**), the AI training process does **not** panic and lose 4 days of mathematical progress.
+  - The training script pauses the neural network, packs the current mathematical weights and optimizer states into an encrypted digital suitcase, and drops it into a secure cloud mountain vault (**Flushes PyTorch Checkpoint to Amazon S3 in 45 seconds**).
+  - The server shuts down. 3 minutes later, your orchestrator (**Karpenter / Ray**) books a new discounted standby seat on another plane, downloads the suitcase from S3, and resumes training from the exact same step!
+
+---
+
+## Architecture Diagram
+
+```text
+               Spot GPU Interruption & Elastic Checkpoint Resumption Flow
+
+ AWS CLOUD / SPOT POOL (Issues 2-Minute Spot Interruption Warning Event)
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 1. AWS EventBridge: `EC2 Spot Instance Interruption Warning`
+                    ▼
+ KARPENTER / AWS NODE TERMINATION HANDLER (NTH)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Intercepts warning ──► Cordons Node (`kubectl cordon`)              │
+ │ 2. Sends `SIGTERM` signal to all running GPU Training Pods!             │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 2. 120-Second Eviction Grace Period Countdown
+                    ▼
+ SPOT GPU TRAINING POD (NVIDIA H100 - `SIGTERM` Handler Intercepted)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Halts current training step iteration                               │
+ │ 2. Captures PyTorch model weights + Adam optimizer state               │
+ │ 3. Streams checkpoint: `s3://ai-checkpoints/llama3/epoch-14.pt`        │
+ │ 4. Completes upload in 42 seconds! ──► Exits gracefully with code 0   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 3. Spot Instance Terminated by AWS
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KARPENTER PROVISIONS FRESH REPLACEMENT SPOT GPU NODE                   │
+ │ ──► `torchrun` discovers new node, downloads S3 checkpoint, & RESUMES! │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## FinOps Economics: On-Demand vs Spot GPU Clusters
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Cost & Billing Metric     │ On-Demand 8x H100 Node Pool     │ Spot / Preemptible GPU Pool     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Hourly Rate (8x H100)** │ **\$32.77 / hour**              │ **\$9.83 / hour (70% Savings!)**│
+ │ **Monthly Bill (1 Node)** │ **\$23,594 / month**            │ **\$7,077 / month**             │
+ │ **Annual Cost (10 Nodes)**│ **\$2,831,280 / year**          │ **\$849,240 / year**            │
+ │ **Net Financial Savings** │ Baseline                        │ **Save \$1.98 Million / Year!** │
+ │ **Interruption Frequency**│ 0% interruptions.               │ 5% – 15% interruptions / week.  │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## 1. Automated PyTorch `SIGTERM` Checkpoint Handler
+
+Embed this graceful termination handler inside your Python AI training script:
+
+```python
+import signal
+import sys
+import torch
+import boto3
+
+s3_client = boto3.client('s3')
+interrupted = False
+
+def handle_sigterm(signum, frame):
+    global interrupted
+    print("🚨 [ALERT] Received SIGTERM (Spot Interruption Warning)! Flushing checkpoint to S3...")
+    interrupted = True
+
+# Register the OS SIGTERM signal handler
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+def train_loop(model, optimizer, epoch, dataloader):
+    for step, batch in enumerate(dataloader):
+        # Normal training step...
+        loss = train_step(model, batch)
+        
+        # Check if Spot Interruption signal was received
+        if interrupted:
+            checkpoint = {
+                'epoch': epoch,
+                'step': step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }
+            torch.save(checkpoint, "/tmp/emergency_checkpoint.pt")
+            s3_client.upload_file("/tmp/emergency_checkpoint.pt", "ai-checkpoints", f"checkpoint-step-{step}.pt")
+            print(" Checkpoint uploaded to S3 successfully. Exiting cleanly.")
+            sys.exit(0)
+```
+
+---
+
+## 2. Production Spot GPU Kubernetes Pod Specification
+
+Configure `terminationGracePeriodSeconds` to match the cloud provider's 2-minute notice:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spot-llama-trainer
+  namespace: ai-training
+spec:
+  # 1. 120-Second Termination Grace Period (Matches AWS 2-minute warning!)
+  terminationGracePeriodSeconds: 120
+  
+  # 2. Tolerations and Node Selectors targeting Spot GPU pools
+  nodeSelector:
+    karpenter.sh/capacity-type: spot
+    nvidia.com/gpu.product: NVIDIA-H100-SXM5-80GB
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "spot"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+      
+  containers:
+  - name: trainer
+    image: nvcr.io/nvidia/pytorch:24.04-py3
+    command: ["python", "train_with_checkpoint.py"]
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+        memory: "256Gi"
+        cpu: "64"
+```
+
+---
+
+## Hybrid Cluster Architecture: Stable Head + Spot Workers
+
+```text
+ The Golden Architecture for Cost-Optimized AI Infrastructure:
+ 1. Ray Head Node / MLflow Server: Run on cheap ON-DEMAND CPU nodes ($0.15/hr).
+    - Guarantees control-plane stability and prevents metadata loss.
+ 2. Ray GPU Worker Pool: Run 100% on SPOT GPU instances ($9.00/hr).
+    - If 2 worker nodes are interrupted, Ray scales them down, provisions 2 new Spot nodes, 
+      and resumes training without dropping the Head Node session!
+```
+
+---
+
+## Hands-On Lab: Simulating a Spot GPU Interruption
+
+```bash
+# Step 1: Query all Spot GPU nodes active in the cluster
+kubectl get nodes -l karpenter.sh/capacity-type=spot -o custom-columns=NAME:.metadata.name,INSTANCE_TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,ZONE:.metadata.labels.topology\.kubernetes\.io/zone 2>/dev/null || echo "Spot GPU nodes active"
+
+# Step 2: Simulate a Spot Interruption by sending SIGTERM to a training pod
+# kubectl delete pod spot-llama-trainer --grace-period=120
+
+# Step 3: Inspect pod logs to verify checkpoint flushing to S3
+# kubectl logs spot-llama-trainer | grep "SIGTERM"
+
+# Step 4: Verify emergency checkpoint existence in S3 bucket
+# aws s3 ls s3://ai-checkpoints/
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How much money can an enterprise save by running AI/ML workloads on Spot GPU instances?**
+
+Running AI training workloads on Spot (AWS) or Preemptible (GCP) GPU instances provides **60% to 75% cost reductions** compared to on-demand pricing. For an 8x NVIDIA H100 node, on-demand costs approximately **\$32.77/hour (\$23,500/month)**, whereas Spot pricing averages **\$9.83/hour (\$7,000/month)**. For an enterprise operating a fleet of 20 GPU nodes, this represents over **\$3.9 million in annual infrastructure savings**.
+
+**Q2: What happens when a cloud provider reclaims a Spot GPU instance, and how is it detected?**
+
+When cloud capacity is needed by on-demand customers, the cloud provider issues a **2-Minute Termination Warning** via cloud metadata APIs (e.g. AWS EC2 metadata `http://169.254.169.254/latest/meta-data/spot/instance-action` or EventBridge). Tools like **AWS Node Termination Handler (NTH)** or **Karpenter** intercept this event instantly, mark the Kubernetes node as `Cordoned` (preventing new pods), and send a `SIGTERM` signal to all running pods with a `120-second` grace period.
+
+**Q3: How does PyTorch handle distributed training resumption after a Spot node is interrupted?**
+
+Using **TorchElastic (`torchrun`)**:
+1. When a Spot worker node is terminated, the remaining worker processes detect the lost TCP connection.
+2. `torchrun` halts the current training epoch.
+3. Once the cluster autoscaler (Karpenter) provisions a replacement Spot GPU node, `torchrun` performs an automated **Rendezvous** handshake over etcd or c10d.
+4. All worker processes synchronize and reload the latest saved model weights and Adam optimizer states from S3, resuming training with zero human intervention.
+
+**Q4: Why should the Ray Head Node always run on an On-Demand instance while Worker Nodes run on Spot?**
+
+The **Ray Head Node** runs the Global Control Store (GCS), the API server, the Raylet scheduler, and the active task lineage graph. If the Head Node is terminated, the entire distributed Ray session dies, and all active worker state is permanently lost. Running the lightweight Head Node on an inexpensive **On-Demand CPU instance (\$0.15/hour)** guarantees control-plane permanence, while placing the expensive **GPU Worker nodes on Spot (\$9.00/hour)** provides massive cost savings with complete fault tolerance.
+
+**Q5: What is the risk of setting `terminationGracePeriodSeconds` to less than 120 seconds on a Spot GPU training pod?**
+
+Saving large LLM model checkpoints (e.g. a 70B parameter model in FP16 is 140GB) requires streaming gigabytes of tensor data to Amazon S3. If `terminationGracePeriodSeconds` is set to the default of `30 seconds`, Kubernetes will forcefully send a `SIGKILL` after 30 seconds while the S3 upload is only partially complete, **corrupting the checkpoint file and wasting the previous hours of training progress**. Setting `terminationGracePeriodSeconds: 120` gives the pod the full 2-minute cloud warning window to complete the upload safely.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Spot GPU instances deliver 60%–75% cloud compute cost savings
+- [ ] Know that cloud providers issue a 2-minute (120s) interruption notice
+- [ ] Know how `SIGTERM` handlers flush PyTorch checkpoints to S3 before termination
+- [ ] Know that `terminationGracePeriodSeconds: 120` is mandatory for Spot training pods
+- [ ] Know that TorchElastic (`torchrun`) automatically resumes training from S3 checkpoints
+- [ ] Know the pattern: Stable On-Demand Head Node + 100% Spot GPU Worker Nodes

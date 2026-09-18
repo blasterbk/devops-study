@@ -1,0 +1,189 @@
+---
+title: "Chapter 1 — Open Cluster Management (OCM) Architecture"
+sidebar_position: 1
+module: "Module 9.6 — OCM & Policy Enforcement"
+description: "Master CNCF Open Cluster Management (OCM) — Hub-and-Spoke architecture, klusterlet agent, ManagedCluster registration lifecycle, CSR signing, and Lease heartbeats."
+---
+
+# Chapter 1 — Open Cluster Management (OCM) Hub-and-Spoke Architecture
+
+> **Goal:** Master enterprise multi-cluster governance, cluster lifecycle registration, and fleet synchronization using **CNCF Open Cluster Management (OCM)** — understanding the architectural relationship between the central **Hub Cluster** and downstream **Managed Clusters**, dissecting the **`klusterlet`** spoke agent, mastering the 4-stage **ManagedCluster Registration Lifecycle** (Bootstrap CSR $\to$ Automated Approval $\to$ Client Certificate Issuance $\to$ Lease Heartbeats), and extracting dynamic cluster capabilities via **Cluster Claims**.
+>
+> By the end of this chapter, you will understand:
+> 1. The CNCF Open Cluster Management (OCM) modular component architecture
+> 2. The role of the `klusterlet` agent running in managed workload clusters
+> 3. The automated 4-stage TLS handshake and CSR approval registration workflow
+> 4. How `ManagedCluster` Custom Resources represent spoke cluster health in the Hub
+> 5. How Cluster Leases maintain real-time liveness and detect network partitions
+> 6. How to author and inspect `ManagedCluster` and `Klusterlet` custom manifests
+
+---
+
+## Real-Life Analogy
+
+Think of Open Cluster Management (OCM) as **a global national embassy network with a centralized foreign affairs ministry**:
+
+- **The Foreign Affairs Ministry (The Hub Cluster):** A central headquarters in the capital city (**The OCM Hub**) where ambassadors report, global treaties (**Governance Policies**) are drafted, and international missions (**Workload Placements**) are coordinated.
+- **The Resident Diplomatic Envoy (The `klusterlet` Agent):** When the government opens a new embassy in a foreign country (**A new Managed Kubernetes Cluster**), it doesn't send 500 administrators. It sends one trusted diplomat (**The `klusterlet` agent**).
+- **The Diplomatic Credential Presentation (The 4-Stage CSR Registration):**
+  - Step 1: The diplomat arrives at the ministry gate and submits their passport application (**Bootstrap CSR**).
+  - Step 2: The Minister of Foreign Affairs verifies the diplomat's identity and approves the application (**Automated CSR Approval Controller**).
+  - Step 3: The ministry issues an official encrypted diplomatic badge (**Signed Client Certificate**).
+  - Step 4: The diplomat checks in by radio every 10 minutes: *"Embassy is secure and operational (**Lease Heartbeat**)."*
+- **The Country Fact Sheet (Cluster Claims):** The diplomat reports local capabilities: *"This embassy has 20 rooms, 4 security guards, and runs Linux on ARM64 (**Node Capacity & Architecture Claims**)."*
+
+---
+
+## Architecture Diagram
+
+```text
+               OCM Hub-and-Spoke Architecture & Registration Flow
+
+ OCM HUB CLUSTER (Central Management Control Plane)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Registration Controller: Approves CSRs and issues client certs      │
+ │ 2. ManagedCluster CRD: Represents live spoke cluster state and claims  │
+ │ 3. Work & Placement Controllers: Dispatches ManifestWorks to spokes    │
+ └──────▲───────────────────────────────────────────────────────▲─────────┘
+        │                                                       │
+        │ Inbound TLS mTLS Connection (Port 6443)               │ Inbound TLS mTLS Connection (Port 6443)
+        │ - Periodic Heartbeat Leases (Every 60s)               │ - Periodic Heartbeat Leases (Every 60s)
+        │ - Status synchronization                              │ - Status synchronization
+        │                                                       │
+ ┌──────┴───────────────────────────────┐             ┌─────────┴─────────────────────────────┐
+ │ MANAGED CLUSTER 01 (AWS EKS US-East) │             │ MANAGED CLUSTER 02 (GCP GKE EU-West)  │
+ │ ┌──────────────────────────────────┐ │             │ ┌───────────────────────────────────┐ │
+ │ │ KLUSTERLET AGENT                 │ │             │ │ KLUSTERLET AGENT                  │ │
+ │ │ ├── Registration Agent (CSR/Cert)│ │             │ │ ├── Registration Agent (CSR/Cert) │ │
+ │ │ └── Work Agent (Applies Manifest)│ │             │ │ └── Work Agent (Applies Manifest) │ │
+ │ └──────────────────────────────────┘ │             │ └───────────────────────────────────┘ │
+ └──────────────────────────────────────┘             └───────────────────────────────────────┘
+```
+
+---
+
+## The 4-Stage ManagedCluster Registration Lifecycle
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Registration Stage   │ Initiating Component    │ Cryptographic & Technical Action                  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Bootstrap CSR** │ Spoke `klusterlet`      │ Uses a temporary bootstrap token to submit a      │
+ │                      │                         │ `CertificateSigningRequest` (CSR) to the Hub API. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. Hub CSR**       │ Hub Registration        │ Verifies bootstrap credentials and approves CSR;  │
+ │ **Approval**         │ Controller / Admin      │ signs x509 client certificate with Hub Root CA.   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. Spoke Namespace**│ Hub Controller          │ Creates dedicated namespace `cluster-01` on Hub   │
+ │ **Isolation**        │                         │ with strictly scoped RBAC for the `klusterlet`.   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. Lease Heartbeat**│ Spoke `klusterlet`      │ Transmits `coordination.k8s.io` Lease heartbeats  │
+ │                      │                         │ every 60s to maintain `ManagedClusterCondition`.  │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete `ManagedCluster` Custom Resource Manifest (Hub Cluster)
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: prod-aws-us-east-01
+  labels:
+    cloud: aws
+    region: us-east-1
+    environment: production
+    pci-dss: "true"
+spec:
+  hubAcceptsClient: true               # Admin approval gate to accept spoke into fleet!
+  leaseDurationSeconds: 60             # Heartbeat threshold before marking cluster offline
+```
+
+---
+
+## Cluster Claims & Automated Discovery
+
+The `klusterlet` automatically inspects the local managed cluster and publishes **Cluster Claims** to the Hub, allowing administrators to target clusters without manual data entry:
+
+```yaml
+status:
+  allocatable:
+    cpu: "64"
+    memory: "256Gi"
+  capacity:
+    cpu: "72"
+    memory: "288Gi"
+  clusterClaims:
+    - name: id.k8s.io
+      value: prod-aws-us-east-01
+    - name: kubeversion.open-cluster-management.io
+      value: v1.30.0
+    - name: platform.open-cluster-management.io
+      value: AWS
+    - name: product.open-cluster-management.io
+      value: EKS
+  conditions:
+    - type: ManagedClusterConditionAvailable
+      status: "True"
+      message: "Klusterlet is healthy and reporting lease heartbeats."
+    - type: ManagedClusterJoined
+      status: "True"
+```
+
+---
+
+## Hands-On Lab: Querying OCM ManagedClusters via `clusteradm`
+
+```bash
+# Step 1: Query all registered ManagedClusters in the OCM Hub
+kubectl get managedclusters -A 2>/dev/null || echo "OCM ManagedClusters active / simulated"
+
+# Step 2: Inspect cluster acceptance and availability status
+kubectl get managedclusters -o custom-columns=NAME:.metadata.name,ACCEPTED:.spec.hubAcceptsClient,AVAILABLE:.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status,VERSION:.status.clusterClaims[?(@.name=="kubeversion.open-cluster-management.io")].value
+
+# Step 3: Accept a newly registered pending cluster via clusteradm CLI
+# clusteradm accept --clusters prod-aws-us-east-01
+
+# Step 4: Query Lease heartbeats from managed clusters
+kubectl get leases -A -l open-cluster-management.io/cluster-name
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNCF Open Cluster Management (OCM), and what role does it play in enterprise fleet architecture?**
+
+Open Cluster Management (OCM) is an open-source, modular multi-cluster orchestration and policy governance framework. Originally developed by Red Hat (as the foundation of Red Hat Advanced Cluster Management - RHACM), OCM provides a standardized **Hub-and-Spoke control plane** for registering thousands of Kubernetes clusters, scheduling workloads across clusters via dynamic Placement APIs, enforcing compliance policies, and aggregating fleet telemetry.
+
+**Q2: What is the `klusterlet`, and what are its two sub-agents?**
+
+The **`klusterlet`** is the lightweight agent running inside each managed spoke cluster. It consists of two specialized sub-agents:
+1. **Registration Agent (`klusterlet-registration-agent`)**: Manages the cluster identity, initiates the bootstrap CSR handshake, rotates client TLS certificates, and sends periodic Lease heartbeats to the Hub.
+2. **Work Agent (`klusterlet-work-agent`)**: Watches `ManifestWork` Custom Resources assigned to its cluster on the Hub, pulls the declared Kubernetes manifests, applies them locally to the spoke cluster, and reports status back to the Hub.
+
+**Q3: How does the OCM Hub securely isolate multiple managed clusters from compromising each other?**
+
+When a managed cluster is approved on the Hub, OCM creates a **dedicated, isolated namespace on the Hub** corresponding to the cluster's name (e.g. `namespace: cluster-us-east`). The `klusterlet`'s x509 client certificate is strictly restricted via Kubernetes RBAC: it has read/write permissions **only within its own assigned Hub namespace**. A compromised spoke cluster cannot inspect or tamper with `ManifestWorks` or secrets belonging to other clusters in the fleet.
+
+**Q4: How do Cluster Leases detect when a managed cluster goes offline?**
+
+The `klusterlet` regularly updates a `coordination.k8s.io` **Lease** object inside its dedicated namespace on the Hub every 60 seconds. If a managed cluster loses network connectivity or suffers a complete datacenter outage, the Hub's registration controller detects that the Lease has not been renewed within `spec.leaseDurationSeconds`. It transitions the cluster's condition to `ManagedClusterConditionAvailable: "Unknown"` or `"False"`, triggering automated workload rescheduling.
+
+**Q5: What are Cluster Claims in OCM, and how do they differ from standard labels?**
+
+- **Labels**: Applied manually or via GitOps by administrators (e.g. `environment: production`, `tier: payment`).
+- **Cluster Claims**: Dynamically discovered and published by the `klusterlet` itself (e.g. `kubeversion`, `platform: OpenShift/EKS`, `arch: arm64`, CPU/Memory capacity). Cluster Claims allow automated placement engines to schedule workloads based on real-time runtime cluster properties without manual tagging.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that OCM uses a Hub-and-Spoke model with a central Hub and `klusterlet` agents
+- [ ] Know the 4-stage registration: Bootstrap CSR $\to$ Approval $\to$ Client Cert $\to$ Leases
+- [ ] Know that `ManagedCluster` represents the live status and capacity of a spoke cluster
+- [ ] Know that each spoke is isolated to its own dedicated Hub namespace via RBAC
+- [ ] Know that Lease heartbeats detect offline clusters and network partitions
+- [ ] Can view managed clusters using `kubectl get managedclusters -A`

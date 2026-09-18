@@ -1,0 +1,211 @@
+---
+title: "Chapter 2 — Images, Runtimes & Registries Trinity"
+sidebar_position: 2
+module: "Module 1.2 — Container Architecture"
+description: "Master the cloud-native container triumvirate — immutable layered images, OCI distribution registries, high-level runtimes (containerd/CRI-O), and low-level runtimes (runc/crun)."
+---
+
+# Chapter 2 — Images, Runtimes & Registries Trinity
+
+> **Goal:** Master the tripartite operational and architectural engine powering all cloud-native container ecosystems — dissecting the symbiotic relationship between **Immutable Layered Images (The Artifact)**, **OCI Distribution Registries (The Supply Chain)**, and **Container Runtimes (The Execution Engine)**, and distinguishing between **High-Level Runtimes** (`containerd`, `CRI-O`) and **Low-Level OCI Runtimes** (`runc`, `crun`).
+>
+> By the end of this chapter, you will understand:
+> 1. How the three pillars (Image $\to$ Registry $\to$ Runtime) interoperate to run containers
+> 2. How immutable image layers are stacked, hashed via SHA-256, and deduplicated
+> 3. How OCI registries store manifests and binary blob tarballs content-addressably
+> 4. The architectural distinction between High-Level Runtimes and Low-Level OCI Runtimes
+> 5. How `runc` consumes an unpacked OCI rootfs bundle and `config.json` to spawn processes
+> 6. How to dissect an image tarball into its raw layers and configuration JSON files
+
+---
+
+## Real-Life Analogy
+
+Think of the Container Trinity (Image, Registry, Runtime) as **a global gourmet meal delivery service**:
+
+- **1. The Immutable Recipe & Frozen Ingredients (`Container Image`):**
+  - A world-class master chef creates a recipe for lasagna (**The Image Config JSON**).
+  - The chef freezes 3 separate ingredient packages: Layer 1 is pasta dough, Layer 2 is tomato sauce, Layer 3 is cheese (**Immutable Layer Tarballs**).
+  - Each layer is stamped with a unique cryptographic barcode (**Content-Addressable SHA-256 Digest**).
+- **2. The Global Distribution Supermarket (`Container Registry`):**
+  - The chef uploads the recipe and frozen ingredient boxes to a global cold-storage warehouse (**Docker Hub / GitHub Container Registry / Harbor**).
+  - When 1,000 restaurants order the cheese layer (**`docker pull`**), the warehouse delivers the exact same cached cheese box to everyone without re-making it (**Content Addressable Deduplication**).
+- **3. The Kitchen Operations (`High-Level vs Low-Level Runtimes`):**
+  - **The Restaurant Executive Chef (`High-Level Runtime: containerd`):** Takes the order over the phone, drives to the warehouse, downloads the 3 ingredient boxes, unpacks them on the kitchen counter, and configures the kitchen timers.
+  - **The High-Heat Oven (`Low-Level Runtime: runc`):** The executive chef hands the assembled lasagna dish to the high-heat oven (**`runc`**). The oven executes the physical cooking (**Calls Linux kernel `clone()` and `pivot_root()`**) and serves the hot meal (**The Running Container Process**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               The Container Trinity: Image ──► Registry ──► Runtime ──► Process
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. BUILD TIME: Developer runs `docker build`                           │
+ │    - Produces Immutable OCI Image (Layers + Config JSON + Manifest)    │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ `docker push` (Uploads SHA-256 Tarball Blobs)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. DISTRIBUTION: OCI Container Registry (GHCR / Docker Hub / Harbor)   │
+ │    - Stores Manifest: Maps image tags to Layer Digests                 │
+ │    - Stores Blob Store: Content-addressable layer tarballs             │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ `docker pull` / CRI PullImage
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. HIGH-LEVEL RUNTIME (`containerd` / `CRI-O` / `dockerd`)             │
+ │    - Pulls and verifies cryptographic SHA-256 layer hashes             │
+ │    - Unpacks layers using Snapshotter (OverlayFS) into Rootfs Bundle   │
+ │    - Generates OCI `config.json` specification                         │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Invokes `runc create` / `runc start`
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 4. LOW-LEVEL OCI RUNTIME (`runc` / `crun`)                             │
+ │    - Calls Linux kernel `clone()` to create new Namespaces             │
+ │    - Configures cgroups in `/sys/fs/cgroup/`                           │
+ │    - Calls `pivot_root()` to lock process in container rootfs          │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Spawns Containerized Process
+                    ▼
+ [ 5. RUNNING LINUX PROCESS: Isolated, constrained, and executing! ]
+```
+
+---
+
+## The Container Trinity Pillars
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Trinity Component    │ Industry Standards      │ Primary Systems Responsibility                    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Image**         │ OCI Image Specification │ **The Static Artifact.** Immutable, content-      │
+ │                      │ (`image-spec`)          │ addressable tarball layers + metadata JSON.       │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. Registry**      │ OCI Distribution Spec   │ **The Supply Chain.** HTTP REST API for pushing,  │
+ │                      │ (`distribution-spec`)   │ pulling, and deduplicating image layers by digest.│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. High-Level**    │ CNCF `containerd`,      │ **The Orchestration Engine.** Image pulling,      │
+ │ **Runtime**          │ Red Hat `CRI-O`         │ storage snapshotting, network setup, & lifecycle. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. Low-Level**     │ OCI Runtime Spec,       │ **The Kernel Execution Tool.** Directly interfaces│
+ │ **Runtime**          │ `runc`, `crun`, `youki` │ with Linux syscalls (namespaces, cgroups, rootfs).│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## High-Level vs Low-Level Container Runtimes
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Architectural Dimension   │ High-Level Runtime (containerd) │ Low-Level Runtime (runc)        │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Primary Purpose**       │ Image management, pulling,      │ Pure kernel container execution │
+ │                           │ networking, and lifecycle.      │ (Namespaces + cgroups setup).   │
+ │ **Process Longevity**     │ Long-running system daemon.     │ **Ephemeral CLI tool.** Runs for│
+ │                           │                                 │ 50ms, spawns process, & exits.  │
+ │ **API Interface**         │ gRPC API (`CRI` / containerd)   │ OCI Command Line (`runc start`) │
+ │ **Network Management**    │ Yes (Interfaces with CNI).      │ **No.** Runc knows zero network.│
+ │ **Image Storage & Pull**  │ Yes (Snapshotters + Blobs).     │ **No.** Expects pre-unpacked dir│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Anatomy of an Unpacked OCI Container Bundle
+
+When a high-level runtime prepares to run an image, it converts the image into an **OCI Runtime Bundle** on disk:
+
+```text
+/run/containerd/io.containerd.runtime.v2.task/default/my-container/
+├── config.json                        # OCI Runtime Configuration (Namespaces, cgroups, env)
+└── rootfs/                            # Unpacked merged root filesystem
+    ├── bin/
+    │   └── busybox
+    ├── etc/
+    ├── lib/
+    ├── proc/
+    └── usr/
+```
+
+---
+
+## Hands-On Lab: Dissecting an OCI Image into Raw Layers
+
+```bash
+# Step 1: Pull an image from registry
+docker pull alpine:3.19.1
+
+# Step 2: Export the raw image to a local tar archive
+mkdir -p /tmp/image-dissect && cd /tmp/image-dissect
+docker save alpine:3.19.1 -o image.tar
+
+# Step 3: Extract the raw image archive contents
+tar -xvf image.tar
+
+# Step 4: Inspect the image manifest JSON
+cat manifest.json | jq .
+
+# Notice the structure:
+# [
+#   {
+#     "Config": "054a09e0236a...",
+#     "RepoTags": ["alpine:3.19.1"],
+#     "Layers": ["blobs/sha256/4abcf20661432fb2d719..."]
+#   }
+# ]
+
+# Step 5: Unpack the actual rootfs layer tarball!
+mkdir -p rootfs
+tar -xvf blobs/sha256/$(jq -r '.[0].Layers[0]' manifest.json | cut -d'/' -f3) -C rootfs/
+
+# Step 6: Verify the rootfs contains the standard Linux filesystem tree
+ls -la rootfs/
+# (Contains /bin, /etc, /lib, /usr — pure Linux root filesystem!)
+
+# Cleanup
+cd /tmp && rm -rf /tmp/image-dissect
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the architectural difference between a High-Level Container Runtime and a Low-Level OCI Runtime?**
+
+- **High-Level Runtime (`containerd`, `CRI-O`)**: A persistent system daemon responsible for the complete container lifecycle management. It downloads container images from registries over the network, unpacks layered tarballs using storage snapshotters (OverlayFS), configures container networking interfaces via CNI, and manages container I/O streams.
+- **Low-Level Runtime (`runc`, `crun`)**: An ephemeral, command-line executable implementing the OCI Runtime Specification. It takes a pre-unpacked root filesystem directory and a `config.json` file, makes direct Linux kernel system calls (`clone()`, `unshare()`, `pivot_root()`) to configure namespaces and cgroups, spawns the user process, and immediately terminates.
+
+**Q2: How does Content-Addressable Storage work in container images and registries?**
+
+In OCI images, every layer and configuration file is named after the **SHA-256 cryptographic hash of its binary contents** (e.g. `sha256:4abcf206...`). This provides two critical benefits: (1) **Immutability and Integrity**: If a single byte in a layer is corrupted or tampered with, its computed SHA-256 hash changes, and the runtime rejects it; (2) **Deduplication**: If 20 different application images all build on `ubuntu:22.04`, the host and registry store the Ubuntu base layer tarball **only once**, saving gigabytes of disk space and network bandwidth.
+
+**Q3: What are the three foundational specifications defined by the Open Container Initiative (OCI)?**
+
+1. **OCI Image Specification (`image-spec`)**: Defines the format, JSON schemas, and media types for container image manifests, image indexes (multi-arch), and layer tarballs.
+2. **OCI Runtime Specification (`runtime-spec`)**: Defines the configuration (`config.json`), filesystem bundle structure, and lifecycle state transitions required to run a container.
+3. **OCI Distribution Specification (`distribution-spec`)**: Defines the standard HTTP REST API protocols for pushing, pulling, and discovering content-addressable container image blobs and manifests across registries.
+
+**Q4: What is an "OCI Runtime Bundle"?**
+
+An OCI Runtime Bundle is a standardized directory structure on disk that contains everything needed by a low-level runtime (`runc`) to execute a container. It consists of exactly two components:
+1. **`rootfs/`**: A directory containing the fully unpacked, layered root filesystem of the container.
+2. **`config.json`**: A declarative JSON configuration file specifying the process arguments, environment variables, Linux namespaces to create, cgroup limits, and security capabilities.
+
+**Q5: Why did Kubernetes deprecate `dockershim` in favor of direct CRI runtimes like `containerd`?**
+
+In early Kubernetes versions, Kubelet communicated with Docker through an internal translation layer called `dockershim`. The execution path was inefficient: `kubelet` $\to$ `dockershim` $\to$ `dockerd` $\to$ `containerd` $\to$ `containerd-shim` $\to$ `runc`. Docker daemon introduced unnecessary overhead (managing its own network bridges and volume systems redundant to Kubernetes). Deprecating `dockershim` allowed Kubelet to communicate directly with **`containerd` or `CRI-O` via the standardized Container Runtime Interface (CRI)**, reducing memory overhead, latency, and operational complexity.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the Trinity: Image (Artifact), Registry (Supply Chain), Runtime (Execution)
+- [ ] Know that images use SHA-256 content-addressable hashes for deduplication
+- [ ] Know the difference: High-Level (`containerd`) vs Low-Level (`runc`) runtimes
+- [ ] Know that an OCI Bundle consists of `rootfs/` + `config.json`
+- [ ] Know the 3 OCI Specs: Image Spec, Runtime Spec, Distribution Spec
+- [ ] Can inspect an image's internal layers using `docker save` and `tar -xvf`

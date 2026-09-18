@@ -1,0 +1,334 @@
+---
+title: "Chapter 4 — Rollbacks, Pause & Revision History"
+sidebar_position: 4
+module: "Module 3.2 — Deployments & ReplicaSets"
+description: "Master Kubernetes Deployment revision management — rollout history internals, undo mechanics, revisionHistoryLimit pruning, change-cause annotations, and rollout restart triggers."
+---
+
+# Chapter 4 — Deployment Rollbacks, Pause & Revision History
+
+> **Goal:** Master the release engineering and rollback mechanisms of Kubernetes Deployments — understanding how `deployment.kubernetes.io/revision` tracks release history across child ReplicaSets, how `kubectl rollout undo` executes point-in-time rollbacks, how `revisionHistoryLimit` manages etcd storage, and how `kubectl rollout restart` triggers zero-downtime rolling refreshes.
+>
+> By the end of this chapter, you will understand:
+> 1. How the Deployment controller tracks revision numbers in `deployment.kubernetes.io/revision`
+> 2. What `kubectl rollout undo` actually does to underlying ReplicaSets
+> 3. How to inspect and revert to specific historical revisions using `--to-revision=N`
+> 4. How `revisionHistoryLimit` automatically prunes inactive ReplicaSets
+> 5. How to properly document release reasons using the `kubernetes.io/change-cause` annotation
+> 6. How `kubectl rollout restart` forces rolling pod restarts without changing application images
+
+---
+
+## Real-Life Analogy
+
+Think of Deployment revisions as **Git commit snapshots of your infrastructure**:
+
+- **The Git Repository (The Deployment & ReplicaSets):** Every time you push a code update that modifies the Deployment's `.spec.template` (image tag, env var, secret mount), Kubernetes commits a new snapshot by creating a new **ReplicaSet stamped with a Revision Number** (`Revision 1`, `Revision 2`, `Revision 3`).
+- **Old Commit History (`revisionHistoryLimit`):** You don't delete old commits; you keep the last 10 snapshots around with 0 running workers just in case you need to revert.
+- **`git revert` (`kubectl rollout undo`):** If Revision 3 starts throwing errors in production, you don't rewrite code under pressure. You tell the controller: *"Roll back to Revision 2!"* The controller looks at the template stored in the old ReplicaSet from Revision 2, creates Revision 4 containing that exact template, and executes a zero-downtime rolling update back to safety.
+
+---
+
+## Architecture Diagram
+
+```text
+           Deployment Revision History & Rollback Mechanics
+
+ 1. Release History (Stored as inactive ReplicaSets scaled to 0):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Deployment: payment-api                                                │
+ │ Current Revision: 3 (Active)                                           │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+ ┌──────────────┐            ┌──────────────┐            ┌──────────────┐
+ │ ReplicaSet 1 │            │ ReplicaSet 2 │            │ ReplicaSet 3 │
+ │ revision: 1  │            │ revision: 2  │            │ revision: 3  │
+ │ Image: v1.0  │            │ Image: v1.1  │            │ Image: v1.2  │
+ │ Replicas: 0  │            │ Replicas: 0  │            │ Replicas: 3  │
+ └──────────────┘            └──────────────┘            └──────────────┘
+   (Inactive)                  (Inactive)                  (Active/Serving)
+
+ ─────────────────────────────────────────────────────────────────────────
+
+ 2. Operator triggers: kubectl rollout undo --to-revision=2
+ 
+ Deployment controller copies spec.template from ReplicaSet 2 
+ and creates a NEW revision (Revision 4):
+
+ ┌──────────────┐            ┌──────────────┐            ┌──────────────┐
+ │ ReplicaSet 2 │            │ ReplicaSet 3 │            │ ReplicaSet 4 │
+ │ revision: 2  │            │ revision: 3  │            │ revision: 4  │
+ │ Image: v1.1  │            │ Image: v1.2  │            │ Image: v1.1  │
+ │ Replicas: 0  │            │ Replicas: 0  │            │ Replicas: 3  │
+ └──────────────┘            └──────────────┘            └──────────────┘
+                               (Scaled Down)               (Scaled UP!)
+```
+
+---
+
+## How Kubernetes Tracks Revision History
+
+Every time a Deployment's `.spec.template` is mutated, the Deployment controller increments the revision number and annotates both the Deployment and the new child ReplicaSet with `deployment.kubernetes.io/revision`:
+
+```yaml
+# On the Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "3"
+---
+# On the active ReplicaSet
+metadata:
+  name: payment-api-7b8f94d
+  annotations:
+    deployment.kubernetes.io/revision: "3"
+```
+
+### What Constitutes a Revision Change?
+- **Triggers a new revision:** Modifying anything inside `.spec.template` (e.g., container image, CPU limits, environment variables, volume mounts, labels).
+- **Does NOT trigger a revision:** Scaling the Deployment (modifying `.spec.replicas`), changing `progressDeadlineSeconds`, or editing strategy parameters (`maxSurge`/`maxUnavailable`).
+
+---
+
+## The Rollback Mechanism: `kubectl rollout undo`
+
+When you execute a rollback:
+```bash
+# Roll back to immediate previous revision
+kubectl rollout undo deployment/payment-api
+
+# Roll back to specific historical revision
+kubectl rollout undo deployment/payment-api --to-revision=1
+```
+
+### Under the Hood:
+1. The controller retrieves the ReplicaSet matching the requested revision.
+2. It extracts the `.spec.template` from that historical ReplicaSet.
+3. It updates the Deployment's `.spec.template` with the historical spec.
+4. It increments the revision counter and applies the changes via a standard `RollingUpdate`.
+5. The historical ReplicaSet is **not** deleted; a new active ReplicaSet (or reused clean ReplicaSet) is scaled up.
+
+---
+
+## Pruning Old Revisions: `revisionHistoryLimit`
+
+Inactive ReplicaSets consume memory and storage within `etcd`. The `revisionHistoryLimit` field (default: **10**) specifies how many old, non-active ReplicaSets to retain:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-api
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5    # Keep only the last 5 inactive ReplicaSets
+  template:
+    ...
+```
+
+> [!WARNING]
+> If `revisionHistoryLimit: 0` is configured, all inactive ReplicaSets are deleted immediately upon rollout completion. This prevents you from executing any `kubectl rollout undo` commands!
+
+---
+
+## Change-Cause Annotations
+
+In production, viewing `kubectl rollout history` should display meaningful messages rather than empty `<none>` strings.
+
+```bash
+# Viewing history
+kubectl rollout history deployment/payment-api
+
+# Output:
+# REVISION  CHANGE-CAUSE
+# 1         Initial release v1.0.0
+# 2         Upgraded to v1.1.0 (Fixes payment gateway timeout)
+# 3         Applied CVE security patch (OpenSSL update)
+```
+
+### How to Populate `CHANGE-CAUSE`:
+The historical `--record` CLI flag is deprecated. The recommended modern practice is explicitly setting the `kubernetes.io/change-cause` annotation in your CI/CD pipeline or GitOps manifest:
+
+```bash
+kubectl annotate deployment/payment-api \
+  kubernetes.io/change-cause="Upgraded to v1.2.0 for Black Friday traffic" \
+  --overwrite
+```
+
+Or declare it directly in YAML:
+```yaml
+metadata:
+  annotations:
+    kubernetes.io/change-cause: "Upgraded Node.js base image to 18-alpine"
+```
+
+---
+
+## Restarting Without Image Changes: `kubectl rollout restart`
+
+Frequently, applications need to be restarted to pick up new `ConfigMap` values, rotated database credentials in `Secrets`, or fresh TLS certificates without changing the underlying image tag.
+
+Running:
+```bash
+kubectl rollout restart deployment/payment-api
+```
+
+### How It Works:
+`kubectl` injects a timestamp annotation into the Pod template:
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: "2026-08-18T13:10:00Z"
+```
+Because `.spec.template` was modified, the Deployment controller treats it as a legitimate configuration change and executes a zero-downtime `RollingUpdate` across all Pods!
+
+---
+
+## Complete Release Management Deployment Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-engine
+  namespace: finance
+  annotations:
+    kubernetes.io/change-cause: "Production Release 2.4.0 (Fixes invoice rounding bug)"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 300
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  selector:
+    matchLabels:
+      app: billing-engine
+
+  template:
+    metadata:
+      labels:
+        app: billing-engine
+    spec:
+      containers:
+      - name: engine
+        image: billing-engine:2.4.0
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+```
+
+---
+
+## Hands-On Lab: History Tracking, Rollbacks & Rolling Restarts
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace history-lab
+
+# Step 2: Deploy Version 1 with an annotated change-cause
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: history-demo
+  namespace: history-lab
+  annotations:
+    kubernetes.io/change-cause: "Initial release v1.0 (nginx 1.24)"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: history-demo
+  template:
+    metadata:
+      labels:
+        app: history-demo
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.24-alpine
+EOF
+
+# Step 3: Wait for rollout and check history
+kubectl rollout status deployment/history-demo -n history-lab
+kubectl rollout history deployment/history-demo -n history-lab
+
+# Step 4: Upgrade to Version 2 with a new change cause
+kubectl annotate deployment/history-demo -n history-lab kubernetes.io/change-cause="Upgraded to nginx 1.25" --overwrite
+kubectl set image deployment/history-demo web=nginx:1.25-alpine -n history-lab
+kubectl rollout status deployment/history-demo -n history-lab
+
+# Step 5: Upgrade to Version 3 (Simulate a broken deployment)
+kubectl annotate deployment/history-demo -n history-lab kubernetes.io/change-cause="Broken release with invalid tag" --overwrite
+kubectl set image deployment/history-demo web=nginx:invalid-tag -n history-lab
+
+# Step 6: View history showing all 3 revisions
+kubectl rollout history deployment/history-demo -n history-lab
+
+# Step 7: Inspect details of a specific revision
+kubectl rollout history deployment/history-demo -n history-lab --revision=2
+
+# Step 8: Execute point-in-time rollback back to Revision 2
+kubectl rollout undo deployment/history-demo -n history-lab --to-revision=2
+kubectl rollout status deployment/history-demo -n history-lab
+
+# Step 9: Trigger a zero-downtime rolling restart
+kubectl rollout restart deployment/history-demo -n history-lab
+kubectl rollout status deployment/history-demo -n history-lab
+
+# Step 10: Verify the injected restartedAt annotation
+kubectl get deployment history-demo -n history-lab -o yaml | grep -i "restartedAt"
+
+# Step 11: Clean up lab
+kubectl delete namespace history-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Kubernetes track historical revisions of a Deployment?**
+
+Kubernetes tracks revisions by retaining inactive child ReplicaSets in `etcd`. When `.spec.template` is updated, the Deployment controller stamps an incremented revision number (`deployment.kubernetes.io/revision`) on both the Deployment and the newly created ReplicaSet. Older ReplicaSets are scaled down to 0 replicas rather than deleted, preserving their pod templates in cluster storage up to the limit defined by `revisionHistoryLimit`.
+
+**Q2: What happens under the hood when an operator runs `kubectl rollout undo`?**
+
+`kubectl rollout undo` does not restore or reactivate the old ReplicaSet in-place. Instead, the Deployment controller reads the `.spec.template` stored inside the target historical ReplicaSet, applies that exact template configuration to the Deployment object, and increments the revision counter to generate a new revision number. It then orchestrates a standard `RollingUpdate` to transition workloads from the failing version to the restored version with zero downtime.
+
+**Q3: What does `revisionHistoryLimit` do, and what are the operational risks of setting it to 0?**
+
+`revisionHistoryLimit` defines the maximum number of inactive (scaled to 0) ReplicaSets that Kubernetes retains for a given Deployment. Setting this value prevents stale ReplicaSets from cluttering API server memory and `etcd`. However, if set to `0`, all historical ReplicaSets are immediately deleted upon rollout completion, entirely disabling the ability to use `kubectl rollout undo` or view past revisions with `kubectl rollout history`.
+
+**Q4: How does `kubectl rollout restart` force all Pods to restart without modifying application container images?**
+
+`kubectl rollout restart` modifies the Deployment manifest by injecting or updating a timestamp annotation (`kubectl.kubernetes.io/restartedAt: "<timestamp>"`) inside `.spec.template.metadata.annotations`. Because the Pod template hash has changed, the Deployment controller detects a valid configuration change and executes a standard rolling update, creating a new ReplicaSet and cycling Pods one by one without any service disruption.
+
+**Q5: Why is the `--record` flag deprecated, and what is the recommended way to set `CHANGE-CAUSE` in modern Kubernetes?**
+
+The `--record` flag was deprecated because it recorded the exact CLI command run on the terminal, which often accidentally leaked sensitive environment variables, tokens, and CLI flags into public `etcd` metadata, while also behaving unreliably in declarative GitOps workflows. The modern, recommended approach is explicitly setting the `kubernetes.io/change-cause` annotation directly in declarative YAML manifests or via `kubectl annotate deployment <name> kubernetes.io/change-cause="<message>"`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Deployment revisions are stored as inactive ReplicaSets scaled to 0
+- [ ] Know how `deployment.kubernetes.io/revision` tracks revision numbers
+- [ ] Know that `kubectl rollout undo --to-revision=N` creates a new forward revision
+- [ ] Know that `revisionHistoryLimit` controls how many old ReplicaSets are retained in etcd
+- [ ] Know that setting `revisionHistoryLimit: 0` disables `kubectl rollout undo`
+- [ ] Know how `kubernetes.io/change-cause` documents release history in `rollout history`
+- [ ] Know how `kubectl rollout restart` uses the `restartedAt` annotation to cycle Pods

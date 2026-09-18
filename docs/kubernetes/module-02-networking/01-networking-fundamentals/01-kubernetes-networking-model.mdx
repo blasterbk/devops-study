@@ -1,0 +1,262 @@
+---
+title: "Chapter 1 — Kubernetes Networking Model"
+sidebar_position: 1
+module: "Module 2.1 — Networking Fundamentals"
+description: "Deep dive into the four rules of Kubernetes networking, the IP-per-Pod model, flat network architecture, network namespaces, and how containers communicate without NAT."
+---
+
+# Module 2.1 — Networking Fundamentals
+
+> **Deep Learning Guide (University-Level + Interview-Oriented)**
+
+---
+
+# Chapter 1 — The Kubernetes Networking Model
+
+> **Goal:** Understand the four fundamental rules of Kubernetes networking, why IP-per-Pod was chosen over NAT-based models, and how the flat network specification enables the entire Kubernetes ecosystem.
+>
+> By the end of this chapter, you will understand:
+> 1. The four mandatory rules of the Kubernetes Networking Model
+> 2. Why Kubernetes chose IP-per-Pod over Docker's NAT model
+> 3. What "flat network" means and why it matters for routing
+> 4. How network namespaces give each Pod its own network stack
+> 5. What the cluster CIDR and node subnet model looks like
+> 6. How CNI plugins satisfy the networking model requirements
+
+---
+
+## Real-Life Analogy
+
+Think of a city with **two postal systems**:
+
+**System A (NAT, like Docker's default):** Every house in a neighborhood shares one front door and one mailbox. Mail from the outside world arrives at the shared mailbox, and the landlord (NAT) re-routes it to the right apartment. Apartments can't give out their *own* address to strangers — only the shared building address.
+
+**System B (Kubernetes):** Every apartment gets its *own* front door and its *own* registered postal address. Anyone who knows your address can mail you directly — no landlord relay required. If you move to a different building (node), your address changes, but the routing system always knows where you are.
+
+Kubernetes chose System B. Every Pod gets a real, routable IP address. No NAT, no port-mapping confusion, no shared mailbox collisions.
+
+---
+
+## Architecture Diagram
+
+```text
+    Cluster CIDR: 10.244.0.0/16
+    ┌─────────────────────────────────────────────────────────────┐
+    │                    Kubernetes Cluster                        │
+    │                                                             │
+    │  Node A (192.168.1.10)          Node B (192.168.1.11)       │
+    │  Subnet: 10.244.1.0/24          Subnet: 10.244.2.0/24       │
+    │  ┌─────────────────────┐        ┌─────────────────────┐     │
+    │  │ Pod A               │        │ Pod C               │     │
+    │  │ IP: 10.244.1.5      │        │ IP: 10.244.2.3      │     │
+    │  │                     │        │                     │     │
+    │  │ Pod B               │        │ Pod D               │     │
+    │  │ IP: 10.244.1.8      │        │ IP: 10.244.2.7      │     │
+    │  └─────────────────────┘        └─────────────────────┘     │
+    │                                                             │
+    │  Pod A → Pod D: 10.244.1.5 → 10.244.2.7  (direct, no NAT)  │
+    └─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Four Rules of the Kubernetes Networking Model
+
+Kubernetes does **not** implement networking itself. Instead, it defines a **specification** — a set of four rules that any networking plugin (CNI) must satisfy:
+
+### Rule 1: Every Pod gets its own unique IP address
+
+No two Pods in a cluster share an IP. Ever. This means:
+- No port conflicts between Pods (two Pods can both listen on port 8080)
+- No need for dynamic port allocation or NAT translation
+- A Pod can be treated like a real host on the network
+
+### Rule 2: Pods on the same node can communicate with each other without NAT
+
+```text
+Pod A (10.244.1.5) → Pod B (10.244.1.8)
+Path: Pod A eth0 → veth pair → Linux bridge (cbr0) → veth pair → Pod B eth0
+No NAT. Source IP remains 10.244.1.5 at the destination.
+```
+
+### Rule 3: Pods on different nodes can communicate with each other without NAT
+
+```text
+Pod A (10.244.1.5) → Pod D (10.244.2.7)
+Path: Pod A → Node A kernel → overlay/underlay → Node B kernel → Pod D
+The source IP Pod D sees is 10.244.1.5, not Node A's IP.
+```
+
+This is the hardest rule to implement — it's what differentiates CNI plugins (Calico, Cilium, Flannel).
+
+### Rule 4: The IP a Pod sees for itself is the same IP that other Pods see for it
+
+No split-horizon networking. A Pod's `eth0` IP (e.g., `10.244.1.5`) is the same address a remote Pod uses to reach it. There is no internal/external translation.
+
+---
+
+## Why Not NAT? Docker's Original Model
+
+Docker's default `bridge` networking uses **NAT (Network Address Translation)**:
+
+```text
+Docker default mode:
+  Container A: 172.17.0.2:8080
+  Container B: 172.17.0.3:8080
+
+  External access:
+  Host port 30001 → NAT → 172.17.0.2:8080
+  Host port 30002 → NAT → 172.17.0.3:8080
+```
+
+Problems with NAT at scale:
+- **Port exhaustion**: Limited host ports to map
+- **Complexity**: Every service needs a host port mapping
+- **Debugging**: Packet traces show host IP, not container IP — logs lie
+- **Service discovery**: Can't use IP directly — need port numbers too
+- **Multi-host**: NAT rules don't work across nodes without tunnels
+
+Kubernetes's flat model eliminates all of these problems.
+
+---
+
+## How the IP Space is Organized
+
+Kubernetes divides the IP space into three ranges:
+
+| Range | CIDR Example | Purpose |
+|-------|-------------|---------|
+| **Cluster CIDR** | `10.244.0.0/16` | All Pod IPs cluster-wide |
+| **Service CIDR** | `10.96.0.0/12` | All ClusterIP Service virtual IPs |
+| **Node CIDR** | `192.168.1.0/24` | Physical node IPs (your infrastructure) |
+
+Each **node** gets a slice of the Cluster CIDR — typically a `/24` (256 addresses):
+
+```text
+Node A → 10.244.1.0/24  (IPs: 10.244.1.1 – 10.244.1.254)
+Node B → 10.244.2.0/24
+Node C → 10.244.3.0/24
+```
+
+This assignment is managed by the `kube-controller-manager` with `--allocate-node-cidrs=true`.
+
+---
+
+## Network Namespaces: How Each Pod Gets Its Own Stack
+
+Linux **network namespaces** (`netns`) are the kernel primitive that makes IP-per-Pod possible. Each network namespace has its own:
+- Network interfaces (loopback, eth0)
+- Routing table
+- iptables rules
+- Socket table
+
+When Kubernetes creates a Pod:
+
+```text
+1. Container runtime creates a new network namespace: /proc/<pid>/ns/net
+2. CNI plugin is called with the namespace path
+3. CNI creates a veth pair:
+     - veth0 → inside Pod's netns (renamed to eth0)
+     - veth1 → in the host root netns
+4. CNI assigns the Pod's IP to eth0 inside the Pod's netns
+5. CNI adds a route: default via node's gateway
+6. CNI may also attach the host veth to a bridge or eBPF program
+```
+
+You can inspect this yourself:
+
+```bash
+# List all network namespaces
+ip netns list
+
+# Execute command inside a specific Pod's network namespace
+# (find the pause container PID first)
+kubectl get pod nginx -o jsonpath='{.status.containerStatuses[0].containerID}'
+crictl inspect <container-id> | jq '.info.pid'
+
+# Enter the network namespace
+nsenter -t <PID> -n ip addr
+nsenter -t <PID> -n ip route
+```
+
+---
+
+## The Role of CNI Plugins
+
+The Kubernetes networking model is a **contract**, not an implementation. CNI (Container Network Interface) plugins are what actually implement it. CNI is called by the container runtime (containerd/CRI-O) at Pod creation and deletion.
+
+```text
+Pod scheduled on Node
+↓
+kubelet → containerd → CNI plugin binary (/opt/cni/bin/calico)
+↓
+CNI: ADD command
+  - Create veth pair
+  - Assign IP from IPAM
+  - Configure routes
+  - Return IP info to runtime
+↓
+Pod starts with correct network config
+```
+
+Popular CNI plugins and their approach to rule 3 (cross-node routing):
+
+| Plugin | Cross-Node Strategy |
+|--------|-------------------|
+| **Flannel** | VXLAN overlay (UDP encapsulation) |
+| **Calico** | BGP direct routing or IPIP overlay |
+| **Cilium** | eBPF dataplane, optional VXLAN or native |
+| **Weave** | Mesh overlay with gossip protocol |
+
+---
+
+## Key Configuration Parameters
+
+```bash
+# Check cluster CIDR (set at kube-controller-manager)
+kubectl cluster-info dump | grep -i cluster-cidr
+
+# Check node subnet allocations
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'
+
+# Check Pod IPs
+kubectl get pods -A -o wide
+
+# Inspect CNI configuration on a node
+cat /etc/cni/net.d/10-calico.conflist
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the four rules of the Kubernetes Networking Model?**
+
+Every Pod gets a unique IP. Pods on the same node communicate without NAT. Pods on different nodes communicate without NAT. A Pod sees the same IP for itself as other Pods see for it.
+
+**Q2: Why can't two Pods on the same node both listen on port 80 without the Kubernetes networking model causing conflicts?**
+
+They can — because each Pod runs in its own Linux network namespace. Port 80 in Pod A's namespace is completely independent of port 80 in Pod B's namespace. They don't share the host network stack (unless `hostNetwork: true`).
+
+**Q3: What allocates the per-node Pod CIDR subnet?**
+
+The `kube-controller-manager` with `--allocate-node-cidrs=true` and `--cluster-cidr=<CIDR>`. It assigns each node a `/24` (configurable) slice of the cluster CIDR when the node joins. The node's `spec.podCIDR` field reflects this assignment.
+
+**Q4: What is the difference between the cluster CIDR and the service CIDR?**
+
+Cluster CIDR (`10.244.0.0/16`) is for Pod IP addresses — real network namespaces with real routes. Service CIDR (`10.96.0.0/12`) is for virtual ClusterIP addresses — these are not real interfaces anywhere; they exist only in kube-proxy's iptables/IPVS rules and are never directly routable.
+
+**Q5: What happens to networking if the CNI plugin pod crashes?**
+
+Existing Pods continue running — their network interfaces were already configured and remain until the Pod terminates. New Pods scheduled on that node will fail — the runtime calls the CNI plugin binary at startup and if it fails, the Pod stays in `ContainerCreating` with a network error.
+
+---
+
+## Summary Checksheet
+
+- [ ] Memorized the four rules of the Kubernetes Networking Model
+- [ ] Understand why IP-per-Pod was chosen over NAT-based Docker networking
+- [ ] Can explain what a Linux network namespace is and how it gives each Pod its own stack
+- [ ] Know how the cluster CIDR, service CIDR, and node CIDRs relate to each other
+- [ ] Understand that CNI plugins are implementations of the networking spec, not part of Kubernetes core
+- [ ] Can explain what happens at the kernel level when a Pod is created (veth pair, netns, IPAM)

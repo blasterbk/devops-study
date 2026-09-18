@@ -1,0 +1,209 @@
+---
+title: "Chapter 2 — Cluster vs Namespace Multi-Tenancy"
+sidebar_position: 2
+module: "Module 9.1 — Multi-Cluster Architectures"
+description: "Master Kubernetes multi-tenancy models — Hard Multi-Tenancy (Cluster-per-Tenant) vs Soft Multi-Tenancy (Namespace-per-Tenant) vs Virtual Clusters (vCluster)."
+---
+
+# Chapter 2 — Cluster-per-Tenant vs Namespace-per-Tenant
+
+> **Goal:** Master the multi-tenancy architectural spectrum in enterprise Kubernetes — comparing **Hard Multi-Tenancy** (dedicated **Cluster-per-Tenant** with hypervisor isolation) against **Soft Multi-Tenancy** (shared **Namespace-per-Tenant** with ResourceQuotas and NetworkPolicies), analyzing noisy-neighbor contention, kernel security boundaries, and Total Cost of Ownership (TCO), and investigating the hybrid **Virtual Clusters (`vCluster`)** model.
+>
+> By the end of this chapter, you will understand:
+> 1. The security and operational trade-offs of Cluster-per-Tenant vs Namespace-per-Tenant
+> 2. Why shared Linux kernels prevent true hard multi-tenancy in single clusters
+> 3. How to calculate Total Cost of Ownership (TCO) and control plane overhead at scale
+> 4. How **Virtual Clusters (`vCluster`)** provide isolated API servers inside shared worker nodes
+> 5. How to enforce strict namespace multi-tenancy using RBAC, Quotas, and NetworkPolicies
+> 6. How to choose the right multi-tenancy strategy for enterprise organizations
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes multi-tenancy models as **different residential housing models**:
+
+- **Soft Multi-Tenancy (The Shared Apartment Complex - Namespace-per-Tenant):** 50 different families (**Engineering Teams**) live in individual apartments (**Namespaces**) inside one massive apartment building (**A Shared 100-Node Cluster**).
+  - Everyone shares the central plumbing, elevator, and foundation (**The Shared Linux Kernel and `etcd`**).
+  - You set apartment rules (**ResourceQuotas & NetworkPolicies**), but if one neighbor plays deafening music at 3:00 AM (**A noisy neighbor generating CPU/Disk I/O thrashing**), everyone suffers.
+  - If a criminal burns down the main elevator shaft (**A Linux kernel privilege escalation exploit**), the entire building collapses.
+- **Hard Multi-Tenancy (The Gated Subdivision of Private Homes - Cluster-per-Tenant):** Every family owns a separate, detached house with its own private yard, private water well, and private fence (**A Dedicated Kubernetes Cluster per Team**).
+  - If House #4 catches fire, House #5 is 100% unharmed (**Absolute Blast Radius Isolation**).
+  - However, building 50 private houses requires 50 separate foundations and 50 private security guards (**High Financial Cost and Management Overhead**).
+- **The Hybrid Model (The Luxury Duplex with Soundproofed Walls - Virtual Clusters / `vCluster`):** You build one large building foundation, but give each tenant their own private front door, private keycard system, and private electrical breaker box (**A private virtual API server running inside a namespace**).
+
+---
+
+## Architecture Diagram
+
+```text
+               The Kubernetes Multi-Tenancy Architectural Spectrum
+
+ 1. SOFT MULTI-TENANCY (Namespace-per-Tenant):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ SINGLE PHYSICAL CLUSTER (Shared Kube-APIServer & Shared Linux Kernel)  │
+ │ ├── Namespace: `team-alpha` (ResourceQuota: 10 Cores, NetworkPolicy)   │
+ │ ├── Namespace: `team-beta`  (ResourceQuota: 10 Cores, NetworkPolicy)   │
+ │ └── Namespace: `team-gamma` (ResourceQuota: 10 Cores, NetworkPolicy)   │
+ └────────────────────────────────────────────────────────────────────────┘
+ (Low Cost, High Bin-Packing Efficiency, but Shared Kernel Security Risk!)
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. HARD MULTI-TENANCY (Cluster-per-Tenant):
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ CLUSTER 1 (Team Alpha) │  │ CLUSTER 2 (Team Beta)  │  │ CLUSTER 3 (Team Gamma) │
+ │ Dedicated Control Plane│  │ Dedicated Control Plane│  │ Dedicated Control Plane│
+ │ Isolated VMs / Kernel  │  │ Isolated VMs / Kernel  │  │ Isolated VMs / Kernel  │
+ └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
+ (Maximum Security Isolation, Zero Noisy Neighbors, but High Cloud Cost Overhead!)
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 3. HYBRID MODEL (Virtual Clusters - `vCluster`):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ SHARED HOST WORKER CLUSTER                                             │
+ │ ├── Namespace `team-alpha` ──► Runs [ Virtual API Server + SQLite/etcd]│
+ │ └── Namespace `team-beta`  ──► Runs [ Virtual API Server + SQLite/etcd]│
+ └────────────────────────────────────────────────────────────────────────┘
+ (Full Cluster-Admin CRD Freedom with Shared Infrastructure Cost Savings!)
+```
+
+---
+
+## Multi-Tenancy Comparison Matrix
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Namespace-per-Tenant (Soft)     │ Cluster-per-Tenant (Hard)       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Security Isolation**    │ **Soft.** Shared Linux kernel;  │ **Hard.** Hardware & hypervisor │
+ │                           │ vulnerable to container escapes.│ isolation (AWS EC2 / GCE VMs).  │
+ │ **Noisy Neighbors**       │ High risk of noisy neighbor CPU,│ **Zero risk.** Dedicated worker │
+ │                           │ disk I/O, and network starvation│ nodes per tenant.               │
+ │ **CRD & Cluster Roles**   │ **Restricted.** Tenants cannot  │ **Full Freedom.** Tenants can   │
+ │                           │ install custom CRDs or operators│ have `cluster-admin` on their VM│
+ │ **Financial Cost (TCO)**  │ **Lowest Cost.** High resource  │ **High Cost.** $70–$150/mo base │
+ │                           │ bin-packing; minimal idle waste.│ fee per control plane + buffers.│
+ │ **Operational Overhead**  │ Low. Manage 1 cluster upgrade.  │ High. Manage 50 cluster upgrades│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Hardening Soft Multi-Tenancy (Namespace-per-Tenant)
+
+To make a single shared cluster as secure as possible, platform teams enforce **The 4 Pillars of Namespace Multi-Tenancy**:
+
+```yaml
+# 1. Mandatory Resource Limits
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-quota
+  namespace: team-alpha
+spec:
+  hard:
+    requests.cpu: "16"
+    requests.memory: "32Gi"
+    limits.cpu: "32"
+    limits.memory: "64Gi"
+---
+# 2. Strict Network Isolation (Deny all cross-namespace traffic by default!)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all-ingress
+  namespace: team-alpha
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+---
+# 3. Pod Security Standards (Enforce Baseline/Restricted Profile!)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-alpha
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+```
+
+---
+
+## The Virtual Cluster (`vCluster`) Paradigm
+
+**vCluster** (Virtual Clusters) allows deploying isolated virtual Kubernetes control planes inside standard namespaces:
+
+```text
+ Why vCluster is Revolutionary:
+ 1. Each tenant gets their own private `vCluster` API Server and `k3s/etcd` storage.
+ 2. Developers can create custom CRDs, namespaces, and ClusterRoles inside their virtual cluster!
+ 3. The underlying virtual workloads are scheduled directly onto the shared host cluster's nodes.
+ 4. Result: Full `cluster-admin` developer experience with 90% cloud infrastructure cost savings!
+```
+
+```bash
+# Provision an isolated virtual cluster in 10 seconds:
+vcluster create team-alpha-vcluster --namespace team-alpha
+# Switch kubeconfig context to the virtual cluster:
+vcluster connect team-alpha-vcluster
+# Developers can now run cluster-admin commands safely!
+kubectl create customresourcedefinition ...
+```
+
+---
+
+## Hands-On Lab: Inspecting Namespace Multi-Tenancy Guardrails
+
+```bash
+# Step 1: Query all non-system namespaces in the cluster
+kubectl get namespaces -l '!kubernetes.io/metadata.name=kube-system'
+
+# Step 2: Check active ResourceQuotas protecting namespaces
+kubectl get resourcequotas -A
+
+# Step 3: Check active NetworkPolicies enforcing namespace network isolation
+kubectl get networkpolicies -A
+
+# Step 4: Verify Pod Security Admission labels on namespaces
+kubectl get namespaces -o custom-columns=NAME:.metadata.name,ENFORCE:.metadata.labels.pod-security\.kubernetes\.io/enforce
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between "Soft Multi-Tenancy" and "Hard Multi-Tenancy" in Kubernetes?**
+
+- **Soft Multi-Tenancy (Namespace-per-Tenant)**: Multiple teams share a single physical Kubernetes control plane and worker node pool, separated logically by Namespaces, RBAC, ResourceQuotas, and NetworkPolicies. It assumes tenants are mutually trusting (e.g. internal departments within the same company).
+- **Hard Multi-Tenancy (Cluster-per-Tenant)**: Tenants are separated by physical or hypervisor-level boundaries (separate VMs, separate `etcd` databases, and dedicated control planes). It is mandatory when tenants are untrusted or hostile (such as multi-tenant SaaS platforms or strictly regulated financial applications).
+
+**Q2: Why does a single Kubernetes cluster fail to provide true security isolation between untrusted tenants?**
+
+All containers running on a Kubernetes worker node **share the exact same host Linux kernel**. If a malicious tenant exploits a Linux kernel vulnerability (such as a Dirty COW or cgroup container breakout flaw), they can escape their container boundary and gain root access to the physical host node, allowing them to inspect memory and sniff network traffic of pods belonging to other tenants on that same node. True hard isolation requires separate virtual machines or hardware virtualization (e.g. Kata Containers / Firecracker microVMs).
+
+**Q3: What are the financial and operational trade-offs of adopting a Cluster-per-Tenant strategy?**
+
+- **Financial**: Cloud providers charge management fees per managed control plane (e.g. AWS EKS charges \$72/month per cluster). Operating 100 dedicated clusters costs \$7,200/month *before* factoring in worker nodes. Furthermore, each cluster requires minimum head-room buffers, leading to low compute bin-packing efficiency.
+- **Operational**: Platform teams must patch, upgrade, monitor, and maintain 100 separate `etcd` instances, CNI plugins, and ingress controllers, multiplying operational maintenance overhead.
+
+**Q4: How do Virtual Clusters (`vCluster`) bridge the gap between soft and hard multi-tenancy?**
+
+`vCluster` deploys a lightweight virtual Kubernetes control plane (an API server and SQLite/etcd backend) inside a standard namespace on a shared host cluster. Tenants connect to the virtual API server and enjoy full `cluster-admin` privileges (allowing them to create virtual namespaces, CRDs, and cluster roles). The vCluster syncer controller mirrors and runs the underlying pods directly on the shared host worker nodes, providing developer freedom with centralized cost efficiency.
+
+**Q5: How does Pod Security Admission (PSA) enforce security in shared multi-tenant namespaces?**
+
+Starting in Kubernetes 1.25, Pod Security Admission replaces PodSecurityPolicies. By applying labels to a namespace (e.g. `pod-security.kubernetes.io/enforce: restricted`), the API server automatically blocks any container in that namespace from running as root (`runAsNonRoot: true`), disabling privilege escalation (`allowPrivilegeEscalation: false`), and blocking host network/PID mounts, neutralizing common container breakout vectors.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Soft Multi-Tenancy (Namespaces) assumes mutually trusting internal teams
+- [ ] Know that Hard Multi-Tenancy (Clusters) is mandatory for untrusted / hostile tenants
+- [ ] Know that containers share the host Linux kernel, posing container breakout risks
+- [ ] Know the 4 pillars of namespace isolation: Quotas, Limits, NetworkPolicies, PSA
+- [ ] Know how `vCluster` provides virtual control planes inside shared namespaces
+- [ ] Can inspect namespace security labels using `kubectl get namespaces -o yaml`

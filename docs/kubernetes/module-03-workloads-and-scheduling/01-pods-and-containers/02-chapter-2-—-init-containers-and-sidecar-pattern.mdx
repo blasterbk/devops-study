@@ -1,0 +1,347 @@
+---
+title: "Chapter 2 — Init Containers & Sidecar Pattern"
+sidebar_position: 2
+module: "Module 3.1 — Pods & Containers"
+description: "Master init container sequencing, native sidecar containers (KEP-753 / K8s 1.29+), multi-container networking over localhost, shared storage, and production sidecar patterns like logging, proxying, and secret injection."
+---
+
+# Chapter 2 — Init Containers & Sidecar Pattern
+
+> **Goal:** Master multi-container Pod design patterns — understanding the sequential execution model of init containers, the modern native sidecar container feature (`restartPolicy: Always` in `initContainers`), inter-container communication over `localhost`, shared storage via `emptyDir`, and real-world sidecar patterns (Envoy, Fluent Bit, Vault Agent).
+>
+> By the end of this chapter, you will understand:
+> 1. The exact startup sequencing and failure recovery mechanics of standard init containers
+> 2. Native Sidecar Containers (Kubernetes 1.28 beta, 1.29+ default) and how they solve the classic sidecar lifecycle problem
+> 3. How init containers and sidecars share network ports, volumes, and process namespaces
+> 4. Production patterns: Database migration, dynamic configuration generation, and service mesh sidecars
+> 5. Proper shutdown and startup ordering for multi-container pods
+
+---
+
+## Real-Life Analogy
+
+Imagine preparing for a **theatrical stage play**:
+
+- **The Stage Setup Crew (Standard Init Containers):** Before any actor steps onto the stage, the stage crew sweeps the floor, positions the props, and adjusts the lighting. They work **one by one in strict sequence**. If the lighting electrician trips a breaker (init container fails), the play cannot begin; the director stops everything and waits for them to fix it. Once their job is done, the setup crew leaves the stage completely (exits with code 0).
+- **The Prompt Prompter & Audio Technician (Native Sidecar Containers):** These specialized crew members enter the wings **before** the actors step out. However, unlike the setup crew, they **stay active throughout the entire performance** (`restartPolicy: Always`). They record audio (logging sidecar) or translate lines in real-time (proxy sidecar).
+- **The Lead Actors (Application Containers):** They step onto the stage only after the setup crew is done and the technicians are ready. When the show ends, the actors bow and leave first, and only then do the technicians pack up and power down.
+
+---
+
+## Architecture Diagram
+
+```text
+       Init Containers vs Native Sidecars vs App Containers
+
+ Pod Creation
+      │
+      ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ 1. Init Container 1 (e.g., db-wait-for-ready)               │
+ │    - Runs to completion (Must exit 0)                       │
+ └────────────────────────────┬────────────────────────────────┘
+                              │ Exit 0
+                              ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ 2. Init Container 2 (e.g., db-schema-migration)             │
+ │    - Runs to completion (Must exit 0)                       │
+ └────────────────────────────┬────────────────────────────────┘
+                              │ Exit 0
+                              ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ 3. Native Sidecar (initContainer with restartPolicy: Always) │
+ │    - Starts BEFORE app containers                           │
+ │    - Continues running in background alongside app          │
+ └────────────────────────────┬────────────────────────────────┘
+                              │ Startup probe passes
+                              ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ 4. Main Application Container(s) Start                      │
+ │    ┌───────────────────────────┐ ┌────────────────────────┐ │
+ │    │ Main App (e.g., Web API)  │ │ Classic Sidecar        │ │
+ │    │ Port: 8080                │ │ (e.g., Log Shipper)    │ │
+ │    └─────────────┬─────────────┘ └────────────┬───────────┘ │
+ │                  │ (Shared netns: localhost)  │             │
+ │                  ▼                            ▼             │
+ │        ┌───────────────────────────────────────────┐        │
+ │        │ Shared emptyDir Volume (/var/log/app)     │        │
+ │        └───────────────────────────────────────────┘        │
+ └─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Standard Init Containers: Sequential Execution
+
+Init containers are specialized containers that run **before** application containers are started. They are defined in `.spec.initContainers[]`.
+
+### Key Operating Rules:
+1. **Strict Sequential Execution:** Init containers execute one after another, in the exact order specified in the YAML list.
+2. **Success Requirement:** Each init container must exit with status `0` before the next one starts.
+3. **Failure Behavior:** If an init container fails (non-zero exit code):
+   - If Pod `restartPolicy: Always` or `OnFailure`: Kubelet restarts the failed init container using exponential backoff (`CrashLoopBackOff`).
+   - If Pod `restartPolicy: Never`: The entire Pod enters the `Failed` phase.
+4. **No Readiness Probes:** Standard init containers support `startupProbe` and `livenessProbe` (in modern versions), but do not support `readinessProbe` because they run to completion rather than receiving Service traffic.
+
+### Common Init Container Use Cases
+
+```text
+ ┌──────────────────────────────────┬─────────────────────────────────────────────────────────┐
+ │ Pattern                          │ Practical Implementation                                │
+ │──────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ 1. Dependency Gating             │ Loop with `nc` or `curl` waiting for PostgreSQL/Redis.  │
+ │ 2. Database Schema Migration     │ Execute `flyway migrate`, `alembic upgrade head`, etc.  │
+ │ 3. Dynamic Configuration / Vault │ Fetch secrets via Vault CLI and write to shared volume. │
+ │ 4. Permission / Ownership Fixes  │ Run `chown -R 1000:1000 /data` on persistent storage.   │
+ └──────────────────────────────────┴─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Classic Sidecar Problem vs Native Sidecars (KEP-753)
+
+Prior to Kubernetes 1.28 (and default in 1.29+), Kubernetes had no formal concept of a "sidecar". Engineers simply placed multiple containers in `.spec.containers[]`.
+
+This created critical production problems:
+
+```text
+ The 3 Major Flaws of Classic Sidecars:
+
+ 1. Non-Deterministic Startup Order:
+    App container starts BEFORE Envoy proxy/Vault agent is ready ──► App crashes on boot.
+
+ 2. Job Completion Blocking:
+    A batch Job finishes its main task, but the logging sidecar stays running ──► Job NEVER terminates!
+
+ 3. Uncontrolled Shutdown Order:
+    Envoy proxy receives SIGTERM and terminates BEFORE the app drains in-flight requests ──► 502 Bad Gateway.
+```
+
+### The Solution: Native Sidecar Containers
+
+In Kubernetes 1.29+, setting `restartPolicy: Always` inside an `initContainers` entry marks it as a **Native Sidecar Container**:
+
+```yaml
+spec:
+  initContainers:
+  - name: vault-agent-sidecar
+    image: hashicorp/vault:1.15
+    restartPolicy: Always       # <--- THIS TURNS IT INTO A NATIVE SIDECAR!
+    command: ["vault", "agent", "-config=/etc/vault/vault-agent-config.hcl"]
+    volumeMounts:
+    - name: shared-secrets
+      mountPath: /vault/secrets
+```
+
+### Native Sidecar Lifecycle Guarantees:
+- **Startup:** Starts in sequential order with other init containers. Kubelet waits until its `startupProbe` (or readiness) passes before moving to the next init container or main container.
+- **Runtime:** Unlike standard init containers, it does **not** terminate. It runs for the lifetime of the Pod.
+- **Job Completion:** When all regular containers in `.spec.containers[]` terminate in a Job, Kubelet automatically sends `SIGTERM` to all native sidecars, allowing the Job to complete cleanly!
+- **Shutdown:** During Pod deletion, native sidecars are terminated **last** (after all main application containers have completely shut down), ensuring loggers and proxies remain available during application teardown.
+
+---
+
+## Multi-Container Communication & Shared Storage
+
+Containers in the same Pod interact through two primary mechanisms:
+
+### 1. Network Communication (`localhost`)
+Because all containers share the identical network namespace (`netns`):
+- Container A listening on port `8080` is reachable by Container B via `http://127.0.0.1:8080` or `http://localhost:8080`.
+- Two containers **cannot** bind to the same port (e.g., both attempting to bind `:80` results in `Address already in use`).
+
+### 2. File Sharing via `emptyDir` Volumes
+Containers do not share filesystems by default. To share files, mount an `emptyDir` volume into both containers:
+
+```yaml
+volumes:
+- name: shared-data
+  emptyDir:
+    medium: Memory    # Optional: Backed by tmpfs RAM disk for ultra-fast I/O
+    sizeLimit: 128Mi
+```
+
+---
+
+## Production Multi-Container Pattern Examples
+
+### Pattern 1: Database Waiter + Schema Migration + Native Vault Sidecar + App
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      volumes:
+      - name: shared-secrets
+        emptyDir: {}
+      - name: shared-logs
+        emptyDir: {}
+
+      # -----------------------------------------------------------
+      # INIT CONTAINERS & NATIVE SIDECARS
+      # -----------------------------------------------------------
+      initContainers:
+      # Step 1: Standard Init Container - Wait for PostgreSQL
+      - name: wait-for-postgres
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z -v -w3 postgres-service 5432; do echo waiting for postgres; sleep 2; done;']
+
+      # Step 2: Standard Init Container - Run DB Migrations
+      - name: run-db-migration
+        image: migrate/migrate:v4.16.2
+        args: ["-path=/migrations", "-database=postgres://user:pass@postgres-service:5432/orders?sslmode=disable", "up"]
+
+      # Step 3: Native Sidecar - Vault Secret Synchronizer
+      - name: vault-agent-sidecar
+        image: hashicorp/vault:1.15
+        restartPolicy: Always    # Native Sidecar in K8s 1.29+
+        args: ["vault", "agent", "-config=/etc/vault/config.hcl"]
+        volumeMounts:
+        - name: shared-secrets
+          mountPath: /vault/secrets
+
+      # -----------------------------------------------------------
+      # MAIN APPLICATION CONTAINERS
+      # -----------------------------------------------------------
+      containers:
+      # Main Web Application
+      - name: order-api
+        image: order-api:v2.4.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_CONFIG_FILE
+          value: /vault/secrets/db-credentials.json
+        volumeMounts:
+        - name: shared-secrets
+          mountPath: /vault/secrets
+          readOnly: true
+        - name: shared-logs
+          mountPath: /var/log/orders
+
+      # Classic Sidecar: Log Shipper (Fluent Bit)
+      - name: fluentbit-logger
+        image: fluent/fluent-bit:2.2
+        volumeMounts:
+        - name: shared-logs
+          mountPath: /var/log/orders
+          readOnly: true
+```
+
+---
+
+## Hands-On Lab: Implementing Init & Native Sidecar Containers
+
+Let's build a real multi-container pod featuring an init gate, a shared volume, and a native background sidecar.
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace sidecar-lab
+
+# Step 2: Create a mock backend service for the init container to wait on
+kubectl create deployment mock-db --image=nginx:alpine -n sidecar-lab --port=80
+kubectl expose deployment mock-db -n sidecar-lab --port=80 --target-port=80
+
+# Step 3: Deploy Pod with Init Container, Native Sidecar, and Main App
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: native-sidecar-demo
+  namespace: sidecar-lab
+spec:
+  volumes:
+  - name: shared-data
+    emptyDir: {}
+
+  initContainers:
+  # 1. Standard init container: checks mock-db connectivity
+  - name: init-check-db
+    image: busybox:1.36
+    command: ['sh', '-c', 'echo "Checking DB..."; until nc -z -w 2 mock-db 80; do echo "waiting..."; sleep 2; done; echo "DB Ready!"']
+
+  # 2. Native sidecar: writes timestamp every 2 seconds to shared file
+  - name: background-timer-sidecar
+    image: alpine:latest
+    restartPolicy: Always
+    command: ['sh', '-c', 'while true; do date >> /shared/timestamps.txt; sleep 2; done']
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+
+  containers:
+  # 3. Main container: serves the shared timestamps file over HTTP
+  - name: web-app
+    image: nginx:1.25-alpine
+    lifecycle:
+      postStart:
+        exec:
+          command: ["sh", "-c", "ln -s /shared/timestamps.txt /usr/share/nginx/html/time.txt"]
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+EOF
+
+# Step 4: Watch Pod startup progression
+kubectl get pod native-sidecar-demo -n sidecar-lab -w
+
+# Step 5: Check the Init container logs
+kubectl logs native-sidecar-demo -n sidecar-lab -c init-check-db
+
+# Step 6: Verify the native sidecar is actively running
+kubectl logs native-sidecar-demo -n sidecar-lab -c background-timer-sidecar | tail -n 5
+
+# Step 7: Verify web application serves data generated by the native sidecar
+kubectl exec -n sidecar-lab native-sidecar-demo -c web-app -- cat /usr/share/nginx/html/time.txt | tail -n 5
+
+# Step 8: Clean up
+kubectl delete namespace sidecar-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the execution lifecycle of init containers, and what happens if one fails?**
+
+Init containers run strictly sequentially in the order they are defined in `.spec.initContainers[]`. Each init container must terminate with exit code `0` before the next one starts. If an init container fails (non-zero exit code), Kubelet restarts it if the Pod's `restartPolicy` is `Always` or `OnFailure`, applying exponential backoff delay (`CrashLoopBackOff`). If `restartPolicy: Never` is set, the entire Pod immediately transitions into the `Failed` phase. Main application containers are never started until all init containers have successfully finished.
+
+**Q2: What are Native Sidecar Containers (introduced in Kubernetes 1.28/1.29), and what problem do they solve?**
+
+Native Sidecar Containers are defined within `.spec.initContainers[]` but include `restartPolicy: Always`. They solve three fundamental flaws of classic sidecars: (1) startup race conditions, by ensuring the sidecar starts and passes its startup probe before subsequent init or main containers launch; (2) Job termination blocking, by automatically shutting down when all regular containers finish; and (3) graceful shutdown ordering, by ensuring sidecars (like logging agents or proxy gateways) stay alive until all main app containers have finished shutting down.
+
+**Q3: How do two containers inside the same Pod communicate, and what limitations exist?**
+
+Containers in the same Pod share the same Linux Network Namespace (`netns`), meaning they share the same IP address and port space. They communicate via `localhost` (e.g., `127.0.0.1:8080`) with virtually zero network serialization overhead. The primary limitation is that containers within the same Pod cannot bind to the same TCP or UDP port; doing so causes a port collision conflict (`EADDRINUSE`).
+
+**Q4: Can init containers access the same storage volumes as application containers?**
+
+Yes. Storage volumes (such as `emptyDir`, `ConfigMap`, `Secret`, or `PersistentVolumeClaim`) are declared at the Pod level under `.spec.volumes[]`. Both init containers and application containers can mount these volumes at identical or different `mountPath` locations. This is commonly used for dynamic configuration: an init container downloads or renders a configuration file onto an `emptyDir` volume, and the application container mounts that volume read-only upon startup.
+
+**Q5: How does resource allocation (CPU and memory requests/limits) work for init containers versus main containers?**
+
+The effective resource request/limit for a Pod is calculated as the **maximum** of: (1) the highest resource request/limit among all init containers, or (2) the **sum** of resource requests/limits of all app containers (plus any active native sidecars). Because standard init containers execute sequentially, their resources do not add together; instead, the single largest init container defines the init baseline. The scheduler uses this effective maximum to place the Pod onto a node with adequate allocatable capacity.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that standard init containers execute sequentially and must exit with `0`
+- [ ] Know that native sidecars are defined in `initContainers` with `restartPolicy: Always`
+- [ ] Know that native sidecars start BEFORE main app containers and terminate AFTER them
+- [ ] Know how native sidecars solve the classic batch Job hanging issue
+- [ ] Know that containers in a Pod share `localhost` networking and cannot bind duplicate ports
+- [ ] Know that file sharing between init, sidecar, and app containers uses `emptyDir` volumes
+- [ ] Can inspect init container logs with `kubectl logs <pod> -c <init-container-name>`

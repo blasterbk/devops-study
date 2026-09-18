@@ -1,0 +1,1378 @@
+---
+title: "Chapter 1 — Container Runtime Architecture"
+sidebar_position: 1
+module: "Module 1.7 — Container Runtime Internals"
+description: "> **Goal:** Understand why Kubernetes requires a Container Runtime, how the **Container Runtime Interface (CRI)** standardizes runtime communication, how the **..."
+---
+
+# Module 1.7 — Container Runtime Internals
+
+> **Deep Learning Guide (University-Level + Interview-Oriented)**
+
+---
+
+## Why We Study This Module
+
+Module 1.6 taught you how the kubelet manages Pod lifecycle. Module 1.7 teaches you what happens **below the kubelet** — how it delegates actual container creation to a runtime, and how that runtime turns an OCI image into a running process inside Linux namespaces.
+
+---
+
+## Learning Roadmap
+
+```text
+Module 1.7 — Container Runtime Internals
+
+Chapter 1   Container Runtime Architecture (CRI, OCI)
+Chapter 2   containerd & runc Internals
+Chapter 3   Image Management
+Chapter 4   Pod Sandbox
+Chapter 5   RuntimeClass
+```
+
+---
+
+# Chapter 1 — Container Runtime Architecture
+
+> **Goal:** Understand why Kubernetes requires a Container Runtime, how the **Container Runtime Interface (CRI)** standardizes runtime communication, how the **Open Container Initiative (OCI)** standardizes container images and runtimes, and how kubelet communicates with container runtimes such as **containerd**.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why Kubernetes decoupled container runtime from kubelet (CRI introduction)
+> 2. CRI: the gRPC interface between kubelet and container runtimes
+> 3. CRI services: RuntimeService (containers) + ImageService (images)
+> 4. OCI: the open standard for container images and runtimes
+> 5. OCI Image Specification: layers, config, manifest
+> 6. OCI Runtime Specification: how runc receives a container bundle
+> 7. The full CRI-to-OCI stack: kubelet -> CRI -> containerd -> runc
+> 8. Why Docker was removed as Kubernetes runtime (dockershim deprecation)
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of CRI like the USB standard for peripherals.
+
+```text
+USB Standard Analogy:
+
+Before USB: every peripheral (mouse, keyboard, camera) needed its own port
+USB created one standard interface: any USB device works with any USB port
+Laptop (kubelet) just sees a USB socket: doesn't care what's plugged in
+Mouse (containerd), keyboard (CRI-O), camera (other runtimes) all work the same
+USB specification defines the protocol: CRI defines the gRPC API
+OCI is the USB cable specification: image format + runtime bundle format
+```
+
+| USB Standard | Container Runtime Interface |
+| :--- | :--- |
+| USB port on laptop | CRI socket on Node (`/run/containerd/containerd.sock`) |
+| USB specification | CRI gRPC API (RuntimeService + ImageService) |
+| USB cable standard | OCI specification (image format + runtime bundle) |
+| Any USB device works | Any CRI-compliant runtime works (containerd, CRI-O) |
+| Laptop doesn't care what's plugged in | kubelet doesn't know which runtime is behind CRI |
+| Peripheral types: mouse, keyboard | Runtime types: runc, gVisor, Kata Containers |
+
+> **Important:** CRI is a **gRPC interface** — kubelet communicates with containerd over a **Unix domain socket** (not over the API Server, not over HTTP). The socket path is typically `/run/containerd/containerd.sock`. This communication is entirely local to the Node and never touches the Kubernetes control plane.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- kubelet Architecture
+- Pod Lifecycle
+- Pod Sync Loop
+- Static Pods
+- Linux Processes (basic understanding)
+- Containers (basic understanding)
+
+---
+
+# Where This Chapter Fits
+
+In the previous module, we learned that:
+
+```text
+Scheduler
+  |
+  v
+Assign Pod
+  |
+  v
+kubelet
+  |
+  v
+Run Pod
+```
+
+But we intentionally skipped one important question:
+
+> **How does kubelet actually start a container?**
+
+The answer is:
+
+```text
+kubelet
+  |
+  v
+Container Runtime
+  |
+  v
+Linux
+```
+
+This chapter explains everything between kubelet and Linux.
+
+---
+
+# Why Kubernetes Needs a Container Runtime
+
+A common misconception is:
+
+> kubelet runs containers.
+
+This is **incorrect**.
+
+The kubelet **never creates Linux containers directly**.
+
+Instead, it delegates container operations to a Container Runtime.
+
+---
+
+# Imagine kubelet Without a Runtime
+
+Suppose Kubernetes only had kubelet.
+
+```text
+kubelet
+  |
+  v
+Create Container
+```
+
+Question:
+
+How would kubelet:
+
+- Create Linux namespaces?
+- Configure cgroups?
+- Mount overlay filesystems?
+- Pull OCI images?
+- Start container processes?
+- Manage container lifecycle?
+
+It would need to implement an entire container engine.
+
+That would make kubelet:
+
+- Extremely large
+- Difficult to maintain
+- Tightly coupled to one runtime
+
+---
+
+# Separation of Responsibilities
+
+Instead, Kubernetes separates responsibilities.
+
+```text
+kubelet
+  |
+  v
+Container Runtime
+  |
+  v
+Linux Kernel
+```
+
+Each layer focuses on its own responsibility.
+
+---
+
+# Responsibilities of kubelet
+
+The kubelet is responsible for:
+
+- Watching Pods
+- Running the Pod Sync Loop
+- Executing health probes
+- Updating Pod Status
+- Monitoring Node health
+- Requesting container operations
+
+Notice:
+
+The kubelet **requests** operations.
+
+It does not execute low-level container operations itself.
+
+---
+
+# Responsibilities of the Container Runtime
+
+The Container Runtime is responsible for:
+
+- Pulling container images
+- Creating Pod Sandboxes
+- Creating containers
+- Starting containers
+- Stopping containers
+- Removing containers
+- Managing container storage
+- Managing namespaces
+- Managing cgroups
+
+Think of it as Kubernetes' execution engine.
+
+---
+
+# High-Level Architecture
+
+```text
+             Kubernetes Control Plane
+
+                     |
+
+               Scheduler
+
+                     |
+
+                 kubelet
+
+                     |
+
+                     ▼
+
+        Container Runtime Interface
+
+                     |
+
+                     ▼
+
+            Container Runtime
+
+                     |
+
+                     ▼
+
+              Linux Kernel
+
+                     |
+
+                     ▼
+
+          Running Container Process
+```
+
+---
+
+# Why an Interface is Needed
+
+Suppose Kubernetes directly supported containerd.
+
+```text
+kubelet
+  |
+  v
+containerd
+```
+
+Now imagine a new runtime appears.
+
+Example:
+
+```text
+NewRuntimeX
+```
+
+The kubelet source code would need modification.
+
+Later another runtime appears.
+
+Again:
+
+```text
+Modify kubelet
+```
+
+This would make Kubernetes difficult to extend.
+
+---
+
+# Solution
+
+Introduce a standard interface.
+
+```text
+kubelet
+  |
+  v
+CRI
+  |
+  v
+Any Runtime
+```
+
+The kubelet speaks one protocol.
+
+Every runtime implements that protocol.
+
+---
+
+# What is CRI?
+
+**CRI** stands for:
+
+```text
+Container Runtime Interface
+```
+
+It is a standardized API that allows kubelet to communicate with different container runtimes.
+
+Think of CRI as a contract.
+
+---
+
+# CRI Concept
+
+```text
+kubelet
+  |
+  v
+CRI
+  |
+  v
+containerd
+
+CRI-O
+
+Future Runtime
+
+Custom Runtime
+```
+
+Every runtime implements the same interface.
+
+---
+
+# Why CRI Was Introduced
+
+Before CRI, Kubernetes communicated directly with Docker through a component called **dockershim**.
+
+Architecture:
+
+```text
+kubelet
+  |
+  v
+dockershim
+  |
+  v
+Docker Engine
+```
+
+This created maintenance challenges because Kubernetes had to maintain Docker-specific integration.
+
+With CRI:
+
+```text
+kubelet
+  |
+  v
+CRI
+  |
+  v
+containerd
+
+or
+
+CRI-O
+```
+
+The runtime becomes responsible for implementing the interface.
+
+---
+
+# Advantages of CRI
+
+CRI provides:
+
+- Runtime independence
+- Standardized communication
+- Easier maintenance
+- Better extensibility
+- Smaller kubelet codebase
+
+---
+
+# CRI Architecture
+
+```text
+              kubelet
+
+                  |
+
+        CRI gRPC Client
+
+                  |
+
+══════════════════════════════
+
+     Container Runtime Interface
+
+══════════════════════════════
+
+                  |
+
+        CRI gRPC Server
+
+                  |
+
+             containerd
+```
+
+Notice:
+
+CRI is implemented using **gRPC**.
+
+---
+
+# CRI Services
+
+Conceptually, CRI exposes two primary services.
+
+```text
+Runtime Service
+  |
+  v
+Manage Sandboxes
+
+Manage Containers
+
+Container Lifecycle
+
+──────────────
+
+Image Service
+  |
+  v
+Pull Images
+
+List Images
+
+Remove Images
+```
+
+The kubelet uses both services continuously.
+
+---
+
+# Common Runtime Operations
+
+Examples of Runtime Service requests include:
+
+```text
+RunPodSandbox
+
+CreateContainer
+
+StartContainer
+
+StopContainer
+
+RemoveContainer
+
+ContainerStatus
+```
+
+Examples of Image Service requests include:
+
+```text
+PullImage
+
+ImageStatus
+
+ListImages
+
+RemoveImage
+```
+
+---
+
+# What is OCI?
+
+**OCI** stands for:
+
+```text
+Open Container Initiative
+```
+
+Unlike CRI,
+
+OCI is **not** a Kubernetes project.
+
+OCI is an industry standard that defines how containers should be built and executed.
+
+---
+
+# Why OCI Exists
+
+Before OCI,
+
+every container engine could define:
+
+- Different image formats
+- Different runtime formats
+- Different specifications
+
+This caused incompatibility.
+
+OCI standardized container technologies.
+
+---
+
+# OCI Defines Two Major Specifications
+
+```text
+OCI
+
++-- Image Specification
+
++-- Runtime Specification
+```
+
+These standards are followed by modern container runtimes.
+
+---
+
+# OCI Image Specification
+
+Defines:
+
+- Image layout
+- Layers
+- Manifests
+- Configuration
+- Metadata
+
+Example:
+
+```text
+nginx:latest
+  |
+  v
+OCI Image
+```
+
+Any OCI-compliant runtime can pull and execute it.
+
+---
+
+# OCI Runtime Specification
+
+Defines:
+
+- Process execution
+- Linux namespaces
+- cgroups
+- Mounts
+- Environment variables
+- Capabilities
+
+It describes how a runtime should create a container.
+
+---
+
+# Relationship Between Kubernetes, CRI, and OCI
+
+These three technologies have different responsibilities.
+
+```text
+Kubernetes
+  |
+  v
+Uses CRI
+  |
+  v
+Container Runtime
+  |
+  v
+Implements OCI
+  |
+  v
+Linux
+```
+
+Or more simply:
+
+```text
+CRI
+  |
+  v
+Communication Standard
+
+────────────
+
+OCI
+  |
+  v
+Container Standard
+```
+
+---
+
+# CRI vs OCI
+
+| CRI | OCI |
+|-----|-----|
+| Kubernetes interface | Industry container standard |
+| Communication between kubelet and runtime | Defines images and runtime behavior |
+| Implemented using gRPC | Implemented through specifications |
+| Used only by Kubernetes | Used by many container platforms |
+| Defines runtime API | Defines image/runtime format |
+
+---
+
+# Container Runtime Architecture
+
+Modern Kubernetes typically uses:
+
+```text
+kubelet
+  |
+  v
+CRI
+  |
+  v
+containerd
+  |
+  v
+runc
+  |
+  v
+Linux Kernel
+```
+
+Each layer has a specific responsibility.
+
+---
+
+# Layered Architecture
+
+```text
++--------------------------------+
+
+        Kubernetes
+
++--------------------------------+
+
+             kubelet
+
++--------------------------------+
+
+              CRI
+
++--------------------------------+
+
+          containerd
+
++--------------------------------+
+
+              runc
+
++--------------------------------+
+
+         Linux Kernel
+
++--------------------------------+
+```
+
+Each layer delegates work to the next.
+
+---
+
+# Responsibilities by Layer
+
+## kubelet
+
+Responsible for:
+
+- Desired state
+- Pod management
+- Health monitoring
+- Status reporting
+
+---
+
+## CRI
+
+Responsible for:
+
+- Standard API
+- Runtime communication
+
+---
+
+## containerd
+
+Responsible for:
+
+- Image management
+- Container lifecycle
+- Snapshots
+- Task management
+
+---
+
+## runc
+
+Responsible for:
+
+- Creating Linux containers
+- Configuring namespaces
+- Configuring cgroups
+- Starting container processes
+
+---
+
+## Linux Kernel
+
+Responsible for:
+
+- Process scheduling
+- Memory management
+- Networking
+- Filesystems
+- Security
+
+---
+
+# Runtime Request Flow
+
+Suppose a Pod is assigned to a Node.
+
+What happens internally?
+
+---
+
+# Step 1
+
+Scheduler assigns:
+
+```text
+Pod
+  |
+  v
+worker-01
+```
+
+---
+
+# Step 2
+
+kubelet receives:
+
+```text
+New Pod Event
+```
+
+---
+
+# Step 3
+
+The Pod Sync Loop calls:
+
+```text
+SyncPod()
+```
+
+---
+
+# Step 4
+
+The kubelet sends a CRI request.
+
+Conceptually:
+
+```text
+RunPodSandbox
+```
+
+---
+
+# Step 5
+
+The runtime creates:
+
+```text
+Pod Sandbox
+```
+
+---
+
+# Step 6
+
+The kubelet requests:
+
+```text
+CreateContainer
+```
+
+---
+
+# Step 7
+
+Runtime prepares the container.
+
+If needed:
+
+```text
+Pull Image
+  |
+  v
+Create Filesystem
+  |
+  v
+Create Container
+```
+
+---
+
+# Step 8
+
+The kubelet requests:
+
+```text
+StartContainer
+```
+
+---
+
+# Step 9
+
+The runtime asks the OCI runtime (such as runc) to start the process.
+
+---
+
+# Step 10
+
+Linux starts:
+
+```text
+Application Process
+```
+
+The Pod is now running.
+
+---
+
+# Complete Runtime Request Flow
+
+```text
+Scheduler
+  |
+  v
+Assign Pod
+  |
+  v
+kubelet
+  |
+  v
+SyncPod()
+  |
+  v
+RunPodSandbox()
+  |
+  v
+CreateContainer()
+  |
+  v
+StartContainer()
+  |
+  v
+containerd
+  |
+  v
+runc
+  |
+  v
+Linux Process Running
+```
+
+---
+
+# kubelet ↔ CRI Communication
+
+The kubelet communicates with the runtime using gRPC.
+
+Conceptually:
+
+```text
+kubelet
+  |
+  v
+gRPC Request
+  |
+  v
+CRI Server
+  |
+  v
+containerd
+```
+
+---
+
+# Communication Pattern
+
+```text
+kubelet
+  |
+  v
+CreateContainer
+  |
+  v
+containerd
+  |
+  v
+Response
+  |
+  v
+Container ID
+```
+
+Every operation follows a request-response model.
+
+---
+
+# Example Communication Sequence
+
+```text
+kubelet
+  |
+  v
+PullImage
+  |
+  v
+containerd
+  |
+  v
+Image Downloaded
+
+────────────
+
+kubelet
+  |
+  v
+CreateContainer
+  |
+  v
+containerd
+  |
+  v
+Container Created
+
+────────────
+
+kubelet
+  |
+  v
+StartContainer
+  |
+  v
+containerd
+  |
+  v
+Running
+```
+
+---
+
+# Status Requests
+
+The kubelet also requests runtime information.
+
+Examples:
+
+```text
+ContainerStatus
+
+PodSandboxStatus
+
+ListContainers
+
+ListPodSandbox
+```
+
+This information is used to update Pod Status.
+
+---
+
+# Failure Example
+
+Suppose:
+
+```text
+containerd
+  |
+  v
+Stopped
+```
+
+Workflow:
+
+```text
+kubelet
+  |
+  v
+CRI Request
+  |
+  v
+Connection Failed
+  |
+  v
+Pod Cannot Start
+  |
+  v
+Node Eventually Reports Runtime Problems
+```
+
+The kubelet cannot manage containers if the runtime is unavailable.
+
+---
+
+# Complete Internal Architecture
+
+```text
+           API Server
+
+                |
+
+                ▼
+
+             kubelet
+
+                |
+
+        Pod Sync Loop
+
+                |
+
+                ▼
+
+             CRI Client
+
+══════════════════════════════════
+
+          gRPC Interface
+
+══════════════════════════════════
+
+                ▼
+
+          containerd
+
+                ▼
+
+              runc
+
+                ▼
+
+         Linux Kernel
+
+                ▼
+
+       Running Containers
+```
+
+---
+
+# Production Example 1
+
+New Deployment
+
+```text
+Deployment
+  |
+  v
+ReplicaSet
+  |
+  v
+Pod
+  |
+  v
+Scheduler
+  |
+  v
+kubelet
+  |
+  v
+CRI
+  |
+  v
+containerd
+  |
+  v
+runc
+  |
+  v
+Running Web Server
+```
+
+---
+
+# Production Example 2
+
+Image Missing
+
+```text
+Container Image
+  |
+  v
+Not Found Locally
+  |
+  v
+CRI PullImage()
+  |
+  v
+Registry
+  |
+  v
+Image Downloaded
+  |
+  v
+Container Started
+```
+
+---
+
+# Production Example 3
+
+Container Crash
+
+```text
+Application Crash
+  |
+  v
+containerd Reports Exit
+  |
+  v
+CRI Status
+  |
+  v
+kubelet
+  |
+  v
+Restart Policy Evaluated
+  |
+  v
+Restart Container
+```
+
+---
+
+# Production Example 4
+
+Runtime Failure
+
+```text
+containerd Stopped
+  |
+  v
+CRI Communication Fails
+  |
+  v
+kubelet Cannot Create Containers
+  |
+  v
+Pods Remain Pending or Fail to Start
+```
+
+---
+
+# Production Best Practices
+
+✔ Use a CRI-compliant runtime such as containerd or CRI-O.
+
+✔ Keep kubelet and the runtime version-compatible.
+
+✔ Monitor container runtime health independently of kubelet.
+
+✔ Use OCI-compliant images.
+
+✔ Avoid Docker-specific assumptions in Kubernetes clusters.
+
+✔ Secure the CRI socket with appropriate permissions.
+
+✔ Monitor image pull latency and runtime errors.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The kubelet creates Linux containers.
+
+**Correct:** The kubelet delegates container creation to the container runtime through CRI.
+
+---
+
+### ❌ Misconception 2
+
+CRI and OCI are the same thing.
+
+**Correct:** CRI is a Kubernetes communication interface, while OCI defines container image and runtime standards.
+
+---
+
+### ❌ Misconception 3
+
+containerd is part of Kubernetes.
+
+**Correct:** containerd is an independent container runtime that implements the CRI interface (via its CRI plugin) and follows OCI standards.
+
+---
+
+### ❌ Misconception 4
+
+Kubernetes requires Docker.
+
+**Correct:** Modern Kubernetes supports any CRI-compliant runtime. Docker is no longer required.
+
+---
+
+### ❌ Misconception 5
+
+The kubelet talks directly to runc.
+
+**Correct:** The kubelet communicates with the container runtime through CRI. The runtime invokes runc (or another OCI runtime) when needed.
+
+---
+
+### ❌ Misconception 6
+
+OCI is only about container images.
+
+**Correct:** OCI defines both the Image Specification and the Runtime Specification.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does Kubernetes need a Container Runtime?
+
+To perform low-level container operations such as pulling images, creating containers, configuring namespaces, and starting processes.
+
+---
+
+### Q2. What is CRI?
+
+The Container Runtime Interface—a gRPC-based API that standardizes communication between kubelet and container runtimes.
+
+---
+
+### Q3. What is OCI?
+
+The Open Container Initiative—an industry standard defining container image and runtime specifications.
+
+---
+
+### Q4. What is the difference between CRI and OCI?
+
+CRI defines how kubelet communicates with runtimes, while OCI defines how containers and images are structured and executed.
+
+---
+
+### Q5. Does kubelet communicate directly with runc?
+
+No. kubelet communicates with a CRI-compliant runtime (such as containerd), which then invokes runc or another OCI runtime.
+
+---
+
+### Q6. Why was CRI introduced?
+
+To decouple Kubernetes from runtime-specific implementations and allow multiple runtimes to integrate through a common interface.
+
+---
+
+### Q7. Which component is responsible for pulling images?
+
+The container runtime, typically after receiving a `PullImage` request through CRI.
+
+---
+
+### Q8. What protocol does CRI use?
+
+gRPC.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod cannot start | Container runtime unavailable or CRI communication failure |
+| Image pull fails | Registry unreachable, authentication failure, or incorrect image name |
+| kubelet reports runtime errors | CRI socket unavailable or runtime service stopped |
+| Containers never start | Runtime unable to create sandbox or invoke OCI runtime |
+| Runtime status unavailable | CRI service not responding or runtime crashed |
+| New Pods remain Pending on the Node | kubelet cannot complete CRI requests to the runtime |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why doesn't kubelet create containers directly?
+2. What responsibilities belong to kubelet versus the container runtime?
+3. What is the purpose of CRI?
+4. Why was CRI introduced?
+5. What does OCI standardize?
+6. What is the difference between CRI and OCI?
+7. How does kubelet communicate with the runtime?
+8. What is the typical runtime request flow?
+9. What happens if the container runtime becomes unavailable?
+10. Which component ultimately starts the Linux container process?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes delegates container execution to specialized runtime components instead of implementing container management inside the kubelet.
+
+You learned:
+
+- Why Kubernetes requires a dedicated Container Runtime
+- How the Container Runtime Interface (CRI) standardizes communication between kubelet and runtimes
+- How the Open Container Initiative (OCI) standardizes container images and runtime behavior
+- The layered architecture of kubelet, CRI, container runtimes, OCI runtimes, and the Linux kernel
+- The complete request flow from Pod scheduling to a running Linux process
+- How kubelet communicates with the runtime using gRPC
+- The distinct responsibilities of kubelet, CRI, containerd, runc, and the Linux kernel
+
+Understanding this architecture is fundamental to Kubernetes internals because every Pod created by kubelet ultimately depends on the container runtime stack to become a running Linux process.
+
+---
+
+# Next Chapter
+
+**Chapter 2 — containerd & runc Internals**
+
+In the next chapter, we'll dive into the implementation details of the most widely used Kubernetes runtime stack.
+
+Topics include:
+
+- containerd Architecture
+- containerd Components
+- containerd-shim
+- runc
+- OCI Runtime Specification
+- Container Creation Workflow
+- Process Lifecycle
+
+You'll learn exactly how containerd manages images and containers, how `containerd-shim` keeps containers alive, and how `runc` creates Linux containers using namespaces and cgroups.
+```

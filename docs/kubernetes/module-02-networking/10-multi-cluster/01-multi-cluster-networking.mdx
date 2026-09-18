@@ -1,0 +1,306 @@
+---
+title: "Chapter 1 — Multi-Cluster Networking"
+sidebar_position: 1
+module: "Module 2.10 — Multi-Cluster"
+description: "Deep dive into multi-cluster Kubernetes networking — why organizations run multiple clusters, the networking models (flat network vs gateway-based), cross-cluster service discovery patterns, and the key tools: Submariner, Cilium Cluster Mesh, and Istio multi-cluster."
+---
+
+# Chapter 1 — Multi-Cluster Networking
+
+> **Goal:** Understand why multi-cluster architectures exist, the fundamental networking challenges they introduce, and the three main approaches to solving cross-cluster connectivity — flat network, gateway-based tunneling, and service mesh federation.
+>
+> By the end of this chapter, you will understand:
+> 1. Why organizations run multiple Kubernetes clusters (isolation, HA, regional)
+> 2. The fundamental networking problem: Pod CIDRs and ClusterIPs are cluster-local
+> 3. Flat network model (BGP route propagation, VPC peering)
+> 4. Gateway/tunnel model (Submariner, WireGuard, IPsec)
+> 5. Service mesh federation (Istio multi-cluster, Linkerd multicluster)
+> 6. Cross-cluster service discovery patterns (DNS federation, ServiceEntry)
+
+---
+
+## Real-Life Analogy
+
+Single cluster is like an **office building** — everyone shares internal phone extensions, the building's internal network, and the same security badge system.
+
+Multi-cluster is like a **corporate campus with multiple buildings**: each building has its own internal phone system (cluster network), its own extension range (Pod CIDR), and its own access card system (RBAC). For employees to call across buildings, you need:
+- A **switchboard** that bridges the two phone systems (gateway/tunnel approach), or
+- A **unified corporate phone network** where all buildings share one numbering scheme (flat network/BGP approach), or
+- A **corporate directory** where you look up someone by name and the system connects you regardless of building (service mesh federation/DNS approach).
+
+---
+
+## Architecture Diagram
+
+```text
+              Multi-Cluster Networking Models
+
+Model 1: Flat Network (BGP/VPC Peering)
+  Cluster A (10.0.0.0/8)    Cluster B (10.1.0.0/8)
+  Pod-A1: 10.0.1.5  ─────────────────────────  Pod-B1: 10.1.2.3
+                     BGP routes exported/imported
+                     OR VPC peering
+  Direct Pod-to-Pod routing. No gateway needed.
+
+Model 2: Gateway/Tunnel (Submariner, WireGuard)
+  Cluster A               Tunnel (IPsec/WireGuard)     Cluster B
+  Pod-A1                   ════════════════════          Pod-B1
+  10.0.1.5 → Gateway A ══╗                  ╔══ Gateway B → 10.1.2.3
+                          ╚══════════════════╝
+
+Model 3: Service Mesh Federation (Istio)
+  Cluster A                                  Cluster B
+  Pod-A1 → Eastwest GW ─── mTLS tunnel ──── Eastwest GW → Pod-B1
+  Service: hello.global   DNS resolves to remote cluster's GW IP
+```
+
+---
+
+## Why Multi-Cluster?
+
+```text
+Reasons organizations run multiple clusters:
+
+1. High Availability / Disaster Recovery
+   - Active-active across two regions
+   - If region-a fails, region-b serves all traffic
+   - No single cluster failure takes down production
+
+2. Isolation for Security/Compliance
+   - PCI/HIPAA workloads in a dedicated cluster
+   - Separate clusters for different trust boundaries
+   - Break-glass isolation: compromise of one cluster doesn't spread
+
+3. Team/Organizational Isolation
+   - Platform team runs the infra cluster (monitoring, CI/CD)
+   - Product teams each have their own cluster
+   - Billing and resource attribution per cluster
+
+4. Scale Limits
+   - Kubernetes is tested to ~5000 nodes per cluster
+   - Very large organizations may need to shard workloads across clusters
+
+5. Regulatory/Data Residency
+   - EU data must stay in EU clusters
+   - Separate cluster per sovereign region
+```
+
+---
+
+## The Core Networking Challenge
+
+```bash
+# The fundamental problem:
+# Each cluster has its own:
+# - Pod CIDR: typically 10.x.0.0/16
+# - Service CIDR: typically 10.96.0.0/12
+# - CoreDNS: only knows about its own cluster's services
+
+# These ranges OVERLAP across clusters by default:
+# Cluster A: Pod CIDR 10.0.0.0/16, Service CIDR 10.96.0.0/12
+# Cluster B: Pod CIDR 10.0.0.0/16, Service CIDR 10.96.0.0/12 (same!)
+
+# Solutions require:
+# 1. Non-overlapping CIDRs (plan ahead at cluster creation time!)
+#    OR
+# 2. NAT/tunneling that translates between overlapping CIDRs
+
+# Service names are also cluster-local:
+# kubectl get svc api-service -n production (only in Cluster A)
+# Cross-cluster: needs DNS federation or explicit ServiceEntry
+```
+
+> [!IMPORTANT]
+> **Plan non-overlapping CIDRs at cluster creation** — retrofitting overlapping CIDR ranges is extremely difficult. Use separate `/16` or `/14` blocks per cluster in your IP address plan.
+
+---
+
+## Approach 1: Flat Network (BGP/VPC Peering)
+
+```text
+How it works:
+  - Cluster A's CNI (Calico/Cilium) advertises Pod CIDR routes via BGP
+  - Cluster B's CNI imports those routes
+  - Pod-to-Pod traffic routes directly over the shared physical network
+  - No tunneling, no additional hops
+
+Prerequisites:
+  - Non-overlapping Pod CIDRs (CRITICAL)
+  - BGP-capable network infrastructure (cloud provider or on-prem)
+  - Clusters must be on the same BGP domain or VPC-peered
+
+Cloud implementation:
+  AWS: VPC Peering + Calico with BGP peering to VPC router
+  GCP: Shared VPC or VPC Peering with Calico/Cilium native routing
+  On-prem: Calico BGP peering to ToR (Top-of-Rack) switches
+
+Pros:
+  - Simplest model: direct routing, lowest latency
+  - No overlay overhead, no tunnel MTU concerns
+  - Standard network tooling (traceroute shows real hops)
+
+Cons:
+  - Requires BGP-capable infrastructure
+  - No encryption by default (need separate mTLS or link encryption)
+  - CIDR planning is mandatory and unforgiving
+```
+
+---
+
+## Approach 2: Gateway/Tunnel (Submariner)
+
+Submariner creates encrypted tunnels between clusters:
+
+```bash
+# Install subctl (Submariner CLI)
+curl -Ls https://get.submariner.io | bash
+
+# Deploy Submariner broker (one broker for all clusters)
+subctl deploy-broker --kubeconfig broker-cluster.yaml
+
+# Join Cluster A
+subctl join --kubeconfig cluster-a.yaml broker-info.subm \
+  --clusterid cluster-a \
+  --natt-discovery-port 4490
+
+# Join Cluster B
+subctl join --kubeconfig cluster-b.yaml broker-info.subm \
+  --clusterid cluster-b
+
+# Verify connectivity
+subctl verify cluster-a.yaml cluster-b.yaml --only connectivity
+
+# Check cross-cluster service discovery
+kubectl get serviceimport -A  # Services exported from other clusters
+```
+
+```yaml
+# Export a service from Cluster A (makes it discoverable in Cluster B)
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: api-service
+  namespace: production
+# Creates a ServiceImport in Cluster B:
+# api-service.production.svc.clusterset.local → routed via Submariner tunnel
+```
+
+---
+
+## Approach 3: Service Mesh Federation (Istio Multi-Cluster)
+
+Istio multi-cluster connects clusters at the service mesh level:
+
+```bash
+# Install Istio on both clusters with the same trust domain
+# (shared root CA is essential for cross-cluster mTLS)
+
+# Cluster A
+istioctl install --set values.global.meshID=mesh1 \
+  --set values.global.multiCluster.clusterName=cluster-a \
+  --set values.global.network=network1
+
+# Cluster B  
+istioctl install --set values.global.meshID=mesh1 \
+  --set values.global.multiCluster.clusterName=cluster-b \
+  --set values.global.network=network2
+
+# Create east-west gateway in each cluster
+# (gateway for cross-cluster traffic)
+istioctl install -f eastwest-gateway.yaml
+
+# Exchange API server secrets (each cluster's istiod needs API access to the other)
+istioctl create-remote-secret \
+  --kubeconfig=cluster-b.yaml \
+  --name=cluster-b | kubectl apply -f - --kubeconfig=cluster-a.yaml
+```
+
+```yaml
+# ServiceEntry for cross-cluster service discovery
+# (Alternatively, Istio auto-discovers if clusters are registered)
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: cluster-b-api
+  namespace: production
+spec:
+  hosts:
+  - api.cluster-b.global
+  location: MESH_INTERNAL
+  ports:
+  - number: 8080
+    name: http
+    protocol: HTTP
+  resolution: DNS
+  endpoints:
+  - address: <cluster-b-eastwest-gateway-ip>
+    ports:
+      http: 15443      # East-west gateway port
+    labels:
+      cluster: cluster-b
+```
+
+---
+
+## Kubernetes Multi-Cluster API (MCS)
+
+The Kubernetes Multi-Cluster Services API (KEP-1645) is the standard API:
+
+```yaml
+# In Cluster A: export api-service
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: api-service
+  namespace: production
+---
+# Cluster B sees (auto-created by controller):
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceImport
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  type: ClusterSetIP
+  ports:
+  - port: 8080
+    protocol: TCP
+# DNS in Cluster B:
+# api-service.production.svc.clusterset.local → cross-cluster
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why do organizations run multiple Kubernetes clusters instead of one large cluster?**
+
+Multiple clusters address four main concerns: (1) **High availability** — a single cluster is a single point of failure at the control plane level; multi-cluster enables active-active or active-passive DR across regions. (2) **Isolation** — security-sensitive workloads (PCI, HIPAA) in dedicated clusters with their own RBAC and audit logs; compromising one cluster doesn't affect others. (3) **Scale limits** — Kubernetes is designed for ~5000 nodes; very large organizations shard workloads. (4) **Organizational boundaries** — separate clusters per team or business unit enable independent upgrade cadences, cost attribution, and autonomy.
+
+**Q2: What is the fundamental networking challenge in multi-cluster Kubernetes?**
+
+Each cluster has its own Pod CIDR and Service CIDR (e.g., 10.0.0.0/16 for Pods). By default, these ranges overlap across clusters — Cluster A and Cluster B both use 10.0.0.0/16. Even if CIDRs don't overlap, Pod IPs are not routable between clusters (they're on overlay networks). Service ClusterIPs are also cluster-local — kube-proxy only programs iptables for local services. Cross-cluster communication requires either: BGP route propagation (flat network), encrypted tunnels (Submariner/WireGuard), or service mesh east-west gateways (Istio).
+
+**Q3: What is Submariner and how does it enable cross-cluster communication?**
+
+Submariner creates encrypted IPsec or WireGuard tunnels between clusters' gateway nodes. It has three components: the broker (stores cluster topology, runs in one cluster), the gateway engine (manages tunnels on gateway nodes), and the route agent (programs routes on all nodes to send cross-cluster traffic to the gateway). Submariner also implements the MCS (Multi-Cluster Services) API — services can be exported from one cluster via `ServiceExport` and auto-discovered in other clusters via `ServiceImport` at the `*.svc.clusterset.local` DNS domain.
+
+**Q4: How does Istio multi-cluster differ from Submariner for cross-cluster connectivity?**
+
+Submariner works at L3/L4 — it creates IP-level tunnels that make Pod IPs routable across clusters. Any protocol works automatically. Istio multi-cluster works at L7 via east-west gateways — cross-cluster traffic is routed through Envoy proxies and encrypted with mTLS using SPIFFE identities. Istio provides: automatic mTLS, traffic management (weighted routing across clusters), observability (cross-cluster traces), and service-level policies. Submariner is simpler and protocol-agnostic; Istio multi-cluster is more powerful but requires Istio on all clusters with a shared trust domain.
+
+**Q5: What is the MCS (Multi-Cluster Services) API?**
+
+The Multi-Cluster Services API (KEP-1645) is a Kubernetes standard for cross-cluster service discovery. It defines two CRDs: `ServiceExport` (in the exporting cluster, marks a Service as available cross-cluster) and `ServiceImport` (auto-created in importing clusters, provides ClusterSetIP and DNS). Exported services are discoverable at `<svc>.<ns>.svc.clusterset.local` from any cluster in the cluster set. Implementations include Submariner, GKE Multi-Cluster Services, and Cilium Cluster Mesh. It standardizes cross-cluster discovery across different connectivity solutions.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why multi-cluster: HA/DR, isolation, scale limits, org boundaries, data residency
+- [ ] Know the core problem: Pod CIDRs and Service CIDRs are cluster-local and may overlap
+- [ ] Know three models: flat network (BGP), gateway/tunnel (Submariner), service mesh (Istio)
+- [ ] Know Submariner uses IPsec/WireGuard tunnels + broker + route agents
+- [ ] Know MCS API: ServiceExport + ServiceImport → `*.svc.clusterset.local` DNS
+- [ ] Know Istio multi-cluster uses east-west gateways with cross-cluster mTLS
+- [ ] Know CIDR planning is mandatory at cluster creation time — overlapping CIDRs are hard to fix

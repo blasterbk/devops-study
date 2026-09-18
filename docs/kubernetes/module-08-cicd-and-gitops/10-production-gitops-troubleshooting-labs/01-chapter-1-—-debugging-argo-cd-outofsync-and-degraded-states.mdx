@@ -1,0 +1,217 @@
+---
+title: "Chapter 1 — Debugging OutOfSync & Degraded States"
+sidebar_position: 1
+module: "Module 8.10 — GitOps Troubleshooting Labs"
+description: "Master Argo CD production troubleshooting — diagnosing OutOfSync and Degraded states, schema validation errors, HPA drift, and custom Lua health scripts."
+---
+
+# Chapter 1 — Debugging Argo CD OutOfSync and Degraded States
+
+> **Goal:** Master systematic diagnostic workflows and triage runbooks for failure states in **Argo CD** — understanding the distinction between **Sync Status** (`Synced` vs `OutOfSync`) and **Health Status** (`Healthy` vs `Degraded` vs `Progressing` vs `Missing`), diagnosing CRD schema validation failures and admission webhook rejections, isolating HPA replica drift, authoring custom Lua health assessment scripts, and executing dry-run synchronizations using the `argocd` CLI.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural matrix separating Sync Status (Git comparison) from Health Status (Runtime state)
+> 2. The 4 most common root causes of permanent `OutOfSync` states and how to resolve them
+> 3. Why `Degraded` states occur even when manifests are 100% syntactically valid in Git
+> 4. How to diagnose HPA and mutating admission controller field drift
+> 5. How to write custom Lua Health Check scripts for Custom Resource Definitions (CRDs)
+> 6. How to execute CLI dry-runs (`argocd app diff`, `argocd app sync --dry-run`) during incident response
+
+---
+
+## Real-Life Analogy
+
+Think of Argo CD's Sync and Health states as **the difference between a home building inspection comparing the paper blueprints vs inspecting whether the plumbing actually works**:
+
+- **The Blueprint Comparison (Sync Status - `Synced` vs `OutOfSync`):** The building inspector walks into the house with the official architect blueprints (**Git Repository**). The inspector checks if the physical walls match the paper drawings:
+  - If the paper says *"3 Doors"* and there are 3 doors $\to$ **`Synced`**.
+  - If someone added a 4th door or painted a wall yellow (**Runtime Mutation / Drift**) $\to$ **`OutOfSync`**.
+- **The Living Quality Inspection (Health Status - `Healthy` vs `Degraded`):** The inspector turns on the water faucets and tests the electrical outlets:
+  - If the water flows smoothly and lights turn on $\to$ **`Healthy`**.
+  - If a pipe burst inside the drywall, the basement is flooding, and the toilet is smoking (**Pods in `CrashLoopBackOff`, OOMKilled, or missing PVCs**) $\to$ **`Degraded`**!
+- **The Critical Takeaway:** A building can be 100% **`Synced`** (built exactly to the blueprint) while being 100% **`Degraded`** (the boiler is on fire!).
+
+---
+
+## Architecture Diagram
+
+```text
+               Argo CD Sync Status vs Health Status Evaluation Matrix
+
+ GIT REPOSITORY (Desired State)                 KUBERNETES LIVE ETCD (Actual State)
+ ┌──────────────────────────────┐              ┌──────────────────────────────┐
+ │ Deployment: payment-api      │              │ Live Deployment Pods in etcd │
+ │ - Replicas: 3                │              │ - 3 Pods running on nodes    │
+ │ - Image: payment:v2.0        │              │ - Status: 1 Running, 2 Crashing
+ └──────────────┬───────────────┘              └──────────────┬───────────────┘
+                │                                             │
+                └──────────────────────┬──────────────────────┘
+                                       │ Evaluated by Application Controller
+                                       ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ARGO CD APPLICATION EVALUATION ENGINE                                  │
+ │                                                                        │
+ │ 1. SYNC STATUS CHECK: (3-Way Diff Engine)                              │
+ │    - Compares: [ Git Manifests ] vs [ Live etcd Object Specs ]         │
+ │    - Result: Manifests match 100% ──► SYNC STATUS: [ SYNCED ]          │
+ │                                                                        │
+ │ 2. HEALTH STATUS CHECK: (Lua Health Script Evaluation)                 │
+ │    - Evaluates: `status.availableReplicas` (1) < `spec.replicas` (3)   │
+ │    - Detects: Pods in `CrashLoopBackOff`!                              │
+ │    - Result: Workload is broken! ──► HEALTH STATUS: [ DEGRADED ]       │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Argo CD Status Matrix
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Status Type & Value  │ Category                │ Meaning & Underlying Cluster Condition            │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Synced`**         │ Sync Status             │ Live cluster resources match Git manifests 100%.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`OutOfSync`**      │ Sync Status             │ Divergence detected between Git and live `etcd`.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Healthy`**        │ Health Status           │ All pods are Ready; Services/PVCs are bound.      │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Progressing`**    │ Health Status           │ Rolling update in flight; waiting for pods to boot│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Degraded`**       │ Health Status           │ Workload failed (CrashLoopBackOff, OOMKill, etc.).│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Missing`**        │ Health Status           │ Resource declared in Git does not exist in cluster│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Root Cause 1: Resolving HPA Replica Count Drift
+
+When a `HorizontalPodAutoscaler` (HPA) scales a Deployment, it updates `spec.replicas` in `etcd`. If your Git manifest also hardcodes `replicas: 3`, Argo CD flags the app as permanent **`OutOfSync`**!
+
+### Solution: Configure `ignoreDifferences` in Application Spec:
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: payment-api-production
+  namespace: argocd
+spec:
+  # Instructs Argo CD diff engine to ignore HPA replica mutations!
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    name: payment-api
+    jsonPointers:
+    - /spec/replicas
+```
+
+---
+
+## Root Cause 2: Custom Lua Health Scripts for Third-Party CRDs
+
+If your application uses third-party Custom Resources (such as Argo Rollouts or Prometheus rules), Argo CD may mark them as `Unknown` or `Progressing` forever because it lacks built-in health scripts for that CRD.
+
+Add a custom Lua health check in `argocd-cm` ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  resource.customizations.health.argoproj.io_Rollout: |
+    hs = {}
+    if obj.status ~= nil then
+      if obj.status.phase == "Healthy" then
+        hs.status = "Healthy"
+        hs.message = "Rollout is healthy"
+        return hs
+      end
+      if obj.status.phase == "Degraded" then
+        hs.status = "Degraded"
+        hs.message = "Rollout has degraded!"
+        return hs
+      end
+      if obj.status.phase == "Progressing" or obj.status.phase == "Paused" then
+        hs.status = "Progressing"
+        hs.message = "Rollout is progressing or paused"
+        return hs
+      end
+    end
+    hs.status = "Progressing"
+    hs.message = "Waiting for rollout status"
+    return hs
+```
+
+---
+
+## The 4-Step SRE GitOps Diagnostic Runbook
+
+```bash
+# STEP 1: Identify precisely WHICH resource is OutOfSync or Degraded
+argocd app get payment-api-production
+
+# STEP 2: View live field-by-field diff between Git and etcd
+argocd app diff payment-api-production
+
+# STEP 3: Execute a simulated dry-run synchronization
+argocd app sync payment-api-production --dry-run
+
+# STEP 4: Inspect controller reconciliation error logs
+kubectl logs -n argocd -l app.kubernetes.io/name=argocd-application-controller --tail=50 | grep -i "error"
+```
+
+---
+
+## Hands-On Lab: Simulating and Debugging an OutOfSync State
+
+```bash
+# Step 1: Query all applications in Degraded or OutOfSync states
+kubectl get applications -n argocd -o json 2>/dev/null | jq '.items[] | select(.status.sync.status=="OutOfSync" or .status.health.status=="Degraded") | {name: .metadata.name, sync: .status.sync.status, health: .status.health.status}' 2>/dev/null || echo "Argo CD query active"
+
+# Step 2: Extract resource-level sync error messages from an application
+# kubectl get application payment-api-production -n argocd -o json | jq '.status.resources[] | select(.status=="OutOfSync")'
+
+# Step 3: Check for missing namespaces or AppProject destination violations
+# kubectl get appprojects -n argocd -o yaml | grep -A 5 "destinations"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between Sync Status and Health Status in Argo CD?**
+
+- **Sync Status** (`Synced`, `OutOfSync`): Measures **declarative state alignment**. It uses a 3-way diff algorithm to compare the desired manifests stored in Git against the live resource specifications stored in `etcd`.
+- **Health Status** (`Healthy`, `Progressing`, `Degraded`, `Missing`): Measures **real-time runtime operational viability**. It evaluates whether running pods pass readiness probes, whether Services have endpoints, and whether database migrations completed, using built-in or custom Lua health scripts.
+
+**Q2: Why does an application with an active Horizontal Pod Autoscaler (HPA) frequently show as `OutOfSync` in Argo CD, and how do you resolve it?**
+
+When traffic spikes, the HPA controller mutates the `spec.replicas` field of the Deployment directly inside the cluster (e.g. from 3 to 10). If the Git repository specifies `replicas: 3`, Argo CD detects the difference and flags the Deployment as `OutOfSync`. To resolve this: (1) Omit `spec.replicas` from the Git manifest entirely; and (2) Configure `spec.ignoreDifferences: [{ group: "apps", kind: "Deployment", jsonPointers: ["/spec/replicas"] }]` in the Argo CD `Application` spec.
+
+**Q3: What causes an Application to fail with `application destination is not permitted in project`?**
+
+Every Argo CD `Application` belongs to an **`AppProject`**. The `AppProject` defines an explicit `destinations` whitelist (restricting allowed cluster URLs and namespaces). If an application attempts to deploy into a namespace (e.g. `production`) that is not explicitly whitelisted in its assigned `AppProject`, the Argo CD API server rejects the synchronization with a permission error.
+
+**Q4: How do you fix Custom Resources (CRDs) that are perpetually stuck in `Progressing` or `Unknown` health states in Argo CD?**
+
+Argo CD includes built-in health scripts for core Kubernetes resources (Deployments, StatefulSets, PVCs), but is blind to custom third-party CRDs (such as cert-manager `Certificate` or Vault `VaultStaticSecret`). To fix this, define a custom **Lua Health Assessment Script** under `resource.customizations.health.<group>_<kind>` in the `argocd-cm` ConfigMap. The Lua script evaluates the CRD's `.status.conditions` array and maps them to standard Argo CD health strings (`Healthy`, `Degraded`, `Progressing`).
+
+**Q5: What is the difference between `argocd app sync --force` and `argocd app sync --replace`?**
+
+- `--force`: If a standard `kubectl apply` fails due to schema conflicts, `--force` deletes the existing resource from the cluster and recreates it from scratch (causing potential downtime and IP/UID changes).
+- `--replace`: Executes a `kubectl replace` (PUT request) rather than a strategic merge patch (`PATCH`), overwriting the entire resource object in `etcd`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Sync Status measures Git alignment; Health Status measures runtime viability
+- [ ] Know that an application can be `Synced` while simultaneously being `Degraded`
+- [ ] Know how `ignoreDifferences` prevents HPA replica counts from triggering drift
+- [ ] Know how custom Lua health scripts in `argocd-cm` evaluate third-party CRDs
+- [ ] Know how `AppProject` destination whitelists block unauthorized namespace deployments
+- [ ] Can troubleshoot diffs using `argocd app diff <name>` and `argocd app get <name>`

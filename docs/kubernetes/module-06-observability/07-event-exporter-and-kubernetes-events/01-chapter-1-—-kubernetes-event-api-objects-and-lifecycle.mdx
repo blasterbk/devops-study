@@ -1,0 +1,235 @@
+---
+title: "Chapter 1 — Kubernetes Event API & Lifecycle"
+sidebar_position: 1
+module: "Module 6.7 — Kubernetes Events & Exporters"
+description: "Master Kubernetes Events architecture — core/v1 vs events.k8s.io/v1 APIs, Event anatomy (type, reason, involvedObject), 1-hour etcd TTL lifecycles, and event aggregation."
+---
+
+# Chapter 1 — Kubernetes Event API Objects & Lifecycle
+
+> **Goal:** Master the core architecture and operational lifecycle of Kubernetes Events — understanding the evolution from legacy `core/v1.Event` to modern `events.k8s.io/v1.Event` resources, analyzing event anatomy (`type`, `reason`, `involvedObject`, `reportingController`), examining how Kubelet aggregates duplicate events using the `count` counter, and investigating why Kubernetes enforces an ephemeral **1-hour TTL** in `etcd` that makes external event streaming mandatory for post-incident root cause analysis (RCA).
+>
+> By the end of this chapter, you will understand:
+> 1. The fundamental role of Kubernetes Events in cluster state changes and failure notifications
+> 2. The structural anatomy of the `events.k8s.io/v1` API resource
+> 3. The distinction between `Normal` informational events and `Warning` failure events
+> 4. How Kubelet and control plane controllers aggregate duplicate events using `count` and `series`
+> 5. Why the API server purges all events from `etcd` after 60 minutes (`--event-ttl=1h0m0s`)
+> 6. How to query, filter, and sort events using advanced `kubectl` JSONPath expressions
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes Events as **the automated security intercom logs and building alert ticker in an apartment complex**:
+
+- **The Status Object (The Permanent Tenant Directory):** Tells you who lives in Apartment 4B right now (**The Pod Spec & Status in `etcd`**).
+- **The Event Object (The Live Intercom Log):** Records point-in-time actions that happened as someone walked through the lobby door:
+  - *"At 10:15:00 AM, Tenant Alice scanned her badge (`Normal: Scheduled`)."*
+  - *"At 10:15:05 AM, Elevator motor stalled due to power surge (`Warning: FailedMount`)."*
+- **Event Deduplication (The Annoying Alarm Squelch):** If a smoke detector beeps 50 times in 1 minute, the security guard doesn't write 50 separate paper tickets in the logbook. The guard writes: *"Smoke detector #4 beeping (**`count: 50`**, first seen 10:15 AM, last seen 10:16 AM)"*.
+- **The 1-Hour Memory Wipe (The 60-Minute Whiteboard Eraser):** The lobby whiteboard is small. Every 60 minutes, the building manager wipes the board clean with an eraser (**`--event-ttl=1h`**). If a pipe burst at 2:00 AM, and the plumber arrives at 9:00 AM, **the whiteboard is completely blank** unless the security team saved the log to an external filing cabinet (**Kubernetes Event Exporter**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Event Generation & 1-Hour etcd Lifecycle
+
+ CONTROLLERS & KUBELETS (Event Producers)
+ ┌──────────────────────────────────────┐     ┌──────────────────────────────────────┐
+ │ Kube-Scheduler                       │     │ Worker Node Kubelet                  │
+ │ Emits: `Normal: Scheduled`           │     │ Emits: `Warning: FailedMount / Crash`│
+ └──────────────────┬───────────────────┘     └──────────────────┬───────────────────┘
+                    │                                            │
+                    │ HTTP POST /api/v1/events                   │
+                    └─────────────────────┬──────────────────────┘
+                                          ▼
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: Event Aggregator & Deduplication                                       │
+ │ - Groups repeated events within 10s window: Increments `.count` and `.lastTimestamp`   │
+ └──────────────────────────────────┬─────────────────────────────────────────────────────┘
+                                    │ Writes Event Object to etcd
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │ ETCD DATABASE STORAGE (Key: `/registry/events/<namespace>/<event-name>`)               │
+ │                                                                                        │
+ │ ┌────────────────────────────────────────────────────────────────────────────────────┐ │
+ │ │ Ephemeral 1-Hour Storage Window (`--event-ttl=1h0m0s`)                             │ │
+ │ │ - Minute 00: Event Recorded in etcd ──► Visible via `kubectl get events`           │ │
+ │ │ - Minute 59: Event Still Queryable in etcd                                         │ │
+ │ │ - Minute 60: API Server Garbage Collector PURGES EVENT PERMANENTLY!                │ │
+ │ └────────────────────────────────────────────────────────────────────────────────────┘ │
+ └────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `core/v1.Event` vs `events.k8s.io/v1.Event`
+
+Kubernetes upgraded the Events API to improve control plane performance and reduce `etcd` write load:
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ Legacy `core/v1.Event`          │ Modern `events.k8s.io/v1.Event` │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **API Group**             │ `v1` (Core)                     │ `events.k8s.io/v1`              │
+ │ **Deduplication Model**   │ Updates entire object repeatedly│ Uses dedicated **`series`**     │
+ │                           │ on every single occurrence.     │ subfield to minimize etcd writes│
+ │ **Producer Attribution**  │ Basic `source.component` string │ **`reportingController`** and   │
+ │                           │ (e.g. `kubelet`).               │ **`reportingInstance`** (Pod/ID)│
+ │ **Action Context**        │ Omitted.                        │ **`action`** field (e.g. `Bind`,│
+ │                           │                                 │ `Pull`, `Mount`, `Restart`).    │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Anatomy of a Kubernetes Event Resource
+
+```yaml
+apiVersion: events.k8s.io/v1
+kind: Event
+metadata:
+  name: payment-api-7b8f.17c91a2b3c4d5e
+  namespace: production
+# 1. Event Type: Normal or Warning
+type: Warning
+
+# 2. Reason: Short machine-readable string
+reason: FailedScheduling
+
+# 3. Message: Detailed human-readable explanation
+note: "0/12 nodes are available: 3 Insufficient memory, 9 node(s) had untolerated taint."
+
+# 4. Involved Object: The resource experiencing the event
+regarding:
+  kind: Pod
+  name: payment-api-7b8f
+  namespace: production
+  uid: a1b2c3d4-5678-90ab-cdef-1234567890ab
+  apiVersion: v1
+
+# 5. Reporting Controller
+reportingController: default-scheduler
+reportingInstance: default-scheduler-control-plane-01
+action: Schedule
+
+# 6. Event Series: Deduplication tracking
+series:
+  count: 14                            # Number of times this event fired!
+  lastObservedTime: "2026-08-18T12:00:00.000000Z"
+eventTime: "2026-08-18T11:55:00.000000Z"
+```
+
+---
+
+## Essential Warning Event Reasons to Monitor
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Event Reason         │ Emitted By              │ Root Cause & Operational Impact                   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`FailedScheduling`**│ `default-scheduler`     │ Pod cannot find a node with sufficient CPU/RAM,   │
+ │                      │                         │ matching nodeAffinity, or matching taints.        │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`FailedMount`**    │ `attachdetach-controller│ CSI driver failed to attach or mount volume (e.g. │
+ │                      │ / Kubelet               │ Multi-AZ mismatch, disk already attached elsewhere│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`BackOff`**        │ Kubelet                 │ Container crashed on boot and is entering an      │
+ │                      │                         │ exponential restart backoff (`CrashLoopBackOff`). │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Unhealthy`**      │ Kubelet                 │ Container failed a Startup, Liveness, or Readiness│
+ │                      │                         │ probe threshold.                                  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`FailedCreate`**   │ `replicaset-controller` │ ReplicaSet blocked from creating pods by quota    │
+ │                      │                         │ limits (`ResourceQuota`) or Admission Controllers.│
+ └──────────────────────┴─────────────────────────┴───────────────────────────────────────────────────┘
+```
+
+---
+
+## The 1-Hour `etcd` TTL Dilemma
+
+Configured on `kube-apiserver` via:
+`--event-ttl=1h0m0s` (Default: 1 Hour)
+
+```text
+ Why Events are Purged After 60 Minutes:
+ - A large 500-node cluster generates 500,000+ events per day during busy CI/CD deployments.
+ - If events were retained indefinitely, the `etcd` 8GB database limit would be exhausted in days, 
+   causing total control-plane database lockups!
+ 
+ The SRE Post-Mortem Dilemma:
+ When an outage happens at 3:00 AM and the on-call engineer investigates at 9:00 AM, running 
+ `kubectl get events` returns zero records. 
+ ──► Solution: Deploy an automated event forwarder (Kubernetes Event Exporter).
+```
+
+---
+
+## Hands-On Lab: Querying & Sorting Kubernetes Events
+
+```bash
+# Step 1: Query all events across all namespaces sorted by creation timestamp
+kubectl get events -A --sort-by='.metadata.creationTimestamp'
+
+# Step 2: Filter strictly for WARNING events across the entire cluster
+kubectl get events -A --field-selector type=Warning
+
+# Step 3: Filter events for a specific Pod
+kubectl get events -n kube-system --field-selector involvedObject.kind=Pod
+
+# Step 4: Extract event reason, count, and message using JSONPath
+kubectl get events -n default -o jsonpath='{range .items[*]}{.type}{"\t"}{.reason}{"\tCount: "}{.count}{"\t"}{.message}{"\n"}{end}'
+
+# Step 5: Trigger a test event by running a pod with an invalid image
+kubectl run bad-image-pod --image=non-existent-registry.internal/fake:v99 -n default
+sleep 5
+
+# Step 6: Verify the ErrImagePull / BackOff Warning event was emitted
+kubectl get events -n default --field-selector involvedObject.name=bad-image-pod
+
+# Step 7: Clean up lab
+kubectl delete pod bad-image-pod -n default
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the primary difference between a Kubernetes Resource Status and a Kubernetes Event?**
+
+- **Resource Status** (e.g. `Pod.status.phase: Running`): Represents the **current, static point-in-time reality** of an object in `etcd`. It tells you what state the object is in right now.
+- **Event** (e.g. `Normal: Scheduled`, `Warning: FailedMount`): Represents an **ephemeral point-in-time state transition or asynchronous incident** that occurred during the object's lifecycle. It tells you *how and why* the object reached its current state.
+
+**Q2: Why does Kubernetes enforce a 1-hour default retention TTL on Events in `etcd`?**
+
+In active clusters with thousands of rolling deployments, job executions, and health checks, controllers emit hundreds of thousands of events every hour. Because Events are stored as individual key-value pairs directly in `etcd` (`/registry/events/...`), storing historical events permanently would cause the `etcd` database to exceed its 8GB storage quota, fragment the B-tree storage index, and degrade control-plane API performance.
+
+**Q3: How does Kubelet deduplicate and aggregate repeated events?**
+
+When Kubelet or a controller detects the same event firing repeatedly within a short time window (e.g. a failing probe firing every 5 seconds), it does not create a new `Event` resource in `etcd` for every single occurrence. Instead, it patches the existing Event object, incrementing the **`count`** (or `series.count`) field and updating the **`lastTimestamp`** / `lastObservedTime`, reducing API server write amplification by over 95%.
+
+**Q4: What is the difference between `core/v1.Event` and `events.k8s.io/v1.Event`?**
+
+The modern `events.k8s.io/v1.Event` API was introduced to address performance bottlenecks of the legacy core `v1` API. Key improvements include: (1) Replaced the heavy monolithic update cycle with the **`series`** struct for lightweight heartbeat updates; (2) Added **`reportingController`** and **`reportingInstance`** fields for explicit attribution of which controller replica generated the event; and (3) Added the **`action`** field to clearly categorize the attempted operation.
+
+**Q5: What are the most critical `Warning` event reasons that indicate cluster-level infrastructure failures?**
+
+- `FailedScheduling`: Indicates compute capacity exhaustion (insufficient node CPU/memory) or scheduling constraints (taints/affinities).
+- `FailedMount` / `FailedAttachVolume`: Indicates cloud CSI storage provisioning failures or multi-AZ volume attachment deadlocks.
+- `NodeNotReady` / `NodeMemoryPressure` / `NodeDiskPressure`: Indicates physical worker node degradation.
+- `FailedCreate`: Indicates `ResourceQuota` exhaustion or admission webhook rejections.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Events represent transient point-in-time state transitions
+- [ ] Know the difference between `Normal` (info) and `Warning` (failure) events
+- [ ] Know how `count` and `series` deduplicate repeated events in `etcd`
+- [ ] Know that the API server enforces an ephemeral 1-hour TTL (`--event-ttl=1h`)
+- [ ] Know why 1-hour TTL makes external event streaming mandatory for post-mortems
+- [ ] Can query warning events using `kubectl get events --field-selector type=Warning`

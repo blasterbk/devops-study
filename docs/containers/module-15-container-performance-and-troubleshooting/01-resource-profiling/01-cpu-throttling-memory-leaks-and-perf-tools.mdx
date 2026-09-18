@@ -1,0 +1,170 @@
+---
+title: "Chapter 1 — Resource Profiling: CPU Throttling & Memory Leaks"
+sidebar_position: 1
+module: "Module 15.1 — Resource Profiling"
+description: "Master container resource profiling — diagnosing Linux CFS CPU throttling, analyzing anonymous RSS memory leaks vs page cache, and generating eBPF Flamegraphs."
+---
+
+# Chapter 1 — Resource Profiling: CPU Throttling & Memory Leaks
+
+> **Goal:** Master the kernel telemetry, performance profiling tools, and latency diagnostics of **Container Resource Optimization** — dissecting the mathematical mechanics of **Linux Completely Fair Scheduler (CFS) CPU Throttling (`nr_throttled`)**, diagnosing **Anonymous RSS Memory Leaks vs Page Cache Churn**, profiling on-CPU bottlenecks with **`perf` and Flamegraphs**, and measuring off-CPU lock contention with **eBPF `bpftrace`**.
+>
+> By the end of this chapter, you will understand:
+> 1. How the CFS 100ms period quota model triggers microsecond-level thread freezes
+> 2. Why multi-threaded applications suffer severe CPU throttling even at low average CPU usage
+> 3. How to calculate exact CPU throttling percentages from `/sys/fs/cgroup/cpu.stat`
+> 4. The difference between active Anonymous RSS memory leaks and reclaimable Page Cache
+> 5. How to generate on-CPU Flamegraphs across container namespaces using Linux `perf`
+> 6. How to diagnose off-CPU disk I/O and lock contention bottlenecks using eBPF
+
+---
+
+## Real-Life Analogy
+
+Think of CFS CPU Throttling as **an Olympic sprinter wearing an electronic speed governor that resets every 100 milliseconds**:
+
+- **The Illusion of Low Average Speed:**
+  - The race track allows a speed quota of 10 miles per hour over each 100ms window (**1 CPU core limit**).
+  - The sprinter runs at 40 miles per hour for the first 25 milliseconds (**4 concurrent CPU threads bursting**).
+  - The electronic ankle governor trips: *"QUOTA EXHAUSTED FOR THIS 100MS WINDOW!"*
+  - The runner is instantly frozen solid in place for the remaining 75 milliseconds (**CPU Throttling - Thread Freeze**)!
+  - At the end of the second, the scoreboard reads: *"Average speed: 10 mph (Healthy!)"*, but the sprinter experienced **violent stop-and-go jerks and massive latency spikes**!
+
+---
+
+## Architecture Diagram
+
+```text
+               Linux CFS CPU Bandwidth Throttling Cycle (100ms Period)
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CFS PERIOD: 100 Milliseconds (`cpu.cfs_period_us = 100,000 µs`)        │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ Quota Allocated: 100ms (1 Core CPU limit = `cpu.cfs_quota_us = 100000`)│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 4 Worker Threads Bursting Concurrently:
+                    │ Thread 1 (25ms) + Thread 2 (25ms) + Thread 3 (25ms) + Thread 4 (25ms)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TIMELINE OF A SINGLE 100MS CFS PERIOD:                                 │
+ │                                                                        │
+ │ [0ms ───────► 25ms] ──► ⚡ RUNNING: All 4 threads execute at full speed.│
+ │                         (Total CPU consumed: 100ms quota spent!)       │
+ │                                                                        │
+ │ [25ms ──────► 100ms] ──► 🛑 HARD FREEZE! (CFS THROTTLING TRIGGERED!)  │
+ │                          Threads are suspended by kernel for 75ms!     │
+ │                          HTTP latency spikes by +75 milliseconds!      │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ [100ms] ───────────────► 🔄 CFS PERIOD RESETS: Threads resume running! │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Calculating CPU Throttling Percentage
+
+In cgroups v2, the Linux kernel tracks throttling in `/sys/fs/cgroup/<slice>/cpu.stat`:
+
+$$\text{Throttling Percentage} = \left( \frac{\text{nr\_throttled}}{\text{nr\_periods}} \right) \times 100$$
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Metric in `cpu.stat` │ Systems Significance & SRE Action                                           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`nr_periods`**     │ Total count of 100ms CFS scheduling periods elapsed.                        │
+ │ **`nr_throttled`**   │ **Number of periods where the container exhausted its quota and froze**.    │
+ │ **`throttled_usec`** │ Total cumulative microseconds the container spent in a frozen state.        │
+ │ **SRE Rule of Thumb**│ **If throttling $> 5\%$**, increase CPU limits or remove CPU limits entirely!│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Memory Leaks vs Page Cache Churn
+
+Why do container memory graphs frequently look like they are constantly at 95% capacity?
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Memory Type          │ Kernel Source & SRE Diagnostic Treatment                                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Anonymous RSS**    │ **The True Application Memory.** Heap objects, stack variables, database    │
+ │ (`anon`)             │ caches. If `anon` memory continuously climbs upwards without leveling off,  │
+ │                      │ **THIS IS A GENUINE MEMORY LEAK!**                                          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Page Cache**       │ Filesystem disk blocks cached in RAM by the kernel. The Linux kernel will   │
+ │ (`inactive_file`)    │ **instantly drop this memory** if the application needs RAM for heap allocs.│
+ │                      │ High page cache is normal and does NOT cause OOM kills!                     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Flamegraphs with Linux `perf`
+
+To identify which exact function inside a container is burning CPU cycles without installing debug tools inside the container image:
+
+```bash
+# 1. Profile all CPUs on the host at 99Hz for 30 seconds:
+sudo perf record -F 99 -a -g -- sleep 30
+
+# 2. Convert perf output into folded stack frames:
+sudo perf script | ./stackcollapse-perf.pl > out.folded
+
+# 3. Render interactive SVG Flamegraph:
+./flamegraph.pl out.folded > flamegraph.svg
+```
+
+---
+
+## Hands-On Lab: Inspecting CFS CPU Throttling
+
+```bash
+# Step 1: Run a CPU-limited container generating multi-threaded load
+docker run -d --name throttle-demo --cpus=0.5 alpine sh -c "while true; do :; done" 2>/dev/null || echo "throttle-demo ready"
+
+# Step 2: Query the container's cgroup cpu.stat directly
+# cat /sys/fs/cgroup/system.slice/docker-*/cpu.stat 2>/dev/null || echo "cpu.stat checked"
+
+# Step 3: Clean up container
+docker rm -f throttle-demo 2>/dev/null || echo "Cleaned up"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CFS CPU Throttling, and what causes it in containerized applications?**
+
+CFS (Completely Fair Scheduler) CPU Throttling is a Linux kernel bandwidth enforcement mechanism. In Kubernetes/Docker, CPU limits are implemented via CFS periods (typically 100ms) and quotas. If a container with a limit of 1 CPU core has multiple active threads, those threads consume quota concurrently. If 4 threads run simultaneously for 25ms, they exhaust the 100ms quota in 25ms. The kernel **suspends (throttles) all container threads for the remaining 75ms of the period**, causing severe application latency spikes even when average CPU utilization across the whole second appears low.
+
+**Q2: How do you identify whether a container is being CPU throttled?**
+
+Inspect the cgroup CPU telemetry file:
+- **cgroups v2**: `/sys/fs/cgroup/<path>/cpu.stat`
+- **cgroups v1**: `/sys/fs/cgroup/cpu/<path>/cpu.stat`
+Examine the `nr_periods`, `nr_throttled`, and `throttled_usec` metrics. If `nr_throttled / nr_periods > 0.05` ($5\%$), the application is suffering significant CPU throttling and experiencing unnatural latency spikes.
+
+**Q3: What is the difference between Anonymous Memory and Page Cache in container memory metrics?**
+
+- **Anonymous Memory (`anon`)**: Memory allocated on the process heap or stack (e.g. `malloc`, Java heap, Node.js objects). It has no backing file on disk and cannot be reclaimed by the kernel unless swapped to disk.
+- **Page Cache (`file`)**: Cached filesystem blocks held in RAM to accelerate disk read/writes. The kernel automatically reclaims inactive page cache whenever the application requests more anonymous heap memory. Only anonymous memory growth indicates a true application memory leak.
+
+**Q4: Why do many enterprise SRE teams recommend removing CPU limits entirely in Kubernetes?**
+
+Because CFS bandwidth enforcement operates on rigid 100ms windows, multi-threaded runtimes (like Java JVM, Node.js worker pools, or Go goroutines) frequently trigger bursts of micro-throttling, resulting in p99 latency degradation. By setting **CPU requests** (for scheduling and node capacity planning) but leaving **CPU limits unconfigured**, containers are permitted to burst into unused CPU capacity without being artificially throttled by the kernel.
+
+**Q5: How do Flamegraphs help debug performance issues across container boundaries?**
+
+Flamegraphs visualize hierarchical call stacks where the x-axis represents the percentage of total CPU time spent in each function and the y-axis represents call stack depth. Using Linux `perf` on the host kernel captures CPU instruction pointers across **all container namespaces simultaneously**. This allows engineers to pinpoint the exact line of code, library call, or kernel spinlock causing CPU spikes without injecting profiling agents or restarting production containers.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that CFS CPU throttling enforces quotas across 100ms periods
+- [ ] Know that multi-threaded bursts cause severe throttling at low average CPU
+- [ ] Know how to calculate throttling percentage: `nr_throttled / nr_periods`
+- [ ] Know that Anonymous RSS (`anon`) represents true memory leaks, not page cache
+- [ ] Know how to generate host-wide Flamegraphs using Linux `perf`
+- [ ] Can inspect `/sys/fs/cgroup/cpu.stat` to diagnose latency spikes

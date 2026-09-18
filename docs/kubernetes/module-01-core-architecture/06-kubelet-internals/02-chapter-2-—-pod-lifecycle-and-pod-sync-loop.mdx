@@ -1,0 +1,1383 @@
+---
+title: "Chapter 2 — Pod Lifecycle & Pod Sync Loop"
+sidebar_position: 2
+module: "Module 1.6 — kubelet Internals"
+description: "> **Goal:** Understand how the kubelet continuously manages Pods after they are scheduled onto a Node. Learn how the Pod Lifecycle, Pod Sync Loop, PodWorkers, `..."
+---
+
+# Module 1.6 — kubelet Internals
+
+# Chapter 2 — Pod Lifecycle & Pod Sync Loop
+
+> **Goal:** Understand how the kubelet continuously manages Pods after they are scheduled onto a Node. Learn how the Pod Lifecycle, Pod Sync Loop, PodWorkers, `SyncPod()`, Desired vs Actual State reconciliation, Restart Policies, and Pod Status Updates work together to keep workloads running reliably.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. How kubelet discovers new Pod assignments: Watch on API Server
+> 2. PLEG (Pod Lifecycle Event Generator): detecting container state changes
+> 3. Pod Sync Loop: per-Pod goroutine (PodWorker) managing each Pod
+> 4. SyncPod(): the core function that reconciles desired vs actual Pod state
+> 5. Pod phases: Pending, Running, Succeeded, Failed, Unknown
+> 6. Container states: Waiting, Running, Terminated
+> 7. Restart policies: Always, OnFailure, Never
+> 8. Pod status reporting: kubelet patches status back to API Server
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Pod Sync Loop like a hospital patient admission and care process.
+
+```text
+Hospital Admission Analogy:
+
+Scheduler assigns patient (Pod) to a ward (Node)
+Nurse station (kubelet) receives patient admission form (Pod spec)
+Nurse checks if patient is already admitted (SyncPod: desired vs actual)
+Nurse arranges bed, equipment, medication (container setup: CRI, CNI, volumes)
+Nurse monitors patient vitals continuously (PLEG: container health)
+Nurse follows doctor's standing orders on deterioration (restart policy)
+Nurse files status reports with central records (Pod status update to API Server)
+```
+
+| Hospital | Pod Sync Loop |
+| :--- | :--- |
+| Patient admission form | Pod spec (assigned via `spec.nodeName`) |
+| Nurse station | kubelet |
+| Per-patient nurse | PodWorker goroutine |
+| Checking on the patient | `SyncPod()` reconcile function |
+| Setting up bed and equipment | CRI (containers), CNI (networking), volumes |
+| Monitoring vitals | PLEG detecting container state changes |
+| Filing status reports | kubelet patching Pod status to API Server |
+
+> **Important:** kubelet reports Pod status by **patching the Pod object on the API Server** — it does **not** write to etcd directly. Only the API Server writes to etcd. This means all status information flows: kubelet -> API Server -> etcd -> all other watchers. This is why Pod status may briefly lag behind actual container state.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- kubelet Architecture
+- Node Registration
+- API Server
+- Scheduler
+- Pods
+- Container Runtime (CRI)
+
+---
+
+# Where Does This Chapter Fit?
+
+In the previous chapter, we learned that:
+
+```text
+Scheduler
+  |
+  v
+Assigns Pod
+  |
+  v
+kubelet Watches Pod
+```
+
+But assignment alone does not run the Pod.
+
+The kubelet must continuously manage it throughout its entire lifecycle.
+
+---
+
+# End-to-End Workflow
+
+```text
+User
+  |
+  v
+Deployment
+  |
+  v
+ReplicaSet
+  |
+  v
+Pod Created
+  |
+  v
+API Server
+  |
+  v
+Scheduler
+  |
+  v
+Assign Node
+  |
+  v
+kubelet
+  |
+  v
+Pod Sync Loop
+  |
+  v
+Containers Running
+```
+
+Everything after scheduling is primarily the responsibility of the kubelet.
+
+---
+
+# What is a Pod Lifecycle?
+
+A Pod does not simply go from "created" to "running."
+
+Instead, it progresses through several well-defined states.
+
+Conceptually:
+
+```text
+Pending
+  |
+  v
+Running
+  |
+  v
+Succeeded
+
+or
+
+Failed
+```
+
+The kubelet is responsible for moving the Pod between these phases.
+
+---
+
+# Pod Lifecycle Overview
+
+```text
+Pod Created
+  |
+  v
+Scheduler
+  |
+  v
+Node Assigned
+  |
+  v
+kubelet Receives Pod
+  |
+  v
+Create Sandbox
+  |
+  v
+Pull Images
+  |
+  v
+Create Containers
+  |
+  v
+Start Containers
+  |
+  v
+Running
+  |
+  v
+Termination
+  |
+  v
+Succeeded / Failed
+```
+
+---
+
+# Kubernetes Pod Phases
+
+A Pod may have one of these phases:
+
+```text
+Pending
+
+Running
+
+Succeeded
+
+Failed
+
+Unknown
+```
+
+---
+
+## Pending
+
+The Pod has been accepted by Kubernetes.
+
+Examples:
+
+```text
+Waiting For Scheduler
+
+Image Pull
+
+Volume Mount
+
+Container Creation
+```
+
+Containers are not yet fully running.
+
+---
+
+## Running
+
+The Pod Sandbox exists.
+
+Containers have been started.
+
+At least one container is running or restarting.
+
+---
+
+## Succeeded
+
+All containers completed successfully.
+
+Typically seen in:
+
+```text
+Jobs
+
+Batch Workloads
+```
+
+---
+
+## Failed
+
+At least one container terminated permanently with failure.
+
+Examples:
+
+```text
+Application Error
+
+RestartPolicy=Never
+
+Container Exit Code ≠ 0
+```
+
+---
+
+## Unknown
+
+The API Server cannot determine the Pod's actual state.
+
+Usually caused by communication problems between the kubelet and the control plane.
+
+---
+
+# Pod Lifecycle vs Container Lifecycle
+
+A common misconception:
+
+```text
+Pod Lifecycle
+
+≠
+
+Container Lifecycle
+```
+
+Example:
+
+```text
+Pod
+
+Running
+  |
+  v
+Container Crash
+  |
+  v
+Restarted
+  |
+  v
+Pod Still Running
+```
+
+Containers may restart many times while the Pod remains in the Running phase.
+
+---
+
+# Pod Lifecycle Diagram
+
+```text
+Pending
+  |
+  v
+Running
+  |
+  v
+Restart?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Container Restart
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Completed
+  |
+  v
+Succeeded
+
+or
+
+Failed
+```
+
+---
+
+# The Pod Sync Loop
+
+The Pod Sync Loop is the heart of the kubelet.
+
+It continuously asks:
+
+```text
+Does Reality
+
+Match
+
+Desired State?
+```
+
+If not,
+
+the kubelet performs reconciliation.
+
+---
+
+# Why is a Sync Loop Needed?
+
+Applications fail.
+
+Containers crash.
+
+Processes exit.
+
+Volumes disappear.
+
+Networks fail.
+
+Without reconciliation:
+
+```text
+Desired
+  |
+  v
+Ignored
+  |
+  v
+Broken Workloads
+```
+
+The Sync Loop continuously repairs the difference.
+
+---
+
+# Core Principle
+
+The kubelet follows exactly the same philosophy as every Kubernetes controller:
+
+```text
+Desired State
+  |
+  v
+Observe Actual State
+  |
+  v
+Compare
+  |
+  v
+Reconcile
+  |
+  v
+Repeat Forever
+```
+
+---
+
+# Sync Loop Architecture
+
+```text
+Assigned Pod
+  |
+  v
+Pod Sync Loop
+  |
+  v
+Desired == Actual?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Wait
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+SyncPod()
+```
+
+---
+
+# Sources of Events
+
+The Sync Loop receives events from multiple sources.
+
+```text
+API Server
+  |
+  v
+Pod Updated
+
+────────────
+
+Container Runtime
+  |
+  v
+Container Exited
+
+────────────
+
+Periodic Resync
+  |
+  v
+Sync Needed
+
+────────────
+
+Static Pod Updates
+  |
+  v
+Manifest Changed
+```
+
+Every event eventually triggers reconciliation.
+
+---
+
+# Continuous Loop
+
+Conceptually:
+
+```text
+while kubelet is running
+  |
+  v
+Watch Events
+  |
+  v
+Queue Pod
+  |
+  v
+SyncPod()
+  |
+  v
+Sleep
+  |
+  v
+Repeat
+```
+
+The loop never stops while kubelet is healthy.
+
+---
+
+# PodWorkers
+
+One kubelet may manage hundreds of Pods.
+
+Running every synchronization serially would be inefficient.
+
+Instead,
+
+the kubelet uses:
+
+```text
+PodWorkers
+```
+
+---
+
+# What are PodWorkers?
+
+PodWorkers are dedicated workers responsible for synchronizing Pods.
+
+Each Pod has its own serialized execution stream.
+
+This prevents concurrent reconciliation of the same Pod.
+
+---
+
+# Why?
+
+Suppose:
+
+```text
+Pod Updated
+  |
+  v
+Container Crashed
+  |
+  v
+Status Changed
+```
+
+Three events arrive simultaneously.
+
+Without PodWorkers:
+
+```text
+Worker A
+
+Create Container
+
+────────
+
+Worker B
+
+Delete Container
+
+────────
+
+Worker C
+
+Update Status
+```
+
+Race conditions occur.
+
+---
+
+# PodWorker Architecture
+
+```text
+Pod Events
+  |
+  v
+Work Queue
+  |
+  v
+PodWorker
+  |
+  v
+SyncPod()
+```
+
+Each PodWorker processes one Pod at a time.
+
+Different Pods can be processed concurrently.
+
+---
+
+# Multiple PodWorkers
+
+```text
+Pod A
+  |
+  v
+Worker A
+
+────────────
+
+Pod B
+  |
+  v
+Worker B
+
+────────────
+
+Pod C
+  |
+  v
+Worker C
+```
+
+This provides scalability without sacrificing consistency.
+
+---
+
+# SyncPod()
+
+The most important kubelet reconciliation function is conceptually known as:
+
+```text
+SyncPod()
+```
+
+Almost every Pod event eventually reaches this function.
+
+---
+
+# Responsibilities of SyncPod()
+
+`SyncPod()` performs operations such as:
+
+- Create Pod Sandbox
+- Pull Images
+- Create Containers
+- Start Containers
+- Restart Containers
+- Kill Containers
+- Mount Volumes
+- Configure Networking
+- Update Status
+
+It reconciles the entire Pod.
+
+---
+
+# SyncPod() Workflow
+
+```text
+Receive Pod
+  |
+  v
+Read Desired Spec
+  |
+  v
+Inspect Runtime
+  |
+  v
+Compare
+  |
+  v
+Differences?
+
+|
+
++-- No
+
+|
+
+▼
+
+Return
+
+|
+
++-- Yes
+
+     |
+
+     ▼
+
+Synchronize Runtime
+```
+
+---
+
+# Desired vs Actual State
+
+This is the core idea behind Kubernetes.
+
+---
+
+## Desired State
+
+Stored in the Pod specification.
+
+Example:
+
+```yaml
+containers:
+
+- nginx:1.30
+
+replicas: 1
+```
+
+---
+
+## Actual State
+
+Observed from:
+
+- Container Runtime
+- Linux Processes
+- Network Namespace
+- Mounted Volumes
+
+---
+
+# Reconciliation Example
+
+Desired:
+
+```text
+Container Running
+```
+
+Actual:
+
+```text
+Container Missing
+```
+
+Result:
+
+```text
+SyncPod()
+  |
+  v
+Create Container
+```
+
+---
+
+Another example:
+
+Desired:
+
+```text
+nginx:1.30
+```
+
+Actual:
+
+```text
+nginx:1.29
+```
+
+The kubelet cannot simply replace the container image in-place. Changes to a Pod's container image generally require the Pod to be recreated by a higher-level controller (such as a Deployment). The kubelet enforces the Pod specification it receives rather than performing rolling upgrades itself.
+
+---
+
+# Another Example
+
+Desired:
+
+```text
+Two Containers
+```
+
+Actual:
+
+```text
+One Running
+```
+
+Result:
+
+```text
+Create Missing Container
+```
+
+---
+
+# Restart Policy
+
+Containers occasionally terminate.
+
+Question:
+
+Should kubelet restart them?
+
+The answer depends on:
+
+```text
+restartPolicy
+```
+
+---
+
+# Supported Policies
+
+```text
+Always
+
+OnFailure
+
+Never
+```
+
+---
+
+## Always
+
+Every exit triggers a restart.
+
+Common for:
+
+```text
+Deployments
+
+StatefulSets
+
+DaemonSets
+```
+
+---
+
+## OnFailure
+
+Restart only if:
+
+```text
+Exit Code ≠ 0
+```
+
+Frequently used for:
+
+```text
+Jobs
+```
+
+---
+
+## Never
+
+Never restart.
+
+If the container exits:
+
+```text
+Finished
+```
+
+This is useful for one-time workloads.
+
+---
+
+# Restart Workflow
+
+```text
+Container Exits
+  |
+  v
+Read restartPolicy
+  |
+  v
+Restart?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Create New Container
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Update Pod Status
+```
+
+---
+
+# CrashLoopBackOff
+
+Suppose:
+
+```text
+Application
+  |
+  v
+Crash
+  |
+  v
+Restart
+  |
+  v
+Crash
+  |
+  v
+Restart
+```
+
+Restarting immediately forever would waste resources.
+
+Instead,
+
+the kubelet applies an exponential backoff between restart attempts.
+
+Conceptually:
+
+```text
+Crash
+  |
+  v
+Restart
+  |
+  v
+Crash
+  |
+  v
+Wait Longer
+  |
+  v
+Restart
+  |
+  v
+Wait Even Longer
+```
+
+This appears as:
+
+```text
+CrashLoopBackOff
+```
+
+---
+
+# Pod Status Updates
+
+The kubelet continuously reports Pod status back to the API Server.
+
+---
+
+# What Does kubelet Update?
+
+Examples include:
+
+```text
+Phase
+
+Conditions
+
+Container Status
+
+Restart Count
+
+Container IDs
+
+IP Address
+
+Start Time
+```
+
+---
+
+# Pod Conditions
+
+The kubelet updates conditions such as:
+
+```text
+Initialized
+
+PodScheduled
+
+ContainersReady
+
+Ready
+```
+
+These conditions help other Kubernetes components make decisions.
+
+---
+
+# Status Update Workflow
+
+```text
+Container Runtime
+  |
+  v
+Observe Current State
+  |
+  v
+Build Pod Status
+  |
+  v
+API Server
+  |
+  v
+etcd
+```
+
+Controllers and users observe this status through the API Server.
+
+---
+
+# Relationship Between Status and Sync
+
+Important:
+
+```text
+SyncPod()
+  |
+  v
+Changes Runtime
+
+────────────
+
+Status Manager
+  |
+  v
+Reports Runtime
+```
+
+Synchronization changes reality.
+
+Status communicates reality.
+
+---
+
+# Complete Internal Workflow
+
+```text
+Scheduler
+  |
+  v
+Assign Pod
+  |
+  v
+API Server
+  |
+  v
+kubelet Watch
+  |
+  v
+PodWorker
+  |
+  v
+SyncPod()
+  |
+  v
+Create Sandbox
+  |
+  v
+Pull Images
+  |
+  v
+Create Containers
+  |
+  v
+Start Containers
+  |
+  v
+Observe Runtime
+  |
+  v
+Update Pod Status
+  |
+  v
+Repeat Forever
+```
+
+---
+
+# Production Example 1
+
+Application Crash
+
+```text
+Container
+  |
+  v
+Crash
+  |
+  v
+Sync Loop
+  |
+  v
+RestartPolicy=Always
+  |
+  v
+Restart
+  |
+  v
+Running
+```
+
+---
+
+# Production Example 2
+
+Job Completion
+
+```text
+Job
+  |
+  v
+Container Exit Code=0
+  |
+  v
+RestartPolicy=Never
+  |
+  v
+Succeeded
+```
+
+---
+
+# Production Example 3
+
+Temporary Runtime Failure
+
+```text
+Runtime Error
+  |
+  v
+Container Missing
+  |
+  v
+SyncPod()
+  |
+  v
+Recreate Container
+```
+
+---
+
+# Production Example 4
+
+Multiple Pods
+
+```text
+Pod A
+  |
+  v
+Worker A
+
+────────────
+
+Pod B
+  |
+  v
+Worker B
+
+────────────
+
+Pod C
+  |
+  v
+Worker C
+```
+
+Each Pod is reconciled independently.
+
+---
+
+# Production Best Practices
+
+✔ Keep applications stateless where possible to simplify recovery.
+
+✔ Configure an appropriate `restartPolicy` for the workload type.
+
+✔ Design containers to tolerate restarts.
+
+✔ Avoid relying on container restart counts as a monitoring strategy; investigate repeated restarts.
+
+✔ Monitor CrashLoopBackOff events.
+
+✔ Use readiness probes to prevent unhealthy Pods from receiving traffic.
+
+✔ Understand that reconciliation is continuous, not one-time.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The Scheduler manages Pod execution.
+
+**Correct:** The Scheduler assigns a Node. The kubelet manages the Pod lifecycle.
+
+---
+
+### ❌ Misconception 2
+
+The Sync Loop runs only once.
+
+**Correct:** It runs continuously for the lifetime of the kubelet.
+
+---
+
+### ❌ Misconception 3
+
+PodWorkers execute all Pods sequentially.
+
+**Correct:** Different Pods can be processed concurrently, but each individual Pod is synchronized serially.
+
+---
+
+### ❌ Misconception 4
+
+A Pod restarts when a container crashes.
+
+**Correct:** Usually only the failed container is restarted, depending on `restartPolicy`.
+
+---
+
+### ❌ Misconception 5
+
+`SyncPod()` always recreates the entire Pod.
+
+**Correct:** It performs only the operations required to reconcile the desired and actual state.
+
+---
+
+### ❌ Misconception 6
+
+A Running Pod means all containers have never restarted.
+
+**Correct:** Containers may restart many times while the Pod phase remains Running.
+
+---
+
+### ❌ Misconception 7
+
+Pod Status is updated by the Scheduler.
+
+**Correct:** The kubelet updates runtime-related Pod Status after observing the actual execution state.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the purpose of the Pod Sync Loop?
+
+To continuously reconcile the desired Pod state with the actual runtime state.
+
+---
+
+### Q2. What is `SyncPod()`?
+
+It is the kubelet's primary reconciliation function responsible for synchronizing a Pod with its desired specification.
+
+---
+
+### Q3. Why are PodWorkers needed?
+
+To ensure only one synchronization for a given Pod runs at a time while allowing different Pods to be processed concurrently.
+
+---
+
+### Q4. What is the difference between Desired State and Actual State?
+
+Desired State comes from the Pod specification in the API Server, while Actual State is observed from the container runtime and the Node.
+
+---
+
+### Q5. What are the supported restart policies?
+
+`Always`, `OnFailure`, and `Never`.
+
+---
+
+### Q6. What causes CrashLoopBackOff?
+
+Repeated container crashes causing kubelet to apply exponential restart backoff.
+
+---
+
+### Q7. Who updates Pod Status?
+
+The kubelet.
+
+---
+
+### Q8. Does kubelet recreate a Pod for every update?
+
+No. It performs only the minimal changes required to reconcile the current runtime with the desired specification.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod stuck in Pending | Image pull, volume mount, networking, or runtime initialization issues |
+| Container repeatedly restarts | Application crash, failing health checks, or unsuitable restart policy |
+| Pod Status not updating | kubelet unable to communicate with the API Server or runtime |
+| Multiple conflicting operations on the same Pod | Normally prevented by PodWorkers; investigate kubelet errors if observed |
+| CrashLoopBackOff | Repeated container failures with exponential restart backoff |
+| Pod Running but application unavailable | Pod phase only indicates lifecycle state; verify readiness and container health |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What are the phases of the Pod lifecycle?
+2. Why does kubelet use a continuous Pod Sync Loop?
+3. What events trigger `SyncPod()`?
+4. Why are PodWorkers required?
+5. How does kubelet compare Desired State and Actual State?
+6. What operations can `SyncPod()` perform?
+7. How do the three restart policies differ?
+8. What is CrashLoopBackOff?
+9. What information does kubelet include in Pod Status updates?
+10. How does Pod Status differ from Pod Lifecycle?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the kubelet manages Pods after they have been scheduled to a Node.
+
+You learned:
+
+- How a Pod progresses through its lifecycle phases
+- Why kubelet continuously runs the Pod Sync Loop
+- How PodWorkers serialize reconciliation for individual Pods while enabling parallel processing across different Pods
+- How `SyncPod()` compares Desired State with Actual State and performs only the changes necessary to reconcile them
+- How `restartPolicy` controls container restart behavior
+- Why CrashLoopBackOff uses exponential backoff to protect the Node
+- How kubelet continuously reports Pod Status back to the API Server
+
+The Pod Sync Loop is one of the most important mechanisms inside the kubelet. It transforms Kubernetes from a system that simply stores desired configuration into a self-healing platform that continuously observes reality, repairs deviations, and keeps workloads aligned with the desired state declared in the API.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — Static Pods**
+
+In the next chapter, we'll explore how kubelet manages Pods that are **not created by the API Server**.
+
+Topics include:
+
+- Static Pods
+- Mirror Pods
+- Static Pod Manifests
+- Static Pod Lifecycle
+- Static Pods vs Normal Pods
+- Production Use Cases
+
+You'll learn how Kubernetes bootstraps its own control plane using kubelet-managed Static Pods.
+```

@@ -1,0 +1,1249 @@
+---
+title: "Chapter 5 — Dynamic Admission Control"
+sidebar_position: 5
+module: "Module 1.10 — Admission Controllers"
+description: "> **Goal:** Understand the complete architecture of **Dynamic Admission Control** in Kubernetes. By the end of this chapter, you'll understand how the API Serve..."
+---
+
+# Module 1.10 — Admission Controllers
+
+# Chapter 5 — Dynamic Admission Control
+
+> **Goal:** Understand the complete architecture of **Dynamic Admission Control** in Kubernetes. By the end of this chapter, you'll understand how the API Server discovers webhooks, routes AdmissionReview requests, performs TLS authentication, executes multiple webhooks, handles failures, scales in production, and guarantees reliable policy enforcement.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Complete dynamic admission architecture and webhook registration resources
+> 2. How the API Server dispatches AdmissionReview requests over HTTPS
+> 3. TLS security requirements: CA bundles, server certificates, and cert-manager automation
+> 4. Internal API Server routing vs external URL routing in clientConfig
+> 5. Ordering semantics: sequential mutating webhooks vs parallel validating webhooks
+> 6. Avoiding deadlock: webhook self-admission and kube-system namespace exemptions
+> 7. Designing highly available webhook servers: multiple replicas, PDBs, and readiness probes
+> 8. Monitoring webhook health, request latency, and failure metrics via Prometheus
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Dynamic Admission Control like a diplomatic courier service with mutual TLS credentials.
+
+```text
+Diplomatic Courier Analogy:
+
+API Server (Foreign Embassy) prepares a diplomatic dispatch (AdmissionReview payload)
+Embassy looks up delivery destination in treaty index (WebhookConfiguration clientConfig)
+Courier establishes secure encrypted channel using trusted embassy seals (TLS with caBundle)
+Foreign ministry office (Webhook Pod) verifies seal, reads dispatch, and stamps decision
+Courier returns the signed response back to the embassy
+Deadlock rule: The embassy security guards must NEVER inspect their own security vehicles!
+  (Namespace exemptions for webhook pods to prevent chicken-and-egg boot loops)
+```
+
+| Diplomatic Courier | Dynamic Admission Control |
+| :--- | :--- |
+| Diplomatic treaty index | `MutatingWebhookConfiguration` / `ValidatingWebhookConfiguration` |
+| Diplomatic dispatch | JSON `AdmissionReview` payload |
+| Trusted embassy seal | Base64-encoded `caBundle` in `clientConfig` |
+| Foreign ministry office | Webhook server Pod behind a Kubernetes Service |
+| Signed decision stamp | `AdmissionResponse` with `allowed: true/false` |
+| Security guard exemption | Exemption labels (`control-plane`, `kube-system`) to prevent boot deadlocks |
+
+> **Important:** Dynamic webhooks **must serve traffic over HTTPS with a valid certificate matching the `caBundle` in their configuration**. A classic production disaster occurs when a webhook configured with `failurePolicy: Fail` is deployed without excluding its own namespace. If the webhook pod restarts, the API Server cannot start the replacement pod because it tries to call the non-existent webhook first, resulting in an unrecoverable **webhook deadlock**. Always exempt critical namespaces like `kube-system`!
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Admission Controllers
+- Built-in Admission Controllers
+- Mutating Admission Webhooks
+- Validating Admission Webhooks
+- ValidatingAdmissionPolicy
+- Kubernetes Services
+- TLS Certificates
+
+---
+
+# Where This Chapter Fits
+
+In previous chapters, we learned:
+
+```text
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Admission
+  |
+  v
+Mutating Webhooks
+  |
+  v
+Validating Webhooks
+  |
+  v
+Persist
+```
+
+But an important question remains:
+
+> **How does the API Server actually find, connect to, authenticate, and communicate with these webhooks?**
+
+That entire mechanism is called **Dynamic Admission Control**.
+
+---
+
+# What is Dynamic Admission Control?
+
+Dynamic Admission Control is the Kubernetes framework that allows the API Server to dynamically discover and invoke external admission webhooks without modifying Kubernetes source code.
+
+Instead of compiling new admission plugins into the API Server, administrators register webhook configurations that the API Server loads and executes at runtime.
+
+---
+
+# Static vs Dynamic Admission
+
+## Static (Built-in)
+
+```text
+API Server
+
++-- NamespaceLifecycle
+
++-- ResourceQuota
+
++-- LimitRanger
+
++-- ServiceAccount
+```
+
+Compiled into Kubernetes.
+
+---
+
+## Dynamic
+
+```text
+API Server
+  |
+  v
+Webhook Configuration
+  |
+  v
+External Webhook
+  |
+  v
+Decision
+```
+
+Configured at runtime.
+
+---
+
+# Why Dynamic Admission Exists
+
+Imagine every organization wants:
+
+- Different security rules
+- Different compliance checks
+- Different default labels
+- Different image registries
+- Different approval workflows
+
+Without Dynamic Admission:
+
+```text
+Modify Kubernetes Source
+  |
+  v
+Compile API Server
+  |
+  v
+Deploy Custom Kubernetes
+```
+
+This is impractical.
+
+Dynamic Admission solves this problem.
+
+---
+
+# High-Level Architecture
+
+```text
+                    kubectl
+  |
+  v
+                  Kubernetes API Server
+
+                        |
+
+        ┌───────────────┼────────────────┐
+
+        v                                v
+
+Mutating Webhooks              Validating Webhooks
+
+        |                                |
+
+        v                                v
+
+Webhook Services               Webhook Services
+
+        |                                |
+
+        v                                v
+
+     Admission Decision Returned to API Server
+  |
+  v
+                      etcd
+```
+
+---
+
+# Components of Dynamic Admission
+
+Dynamic Admission consists of:
+
+- API Server
+- MutatingWebhookConfiguration
+- ValidatingWebhookConfiguration
+- AdmissionReview
+- HTTPS Webhook Service
+- TLS Certificates
+- Kubernetes Service
+- CA Bundle
+
+---
+
+# API Server Responsibilities
+
+The API Server is responsible for:
+
+- Discovering webhook configurations
+- Matching incoming requests
+- Calling webhooks
+- Applying patches
+- Collecting validation decisions
+- Handling failures
+- Persisting approved objects
+
+The webhook never contacts the API Server directly.
+
+The API Server always initiates communication.
+
+---
+
+# Dynamic Webhook Discovery
+
+How does the API Server know which webhooks exist?
+
+It watches Kubernetes resources.
+
+```text
+MutatingWebhookConfiguration
+
+ValidatingWebhookConfiguration
+```
+
+Whenever these resources change,
+
+the API Server updates its in-memory webhook registry.
+
+---
+
+# Discovery Workflow
+
+```text
+Webhook Configuration Created
+  |
+  v
+Stored in etcd
+  |
+  v
+API Server Watch
+  |
+  v
+Update Internal Admission Registry
+  |
+  v
+Ready for Future Requests
+```
+
+No API Server restart is required.
+
+---
+
+# Internal Registry
+
+Conceptually,
+
+the API Server maintains:
+
+```text
+Admission Registry
+
++-- Webhook A
+
++-- Webhook B
+
++-- Webhook C
+```
+
+Each incoming request is matched against this registry.
+
+---
+
+# Request Routing
+
+Suppose a request arrives:
+
+```yaml
+kind: Pod
+operation: CREATE
+namespace: production
+```
+
+The API Server evaluates every webhook configuration.
+
+```text
+Matches?
+  |
+  v
+Yes
+  |
+  v
+Call Webhook
+
+------------
+
+No
+  |
+  v
+Skip
+```
+
+---
+
+# Routing Criteria
+
+Each webhook may specify:
+
+- API Group
+- Version
+- Resource
+- Operation
+- Namespace Selector
+- Object Selector
+- Match Conditions
+
+Only matching webhooks are invoked.
+
+---
+
+# AdmissionReview Request Flow
+
+Once a webhook matches,
+
+the API Server builds an AdmissionReview request.
+
+```text
+Incoming Request
+  |
+  v
+AdmissionReview Object
+  |
+  v
+Serialize JSON
+  |
+  v
+HTTPS Request
+  |
+  v
+Webhook
+```
+
+---
+
+# AdmissionReview Contents
+
+Conceptually,
+
+the request contains:
+
+```text
+UID
+
+User
+
+Operation
+
+Namespace
+
+Object
+
+Old Object
+
+Resource
+
+DryRun
+
+Options
+```
+
+Everything required to evaluate the request.
+
+---
+
+# HTTPS Communication
+
+Communication always occurs over HTTPS.
+
+```text
+API Server
+  |
+  v
+TLS Connection
+  |
+  v
+Webhook Service
+  |
+  v
+AdmissionReview
+  |
+  v
+Response
+```
+
+Plain HTTP is not supported.
+
+---
+
+# Why HTTPS?
+
+Admission webhooks receive sensitive data.
+
+Examples:
+
+- Secrets
+- Service Accounts
+- RBAC objects
+- Certificates
+- Configuration
+
+Communication must be encrypted.
+
+---
+
+# TLS Authentication
+
+The API Server verifies the webhook's TLS certificate before sending requests.
+
+```text
+Certificate
+  |
+  v
+Trusted?
+  |
+  v
+Yes
+  |
+  v
+Continue
+
+------------
+
+No
+  |
+  v
+Reject Connection
+```
+
+---
+
+# CA Bundle
+
+How does the API Server trust the webhook certificate?
+
+The webhook configuration includes a CA bundle.
+
+```text
+Webhook Configuration
+  |
+  v
+CA Bundle
+  |
+  v
+Certificate Verification
+  |
+  v
+Secure Connection
+```
+
+Without a valid CA bundle,
+
+TLS verification fails.
+
+---
+
+# Service Resolution
+
+Webhook configurations usually reference a Kubernetes Service.
+
+```text
+Webhook
+  |
+  v
+Service
+  |
+  v
+Endpoints
+  |
+  v
+Pods
+```
+
+The API Server connects through the Service rather than directly to Pods.
+
+---
+
+# Sequential Webhook Execution
+
+Multiple webhooks may match the same request.
+
+Execution order:
+
+```text
+Webhook A
+  |
+  v
+Webhook B
+  |
+  v
+Webhook C
+```
+
+Each webhook receives the latest version of the object after previous mutations.
+
+---
+
+# Why Sequential Execution?
+
+Suppose:
+
+Webhook A adds:
+
+```text
+Sidecar
+```
+
+Webhook B validates:
+
+```text
+All Containers
+```
+
+Webhook B must see the sidecar.
+
+Therefore,
+
+mutating webhooks execute sequentially.
+
+---
+
+# Mutation Before Validation
+
+The complete admission order is:
+
+```text
+Built-in Mutating
+  |
+  v
+Mutating Webhooks
+  |
+  v
+Built-in Validating
+  |
+  v
+ValidatingAdmissionPolicy
+  |
+  v
+Validating Webhooks
+  |
+  v
+Persist
+```
+
+Validation always evaluates the final object.
+
+---
+
+# Admission Decision Flow
+
+```text
+Incoming Request
+  |
+  v
+Webhook Match?
+  |
+  v
+No
+  |
+  v
+Next Webhook
+
+------------
+
+Yes
+  |
+  v
+Call Webhook
+  |
+  v
+Allowed?
+  |
+  v
+Yes
+  |
+  v
+Continue
+
+------------
+
+No
+  |
+  v
+Reject Request
+```
+
+---
+
+# Failure Handling
+
+What happens if a webhook is unavailable?
+
+Possible failures:
+
+- Network timeout
+- DNS failure
+- TLS failure
+- Pod crash
+- Service unavailable
+
+The API Server consults:
+
+```text
+Failure Policy
+```
+
+---
+
+# Failure Policy = Fail
+
+```text
+Webhook Unavailable
+  |
+  v
+Reject Request
+```
+
+Used for:
+
+- Security
+- Compliance
+- Governance
+
+---
+
+# Failure Policy = Ignore
+
+```text
+Webhook Unavailable
+  |
+  v
+Continue Request
+```
+
+Used for:
+
+- Optional mutations
+- Best-effort validation
+
+---
+
+# Timeout Handling
+
+Every webhook has a timeout.
+
+```text
+API Server
+  |
+  v
+Wait
+  |
+  v
+Timeout
+  |
+  v
+Failure Policy
+```
+
+Slow webhooks delay every API request.
+
+---
+
+# Retry Behavior
+
+The API Server may retry admission requests under certain failure scenarios (for example, transient transport failures before receiving a response). Because of this, webhook implementations should always be **idempotent**.
+
+Never assume a webhook will be invoked exactly once.
+
+---
+
+# High Availability
+
+Production deployments should use multiple replicas.
+
+```text
+                Service
+
+          ┌──────┼──────┐
+
+          v      v      v
+
+      Webhook Webhook Webhook
+
+       Pod 1   Pod 2   Pod 3
+```
+
+One Pod failure should not block admission.
+
+---
+
+# Load Balancing
+
+The Kubernetes Service distributes requests.
+
+```text
+API Server
+  |
+  v
+Service
+  |
+  v
+Replica 1
+
+Replica 2
+
+Replica 3
+```
+
+No webhook Pod should become a bottleneck.
+
+---
+
+# Scaling
+
+Large clusters may process thousands of admission requests per second.
+
+Webhook services should:
+
+- Scale horizontally
+- Be stateless
+- Respond quickly
+- Avoid blocking operations
+
+---
+
+# Caching
+
+Avoid expensive operations.
+
+Poor design:
+
+```text
+Webhook
+  |
+  v
+Database Query
+  |
+  v
+External API
+  |
+  v
+Decision
+```
+
+Better design:
+
+```text
+Webhook
+  |
+  v
+In-Memory Cache
+  |
+  v
+Decision
+```
+
+Use caches carefully and ensure stale data does not compromise policy correctness.
+
+---
+
+# Monitoring
+
+Production monitoring should include:
+
+- Request rate
+- Latency
+- Error rate
+- Timeout count
+- TLS failures
+- Rejection rate
+- Availability
+
+---
+
+# Observability
+
+Monitor webhook performance using:
+
+```text
+Metrics
+  |
+  v
+Logs
+  |
+  v
+Traces
+  |
+  v
+Alerts
+```
+
+Admission latency directly affects API Server responsiveness.
+
+---
+
+# Production Example 1 — Istio
+
+Request:
+
+```text
+Create Pod
+```
+
+API Server:
+
+```text
+v
+
+Istio Webhook
+  |
+  v
+Inject Envoy
+  |
+  v
+Continue
+```
+
+---
+
+# Production Example 2 — Kyverno
+
+Incoming Pod:
+
+```text
+v
+
+Kyverno
+  |
+  v
+Validate Labels
+  |
+  v
+Reject
+```
+
+The Pod never reaches etcd.
+
+---
+
+# Production Example 3 — Gatekeeper (OPA)
+
+Incoming Deployment:
+
+```text
+v
+
+OPA
+  |
+  v
+Evaluate Policy
+  |
+  v
+Allow
+```
+
+OPA returns the admission decision.
+
+---
+
+# Production Example 4 — Organization Policy
+
+Incoming Secret:
+
+```text
+v
+
+Security Webhook
+  |
+  v
+Naming Rules
+  |
+  v
+Allow
+```
+
+Every Secret follows company conventions.
+
+---
+
+# End-to-End Dynamic Admission Flow
+
+```text
+Developer
+  |
+  v
+kubectl apply
+  |
+  v
+API Server
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Webhook Discovery
+  |
+  v
+Match Rules
+  |
+  v
+AdmissionReview
+  |
+  v
+HTTPS + TLS
+  |
+  v
+Webhook Service
+  |
+  v
+AdmissionReview Response
+  |
+  v
+Apply Patch / Validate
+  |
+  v
+Persist
+  |
+  v
+etcd
+```
+
+---
+
+# Complete Internal Architecture
+
+```text
+                 API Server
+
+                      |
+
+         Watches Webhook Configurations
+  |
+  v
+          Internal Webhook Registry
+
+                      |
+
+         Matches Incoming Requests
+
+                      |
+
+          ┌───────────┴────────────┐
+
+          v                        v
+
+Mutating Webhooks        Validating Webhooks
+
+          |                        |
+
+          +--─────────┬────────────┘
+  |
+  v
+             Admission Decision
+  |
+  v
+                   Persist etcd
+```
+
+---
+
+# Performance Considerations
+
+Dynamic Admission introduces additional overhead compared to built-in admission plugins.
+
+Sources of latency:
+
+- HTTPS connection establishment (or reuse)
+- TLS verification
+- JSON serialization/deserialization
+- Network communication
+- Webhook execution time
+
+Minimize these costs wherever possible.
+
+---
+
+# Security Considerations
+
+Production webhook deployments should:
+
+✔ Use valid TLS certificates.
+
+✔ Rotate certificates before expiration.
+
+✔ Restrict webhook permissions using least-privilege RBAC.
+
+✔ Avoid exposing webhook services outside the cluster unless required.
+
+✔ Protect webhook Pods using NetworkPolicies where appropriate.
+
+✔ Audit webhook failures and rejected requests.
+
+---
+
+# Production Best Practices
+
+✔ Keep webhook logic deterministic.
+
+✔ Make webhooks idempotent.
+
+✔ Deploy multiple replicas.
+
+✔ Configure readiness and liveness probes.
+
+✔ Use short timeout values.
+
+✔ Avoid long-running operations.
+
+✔ Cache frequently used data when safe.
+
+✔ Prefer ValidatingAdmissionPolicy for simple declarative rules.
+
+✔ Continuously monitor latency and failures.
+
+✔ Test Failure Policy behavior before production deployment.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The webhook contacts the API Server.
+
+**Correct:** The API Server always initiates webhook communication.
+
+---
+
+### ❌ Misconception 2
+
+Dynamic Admission requires restarting the API Server.
+
+**Correct:** The API Server watches webhook configuration resources and updates dynamically.
+
+---
+
+### ❌ Misconception 3
+
+HTTP is sufficient for admission webhooks.
+
+**Correct:** Kubernetes requires HTTPS with certificate validation.
+
+---
+
+### ❌ Misconception 4
+
+Webhook execution order is random.
+
+**Correct:** Matching webhooks execute sequentially according to the API Server's admission processing.
+
+---
+
+### ❌ Misconception 5
+
+Only one webhook can evaluate a request.
+
+**Correct:** Multiple mutating and validating webhooks may evaluate the same request.
+
+---
+
+### ❌ Misconception 6
+
+Slow webhooks affect only webhook performance.
+
+**Correct:** Slow webhooks increase API request latency and can reduce overall cluster responsiveness.
+
+---
+
+### ❌ Misconception 7
+
+Webhook Pods can safely maintain local state.
+
+**Correct:** Production webhook services should generally be stateless so they can scale horizontally and recover easily.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is Dynamic Admission Control?
+
+A Kubernetes framework that allows external admission webhooks to participate in API request processing without modifying Kubernetes source code.
+
+---
+
+### Q2. How does the API Server discover admission webhooks?
+
+By watching `MutatingWebhookConfiguration` and `ValidatingWebhookConfiguration` resources.
+
+---
+
+### Q3. Does the API Server or the webhook initiate communication?
+
+The API Server initiates all webhook communication.
+
+---
+
+### Q4. Why is HTTPS mandatory?
+
+Admission requests may contain sensitive Kubernetes objects, so communication must be encrypted and authenticated.
+
+---
+
+### Q5. What is the purpose of the CA Bundle?
+
+It allows the API Server to verify the webhook server's TLS certificate.
+
+---
+
+### Q6. Why are mutating webhooks executed before validating webhooks?
+
+Because validators must evaluate the final object after all mutations have been applied.
+
+---
+
+### Q7. Why should admission webhooks be idempotent?
+
+Because requests may be retried under certain failure scenarios.
+
+---
+
+### Q8. Why should webhook services be stateless?
+
+To support horizontal scaling, load balancing, and reliable failover.
+
+---
+
+### Q9. What happens if a webhook times out?
+
+The API Server applies the configured Failure Policy (`Fail` or `Ignore`).
+
+---
+
+### Q10. Why are slow webhooks dangerous?
+
+They increase API Server admission latency and can negatively affect overall cluster performance.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Webhook never invoked | Rules, selectors, or match conditions do not match |
+| TLS handshake failed | Invalid certificate or incorrect CA bundle |
+| Admission timeout | Slow webhook or network issue |
+| Requests unexpectedly rejected | Failure Policy set to `Fail` and webhook unavailable |
+| High API latency | Slow webhook processing or excessive webhook chain |
+| Connection refused | Service or webhook Pods unavailable |
+| Certificate expired | TLS certificate rotation required |
+| Uneven load | Insufficient webhook replicas or Service issues |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is Dynamic Admission Control?
+2. How does the API Server discover webhooks?
+3. How are AdmissionReview requests routed?
+4. Why is HTTPS required?
+5. What is the purpose of the CA bundle?
+6. Why are webhooks executed sequentially?
+7. Why do mutating webhooks execute before validating webhooks?
+8. Why should webhook services be stateless?
+9. How does Failure Policy affect admission?
+10. Why is observability critical for production webhook deployments?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how **Dynamic Admission Control** enables Kubernetes to extend admission processing through externally managed webhooks.
+
+You learned:
+
+- How the API Server dynamically discovers webhook configurations
+- How requests are matched and routed to webhooks
+- The role of the AdmissionReview protocol
+- How HTTPS, TLS certificates, and CA bundles secure webhook communication
+- Why mutating webhooks execute before validating webhooks
+- How sequential execution, failure handling, retries, and timeouts influence admission behavior
+- Production considerations for scalability, monitoring, observability, and high availability
+- Real-world architectures used by Istio, Kyverno, and Gatekeeper
+
+Dynamic Admission Control is the extensibility layer of Kubernetes admission. It allows organizations to enforce custom security, governance, and operational policies while keeping the Kubernetes API Server generic, secure, and dynamically configurable.
+
+---
+
+# Next Chapter
+
+**Chapter 6 — Module Summary & Production Patterns**
+
+Topics include:
+
+- Complete Admission Request Lifecycle
+- Built-in vs Dynamic Admission
+- Mutating vs Validating
+- Webhooks vs ValidatingAdmissionPolicy
+- Production Architecture Patterns
+- Performance Optimization
+- Security Best Practices
+- Troubleshooting Matrix
+- Interview Revision
+- Module Knowledge Check
+```

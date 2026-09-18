@@ -1,0 +1,232 @@
+---
+title: "Chapter 2 — Cross-Namespace & Canary Routing"
+sidebar_position: 2
+module: "Module 7.9 — Gateway API & Routing"
+description: "Master advanced Gateway API traffic routing — ReferenceGrant cross-namespace security, canary weighted traffic splitting, header-based routing, and request shadowing."
+---
+
+# Chapter 2 — Cross-Namespace Routing & Canary Traffic Splitting
+
+> **Goal:** Master advanced traffic engineering and zero-trust cross-namespace routing in Kubernetes using the **Gateway API** — understanding how **`ReferenceGrant`** prevents cross-namespace security hijacking of TLS secrets and backend services, implementing native **Weighted Canary Traffic Splitting** (e.g. 90% v1 vs 10% v2) without external service meshes, configuring **Header-Based Routing** for internal beta testers, and executing live **Request Mirroring (Traffic Shadowing)**.
+>
+> By the end of this chapter, you will understand:
+> 1. How the `ReferenceGrant` CRD enforces explicit cross-namespace security boundaries
+> 2. How to split traffic between multiple backend Services using `backendRefs[].weight`
+> 3. How to route traffic based on HTTP Headers, Query Parameters, and Methods
+> 4. How Request Mirroring (`RequestMirror` filter) tests new releases with real production traffic
+> 5. How Gateway API canary routing replaces complex Flagger / Service Mesh setups
+> 6. How to troubleshoot rejected cross-namespace route bindings
+
+---
+
+## Real-Life Analogy
+
+Think of cross-namespace routing, `ReferenceGrant`, and Canary traffic splitting as **a high-security international airport customs gate and an airline flight upgrade funnel**:
+
+- **The Cross-Namespace Security Risk (The Unauthorized Master Key):** If anyone could walk into an airport and say: *"I am routing passengers to Delta Airlines Flight 501 in Terminal B using the Presidential VIP security badge (**A developer binding an HTTPRoute to an admin Gateway in another namespace**)"*, rogue actors could hijack official traffic or steal corporate TLS certificates (**Cross-Namespace Security Hijacking**).
+- **The Formal Notarized Permission Slip (`ReferenceGrant`):** The Terminal B security manager writes an explicit signed document (**`ReferenceGrant`**): *"We explicitly permit `HTTPRoutes` from the `production` namespace to connect to our Gateway."* Without this explicit grant, the connection is instantly rejected.
+- **Canary Traffic Splitting (The 90/10 Passenger Boarding Funnel):** The airline wants to test a brand new double-decker airplane (**Version 2**). Instead of putting all 1,000 passengers on the new plane, the gate agent directs **90% of passengers to the reliable old plane (`weight: 90`)** and **10% of adventurous volunteers to the new plane (`weight: 10`)**. If the new plane experiences an issue, only 10% of users are impacted.
+- **Request Mirroring (The Invisible Ghost Passenger):** An exact clone of the passenger's luggage is placed on the test plane to see if it fits in the overhead bins (**100% Shadow Copy of live HTTP traffic**), without delaying or risking the real passenger's journey.
+
+---
+
+## Architecture Diagram
+
+```text
+               Cross-Namespace ReferenceGrant & Canary Traffic Splitting
+
+ PUBLIC CLIENTS: `https://api.company.com/v1/checkout`
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HTTPS Traffic on Port 443                                              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GATEWAY (Namespace: `gateway-infra`)                                   │
+ │ Validates Cross-Namespace Permissions via `ReferenceGrant`             │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ Attaches Route across namespace boundary
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HTTPROUTE (Namespace: `production`)                                    │
+ │ Path Match: `/v1/checkout`                                             │
+ │                                                                        │
+ │ CANARY TRAFFIC SPLITTING RULE:                                         │
+ │ ├── Weight: 90 (90% Traffic) ──► `payment-service-v1:8080` (STABLE)     │
+ │ └── Weight: 10 (10% Traffic) ──► `payment-service-v2:8080` (CANARY)     │
+ │                                                                        │
+ │ REQUEST SHADOWING:                                                     │
+ │ └── Mirror Filter: Sends 100% shadow copy to `payment-shadow-v3:8080`  │
+ └──────┬───────────────────────────────┬───────────────────────────────┬─┘
+        │ 90% Traffic                   │ 10% Traffic                   │ 100% Shadow
+        ▼                               ▼                               ▼
+ ┌────────────────────┐          ┌────────────────────┐          ┌────────────────────┐
+ │ Pods: Payment v1   │          │ Pods: Payment v2   │          │ Pods: Payment v3   │
+ │ (Stable Production)│          │ (10% Canary Test)  │          │ (Shadow Analysis)  │
+ └────────────────────┘          └────────────────────┘          └────────────────────┘
+```
+
+---
+
+## `ReferenceGrant`: Cross-Namespace Security Hardening
+
+In Kubernetes, allowing resources in Namespace A to reference resources in Namespace B without permission is a severe security vulnerability.
+
+**`ReferenceGrant`** (`gateway.networking.k8s.io/v1beta1`) enforces explicit opt-in permissions:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-production-to-gateway
+  namespace: gateway-infra             # Resides in the target namespace!
+spec:
+  from:
+    # 1. Who is allowed to reference us?
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: production            # Allows routes in 'production' namespace
+  to:
+    # 2. Which resources are they allowed to reference?
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+```
+
+---
+
+## Complete Production Canary Traffic Splitting Manifest
+
+This `HTTPRoute` splits production traffic **90% to Stable (v1)** and **10% to Canary (v2)**, while routing anyone with the header `X-Beta-Tester: true` **100% to v2**:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: payment-canary-route
+  namespace: production
+spec:
+  parentRefs:
+  - name: external-https-gateway
+    namespace: gateway-infra
+  hostnames:
+  - "api.company.com"
+
+  rules:
+  # RULE 1: Header-Based Routing (Internal Beta Testers always go 100% to v2!)
+  - matches:
+    - headers:
+      - name: "X-Beta-Tester"
+        value: "true"
+      path:
+        type: PathPrefix
+        value: /v1/checkout
+    backendRefs:
+    - name: payment-service-v2
+      port: 8080
+
+  # RULE 2: Weighted Canary Traffic Split (90% v1 / 10% v2)
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1/checkout
+    backendRefs:
+    # 90% of regular customer traffic to v1 (Stable)
+    - name: payment-service-v1
+      port: 8080
+      weight: 90
+    # 10% of regular customer traffic to v2 (Canary)
+    - name: payment-service-v2
+      port: 8080
+      weight: 10
+```
+
+---
+
+## Live Request Mirroring (Traffic Shadowing)
+
+Test a new microservice release against **100% of live production traffic** with zero risk to customers:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shadow-testing-route
+  namespace: production
+spec:
+  parentRefs:
+  - name: external-https-gateway
+    namespace: gateway-infra
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v1/search
+    # 1. Main Live Backend (Customer receives response from here)
+    backendRefs:
+    - name: search-service-v1
+      port: 8080
+    # 2. Mirror Filter (100% shadow copy sent asynchronously; response ignored)
+    filters:
+    - type: RequestMirror
+      requestMirror:
+        backendRef:
+          name: search-service-v2-experimental
+          port: 8080
+```
+
+---
+
+## Hands-On Lab: Deploying a Canary Weighted Split
+
+```bash
+# Step 1: Create lab namespaces
+kubectl create namespace canary-lab
+
+# Step 2: Deploy v1 (Stable) and v2 (Canary) applications
+kubectl create deployment app-v1 --image=hashicorp/http-echo --port=5678 -n canary-lab -- -text="Version 1 - Stable (90%)"
+kubectl expose deployment app-v1 --port=80 --target-port=5678 -n canary-lab
+
+kubectl create deployment app-v2 --image=hashicorp/http-echo --port=5678 -n canary-lab -- -text="Version 2 - Canary (10%)"
+kubectl expose deployment app-v2 --port=80 --target-port=5678 -n canary-lab
+
+# Step 3: Verify backend services are Ready
+kubectl get svc -n canary-lab
+
+# Step 4: Clean up lab
+kubectl delete namespace canary-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a `ReferenceGrant` in the Gateway API, and what security vulnerability does it prevent?**
+
+In Kubernetes multi-tenant clusters, allowing a developer in the `developer-sandbox` namespace to reference a Secret or Gateway in the `kube-system` or `gateway-infra` namespace without permission creates a severe security risk (cross-namespace privilege escalation or TLS private key theft). The **`ReferenceGrant`** resource must be placed in the target namespace (e.g. `gateway-infra`) to explicitly declare which namespaces and resource kinds are permitted to reference its objects. Cross-namespace references without a valid matching `ReferenceGrant` are automatically rejected.
+
+**Q2: How does Gateway API implement Canary Traffic Splitting without requiring a service mesh (Istio/Linkerd)?**
+
+In the Gateway API specification, each rule inside an `HTTPRoute` supports multiple `backendRefs`, each assigned an integer **`weight`** (e.g. `weight: 90` for v1 and `weight: 10` for v2). The underlying data plane controller (such as Envoy Gateway or Cilium eBPF) calculates the relative percentages ($\text{Percentage} = \frac{\text{Weight}_i}{\sum \text{Weights}} \times 100$) and distributes incoming L7 HTTP requests at the ingress gateway directly, completely eliminating the need for heavy in-cluster sidecar proxies.
+
+**Q3: How does Header-Based Routing work in Gateway API?**
+
+An `HTTPRoute` rule defines `spec.rules[].matches[].headers`. When an incoming HTTP request contains matching key-value pairs (e.g. `name: "X-Beta-Tester", value: "true"` or regex matching `name: "Cookie", value: ".*session_tier=enterprise.*"`), Gateway API prioritizes that specific rule over general path rules, routing internal employees or VIP customers directly to experimental or dedicated backend service pools.
+
+**Q4: What is Request Mirroring (Traffic Shadowing), and what happens to the responses from the mirrored backend?**
+
+Request Mirroring (`filters: [{ type: RequestMirror }]`) clones live incoming HTTP requests and sends an exact duplicate asynchronous copy to an experimental backend service. The primary live backend processes the original request and returns the response to the customer. The response from the mirrored backend is **completely discarded by the gateway**, allowing engineering teams to test new database queries, algorithms, and CPU performance under 100% production traffic with zero impact on customer latency or errors.
+
+**Q5: What happens if the sum of weights in `backendRefs` does not equal 100?**
+
+The weights in `backendRefs` are **relative proportions**, not strict percentages. For example, setting `weight: 3` for Service A and `weight: 1` for Service B results in Service A receiving $\frac{3}{3+1} = 75\%$ of traffic and Service B receiving $\frac{1}{3+1} = 25\%$ of traffic. If a backend service has `weight: 0`, the gateway sends 0% of traffic to that service.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know how `ReferenceGrant` prevents unauthorized cross-namespace resource access
+- [ ] Know that `ReferenceGrant` must reside in the target namespace granting access
+- [ ] Know how `backendRefs[].weight` implements native canary traffic splitting
+- [ ] Know how to route traffic using HTTP header matches (`X-Beta-Tester`)
+- [ ] Know how the `RequestMirror` filter enables zero-risk production traffic shadowing
+- [ ] Can view active ReferenceGrants using `kubectl get referencegrants -A`

@@ -1,0 +1,380 @@
+---
+title: "Chapter 1 — HorizontalPodAutoscaler (HPA) Internals"
+sidebar_position: 1
+module: "Module 3.8 — Autoscaling: HPA, VPA, KEDA"
+description: "Master Kubernetes HorizontalPodAutoscaler (HPA) internals — the mathematical scaling formula, metrics-server integration, custom/external metrics APIs, stabilization windows, and behavior rate-limiting."
+---
+
+# Chapter 1 — HorizontalPodAutoscaler (HPA) Internals
+
+> **Goal:** Master the internal control loops and algorithms of the HorizontalPodAutoscaler (HPA) — understanding the exact ceiling scaling formula, integrating resource and custom metric pipelines (`metrics.k8s.io`, `custom.metrics.k8s.io`), tuning anti-flapping stabilization windows, configuring fine-grained scaling rate behaviors, and avoiding GitOps replica drift.
+>
+> By the end of this chapter, you will understand:
+> 1. The HPA control loop executed by `kube-controller-manager` every 15 seconds
+> 2. The core mathematical scaling formula and the 10% tolerance boundary
+> 3. The 3 Kubernetes Metrics APIs (Resource, Custom, External)
+> 4. How to configure multi-metric policies under `autoscaling/v2`
+> 5. How `behavior.scaleDown.stabilizationWindowSeconds` eliminates auto-scaling flapping
+> 6. Why GitOps manifests must omit `.spec.replicas` when managed by HPA
+
+---
+
+## Real-Life Analogy
+
+Think of an HPA as an **intelligent thermostat controlling opening cash registers at a supermarket**:
+
+- **The Metric Target (`averageUtilization: 70%`):** The store manager mandates: *"We want cashiers working at roughly 70% capacity."*
+- **The Evaluation Cycle (Every 15s):** Every few minutes, the manager checks the checkout lines.
+- **The Scaling Formula:** If 4 cashiers are currently open, but customer lines are surging to 140% capacity, the manager computes:
+  $$\text{Desired Cashiers} = \left\lceil 4 \times \left(\frac{140\%}{70\%}\right) \right\rceil = \lceil 8 \rceil = 8\text{ cashiers}$$
+  She immediately calls 4 more cashiers to the registers.
+- **The Stabilization Window (`scaleDown.stabilizationWindowSeconds: 300s`):** When the rush subsides and lines drop to 30%, she does **not** send cashiers home instantly. She waits 5 minutes to make sure another tour bus didn't just pull into the parking lot. This prevents cashiers from being repeatedly hired and fired every 30 seconds (thrashing/flapping).
+
+---
+
+## Architecture Diagram
+
+```text
+               HorizontalPodAutoscaler Metrics & Control Loop
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ kube-controller-manager (HPA Controller Loop: Every 15s)               │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+       ┌────────────────────────────┼────────────────────────────┐
+       ▼                            ▼                            ▼
+ ┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+ │ Resource Metrics API │    │ Custom Metrics API   │    │ External Metrics API │
+ │ (metrics.k8s.io)     │    │(custom.metrics.k8s.io│    │(external.metrics.k8s)│
+ │ metrics-server       │    │ prometheus-adapter   │    │ keda-metrics-adapter │
+ │ [CPU / Memory Usage] │    │ [HTTP Req/sec, P99]  │    │ [AWS SQS / Kafka Lag]│
+ └─────────────┬────────┘    └──────────┬───────────┘    └──────────┬───────────┘
+               │                        │                           │
+               └────────────────────────┼───────────────────────────┘
+                                        │
+                                        ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Calculate Target Replicas:                                             │
+ │ desiredReplicas = ceil( currentReplicas * (currentMetric / targetVal) )│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Updates Target Deployment: `spec.replicas`                             │
+ │ Child ReplicaSet scales Pods up or down!                               │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Mathematical Scaling Formula
+
+The HPA controller queries metrics and computes desired replica counts using the following formula:
+
+$$\text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \left( \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right) \right\rceil$$
+
+```text
+ The 10% Tolerance Band (Anti-Thrashing Filter):
+ If `(currentMetricValue / desiredMetricValue)` is between 0.90 and 1.10 (within 10% of target),
+ the HPA controller takes ZERO action. This prevents minor metric fluctuations from scaling pods.
+```
+
+### Mathematical Example:
+- Current Replicas: $5$
+- Target CPU Utilization: $50\%$
+- Current Average CPU: $85\%$
+$$\text{Ratio} = \frac{85}{50} = 1.7 \quad (\text{Greater than } 1.10)$$
+$$\text{desiredReplicas} = \lceil 5 \times 1.7 \rceil = \lceil 8.5 \rceil = 9\text{ replicas}$$
+The HPA scales the Deployment from $5 \to 9$ Pods.
+
+---
+
+## The 3 Kubernetes Metrics APIs
+
+```text
+ ┌───────────────────────────┬───────────────────────────┬─────────────────────────────────────────────────┐
+ │ API Group                 │ Core Provider             │ Example Metrics & Use Cases                     │
+ │───────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────┤
+ │ **`metrics.k8s.io`**      │ `metrics-server`          │ Pod CPU (`cpu`) and Memory (`memory`) usage     │
+ │                           │ (Scraped from Kubelet)    │ gathered directly from cgroups.                 │
+ │───────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────┤
+ │ **`custom.metrics.k8s.io`**│ `prometheus-adapter`      │ Application-internal metrics:                   │
+ │                           │                           │ HTTP Requests/sec, active WebSockets, p95 delay.│
+ │───────────────────────────┼───────────────────────────┼─────────────────────────────────────────────────┤
+ │ **`external.metrics.k8s.io`**│ Datadog / KEDA Metrics │ Cloud & infrastructure metrics external to K8s: │
+ │                           │ Adapter                   │ AWS SQS queue depth, GCP PubSub lag.            │
+ └───────────────────────────┴───────────────────────────┴─────────────────────────────────────────────────┘
+```
+
+> [!IMPORTANT]
+> **CPU Requests are Mandatory for HPA:**
+> If a container does not specify `resources.requests.cpu`, target CPU percentage utilization cannot be calculated, and the HPA will report `<unknown>` and refuse to scale!
+
+---
+
+## Tuning Scaling Rates with `behavior`
+
+In high-traffic production events (e.g. Flash Sales, DDoS spikes), scaling up must happen **instantaneously**, while scaling down must happen **gradually**:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-api
+  minReplicas: 3
+  maxReplicas: 30
+
+  # Advanced Scaling Behavior Tuning
+  behavior:
+    # Scale UP: Aggressive & Fast
+    scaleUp:
+      stabilizationWindowSeconds: 0    # React immediately to traffic spikes
+      policies:
+      - type: Percent
+        value: 100                     # Double the replica count
+        periodSeconds: 15
+      - type: Pods
+        value: 4                       # Or add at least 4 pods
+        periodSeconds: 15
+      selectPolicy: Max                # Choose whichever adds MORE pods!
+
+    # Scale DOWN: Conservative & Safe
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Look back 5 minutes before downscaling
+      policies:
+      - type: Percent
+        value: 10                      # Downscale at most 10% of fleet per minute
+        periodSeconds: 60
+      selectPolicy: Min                # Choose whichever removes FEWER pods!
+```
+
+---
+
+## Multi-Metric Scaling Evaluation
+
+Under `autoscaling/v2`, an HPA can evaluate multiple metrics simultaneously (e.g. CPU + Memory + HTTP Requests/sec).
+
+```text
+ Multi-Metric Rule:
+ The HPA computes the desired replica count for EACH metric independently.
+ The FINAL replica count chosen is always the MAXIMUM calculated value across all metrics!
+```
+
+```yaml
+spec:
+  metrics:
+  # Metric 1: Resource Metric (CPU)
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 75
+
+  # Metric 2: Custom Pod Metric (HTTP Request Rate)
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: 1k
+```
+
+---
+
+## The GitOps Replica Drift Conflict
+
+When managing Deployments via GitOps tools (like Argo CD or Flux), declaring `spec.replicas: 3` in Git creates an endless reconciliation fight:
+1. HPA scales Deployment to `replicas: 15` due to high load.
+2. Argo CD detects that live state (`15`) does not match Git (`3`).
+3. Argo CD forcibly resets the Deployment back to `3`, causing an outage!
+
+### The Solution:
+- **Omit `spec.replicas`** entirely from your Deployment YAML in Git.
+- Or configure Argo CD `ignoreDifferences`:
+  ```yaml
+  spec:
+    ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+      - /spec/replicas
+  ```
+
+---
+
+## Complete Production HPA Manifest
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-processing-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-processing
+  minReplicas: 4
+  maxReplicas: 50
+
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: AverageValue
+        averageValue: 400Mi
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 15
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+---
+
+## Hands-On Lab: Load-Testing HPA Auto-Scaling
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace hpa-lab
+
+# Step 2: Deploy a CPU-intensive web app
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: php-apache
+  namespace: hpa-lab
+spec:
+  selector:
+    matchLabels:
+      run: php-apache
+  template:
+    metadata:
+      labels:
+        run: php-apache
+    spec:
+      containers:
+      - name: php-apache
+        image: registry.k8s.io/hpa-example
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 200m
+          limits:
+            cpu: 500m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: php-apache
+  namespace: hpa-lab
+spec:
+  ports:
+  - port: 80
+  selector:
+    run: php-apache
+EOF
+
+# Step 3: Create an HPA targeting 50% CPU utilization
+cat <<EOF | kubectl apply -f -
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: php-apache-hpa
+  namespace: hpa-lab
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: php-apache
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+EOF
+
+# Step 4: Verify initial HPA status
+kubectl get hpa -n hpa-lab
+
+# Step 5: Launch a load-generator pod to flood the service with HTTP traffic
+kubectl run -i --tty load-generator --rm --image=busybox:1.36 --restart=Never -n hpa-lab -- /bin/sh -c "while true; do wget -q -O- http://php-apache; done"
+
+# Step 6: In a second terminal window, watch the HPA scale up!
+kubectl get hpa -n hpa-lab -w
+
+# Step 7: Stop the load generator (Ctrl+C in terminal 1) and observe scaleDown stabilization window
+kubectl get pods -n hpa-lab -w
+
+# Step 8: Clean up lab
+kubectl delete namespace hpa-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the mathematical formula used by HPA to calculate desired replicas?**
+
+The HPA controller calculates desired replicas using the formula:
+$$\text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \left( \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right) \right\rceil$$
+The controller applies a 10% tolerance boundary ($\pm 10\%$); if the ratio of current metric to desired metric is between $0.90$ and $1.10$, no scaling action is taken, preventing minor metric fluctuations from inducing unnecessary scale events.
+
+**Q2: Why must container `resources.requests.cpu` be declared for HPA CPU scaling?**
+
+Target CPU percentage utilization is calculated relative to the container's configured CPU request ($\text{Utilization} = \frac{\text{Actual CPU Usage}}{\text{CPU Request}} \times 100$). If a container omits `resources.requests.cpu`, the denominator is undefined, making percentage calculation impossible. The HPA will report `<unknown>` utilization in `kubectl get hpa` and refuse to scale the workload.
+
+**Q3: How does the HPA reconcile scaling when multiple metrics are configured?**
+
+Under `autoscaling/v2`, when multiple metrics are declared (e.g. CPU utilization, Memory usage, and HTTP Requests/sec), the HPA controller computes the target replica count for **each metric independently**. To ensure sufficient capacity and prevent performance degradation, the controller selects the **maximum** computed replica count among all evaluated metrics.
+
+**Q4: What is `stabilizationWindowSeconds` in HPA behavior, and what problem does it solve?**
+
+`stabilizationWindowSeconds` defines a lookback window during which the HPA tracks all previously calculated desired replica states. When scaling down, it selects the maximum calculated replica count observed within that window (default: 300s / 5 minutes). This prevents "flapping" or "thrashing" — a dangerous condition where rapid, oscillating traffic spikes cause a Deployment to repeatedly scale up and down in rapid succession.
+
+**Q5: How do you resolve the conflict between GitOps controllers (Argo CD) and HPA managing `spec.replicas`?**
+
+If a Deployment manifest in Git specifies `spec.replicas: 3` and an HPA scales the cluster to 20 replicas during peak load, GitOps engines will detect drift and forcibly scale the Deployment back down to 3, causing a severe outage. To fix this: (1) Omit `spec.replicas` entirely from the Deployment manifest in Git, allowing the API server and HPA to retain ownership; or (2) Configure the GitOps tool to ignore differences on the `/spec/replicas` JSON pointer.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the HPA formula: $\lceil \text{currentReplicas} \times (\text{currentMetric} / \text{targetMetric}) \rceil$
+- [ ] Know that the 10% tolerance band prevents unnecessary scaling actions
+- [ ] Know that `resources.requests` is strictly mandatory for percentage-based scaling
+- [ ] Know the 3 Metrics APIs: Resource (`metrics-server`), Custom (`prometheus`), External (`keda`)
+- [ ] Know that multi-metric HPAs scale to the MAXIMUM calculated replica count
+- [ ] Know how `stabilizationWindowSeconds: 300` prevents scale-down flapping
+- [ ] Can monitor HPA activity with `kubectl get hpa -w` and `kubectl describe hpa`

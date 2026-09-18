@@ -1,0 +1,240 @@
+---
+title: "Chapter 1 — Helm v3 Architecture & Structure"
+sidebar_position: 1
+module: "Module 8.5 — Helm Templating & Charts"
+description: "Master Helm v3 package management architecture — Tillerless design, Secret release storage, Chart.yaml structure, Go template pipelines, and _helpers.tpl partials."
+---
+
+# Chapter 1 — Helm v3 Architecture & Chart Structure
+
+> **Goal:** Master the packaging, templating, and release lifecycle management of Kubernetes applications using **Helm v3** — understanding the **Tillerless architecture** and in-cluster Secret release storage, dissecting the standard chart directory structure (`Chart.yaml`, `values.yaml`, `templates/`, `_helpers.tpl`), mastering Go template directives, pipelines, and indentation functions (`nindent`, `toYaml`), and packaging charts into standard OCI container registries.
+>
+> By the end of this chapter, you will understand:
+> 1. How Helm v3 eliminated the security vulnerabilities of Helm v2's Tiller daemon
+> 2. How Helm v3 stores release state revisions in compressed `sh.helm.release.v1` Secrets
+> 3. The canonical directory layout of a production Helm chart
+> 4. How Go template pipelines (`{{ .Values.image | default "nginx" | quote }}`) process values
+> 5. How `_helpers.tpl` defines reusable named template partials using `define` and `include`
+> 6. How to lint, test, and package charts for OCI registry distribution (`helm package`)
+
+---
+
+## Real-Life Analogy
+
+Think of Helm v3 as **the official package manager (like `apt`, `npm`, or `Homebrew`) and dynamic blueprint printer for Kubernetes applications**:
+
+- **The Raw YAML Nightmare (Hand-Drafting 50 Blueprints):** To install a complex database cluster, you must manually write and edit 50 individual YAML files (**Deployments, Services, Secrets, PVCs, ConfigMaps**). If you need to deploy the same database to 5 environments, you have to copy-paste 250 files and manually search-and-replace IP addresses and passwords (**High Error Rate**).
+- **The Helm Chart (The Parametric Blueprint Template):** A Helm Chart is a single reusable template package. It replaces hardcoded values with dynamic variables (**`{{ .Values.replicaCount }}`**).
+- **The Values File (`values.yaml` - The Customer Customization Form):** When ordering the application, you fill out a simple questionnaire:
+  - `replicaCount: 3`
+  - `storageSize: 100Gi`
+  - `environment: production`
+- **The Tillerless Architecture (Direct Client Authority):** In Helm v2, an all-powerful super-admin daemon named "Tiller" lived inside the cluster with root permissions. In Helm v3, Tiller was completely abolished (**Tillerless**). The Helm CLI on your workstation communicates directly with the Kubernetes API server using your personal RBAC credentials.
+- **The Notarized Filing Cabinet (In-Cluster Release Secrets):** When Helm installs an app, it compresses the exact deployed configuration and stores it inside a secure locked box in the namespace (**Kubernetes Secret**), allowing instant 1-click rollbacks to any historical revision.
+
+---
+
+## Architecture Diagram
+
+```text
+               Helm v3 Tillerless Architecture & Release Lifecycle
+
+ DEVELOPER WORKSTATION (Helm v3 CLI)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `helm install my-release ./my-chart --values prod-values.yaml`      │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 1. Evaluates Go Templates against values.yaml
+                    │ 2. Compiles raw Kubernetes YAML manifests
+                    ▼ HTTPS Port 6443 (Uses User's Personal RBAC!)
+ KUBERNETES KUBE-APISERVER
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Validates RBAC & Admission Control ──► Stores Objects in etcd          │
+ └──────┬───────────────────────────────────────────────────────┬─────────┘
+        │                                                       │
+        ▼ 1. Deploys Workloads                                  ▼ 2. Stores Release State
+ ┌──────────────────────────────────────┐             ┌───────────────────────────────────┐
+ │ TARGET NAMESPACE: `production`       │             │ IN-CLUSTER RELEASE SECRET         │
+ │ ├── Deployment: `my-release-backend` │             │ `sh.helm.release.v1.my-release.v1`│
+ │ ├── Service:    `my-release-svc`     │             │ (Stores gzipped JSON state of the │
+ │ └── Ingress:    `my-release-ingress` │             │  release for 1-click rollbacks!)  │
+ └──────────────────────────────────────┘             └───────────────────────────────────┘
+```
+
+---
+
+## Helm v2 vs Helm v3: Core Architectural Changes
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Architectural   │ Legacy Helm v2                  │ Modern Helm v3                  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **In-Cluster Daemon**     │ **Tiller Daemon** required      │ **Tillerless.** Zero in-cluster │
+ │                           │ (Major security vulnerability). │ daemons; runs purely client-side│
+ │ **Security / RBAC**       │ Tiller ran as `cluster-admin`,  │ Direct client RBAC. Helm cannot │
+ │                           │ bypassing user permissions.     │ do what the user cannot do.     │
+ │ **Release Storage**       │ ConfigMaps in `kube-system`.    │ **Secrets** inside the target   │
+ │                           │                                 │ application's own namespace.    │
+ │ **Upgrade Algorithm**     │ 2-way diff (Overwrote live      │ **3-Way Strategic Merge Patch** │
+ │                           │ runtime modifications).         │ (Preserves live HPA/mesh tags). │
+ │ **Chart Repositories**    │ HTTP Chart Repositories only.   │ **OCI Registries** (GHCR, ECR,  │
+ │                           │                                 │ Harbor) supported natively.     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Canonical Helm Chart Directory Layout
+
+```text
+ payment-service-chart/
+ ├── Chart.yaml              # Metadata: Name, chart version, appVersion, dependencies
+ ├── values.yaml             # Default configuration values hierarchy
+ ├── .helmignore             # Patterns to ignore when packaging chart
+ ├── templates/              # Manifest templates compiled by the Go template engine
+ │   ├── _helpers.tpl        # Reusable named template partials (labels, fullnames)
+ │   ├── deployment.yaml     # Parametric Deployment manifest
+ │   ├── service.yaml        # Parametric Service manifest
+ │   ├── ingress.yaml        # Parametric Ingress manifest
+ │   ├── serviceaccount.yaml # Parametric ServiceAccount manifest
+ │   ├── NOTES.txt           # Post-installation instructional banner printed to user
+ │   └── tests/              # Helm test verification pods
+ └── charts/                 # Subcharts and embedded dependencies
+```
+
+---
+
+## Complete Production `Chart.yaml` & `_helpers.tpl`
+
+### 1. `Chart.yaml`:
+```yaml
+apiVersion: v2
+name: payment-service
+description: Enterprise Payment Processing Microservice
+type: application
+version: 1.4.0                       # The version of the Helm Chart itself
+appVersion: "2.5.1"                  # The version of the underlying application code
+keywords:
+  - payment
+  - finance
+maintainers:
+  - name: SRE Platform Team
+    email: sre@company.com
+```
+
+---
+
+### 2. `templates/_helpers.tpl` (Named Template Partials):
+```yaml
+{{/* Generate a standardized chart fullname */}}
+{{- define "payment-service.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{/* Standardized Common Kubernetes Labels */}}
+{{- define "payment-service.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+```
+
+---
+
+## Production `templates/deployment.yaml` with Go Template Directives
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "payment-service.fullname" . }}
+  labels:
+    {{- include "payment-service.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount | default 2 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "payment-service.labels" . | nindent 8 }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+        ports:
+        - containerPort: {{ .Values.service.port | default 8080 }}
+        {{- if .Values.resources }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        {{- end }}
+```
+
+---
+
+## Hands-On Lab: Linting, Rendering & Packaging Helm Charts
+
+```bash
+# Step 1: Verify Helm version (Must be Helm v3!)
+helm version --short
+
+# Step 2: Create a clean boilerplate Helm chart
+helm create helm-demo-chart
+
+# Step 3: Lint the chart for syntax and best-practice violations
+helm lint helm-demo-chart
+
+# Step 4: Dry-run and render templates locally without touching a cluster
+helm template test-release helm-demo-chart --set replicaCount=5 | head -n 30
+
+# Step 5: Package the chart into a distributable .tgz archive
+helm package helm-demo-chart
+
+# Step 6: Clean up lab
+rm -rf helm-demo-chart helm-demo-chart-*.tgz
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why was the Tiller daemon removed in Helm v3, and how does Helm v3 enforce security?**
+
+In Helm v2, Tiller was an in-cluster pod that had to be granted broad `cluster-admin` privileges to create arbitrary resources. This created a massive security hole: any developer with basic access to Tiller could bypass their own restricted RBAC and deploy administrative cluster-wide objects. Helm v3 eliminated Tiller entirely (**Tillerless**). The Helm client executes locally on the user's terminal and makes direct API calls to the Kubernetes API server using the user's own `kubeconfig` and RBAC permissions.
+
+**Q2: Where and how does Helm v3 store release state history?**
+
+Helm v3 stores release state as **Kubernetes `Secret` objects** directly inside the namespace where the application is installed (e.g. `sh.helm.release.v1.<release-name>.v1`, `.v2`, etc.). The release metadata and rendered manifests are compressed with Gzip, base64-encoded, and stored inside the Secret's `data.release` field. This allows Helm to support multi-tenant isolation and execute rollbacks without any external database.
+
+**Q3: What is the difference between `{{ template "name" . }}` and `{{ include "name" . }}` in Helm?**
+
+- `template`: An action built into standard Go templating. It cannot pass its output into a pipeline (e.g. `{{ template "name" . | nindent 4 }}` will fail with a syntax error).
+- `include`: A Helm-specific function that returns the rendered template string as a pipeline-compatible output. This allows piping the result into indentation and formatting functions: `{{ include "name" . | nindent 4 }}`. **`include` is the production standard.**
+
+**Q4: Why is the `nindent` function preferred over `indent` in Helm templates?**
+
+`indent` indents every line in a multi-line string *except* the first line. If placed on a new line, it creates misaligned YAML whitespace errors. `nindent` writes a newline character first and then indents *every* line (including the first) by the specified number of spaces, guaranteeing perfectly valid, properly aligned YAML blocks.
+
+**Q5: How does Helm v3 handle 3-way Strategic Merge Patches during upgrades?**
+
+When running `helm upgrade`, Helm v2 used a naive 2-way diff (comparing old chart vs new chart), which unintentionally deleted runtime changes made by Kubernetes controllers (such as replica counts adjusted by an HPA or sidecars injected by Istio). Helm v3 uses a **3-way strategic merge patch** that compares: (1) The old chart; (2) The live cluster state; and (3) The new chart, preserving out-of-band mutations while applying intentional updates.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Helm v3 is Tillerless and uses client RBAC credentials directly
+- [ ] Know that release states are stored as compressed Secrets in the release namespace
+- [ ] Know the structure: `Chart.yaml`, `values.yaml`, `templates/`, `_helpers.tpl`
+- [ ] Know why `include` is preferred over `template` for pipeline indentation
+- [ ] Know why `nindent` prevents YAML indentation bugs in multi-line blocks
+- [ ] Know how 3-way strategic merge patching preserves HPA and service mesh state
+- [ ] Can lint and render charts locally using `helm lint` and `helm template`

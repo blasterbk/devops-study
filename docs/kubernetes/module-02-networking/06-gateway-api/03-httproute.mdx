@@ -1,0 +1,498 @@
+---
+title: "Chapter 3 — HTTPRoute"
+sidebar_position: 3
+module: "Module 2.6 — Gateway API"
+description: "Deep dive into HTTPRoute — the application-tier routing resource in Gateway API. Covers host and path matching, request header manipulation, traffic splitting for canary deployments, request mirroring, timeouts, and retry policies."
+---
+
+# Chapter 3 — HTTPRoute
+
+> **Goal:** Master HTTPRoute as the primary routing resource in Gateway API — understand its match rules, traffic splitting for canary deployments, filters for request/response modification, and how it improves upon Ingress annotations with type-safe, validated configuration.
+>
+> By the end of this chapter, you will understand:
+> 1. How HTTPRoute attaches to a Gateway via `parentRefs`
+> 2. Route rules: host matching, path matching, header matching, query matching
+> 3. Native traffic splitting — weighted backends for canary deployments
+> 4. Filters: request/response header modification, URL rewrite, redirects
+> 5. Request mirroring for shadow testing
+> 6. Timeouts and retry policies
+
+---
+
+## Real-Life Analogy
+
+HTTPRoute is like a **sophisticated restaurant order routing system**:
+
+Each customer's order (HTTP request) is examined: Which restaurant are they calling (host), which dish do they want (path), any special preferences (headers)? Based on this, the order is routed to:
+- The main kitchen (stable backend): 80% of burger orders
+- The new kitchen testing a new recipe (canary backend): 20% of burger orders
+- A special kitchen for VIP orders (header match: `X-VIP: true`)
+- Copied to the taste-test kitchen (request mirroring for observability)
+
+All of this logic is expressed in typed, validated YAML — not string annotations.
+
+---
+
+## Architecture Diagram
+
+```text
+                HTTPRoute — Rule Matching Flow
+
+  Request arrives at Gateway listener: HTTPS:443
+        │
+        ▼
+  HTTPRoute matching (in order):
+  ┌──────────────────────────────────────────────────────────┐
+  │ Rule 1: host=api.example.com AND path=/v2/*              │
+  │   → 100% to api-v2-service:8080                         │
+  ├──────────────────────────────────────────────────────────┤
+  │ Rule 2: host=api.example.com AND path=/v1/*              │
+  │   → 80% to api-v1-service:8080  (stable)                │
+  │   → 20% to api-v1-canary:8080   (canary)                │
+  ├──────────────────────────────────────────────────────────┤
+  │ Rule 3: host=api.example.com AND header[X-Debug]=true    │
+  │   → 100% to api-debug-service:8080                      │
+  ├──────────────────────────────────────────────────────────┤
+  │ Rule 4: host=api.example.com (default)                   │
+  │   → 100% to api-v1-service:8080                         │
+  └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Basic HTTPRoute
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+  namespace: production
+spec:
+  # Attach to the Gateway
+  parentRefs:
+  - name: main-gateway
+    namespace: gateway-infra      # Gateway's namespace
+    sectionName: https            # Specific listener (optional)
+
+  # Hostnames this route handles
+  hostnames:
+  - "api.example.com"
+  - "api.prod.example.com"       # Multiple hostnames supported
+
+  rules:
+  # Rule 1: Route /v2 to new service
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /v2
+    backendRefs:
+    - name: api-v2-service
+      port: 8080
+
+  # Rule 2: Route everything else to v1
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: api-v1-service
+      port: 8080
+```
+
+---
+
+## Route Matching
+
+### Path Matching
+
+```yaml
+# Exact match
+- path:
+    type: Exact
+    value: /api/health
+
+# Prefix match (most common)
+- path:
+    type: PathPrefix
+    value: /api
+
+# Regex match (not in standard channel — use with care)
+- path:
+    type: RegularExpression
+    value: /api/v[0-9]+/.*
+```
+
+### Header Matching
+
+```yaml
+- matches:
+  - headers:
+    # Exact header match
+    - name: X-API-Version
+      type: Exact
+      value: "v2"
+    # Or: regex match
+    - name: User-Agent
+      type: RegularExpression
+      value: ".*Mobile.*"
+    # Or: header exists (empty value matches presence)
+    - name: X-Debug
+      type: Exact
+      value: "true"
+```
+
+### Query Parameter Matching
+
+```yaml
+- matches:
+  - queryParams:
+    - name: version
+      type: Exact
+      value: "v2"
+    - name: debug
+      type: Exact
+      value: "true"
+```
+
+### Combined Matching (AND logic)
+
+Multiple fields within one match entry are AND'd:
+
+```yaml
+- matches:
+  - path:
+      type: PathPrefix
+      value: /admin
+    headers:
+    - name: X-Admin-Key
+      type: Exact
+      value: "secret"
+    method: GET       # Host AND path=/admin AND header AND method=GET
+```
+
+Multiple match entries in a rule are OR'd:
+
+```yaml
+- matches:
+  - path:
+      type: Exact
+      value: /health     # Match /health
+  - path:
+      type: Exact
+      value: /readyz     # OR /readyz
+  - path:
+      type: Exact
+      value: /livez      # OR /livez
+```
+
+---
+
+## Traffic Splitting: Native Canary
+
+HTTPRoute has **first-class traffic splitting** — no separate Ingress objects needed:
+
+```yaml
+rules:
+- matches:
+  - path:
+      type: PathPrefix
+      value: /
+  backendRefs:
+  # 90% to stable
+  - name: api-stable
+    port: 8080
+    weight: 90
+  # 10% to canary
+  - name: api-canary
+    port: 8080
+    weight: 10
+```
+
+The weights are relative: `90:10` is the same as `9:1`. If only one backend, weight is irrelevant.
+
+### Progressive Canary Rollout
+
+```bash
+# Start: 5% canary
+kubectl patch httproute api-route -n production --type json \
+  -p '[{"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":5}]'
+
+# Increase to 25%
+kubectl patch httproute api-route -n production --type json \
+  -p '[{"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":25}]'
+
+# Full rollout: 100% to new version
+kubectl patch httproute api-route -n production --type json \
+  '[{"op":"replace","path":"/spec/rules/0/backendRefs/0/weight","value":0},
+    {"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":100}]'
+```
+
+---
+
+## Filters: Request/Response Modification
+
+### Request Header Modification
+
+```yaml
+rules:
+- matches:
+  - path:
+      type: PathPrefix
+      value: /api
+  filters:
+  - type: RequestHeaderModifier
+    requestHeaderModifier:
+      add:
+      - name: X-Forwarded-Host
+        value: "%{req.host}"
+      - name: X-Request-ID
+        value: "%{req.id}"
+      set:
+      - name: X-API-Key
+        value: "internal-trusted"
+      remove:
+      - X-Internal-Debug       # Remove before forwarding to backend
+  backendRefs:
+  - name: api-service
+    port: 8080
+```
+
+### Response Header Modification
+
+```yaml
+filters:
+- type: ResponseHeaderModifier
+  responseHeaderModifier:
+    add:
+    - name: X-Content-Type-Options
+      value: nosniff
+    - name: Strict-Transport-Security
+      value: "max-age=31536000; includeSubDomains"
+    set:
+    - name: Cache-Control
+      value: "no-store"
+    remove:
+    - Server          # Remove server version disclosure
+```
+
+### URL Rewrite
+
+```yaml
+# Strip prefix before forwarding: /api/users → /users
+filters:
+- type: URLRewrite
+  urlRewrite:
+    path:
+      type: ReplacePrefixMatch
+      replacePrefixMatch: /
+
+# Full path replace: /old/path → /new/path
+filters:
+- type: URLRewrite
+  urlRewrite:
+    path:
+      type: ReplaceFullPath
+      replaceFullPath: /new/path
+
+# Change hostname
+filters:
+- type: URLRewrite
+  urlRewrite:
+    hostname: "internal-api.svc.cluster.local"
+```
+
+### HTTP Redirect
+
+```yaml
+# Redirect HTTP to HTTPS
+rules:
+- matches:
+  - path:
+      type: PathPrefix
+      value: /
+  filters:
+  - type: RequestRedirect
+    requestRedirect:
+      scheme: https
+      statusCode: 301
+
+# Redirect to new URL
+filters:
+- type: RequestRedirect
+  requestRedirect:
+    hostname: new.example.com
+    path:
+      type: ReplacePrefixMatch
+      replacePrefixMatch: /new
+    statusCode: 302
+```
+
+---
+
+## Request Mirroring
+
+Mirror a copy of requests to a secondary backend (for testing/observability). The mirrored request is fire-and-forget — the response is ignored:
+
+```yaml
+rules:
+- matches:
+  - path:
+      type: PathPrefix
+      value: /api
+  filters:
+  - type: RequestMirror
+    requestMirror:
+      backendRef:
+        name: api-shadow          # Shadow service
+        port: 8080
+        percentage:
+          value: 100              # Mirror 100% of requests
+  backendRefs:
+  - name: api-production         # Real backend (client gets this response)
+    port: 8080
+```
+
+Use cases:
+- **Shadow testing**: send traffic to new version without affecting clients
+- **Traffic replay**: capture production traffic for load testing
+- **Debugging**: duplicate traffic to a debug instance
+
+---
+
+## Timeouts and Retry Policies
+
+```yaml
+# Timeouts (Gateway API standard since v1.0)
+rules:
+- matches:
+  - path:
+      type: PathPrefix
+      value: /api
+  timeouts:
+    request: "30s"              # Total request timeout (client → backend → response)
+    backendRequest: "10s"       # Timeout for each backend request attempt
+  backendRefs:
+  - name: api-service
+    port: 8080
+```
+
+Retry policies (currently experimental, in standard channel as of v1.1):
+```yaml
+rules:
+- retryOn:
+    statusCodes: [502, 503, 504]
+    attempts: 3
+    backoff:
+      baseInterval: 100ms
+      maxInterval: 1s
+```
+
+---
+
+## Cross-Namespace Backend References
+
+HTTPRoute can route to Services in other namespaces (with ReferenceGrant):
+
+```yaml
+# HTTPRoute in "frontend" namespace routing to "backend" namespace
+spec:
+  backendRefs:
+  - name: api-service
+    namespace: backend          # Cross-namespace reference
+    port: 8080
+    group: ""
+    kind: Service
+```
+
+```yaml
+# Required: ReferenceGrant in "backend" namespace
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-frontend-to-backend
+  namespace: backend
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    namespace: frontend          # Allow HTTPRoutes from this namespace
+  to:
+  - group: ""
+    kind: Service               # To access Services here
+```
+
+---
+
+## Hands-On: HTTPRoute Debugging
+
+```bash
+# 1. List all HTTPRoutes
+kubectl get httproute -A
+
+# 2. Check HTTPRoute attachment status
+kubectl describe httproute api-route -n production
+# Status.Parents:
+#   ControllerName: gateway.nginx.org/nginx-gateway-controller
+#   Conditions:
+#     Accepted: True     ← Route is attached to Gateway
+#     ResolvedRefs: True ← Backend Services found
+
+# 3. Test routing rules
+curl -H "Host: api.example.com" http://<gateway-ip>/v1/users
+curl -H "Host: api.example.com" http://<gateway-ip>/v2/users
+curl -H "Host: api.example.com" -H "X-API-Version: v2" http://<gateway-ip>/users
+
+# 4. Test traffic splitting (run many times, observe distribution)
+for i in $(seq 1 100); do
+  curl -s -o /dev/null -w "%{http_code} " http://api.example.com/
+done | tr ' ' '\n' | sort | uniq -c
+# Should show ~80% to stable, ~20% to canary
+
+# 5. Check backend Service exists and has endpoints
+kubectl get svc api-v1-service -n production
+kubectl get endpoints api-v1-service -n production
+
+# 6. HTTPRoute not accepted?
+kubectl get httproute api-route -n production \
+  -o jsonpath='{.status.parents[0].conditions}' | python3 -m json.tool
+# Reason: "NotAllowedByListeners" — check allowedRoutes on Gateway
+# Reason: "NoMatchingParent"    — Gateway doesn't exist or wrong name
+# Reason: "BackendNotFound"     — Service doesn't exist
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does HTTPRoute attach to a Gateway and what controls whether attachment is allowed?**
+
+An HTTPRoute attaches to a Gateway via `spec.parentRefs`, specifying the Gateway's name, namespace, and optionally the specific listener section (`sectionName`). Attachment is allowed based on the Gateway listener's `allowedRoutes` policy: the HTTPRoute's namespace must match (`Same`, `All`, or a label `Selector`). The controller validates attachment and sets `status.parents[].conditions[Accepted]` to indicate whether the Route is attached. If `Accepted: False`, the reason field explains why (e.g., `NotAllowedByListeners`).
+
+**Q2: How does traffic splitting in HTTPRoute compare to Ingress canary via annotations?**
+
+Ingress canary requires two separate Ingress objects with specific annotations that must share the same host — awkward, controller-specific, and unvalidated. HTTPRoute's `backendRefs[].weight` natively expresses traffic splitting within a single rule: one Rule with two `backendRefs` each with a weight. It's controller-agnostic, schema-validated, expressed in typed YAML (not strings), and supports progressive adjustment via `kubectl patch`. No secondary objects needed.
+
+**Q3: What does the `URLRewrite` filter do and how does it differ from NGINX's `rewrite-target`?**
+
+`URLRewrite` is a Gateway API standard filter that modifies the request URL before forwarding to the backend. `ReplacePrefixMatch` strips a path prefix: `/api/users` → `/users`. `ReplaceFullPath` replaces the entire path. It can also change the hostname. Unlike NGINX's `rewrite-target` (which is an annotation string with NGINX regex capture groups), `URLRewrite` is a typed, validated CRD field with a clear schema — no regex syntax errors, works across controllers.
+
+**Q4: What is request mirroring and what are its use cases?**
+
+Request mirroring (`RequestMirror` filter) sends a copy of incoming requests to a secondary backend in parallel with the primary. The primary backend's response is returned to the client; the mirror's response is discarded. Use cases: (1) shadow testing — send production traffic to a new version without risk; (2) load testing with real traffic patterns; (3) debugging — duplicate a portion of traffic to a diagnostic instance; (4) data replication — copy requests to an audit system. The mirror is completely transparent to the client.
+
+**Q5: How are HTTPRoute timeouts configured and what is the difference between `request` and `backendRequest`?**
+
+`timeouts.request` is the total timeout from when the client sends the request to when the response is fully received — it includes all retry attempts. `timeouts.backendRequest` is the timeout for a single backend request attempt. If retries are configured, `backendRequest` applies per-attempt while `request` caps the total duration. If `request` is smaller than `backendRequest × retryAttempts`, the request will timeout before all retries complete. Set `backendRequest` < `request` to allow meaningful retry behavior.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know HTTPRoute attaches to Gateway via `parentRefs` — gateway name + namespace + optional listener
+- [ ] Know matching rules: path (Exact/Prefix/Regex), header, query params — AND within a match, OR across matches
+- [ ] Know traffic splitting via `backendRefs[].weight` — native canary without extra objects
+- [ ] Know filters: RequestHeaderModifier, ResponseHeaderModifier, URLRewrite, RequestRedirect, RequestMirror
+- [ ] Know `URLRewrite` with `ReplacePrefixMatch` strips path prefixes before forwarding
+- [ ] Know `timeouts.request` (total) vs `timeouts.backendRequest` (per-attempt)
+- [ ] Can debug with `kubectl describe httproute` checking `status.parents[].conditions`

@@ -1,0 +1,230 @@
+---
+title: "Chapter 2 — OCM Placement, ManifestWork & Policies"
+sidebar_position: 2
+module: "Module 9.6 — OCM & Policy Enforcement"
+description: "Master Open Cluster Management (OCM) advanced capabilities — Placement API cluster scheduling, ManifestWork delivery, and Governance ConfigurationPolicies."
+---
+
+# Chapter 2 — Placement API, ManifestWork & Governance Policies
+
+> **Goal:** Master multi-cluster workload scheduling, atomic resource dispatching, and automated compliance enforcement in **Open Cluster Management (OCM)** — understanding how the **`Placement`** API dynamically selects clusters using predicates, claim selectors, and resource prioritizers, deploying encapsulated resources via **`ManifestWork`**, and enforcing fleet-wide security baselines across 1,000+ clusters using declarative **Governance `Policy`** CRDs (`inform` vs `enforce`).
+>
+> By the end of this chapter, you will understand:
+> 1. How the `Placement` API acts as a cluster-level kube-scheduler for multi-cluster fleets
+> 2. How `PlacementDecision` binds selected clusters to downstream workloads
+> 3. The structural anatomy of `ManifestWork` and its atomic in-cluster reconciliation lifecycle
+> 4. How OCM Governance Policies continuously audit and enforce security baselines
+> 5. The difference between `remediationAction: inform` (Audit) and `enforce` (Auto-remediate)
+> 6. How to author production `Placement`, `ManifestWork`, and `ConfigurationPolicy` manifests
+
+---
+
+## Real-Life Analogy
+
+Think of OCM Placement, ManifestWork, and Governance Policies as **a national retail corporation's corporate headquarters directing seasonal merchandise and enforcing fire safety codes across 1,000 franchise stores**:
+
+- **The Store Selection Engine (`Placement` API):** Corporate headquarters wants to roll out a new high-end winter jacket line (**Workload Deployment**). Headquarters doesn't manually email 1,000 store managers. It queries the master database: *"Find all stores located in cold northern regions with at least 500 sq ft of available shelf space (**`predicates: matchExpressions` & `prioritizers`**)."* The system selects 50 matching flagship stores (**`PlacementDecision`**).
+- **The Sealed Cargo Container (`ManifestWork`):** Headquarters packs the jackets, price tags, and promotional posters into an armored, tamper-evident shipping crate (**`ManifestWork` CRD**) and addresses it to Store #42. The local store agent (**`klusterlet-work-agent`**) opens the box, hangs the jackets on the racks (**Applies manifests**), and scans the confirmation barcode back to headquarters (**Status: `Applied` & `Available`**).
+- **The National Fire Safety Inspector (`ConfigurationPolicy`):** Headquarters has a mandatory legal safety rule: *"Every store MUST keep emergency exit doors unlocked and possess an active fire extinguisher (**Mandatory Security Baseline**)."*
+  - **Audit Mode (`remediationAction: inform`):** The inspector visits the store, notes that an exit is blocked, and submits a violation ticket to the dashboard.
+  - **Auto-Fix Mode (`remediationAction: enforce`):** The inspector cuts the padlock off the exit door on the spot and replaces the dead fire extinguisher immediately (**Automatic Self-Healing Compliance**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               OCM Placement Scheduling, ManifestWork & Policy Workflow
+
+ OCM HUB CLUSTER (Central Management Control Plane)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. PLACEMENT API: Evaluates `region: us-east` & `availableCPU > 16`     │
+ │    ──► Emits: `PlacementDecision` (Selected: `cluster-01`, `cluster-02`)│
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 2. POLICY CONTROLLER: Enforces `ConfigurationPolicy` (Rootless Pods)   │
+ │    ──► Generates `ManifestWork` inside target cluster namespaces!      │
+ └──────┬───────────────────────────────────────────────────────┬─────────┘
+        │ Dispatches `ManifestWork` (Namespace: `cluster-01`)   │ Dispatches `ManifestWork`
+        ▼                                                       ▼
+ ┌──────────────────────────────────────┐             ┌───────────────────────────────────┐
+ │ MANAGED CLUSTER 01                   │             │ MANAGED CLUSTER 02                │
+ │ ┌──────────────────────────────────┐ │             │ ┌───────────────────────────────┐ │
+ │ │ WORK AGENT (`klusterlet`)        │ │             │ │ WORK AGENT (`klusterlet`)     │ │
+ │ │ - Unpacks `ManifestWork` YAML    │ │             │ │ - Unpacks `ManifestWork` YAML │ │
+ │ │ - Applies Deployment / RBAC / PDB│ │             │ │ - Applies Deployment / RBAC   │ │
+ │ │ - Auto-heals policy violations!  │ │             │ │ - Auto-heals violations!      │ │
+ │ └──────────────────────────────────┘ │             │ └───────────────────────────────┘ │
+ └──────────────────────────────────────┘             └───────────────────────────────────┘
+```
+
+---
+
+## 1. Declarative Cluster Scheduling (`Placement` Manifest)
+
+The `Placement` API acts as a multi-cluster scheduler:
+
+```yaml
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: payment-service-placement
+  namespace: default
+spec:
+  numberOfClusters: 3                  # Selects exactly 3 clusters from matching pool!
+  predicates:
+    # 1. Label Matcher
+    - requiredClusterSelector:
+        labelSelector:
+          matchLabels:
+            environment: production
+            tier: payment
+        # 2. Dynamic Cluster Claim Matcher (EKS Clusters with K8s >= v1.28)
+        claimSelector:
+          matchExpressions:
+            - key: product.open-cluster-management.io
+              operator: In
+              values: ["EKS"]
+  # 3. Resource Prioritizer (Picks clusters with highest allocatable CPU!)
+  prioritizerPolicy:
+    mode: Exact
+    configurations:
+      - scoreCoordinate:
+          type: BuiltIn
+          builtIn: ResourceAllocatableCPU
+        weight: 100
+```
+
+---
+
+## 2. Atomic Workload Encapsulation (`ManifestWork`)
+
+A `ManifestWork` is created in the spoke's dedicated Hub namespace (`namespace: prod-cluster-01`):
+
+```yaml
+apiVersion: work.open-cluster-management.io/v1
+kind: ManifestWork
+metadata:
+  name: payment-api-workload
+  namespace: prod-cluster-01           # Must be placed in target cluster's namespace!
+spec:
+  workload:
+    manifests:
+      # Embedded Kubernetes Manifest 1: Deployment
+      - apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: payment-api
+          namespace: default
+        spec:
+          replicas: 3
+          template:
+            spec:
+              containers:
+              - name: payment
+                image: ghcr.io/org/payment-api:v2.4.0
+      # Embedded Kubernetes Manifest 2: Service
+      - apiVersion: v1
+        kind: Service
+        metadata:
+          name: payment-api-svc
+          namespace: default
+        spec:
+          ports:
+          - port: 8080
+            targetPort: 8080
+```
+
+---
+
+## 3. Fleet Governance & Compliance Policy (`Policy` CRD)
+
+Enforce cluster-wide security baselines across the entire fleet:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: enforce-pod-security-standards
+  namespace: default
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+spec:
+  disabled: false
+  remediationAction: enforce           # Options: 'inform' (Audit) or 'enforce' (Auto-Remediate!)
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: require-restricted-namespaces
+        spec:
+          severity: high
+          namespaceSelector:
+            exclude: ["kube-*", "open-cluster-management*"]
+            include: ["*"]
+          object-templates:
+            # Mandates that all namespaces MUST have Pod Security Restricted label!
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  labels:
+                    pod-security.kubernetes.io/enforce: restricted
+```
+
+---
+
+## Hands-On Lab: Querying OCM Placements & Governance Status
+
+```bash
+# Step 1: Query active Placements and selected cluster decisions
+kubectl get placements.cluster.open-cluster-management.io -A 2>/dev/null || echo "OCM Placements active / simulated"
+
+# Step 2: Inspect generated PlacementDecisions
+kubectl get placementdecisions.cluster.open-cluster-management.io -A -o yaml | grep -A 5 "clusterName"
+
+# Step 3: Query ManifestWorks assigned to a specific managed cluster
+# kubectl get manifestworks -n prod-cluster-01
+
+# Step 4: Query fleet-wide governance compliance policy status
+kubectl get policies.policy.open-cluster-management.io -A -o custom-columns=NAME:.metadata.name,ACTION:.spec.remediationAction,COMPLIANT:.status.compliant
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the OCM `Placement` API differ from standard Kubernetes Pod scheduling?**
+
+While the standard `kube-scheduler` schedules **Pods onto Nodes** within a single cluster, the OCM `Placement` API schedules **entire Workloads onto Clusters** across a global multi-cluster fleet. It evaluates multi-cluster predicates (cloud provider, geographical region, Kubernetes version) and resource prioritizers (cluster CPU/memory allocatable, cost metrics), outputting a **`PlacementDecision`** Custom Resource that binds applications to the most optimal clusters.
+
+**Q2: What is a `ManifestWork`, and how does the `klusterlet-work-agent` reconcile it?**
+
+A `ManifestWork` is an OCM Custom Resource stored in the Hub cluster within a target managed cluster's namespace. It encapsulates a list of raw Kubernetes manifests (Deployments, Services, RBAC, CRDs). The `klusterlet-work-agent` on the spoke cluster watches this resource, pulls the embedded manifests, and applies them to the spoke's local API server. It continuously monitors the live objects and reports real-time status (`Applied: True`, `Available: True`, `Degraded: False`) back to the `ManifestWork.status` on the Hub.
+
+**Q3: What is the operational difference between `remediationAction: inform` and `remediationAction: enforce` in OCM Governance Policies?**
+
+- **`inform` (Audit Mode)**: The policy controller inspects managed clusters for compliance against the declared baseline. If a cluster violates the policy (e.g. a namespace lacks mandatory security labels or a container runs as root), the controller marks the policy status as **`NonCompliant`** and fires alerts, but does **not** modify live cluster resources.
+- **`enforce` (Auto-Remediate Mode)**: If a violation is detected, the policy controller immediately executes a mutating `apply/patch` to **forcefully overwrite and fix the non-compliant resource**, guaranteeing zero-drift security enforcement.
+
+**Q4: How does OCM handle garbage collection when a `ManifestWork` is deleted from the Hub?**
+
+When a `ManifestWork` is deleted from the Hub cluster, OCM's work agent detects the deletion event and automatically deletes all underlying Kubernetes resources that were originally created by that `ManifestWork` on the spoke cluster. Administrators can configure `spec.deleteOption.propagationPolicy: Foreground` or `Orphan` if they wish to delete the ManifestWork without purging live workloads.
+
+**Q5: What are the three core policy types supported by the OCM Governance Framework?**
+
+1. **`ConfigurationPolicy`**: Audits and enforces the presence, absence, or specific field values of any Kubernetes resource (ConfigMaps, Deployments, Namespaces, NetworkPolicies).
+2. **`CertificatePolicy`**: Monitored across all clusters to detect expiring TLS certificates (e.g. alerting when certificates expire in $< 30$ days).
+3. **`IAMPolicy`**: Enforces role bindings, restricting unauthorized `cluster-admin` RBAC assignments.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `Placement` acts as a multi-cluster scheduler for fleets
+- [ ] Know that `PlacementDecision` binds selected clusters to workloads
+- [ ] Know that `ManifestWork` encapsulates raw manifests in target Hub namespaces
+- [ ] Know the difference: `remediationAction: inform` (Audit) vs `enforce` (Auto-Fix)
+- [ ] Know that `ConfigurationPolicy` enforces mandatory security baselines across fleets
+- [ ] Can view policy compliance using `kubectl get policies -A`

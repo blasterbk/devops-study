@@ -1,0 +1,207 @@
+---
+title: "Chapter 2 — GSLB DNS Failover & Velero Migration"
+sidebar_position: 2
+module: "Module 9.9 — Disaster Recovery & Failover"
+description: "Master multi-cluster edge failover with Global Server Load Balancing (GSLB) and persistent state backup/migration across clouds using Velero."
+---
+
+# Chapter 2 — GSLB DNS Failover & Velero State Migration
+
+> **Goal:** Master automated global traffic routing and cross-cluster stateful recovery across Kubernetes fleets using **Global Server Load Balancing (GSLB)** and **CNCF Velero** — understanding how intelligent Anycast/GeoDNS health probes dynamically reroute edge traffic during regional cluster outages, backing up Kubernetes resource manifests and persistent volume storage snapshots via **CSI VolumeSnapshots**, and executing end-to-end disaster recovery re-hydration using Velero **`Backup`**, **`Schedule`**, and **`Restore`** Custom Resources.
+>
+> By the end of this chapter, you will understand:
+> 1. How GSLB (Cloudflare, AWS Route53, K8gb) routes global traffic based on real-time endpoint health
+> 2. How DNS TTLs, active health checks, and Anycast IPs coordinate sub-30-second automated failovers
+> 3. The architecture of Velero: Kubernetes API metadata backups combined with CSI storage snapshots
+> 4. How Velero uses Restic/Kopia and cloud object storage (S3/GCS) for cross-cloud migration
+> 5. How to author production Velero `Schedule` and `Restore` Custom Resources
+> 6. How to execute a full disaster recovery drill restoring stateful workloads into a fresh cluster
+
+---
+
+## Real-Life Analogy
+
+Think of GSLB DNS Failover and Velero State Migration as **an intelligent airport air traffic control tower combined with a high-speed disaster relocation convoy**:
+
+- **The Global Air Traffic Controller (GSLB - Global Server Load Balancing):** Airplanes (**Global User HTTP Requests**) fly towards the destination city.
+  - The control tower (**Cloudflare / Route53 GSLB**) constantly monitors the runway lights at Airport A in Virginia (**Primary Cluster Health Probe `/healthz`**).
+  - If a blizzard covers the runway in Virginia (**Regional Datacenter Outage**), the control tower immediately radios all incoming planes: *"Reroute to Airport B in Ohio (**Standby Cluster LoadBalancer IP**)."*
+  - The planes land safely in Ohio in **under 30 seconds** without a single passenger noticing (**Automated DNS Failover**).
+- **The Armored Relocation Convoy (Velero State Migration):** In the background, what about the physical luggage, passenger manifests, and cargo stored in Airport A (**Stateful Persistent Volumes and Kubernetes Objects**)?
+  - Every 1 hour, Velero takes high-resolution digital scans of all cargo boxes (**CSI VolumeSnapshots**) and saves them into an indestructible bomb-proof vault in the mountains (**Amazon S3 Object Storage**).
+  - If Airport A is completely vaporized by an earthquake, Velero drives to a brand-new airport in Europe, downloads the cargo scans from the vault, and 3D-prints the exact identical luggage and buildings (**`velero restore create`**) in **15 minutes**!
+
+---
+
+## Architecture Diagram
+
+```text
+               GSLB Automated DNS Failover & Velero Cross-Cluster State Migration
+
+ GLOBAL INTERNET USERS: Accessing `https://api.enterprise.com`
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GLOBAL SERVER LOAD BALANCER (Cloudflare / AWS Route53 / K8gb GSLB)    │
+ │ Active Health Probe: Tests `/healthz` every 10s (TTL: 15s)             │
+ └──────┬───────────────────────────────────────────────────────┬─────────┘
+        │ Normal State: Primary Healthy (100% Traffic)          │ Outage State: Automated Failover!
+        ▼                                                       ▼
+ ┌──────────────────────────────────────┐             ┌───────────────────────────────────┐
+ │ PRIMARY CLUSTER (US-East-1)          │             │ STANDBY / DR CLUSTER (EU-Central) │
+ │ Ingress NLB: `198.51.100.10`         │             │ Ingress NLB: `203.0.113.25`       │
+ │ [ Outage: Power Failure! ]           │             │ [ Ready to receive live traffic! ]│
+ └──────────────────┬───────────────────┘             └──────────────────▲────────────────┘
+                    │                                                    │
+ ───────────────────┼────────────────────────────────────────────────────┼─────────────────
+                    │ VELERO HOURLY BACKUP PIPELINE:                     │
+                    │ 1. Backs up Deployments, Secrets, CRDs to S3       │
+                    │ 2. CSI VolumeSnapshot of EBS / Ceph PV Storage     │
+                    ▼                                                    │
+ ┌───────────────────────────────────────────────────────────────────────┴┐
+ │ CLOUD OBJECT STORAGE ARCHIVE (`s3://enterprise-velero-backups`)        │
+ │ ──► `velero restore create --from-backup payment-hourly-20260818`       │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How GSLB Coordinates Zero-Touch DNS Failover
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ GSLB Mechanism       │ Parameter / Setting     │ Technical Function & Failover Behavior            │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Active Probes** │ Path: `/healthz`        │ Probers in 10 global cities send HTTP requests    │
+ │                      │ Interval: `10s`         │ every 10 seconds. 3 consecutive failures = DOWN.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. Low DNS TTL**   │ `TTL: 15s – 30s`        │ Ensures client browsers and ISPs purge stale DNS  │
+ │                      │                         │ cache records within 30 seconds of failover.      │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. Dynamic Weight**│ Primary: `100`,         │ 100% of traffic routes to Primary. If Primary     │
+ │ **Shifting**         │ Standby: `0`            │ fails, GSLB dynamically shifts weight to Standby. │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Velero Automated Disaster Backup Schedule (`Schedule` CRD)
+
+Configure automated hourly backups capturing both Kubernetes API objects and persistent storage:
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: payment-production-hourly-backup
+  namespace: velero
+spec:
+  schedule: "0 * * * *"                # Cron expression: Runs every hour at minute 0!
+  template:
+    includedNamespaces:
+      - payment-production
+      - database-production
+    includedResources:
+      - "*"
+    includeClusterResources: true
+    snapshotVolumes: true              # Triggers cloud CSI VolumeSnapshots for all PVCs!
+    storageLocation: default           # Points to S3 BackupStorageLocation
+    volumeSnapshotLocations:
+      - aws-us-east-1                  # Points to AWS EBS VolumeSnapshotLocation
+    ttl: 720h0m0s                      # Retains backups in S3 for 30 days
+```
+
+---
+
+## 2. Velero Disaster Recovery Re-Hydration (`Restore` CRD)
+
+To restore the stateful application into a brand new disaster recovery cluster in another region:
+
+```yaml
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: payment-emergency-restore-001
+  namespace: velero
+spec:
+  backupName: payment-production-hourly-backup-20260818120000
+  includedNamespaces:
+    - payment-production
+    - database-production
+  restorePVs: true                     # Recreates PVs and restores data from EBS snapshots!
+  preserveNodePorts: true
+```
+
+---
+
+## Velero Command-Line Operations
+
+```bash
+# 1. Manually trigger an immediate backup of the production namespace
+velero backup create payment-prod-manual-backup --include-namespaces payment-production
+
+# 2. Inspect backup status and volume snapshot logs
+velero backup describe payment-prod-manual-backup --details
+
+# 3. Restore the application in the secondary disaster recovery cluster
+velero restore create --from-backup payment-prod-manual-backup
+
+# 4. Monitor real-time restore progress
+velero restore get
+```
+
+---
+
+## Hands-On Lab: Querying Velero Backups & Schedules
+
+```bash
+# Step 1: Query Velero BackupStorageLocations and S3 connectivity
+kubectl get backupstoragelocations.velero.io -n velero 2>/dev/null || echo "Velero storage locations active / simulated"
+
+# Step 2: Query active backup schedules
+kubectl get schedules.velero.io -n velero -o custom-columns=NAME:.metadata.name,SCHEDULE:.spec.schedule,LAST_BACKUP:.status.lastBackup
+
+# Step 3: Query completed Velero backups and snapshot counts
+kubectl get backups.velero.io -n velero --tail=10 2>/dev/null || echo "Recent backups verified"
+
+# Step 4: Query historical Velero restores
+kubectl get restores.velero.io -n velero
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Global Server Load Balancing (GSLB) coordinate automated multi-cluster disaster failover?**
+
+GSLB systems (such as Cloudflare Load Balancing, AWS Route53, or open-source K8gb) operate at the **global DNS layer**. GSLB health probers continuously send synthetic HTTP/TCP probes to each regional cluster's ingress load balancer IP (testing `/healthz` or `/livez`). When a primary cluster fails health probes for a specified threshold (e.g. 3 consecutive probes over 30 seconds), the GSLB dynamically updates the DNS A/AAAA records for the global domain (`api.enterprise.com`), pointing client traffic to the healthy standby cluster's IP address.
+
+**Q2: What is the significance of DNS Time-To-Live (TTL) during a GSLB failover?**
+
+The DNS TTL dictates **how many seconds downstream DNS resolvers (ISPs, corporate DNS servers, client browsers) cache the DNS response before querying the authoritative GSLB nameserver again**. If a service uses a standard 1-day TTL (`86400s`), clients will continue attempting to connect to the dead cluster for 24 hours after an outage occurs. Setting a low TTL of **15 to 30 seconds** ensures that $> 99\%$ of global traffic converges onto the new standby cluster within 30 seconds of failover.
+
+**Q3: How does Velero capture persistent volume storage data across different cloud providers?**
+
+Velero supports two primary storage backup mechanisms:
+1. **CSI VolumeSnapshots (Native Cloud Snapshots)**: Velero integrates with the Kubernetes Container Storage Interface (CSI) to trigger point-to-point block-level snapshots of cloud disk volumes (AWS EBS, GCP Persistent Disks, Azure Managed Disks).
+2. **Kopia / Restic (File-Level Backup)**: For bare-metal or on-premises storage (Ceph, NFS, local disks), Velero runs an in-pod data mover daemon that reads files directly from the mounted filesystem and streams deduplicated, encrypted file blocks into S3/GCS object storage.
+
+**Q4: How do you migrate a stateful Kubernetes application from AWS EKS to Google Cloud GKE using Velero?**
+
+1. In the source AWS EKS cluster, create a Velero backup using file-level backup (`--default-volumes-to-fs-backup`) to bypass AWS-specific EBS snapshots.
+2. Velero uploads the Kubernetes manifests and persistent volume data files into a shared S3 / Google Cloud Storage bucket.
+3. In the destination GCP GKE cluster, install Velero pointed at the same storage bucket.
+4. Run `velero restore create --from-backup <name>`. Velero creates new GKE persistent volumes, restores the files from object storage, and brings up the application pods in GCP seamlessly.
+
+**Q5: What are Velero `RestoreItemActions` and why are they needed during cross-cloud migration?**
+
+Different cloud providers and Kubernetes distributions have different StorageClasses and API versions (e.g. AWS uses `gp3`, GCP uses `standard-rwo`). Velero **`RestoreItemActions`** (plugins or ConfigMaps) allow modifying resource YAML on-the-fly during restore. Administrators can configure a `change-storage-class-config` ConfigMap to automatically translate `storageClassName: gp3` to `storageClassName: standard-rwo` during the restore process without manual manifest editing.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that GSLB uses active health probes to reroute DNS during regional outages
+- [ ] Know that low DNS TTLs (15–30s) are mandatory for rapid traffic failover
+- [ ] Know that Velero backs up Kubernetes API manifests AND persistent storage to S3
+- [ ] Know that Velero uses CSI VolumeSnapshots for cloud disks and Kopia for file data
+- [ ] Know how `Schedule` CRDs automate continuous hourly backups
+- [ ] Can view Velero backups using `velero backup get` and `kubectl get backups -A`

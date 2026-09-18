@@ -1,0 +1,1469 @@
+---
+title: "Chapter 9 — Reserve Phase"
+sidebar_position: 9
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand how Kubernetes temporarily reserves resources after selecting the best Node but before binding the Pod. Learn how the Reserve Plugin work..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 9 — Reserve Phase
+
+> **Goal:** Understand how Kubernetes temporarily reserves resources after selecting the best Node but before binding the Pod. Learn how the Reserve Plugin works, how resource reservation prevents race conditions, how rollback is performed on failures, how the Scheduler Cache is updated, and why the Reserve phase is critical for correctness in large production clusters.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why Reserve exists (preventing double-allocation between scheduling and binding)
+> 2. How Reserve updates the Scheduler Cache (assumed Pod state)
+> 3. Reserve plugin interface and implementation
+> 4. What "assumed Pod" means in cache terminology
+> 5. Reservation lifecycle: Reserve -> binding -> confirmed or expired
+> 6. Unreserve: rollback when binding fails
+> 7. Why Reserve is in-memory only (not written to API Server)
+> 8. Production examples: stateful workloads, volume reservations
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Reserve Phase like holding a hotel room with a credit card.
+
+```text
+Hotel Room Hold Analogy:
+
+You find the perfect room (scoring selected the Node)
+Hotel places a hold on your credit card (Reserve phase)
+Room is marked unavailable to other guests (cache update)
+You haven't checked in yet (binding not confirmed)
+If you cancel, hold is released (Unreserve on failure)
+If you check in, hold becomes a charge (binding confirmed)
+```
+
+| Hotel Room | Reserve Phase |
+| :--- | :--- |
+| Finding the perfect room | Score phase selected the Node |
+| Credit card hold | Reserve: deducting resources in cache |
+| Room marked unavailable | Node's allocatable updated in Scheduler Cache |
+| Not checked in yet | Binding not yet confirmed |
+| Canceling the hold | Unreserve called on binding failure |
+| Successful check-in | Binding confirmed; assumed state finalized |
+
+> **Important:** Reserve is **in-memory only** — it updates the Scheduler Cache but does **not** write anything to the API Server or etcd. If binding fails after Reserve, the Scheduler **must call Unreserve** to roll back the in-memory resource deduction, otherwise the Node will appear over-allocated in the cache until the assumption expires.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Scheduling Cycle
+- Scheduler Cache
+- Binding Cycle
+- Scheduler Queue
+- Score Plugins
+- NodeInfo
+- PodInfo
+
+---
+
+# Where Does Reserve Fit?
+
+The Scheduling Framework executes:
+
+```text
+Scheduling Queue
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+Reserve happens **after the Scheduler has selected the winning Node** but **before anything is written to the API Server**.
+
+---
+
+# What Happens Before Reserve?
+
+Suppose the Scheduler has completed:
+
+```text
+100 Nodes
+
+v
+
+Filter
+
+v
+
+12 Nodes
+
+v
+
+Score
+
+v
+
+Winner
+
+v
+
+worker-5
+```
+
+The Scheduler has decided:
+
+```text
+Pod
+
+v
+
+worker-5
+```
+
+But...
+
+The API Server still contains:
+
+```yaml
+spec:
+  nodeName: ""
+```
+
+Nothing has been committed yet.
+
+---
+
+# Why Does the Reserve Phase Exist?
+
+Imagine two Pods arriving almost simultaneously.
+
+```text
+Pod A
+
+Needs
+
+4 CPU
+
+Pod B
+
+Needs
+
+4 CPU
+```
+
+Node:
+
+```text
+worker-3
+
+Available
+
+4 CPU
+```
+
+Without reservation:
+
+```text
+Pod A
+
+v
+
+Chooses worker-3
+
+v
+
+Pod B
+
+v
+
+Chooses worker-3
+
+v
+
+Both Think Resources Exist
+```
+
+This creates a race condition.
+
+---
+
+# The Race Condition
+
+Timeline:
+
+```text
+Time 1
+
+Node
+
+4 CPU Free
+
+v
+
+Scheduler A Reads
+
+4 CPU
+
+v
+
+Scheduler B Reads
+
+4 CPU
+
+v
+
+Scheduler A Selects Node
+
+v
+
+Scheduler B Selects Same Node
+
+v
+
+Conflict
+```
+
+Both scheduling cycles used the same stale information.
+
+---
+
+# Reserve Solves This
+
+Instead:
+
+```text
+Scheduler A
+
+v
+
+Reserve Resources
+
+v
+
+Scheduler Cache Updated
+
+v
+
+Scheduler B Reads
+
+0 CPU Available
+
+v
+
+Chooses Another Node
+```
+
+No conflict occurs.
+
+---
+
+# Simple Definition
+
+The Reserve Phase is:
+
+> **A temporary reservation of the selected Node's resources inside the Scheduler before binding is attempted.**
+
+It is **not** a Kubernetes API operation.
+
+It is entirely internal to the Scheduler.
+
+---
+
+# High-Level Reserve Workflow
+
+```text
+Scheduling Finished
+
+v
+
+Winning Node
+
+v
+
+Reserve Plugin
+
+v
+
+Scheduler Cache Updated
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+---
+
+# Important Concept
+
+Reserve does **not**:
+
+- Update the API Server
+- Update etcd
+- Start containers
+- Inform kubelet
+
+Reserve only updates the Scheduler's internal state.
+
+---
+
+# Reserve Plugin
+
+The Scheduling Framework exposes the:
+
+```text
+Reserve Plugin
+```
+
+extension point.
+
+Purpose:
+
+> **Reserve Scheduler-side resources before binding begins.**
+
+---
+
+# Reserve Plugin Interface
+
+Conceptually:
+
+```text
+Selected Node
+
+v
+
+Reserve()
+
+v
+
+Reservation Successful?
+
+v
+
+Yes
+
+v
+
+Continue
+
+No
+
+v
+
+Rollback
+```
+
+---
+
+# Why Is It a Plugin?
+
+Different environments may reserve:
+
+- CPU
+- Memory
+- GPUs
+- Licenses
+- External hardware
+- Network allocations
+- Storage resources
+
+A plugin architecture allows customization.
+
+---
+
+# Default Behavior
+
+The built-in Scheduler primarily reserves:
+
+```text
+Node Assignment
+
+v
+
+Assumed Pod
+
+v
+
+Resource Accounting
+```
+
+using the Scheduler Cache.
+
+---
+
+# Resource Reservation
+
+Suppose:
+
+Node:
+
+```text
+worker-2
+
+CPU
+
+16
+
+Memory
+
+64 GB
+```
+
+Running Pods:
+
+```text
+CPU Used
+
+8
+
+Memory Used
+
+24 GB
+```
+
+Available:
+
+```text
+CPU
+
+8
+
+Memory
+
+40 GB
+```
+
+---
+
+# New Pod
+
+Requests:
+
+```yaml
+resources:
+  requests:
+    cpu: 4
+    memory: 8Gi
+```
+
+Reserve updates the Scheduler Cache.
+
+---
+
+# Before Reservation
+
+```text
+Node
+
+CPU Free
+
+8
+
+Memory Free
+
+40 GB
+```
+
+---
+
+# After Reservation
+
+```text
+Node
+
+CPU Free
+
+4
+
+Memory Free
+
+32 GB
+```
+
+Notice:
+
+Nothing changed in the API Server.
+
+Only the Scheduler Cache changed.
+
+---
+
+# Assumed Pod
+
+One of the key concepts in the Reserve phase is the:
+
+```text
+Assumed Pod
+```
+
+---
+
+# What Is an Assumed Pod?
+
+An Assumed Pod is:
+
+> **A temporary Scheduler-side record indicating that a Pod is expected to run on a Node, even though binding has not yet completed.**
+
+---
+
+# Why Assume?
+
+Imagine:
+
+```text
+Reserve
+
+v
+
+Binding
+
+v
+
+API Server
+
+v
+
+Network Delay
+```
+
+During that delay,
+
+another scheduling cycle starts.
+
+Without an assumed Pod:
+
+```text
+Resources
+
+Appear Free
+```
+
+Incorrect.
+
+---
+
+# Assumed Pod Workflow
+
+```text
+Selected Node
+
+v
+
+Reserve
+
+v
+
+Create Assumed Pod
+
+v
+
+Update Scheduler Cache
+
+v
+
+Bind
+
+v
+
+Binding Success
+
+v
+
+Assumption Confirmed
+```
+
+---
+
+# Reservation Lifecycle
+
+Every reservation follows a lifecycle.
+
+```text
+Node Selected
+
+v
+
+Reserve
+
+v
+
+Assumed Pod
+
+v
+
+Permit
+
+v
+
+Bind
+
+v
+
+API Success
+
+v
+
+Reservation Becomes Real
+```
+
+If anything fails:
+
+```text
+Reserve
+
+v
+
+Rollback
+
+v
+
+Resources Released
+```
+
+---
+
+# Scheduler Cache Updates
+
+Reserve modifies:
+
+```text
+Scheduler Cache
+```
+
+Specifically:
+
+```text
+NodeInfo
+
+v
+
+Requested Resources
+
+v
+
+Available Resources
+
+v
+
+Assumed Pods
+```
+
+---
+
+# Example
+
+Before:
+
+```text
+worker-8
+
+Requested CPU
+
+10
+```
+
+Reserve:
+
+```text
+Pod
+
+Needs
+
+2 CPU
+```
+
+After:
+
+```text
+worker-8
+
+Requested CPU
+
+12
+```
+
+Again,
+
+only inside the Scheduler Cache.
+
+---
+
+# NodeInfo Changes
+
+Conceptually:
+
+```text
+NodeInfo
+
+Before
+
+CPU Requested
+
+10
+
+v
+
+Reserve
+
+v
+
+CPU Requested
+
+12
+```
+
+Future scheduling cycles immediately observe:
+
+```text
+12 CPU Requested
+```
+
+---
+
+# Why Update the Cache First?
+
+Because scheduling is highly concurrent.
+
+Suppose:
+
+```text
+500 Pods
+
+Scheduling
+
+At Once
+```
+
+Every scheduling cycle depends on an accurate view of resource availability.
+
+The Scheduler Cache provides that view.
+
+---
+
+# Reservation Failure
+
+Not every reservation succeeds.
+
+Possible reasons include:
+
+- Plugin failure
+- Internal Scheduler error
+- Invalid reservation
+- External reservation failure
+- Custom plugin rejection
+
+---
+
+# Example
+
+Custom GPU plugin:
+
+```text
+GPU License
+
+Unavailable
+```
+
+Reserve Plugin returns:
+
+```text
+Failure
+```
+
+Scheduling stops.
+
+---
+
+# Another Example
+
+External hardware allocator:
+
+```text
+Reserve FPGA
+
+v
+
+Allocation Failed
+```
+
+Reservation cannot continue.
+
+---
+
+# Reservation Failure Flow
+
+```text
+Reserve
+
+v
+
+Failure
+
+v
+
+Rollback
+
+v
+
+Pod Requeued
+```
+
+The Pod is **not** bound.
+
+---
+
+# Rollback
+
+If Reserve fails,
+
+the Scheduler must undo every temporary change.
+
+This is called:
+
+```text
+Rollback
+```
+
+In the Scheduling Framework,
+
+this is performed through:
+
+```text
+Unreserve
+```
+
+---
+
+# Unreserve Plugin
+
+The framework provides:
+
+```text
+Unreserve()
+```
+
+Purpose:
+
+```text
+Undo Reservation
+```
+
+---
+
+# Rollback Workflow
+
+```text
+Reserve
+
+v
+
+Update Cache
+
+v
+
+Failure
+
+v
+
+Unreserve
+
+v
+
+Restore Cache
+
+v
+
+Retry Scheduling
+```
+
+---
+
+# Example
+
+Before Reserve:
+
+```text
+CPU Free
+
+8
+```
+
+Reserve:
+
+```text
+CPU Free
+
+4
+```
+
+Failure occurs.
+
+Rollback:
+
+```text
+CPU Free
+
+8
+```
+
+Cluster state returns to normal.
+
+---
+
+# Reservation Lifecycle Diagram
+
+```text
+Scheduling Finished
+
+v
+
+Reserve
+
+v
+
+Assumed Pod
+
+v
+
+Scheduler Cache Updated
+
+v
+
+Permit
+
+v
+
+Bind
+
+v
+
+Success
+
+v
+
+Reservation Confirmed
+```
+
+Failure path:
+
+```text
+Reserve
+
+v
+
+Failure
+
+v
+
+Unreserve
+
+v
+
+Remove Assumed Pod
+
+v
+
+Restore Resources
+
+v
+
+Requeue Pod
+```
+
+---
+
+# Reserve vs Bind
+
+| Reserve | Bind |
+|----------|------|
+| Internal Scheduler operation | API Server operation |
+| Updates Scheduler Cache | Updates Pod object |
+| Temporary | Persistent |
+| Prevents race conditions | Commits scheduling decision |
+| Reversible | Cluster state changes |
+
+---
+
+# Production Example 1
+
+Cluster:
+
+```text
+1,000 Nodes
+```
+
+Two Pods:
+
+```text
+Pod A
+
+Pod B
+```
+
+Both want:
+
+```text
+worker-15
+```
+
+Reserve sequence:
+
+```text
+Pod A
+
+v
+
+Reserve
+
+v
+
+Cache Updated
+
+v
+
+Pod B
+
+v
+
+Reads Updated Cache
+
+v
+
+Chooses worker-22
+```
+
+Conflict avoided.
+
+---
+
+# Production Example 2
+
+AI Cluster
+
+Node:
+
+```text
+8 GPUs
+```
+
+Current allocation:
+
+```text
+6 Reserved
+```
+
+New Pod:
+
+```text
+Needs
+
+2 GPUs
+```
+
+Reserve succeeds.
+
+Another Pod:
+
+```text
+Needs
+
+2 GPUs
+```
+
+Reads cache:
+
+```text
+0 GPUs Available
+```
+
+Chooses another Node.
+
+---
+
+# Production Example 3
+
+Storage Reservation
+
+Reserve Plugin:
+
+```text
+Temporary Volume Reservation
+
+v
+
+Storage System Error
+
+v
+
+Unreserve
+
+v
+
+Retry Later
+```
+
+No incorrect resource accounting remains.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Scheduling Queue
+
+v
+
+Scheduler Cache
+
+v
+
+Filter
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+
+v
+
+API Server
+```
+
+Reserve connects scheduling decisions with safe resource accounting.
+
+---
+
+# Internal Scheduler Workflow
+
+```text
+Winning Node
+
+v
+
+Reserve Plugin
+
+v
+
+Update NodeInfo
+
+v
+
+Create Assumed Pod
+
+v
+
+Update Scheduler Cache
+
+v
+
+Continue
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+Failure path:
+
+```text
+Reserve
+
+v
+
+Failure
+
+v
+
+Unreserve
+
+v
+
+Restore Cache
+
+v
+
+Requeue
+```
+
+---
+
+# Performance Considerations
+
+Reserve is intentionally lightweight.
+
+Why?
+
+Because every scheduled Pod executes it.
+
+Typical operations involve:
+
+- Updating NodeInfo
+- Creating an assumed Pod
+- Adjusting resource accounting
+
+No API Server communication occurs during Reserve.
+
+This keeps scheduling latency low.
+
+---
+
+# Production Best Practices
+
+✔ Keep Reserve plugins fast and deterministic.
+
+✔ Never perform long-running network operations inside Reserve.
+
+✔ Always implement corresponding `Unreserve()` logic for custom Reserve plugins.
+
+✔ Treat the Scheduler Cache as the authoritative source during scheduling.
+
+✔ Ensure rollback fully restores resource accounting.
+
+✔ Avoid external side effects unless absolutely necessary.
+
+✔ Test reservation failures under production-scale workloads.
+
+✔ Monitor scheduling failures caused by Reserve plugins separately from Filter and Score failures.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Reserve allocates resources in Kubernetes.
+
+Wrong.
+
+Reserve only updates the Scheduler's internal state.
+
+---
+
+### ❌ Misconception 2
+
+Reserve updates the API Server.
+
+Wrong.
+
+Only the Binding phase modifies Kubernetes objects.
+
+---
+
+### ❌ Misconception 3
+
+Resources become permanently allocated after Reserve.
+
+Wrong.
+
+Reservations are temporary until binding succeeds.
+
+---
+
+### ❌ Misconception 4
+
+Assumed Pods are running Pods.
+
+Wrong.
+
+They exist only inside the Scheduler Cache.
+
+---
+
+### ❌ Misconception 5
+
+Rollback is optional.
+
+Wrong.
+
+Every successful Reserve implementation must be reversible if later stages fail.
+
+---
+
+### ❌ Misconception 6
+
+Other scheduling cycles ignore reservations.
+
+Wrong.
+
+They observe updated NodeInfo through the Scheduler Cache.
+
+---
+
+### ❌ Misconception 7
+
+Reserve prevents all scheduling conflicts.
+
+Wrong.
+
+Reserve prevents conflicts within the Scheduler's decision-making process. Final correctness still depends on successful binding and the latest cluster state.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does Kubernetes have a Reserve phase?
+
+To temporarily reserve resources and prevent race conditions before binding.
+
+---
+
+### Q2. What is the Reserve Plugin?
+
+A Scheduling Framework extension point that performs temporary Scheduler-side resource reservation.
+
+---
+
+### Q3. What is an Assumed Pod?
+
+A temporary Scheduler Cache entry representing a Pod expected to be bound to a Node.
+
+---
+
+### Q4. Does Reserve update the API Server?
+
+No.
+
+Reserve only updates the Scheduler Cache.
+
+---
+
+### Q5. Why is the Scheduler Cache updated during Reserve?
+
+So concurrent scheduling cycles immediately see reserved resources.
+
+---
+
+### Q6. What happens if Reserve fails?
+
+The Scheduler executes `Unreserve()`, removes temporary reservations, restores the cache, and retries scheduling.
+
+---
+
+### Q7. What is the purpose of rollback?
+
+To undo temporary Scheduler-side state when scheduling cannot continue.
+
+---
+
+### Q8. What is the difference between Reserve and Bind?
+
+Reserve is temporary and internal to the Scheduler, while Bind persists the scheduling decision through the API Server.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod repeatedly fails after scoring | Reserve plugin failure or custom reservation logic error |
+| Incorrect available resources reported by Scheduler | Assumed Pod not removed or rollback failed |
+| Resource conflicts during concurrent scheduling | Reservation logic missing or custom plugin not updating Scheduler Cache correctly |
+| Scheduler memory shows reserved resources after failures | `Unreserve()` implementation incomplete or failed |
+| Binding never starts | Reserve or Permit phase failed before the Binding Cycle |
+| Frequent reservation failures | External reservation systems, plugin errors, or inconsistent Scheduler Cache state |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does the Reserve phase exist?
+2. What problem does resource reservation solve?
+3. What is the purpose of the Reserve Plugin?
+4. What is an Assumed Pod?
+5. Which Scheduler Cache structures are updated during Reserve?
+6. Why are Scheduler Cache updates performed before binding?
+7. What happens when a reservation fails?
+8. What is the role of `Unreserve()`?
+9. How does rollback restore Scheduler state?
+10. What is the difference between Reserve and Bind?
+11. Why must Reserve plugins be lightweight?
+12. How does Reserve improve scheduling correctness in highly concurrent clusters?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes safely transitions from selecting a Node to committing that decision.
+
+You learned:
+
+- Why the Reserve phase exists
+- How the Reserve Plugin performs temporary resource reservation
+- How the Scheduler uses Assumed Pods to represent pending assignments
+- How the Scheduler Cache is updated with temporary resource accounting
+- Why these updates prevent race conditions during concurrent scheduling
+- How reservation failures trigger rollback through `Unreserve()`
+- Why rollback is essential for maintaining cache consistency
+- How the Reserve phase fits into the overall Scheduling Framework
+
+The Reserve phase acts as a protective layer between **decision** and **commitment**. By temporarily updating the Scheduler Cache before binding, Kubernetes ensures that concurrent scheduling decisions are made using the most up-to-date view of available resources while remaining fully reversible if later stages fail.
+
+---
+
+# Next Chapter
+
+**Chapter 10 — Permit Phase**
+
+In the next chapter, we'll explore one of the most advanced extension points in the Scheduling Framework.
+
+Topics include:
+
+- Why the Permit Phase Exists
+- Permit Plugin
+- Wait, Allow, and Reject Decisions
+- Gang Scheduling
+- Scheduling Barriers
+- Timeout Handling
+- Permit Lifecycle
+- Production Use Cases
+- Failure Recovery
+- Scheduler Workflow with Permit
+
+You'll learn how Kubernetes can intentionally delay scheduling decisions to coordinate complex multi-Pod workloads before binding begins.
+```

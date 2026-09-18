@@ -1,0 +1,218 @@
+---
+title: "Chapter 1 — Centralized OIDC Identity Federation"
+sidebar_position: 1
+module: "Module 9.8 — Identity Federation & RBAC"
+description: "Master multi-cluster identity federation with Pinniped and OIDC — SSO login, Okta/Azure AD group mapping, eliminating static kubeconfigs, and Concierge TokenAuthenticators."
+---
+
+# Chapter 1 — Centralized OIDC Identity Federation
+
+> **Goal:** Master centralized enterprise authentication, single-sign-on (SSO) developer access, and unified Role-Based Access Control (RBAC) across Kubernetes fleets using **Pinniped** and **OpenID Connect (OIDC)** — understanding why static `admin.kubeconfig` files create catastrophic security liabilities, architecting the two-tier **Pinniped Supervisor** (Identity Broker) and **Pinniped Concierge** (In-Cluster Token Authenticator), federating with corporate Identity Providers (**Okta**, **Microsoft Entra ID / Azure AD**, **Keycloak**), and mapping enterprise IdP security groups to Kubernetes `ClusterRoleBindings`.
+>
+> By the end of this chapter, you will understand:
+> 1. The security hazards of distributing static x509 client certificates in multi-cluster fleets
+> 2. How the Pinniped Supervisor acts as a centralized OIDC identity gateway
+> 3. How the Pinniped Concierge validates short-lived JSON Web Tokens (JWT) without cluster restarts
+> 4. How to configure single-pane CLI login (`pinniped get kubeconfig`) with Multi-Factor Authentication (MFA)
+> 5. How to map corporate enterprise groups to Kubernetes `ClusterRoles` across 500 clusters
+> 6. How to author production Pinniped `JWTAuthenticator` and `ClusterRoleBinding` manifests
+
+---
+
+## Real-Life Analogy
+
+Think of centralized OIDC identity federation as **a modern smart hotel keycard system with a central front desk versus issuing physical brass master keys to 500 buildings**:
+
+- **The Static Kubeconfig Disaster (The Brass Master Key):** You hand an engineer a physical brass master key (**A static `admin.kubeconfig` with a 10-year x509 client certificate**) that opens all 500 company office buildings.
+  - There is no Multi-Factor Authentication (MFA).
+  - If the engineer leaves the company or loses their laptop in a coffee shop, **you cannot revoke the brass key without re-keying the locks on all 500 buildings simultaneously (**Regenerating the cluster Root CA!**)**.
+  - The security logs show: *"User `admin` opened the door,"* with zero record of *who* actually turned the key (**Zero Audit Attribution**).
+- **The Modern Identity Federation (The Smart Keycard with Front Desk SSO - Pinniped):**
+  - **The Central Front Desk (`Pinniped Supervisor`):** The engineer taps their corporate badge and enters an MFA code on their smartphone (**Okta / Azure AD SSO**).
+  - **The Ephemeral Keycard (Short-Lived 15-Minute JWT):** The front desk issues a temporary digital keycard that expires in **15 minutes**.
+  - **The In-Door NFC Scanner (`Pinniped Concierge`):** The lock on the door in Building #42 scans the digital badge, verifies the signature with the front desk, and checks their job title (**`groups: ["finance-engineers"]`**). If the employee is fired, their access is revoked globally in 1 second!
+
+---
+
+## Architecture Diagram
+
+```text
+               Pinniped Centralized Multi-Cluster OIDC Authentication
+
+ DEVELOPER WORKSTATION (Runs `kubectl get pods --context=prod-cluster-01`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Executes: `pinniped get kubeconfig` ──► Triggers SSO Browser Login │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 2. Authenticates via OIDC / SAML with MFA
+                    ▼
+ CORPORATE IDENTITY PROVIDER (Okta / Microsoft Entra ID / Keycloak / Google)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. Authenticates user ──► Issues Identity Claims & Group Memberships   │
+ │    (User: `alice@enterprise.com`, Groups: `["sre-leads", "prod-admin"]`)│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 4. Exchanges ID Token for Pinniped Short-Lived JWT
+                    ▼
+ PINNIPED SUPERVISOR (Central Management Hub)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Issues cryptographic short-lived Federated Token (15-Minute TTL)       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 5. Transmits JWT in `Authorization: Bearer <token>`
+                    ▼
+ MANAGED WORKLOAD CLUSTER (`prod-cluster-01`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER ──► Webhook TokenAuthenticator ──► PINNIPED CONCIERGE   │
+ │ 1. Concierge cryptographically validates JWT signature with Supervisor │
+ │ 2. Injects User (`alice@enterprise.com`) & Groups into API request     │
+ │ 3. Evaluates Kubernetes RBAC `ClusterRoleBinding` ──► ACCESS GRANTED!  │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why Static Kubeconfigs Fail in Enterprise Fleets
+
+```text
+ ┌──────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Security Dimension   │ Static x509 Client Certificates │ Federated OIDC (Pinniped)       │
+ │──────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Credential TTL**   │ **Years.** Static expiration;   │ **15 Minutes.** Automatically   │
+ │                      │ remains valid indefinitely.     │ refreshed via OIDC refresh token│
+ │ **Instant Revocation**│ **Impossible.** Requires wiping │ **Instant.** Disable user in    │
+ │                      │ Root CA or CRL blacklists.      │ Okta / Azure AD directory.      │
+ │ **Multi-Factor Auth**│ **None.** Bypasses corporate    │ **Mandatory.** Enforced by IdP  │
+ │                      │ MFA policies completely.        │ during initial browser login.   │
+ │ **Audit Logs**       │ Generic names (`admin`, `dev`). │ Real user email (`alice@org.com`│
+ │                      │                                 │ and verified security groups).  │
+ └──────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## 1. Pinniped Supervisor OIDC Provider Manifest (Hub Cluster)
+
+```yaml
+apiVersion: config.supervisor.pinniped.dev/v1alpha1
+kind: OIDCIdentityProvider
+metadata:
+  name: enterprise-okta-idp
+  namespace: pinniped-supervisor
+spec:
+  issuer: https://enterprise.okta.com/oauth2/default
+  claims:
+    username: email                    # Maps Okta email claim to Kubernetes username
+    groups: groups                     # Extracts corporate Okta groups
+  client:
+    secretName: okta-client-credentials
+```
+
+---
+
+## 2. Pinniped Concierge JWT Authenticator (Managed Workload Clusters)
+
+Deploy this manifest to **all managed clusters** to enable automated token validation:
+
+```yaml
+apiVersion: authentication.concierge.pinniped.dev/v1alpha1
+kind: JWTAuthenticator
+metadata:
+  name: supervisor-jwt-authenticator
+spec:
+  issuer: https://pinniped-supervisor.enterprise.com
+  audience: enterprise-k8s-fleet
+  claims:
+    username: username
+    groups: groups
+  tls:
+    certificateAuthorityDataSource:
+      kind: Secret
+      name: supervisor-ca-cert
+```
+
+---
+
+## 3. Mapping Enterprise IdP Groups to Kubernetes RBAC
+
+Bind corporate Okta / Azure AD security groups directly to Kubernetes `ClusterRoles`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-team-cluster-admin-binding
+subjects:
+  # Binds directly to the corporate IdP group claim!
+  - kind: Group
+    name: "okta:sre-platform-team"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: developers-view-binding
+subjects:
+  - kind: Group
+    name: "okta:engineering-developers"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+```
+
+---
+
+## Hands-On Lab: Logging in via Pinniped CLI
+
+```bash
+# Step 1: Query active Pinniped Concierge authenticators in the local cluster
+kubectl get jwtauthenticators.authentication.concierge.pinniped.dev -A 2>/dev/null || echo "Pinniped authenticators active / simulated"
+
+# Step 2: Generate dynamic SSO kubeconfig for developers
+# pinniped get kubeconfig --concierge-authenticator-name supervisor-jwt-authenticator > /tmp/sso-kubeconfig.yaml
+
+# Step 3: Test user credential verification via kubectl auth can-i
+kubectl auth can-i create deployments --as=alice@enterprise.com --as-group=okta:sre-platform-team
+
+# Step 4: Verify whoami identity resolution
+# pinniped whoami
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is distributing static `admin.kubeconfig` client certificates considered a critical security anti-pattern?**
+
+Standard Kubernetes x509 client certificates are **cryptographically un-revocable without rotating the cluster's entire Root Certificate Authority (CA)**. If an engineer downloads an `admin.kubeconfig` onto a personal laptop, they retain indefinite root access to the cluster even if they are terminated from the company. Furthermore, client certificates lack Multi-Factor Authentication (MFA) and do not support dynamic group membership updates. Centralized OIDC identity federation eliminates static certificates by issuing short-lived, verifiable JWT tokens tied to active corporate directory accounts.
+
+**Q2: What is the separation of responsibilities between the Pinniped Supervisor and Pinniped Concierge?**
+
+- **`Pinniped Supervisor` (Hub / Identity Broker)**: Runs centrally. It acts as an OIDC/SAML client connecting upstream to enterprise identity providers (Okta, Azure AD, Keycloak). It authenticates users, verifies MFA, extracts group claims, and issues short-lived federated JWT tokens.
+- **`Pinniped Concierge` (Spoke / Workload Cluster)**: Runs inside each managed cluster. It acts as a Kubernetes Webhook TokenAuthenticator. When a developer sends a request, the API server asks Concierge to validate the JWT. Concierge verifies the signature against the Supervisor and injects the user's email and groups into the request context.
+
+**Q3: Why is Pinniped preferred over configuring the Kubernetes API server's native `--oidc-*` flags directly?**
+
+Configuring native `--oidc-issuer-url` flags on the `kube-apiserver` has severe operational drawbacks: (1) Modifying OIDC settings requires restarting all API server static pods on every master node; (2) The native API server supports only a single OIDC provider; (3) It cannot federate multiple different clouds/IdPs dynamically. Pinniped requires **zero API server restarts** (integrating via standard dynamic webhook authenticators) and supports multi-IdP brokering across hundreds of clusters simultaneously.
+
+**Q4: How do enterprise IdP security groups integrate with Kubernetes RBAC?**
+
+When a user logs in via Okta or Microsoft Entra ID, their SAML/OIDC response includes a list of security groups (e.g. `groups: ["k8s-sre-admins", "us-east-developers"]`). Pinniped passes these strings into the Kubernetes authentication context. Kubernetes RBAC evaluates standard `ClusterRoleBindings` matching `subjects: [{ kind: Group, name: "k8s-sre-admins" }]`, allowing platform teams to manage all cluster permissions centrally in Okta without modifying in-cluster YAML.
+
+**Q5: How does credential caching and token renewal work on a developer's machine with Pinniped?**
+
+When a developer runs `kubectl`, the Pinniped client credential plugin checks its local cache (`~/.pinniped/credentials.json`). If the 15-minute access token has expired, Pinniped uses the long-lived OIDC **Refresh Token** in the background to request a fresh short-lived JWT from the Supervisor without prompting the user. Only when the refresh token expires or is revoked (e.g. after 8 hours or upon employee deprovisioning) does the browser prompt for MFA re-authentication.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why static `admin.kubeconfig` x509 certificates are a severe security risk
+- [ ] Know that Pinniped Supervisor brokers upstream OIDC (Okta/Azure AD) with MFA
+- [ ] Know that Pinniped Concierge validates short-lived 15-min JWTs in workload clusters
+- [ ] Know that Pinniped eliminates the need to restart API servers for OIDC changes
+- [ ] Know how `ClusterRoleBindings` map corporate IdP groups to Kubernetes roles
+- [ ] Can verify permissions using `kubectl auth can-i --as=user@org.com --as-group=group`

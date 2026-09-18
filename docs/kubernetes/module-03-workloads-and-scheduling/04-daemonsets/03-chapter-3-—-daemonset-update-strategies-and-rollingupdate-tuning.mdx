@@ -1,0 +1,302 @@
+---
+title: "Chapter 3 — Update Strategies & RollingUpdate Tuning"
+sidebar_position: 3
+module: "Module 3.4 — DaemonSets"
+description: "Master DaemonSet update strategies — RollingUpdate vs OnDelete, maxUnavailable and maxSurge tuning, safe CNI and logging agent upgrades, and preventing cluster-wide infrastructure outages."
+---
+
+# Chapter 3 — DaemonSet Update Strategies & RollingUpdate Tuning
+
+> **Goal:** Master the release engineering and rolling update strategies of Kubernetes DaemonSets — understanding how `maxUnavailable` and `maxSurge` control rollout concurrency across worker nodes, why `OnDelete` is the gold standard for critical CNI networking upgrades, and how to safely update infrastructure daemons without triggering cluster-wide outages.
+>
+> By the end of this chapter, you will understand:
+> 1. The execution mechanics of DaemonSet `RollingUpdate` across cluster nodes
+> 2. How to configure `maxUnavailable` (integer vs percentage) to balance speed and availability
+> 3. How `maxSurge` (Kubernetes 1.22+) enables zero-downtime surge updates on DaemonSets
+> 4. Why CNI plugins (Cilium, Calico) and storage daemons require `updateStrategy: OnDelete`
+> 5. How to track and troubleshoot DaemonSet upgrades using `kubectl rollout status`
+> 6. Production rollback strategies for failed infrastructure daemons
+
+---
+
+## Real-Life Analogy
+
+Think of upgrading a **fleet-wide electrical breaker box in every building of a corporate office park**:
+
+- **Default Rolling Update (`maxUnavailable: 1`):** The electrician walks to Building 1, powers down the breaker, installs the new hardware, tests it, and powers it back up. Only after Building 1's lights turn back on do they walk over to Building 2. It's safe and predictable, but in a 500-building complex, it takes all week.
+- **Surge Update (`maxSurge: 1`):** In buildings where extra wall space exists, the electrician installs the new breaker box *next to* the old one while power is still running. Once the new breaker is online, they instantly flip the main switch with zero power interruption.
+- **Manual Phased Governance (`OnDelete`):** For the Central Server Room (a critical CNI network plugin), automated rolling scripts are banned. If an automated script pushes a faulty breaker to all buildings simultaneously, the entire company suffers a complete blackout. An experienced engineer must manually upgrade and verify one test building at a time (`OnDelete`).
+
+---
+
+## Architecture Diagram
+
+```text
+               DaemonSet RollingUpdate vs maxSurge Mechanics
+
+ 1. Standard RollingUpdate (maxUnavailable: 1, maxSurge: 0)
+ Node 1:  [Old Pod Terminating] ──► [New Pod Creating] ──► [New Pod Ready]
+ Node 2:  [Old Pod Running    ] ──► (Waits for Node 1 to be Ready) ──► [Update Starts]
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. Surge-Based RollingUpdate (maxUnavailable: 0, maxSurge: 1)
+ 
+ Node 1:  [Old Pod Running    ]
+          [New Pod Creating   ] ──► Passes Readiness Probe ──► [Old Pod Terminated]
+          
+ Node 2:  [Old Pod Running    ]
+          (Waits for Node 1 swap) ──► [New Pod Creating] ──► [Old Pod Terminated]
+
+ *Note: maxSurge requires that containers do NOT bind conflicting hostPorts!
+```
+
+---
+
+## DaemonSet Update Strategies: `RollingUpdate` vs `OnDelete`
+
+Under `.spec.updateStrategy`, a DaemonSet supports two modes:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Strategy Type        │ Operational Behavior & Best Use Cases                                       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`RollingUpdate`**  │ **Automated Phased Rollout (Default).**                                     │
+ │                      │ As soon as `.spec.template` is updated, the controller cycles old Pods and  │
+ │                      │ replaces them with new Pods according to `maxUnavailable` / `maxSurge`.     │
+ │                      │ *Best for:* Non-critical agents (Node Exporter, Fluent Bit, Promtail).      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`OnDelete`**       │ **Strict Manual Control.**                                                  │
+ │                      │ Modifying `.spec.template` does NOT touch running Pods. A node's Pod is     │
+ │                      │ only updated when an administrator explicitly runs `kubectl delete pod`.    │
+ │                      │ *Best for:* Mission-critical CNI (Cilium/Calico), kube-proxy, Rook/Ceph OSD.│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Tuning `maxUnavailable` for Scale
+
+The `.spec.updateStrategy.rollingUpdate.maxUnavailable` setting defines how many DaemonSet Pods can be offline simultaneously across the cluster during an upgrade:
+
+```text
+ ┌───────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ Configuration             │ Behavior & Cluster Impact                                              │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ `maxUnavailable: 1`       │ **Safest (Default).** Updates one node at a time. Total rollout time   │
+ │                           │ equals: $\text{Node Count} \times \text{Pod Startup Time}$.            │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ `maxUnavailable: 10%`     │ **Enterprise Standard.** Updates 10% of nodes in parallel. On a        │
+ │                           │ 100-node cluster, 10 nodes update concurrently, speeding up 10x.       │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ `maxUnavailable: 100%`    │ **DANGEROUS.** Kills all DaemonSet Pods cluster-wide simultaneously!   │
+ │                           │ Causes immediate telemetry / logging blackouts.                        │
+ └───────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+```yaml
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%    # Accepts absolute integer or percentage
+```
+
+---
+
+## Zero-Downtime DaemonSet Upgrades with `maxSurge`
+
+Prior to Kubernetes 1.22, updating a DaemonSet always caused a brief downtime window on each node because the old Pod had to be killed before the new Pod could be created.
+
+`maxSurge` (Kubernetes 1.22+) allows a temporary surplus Pod to be created on the node *before* deleting the old one:
+
+```yaml
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+```
+
+> [!WARNING]
+> **HostPort Collision Warning:** If your DaemonSet uses `hostPort: 80` or `hostNetwork: true` with hardcoded listening ports, `maxSurge: 1` will **fail** because the new Pod will attempt to bind the same host TCP/UDP port that the old running Pod is currently holding (`EADDRINUSE`). Only use `maxSurge` on DaemonSets that do not bind dedicated host ports.
+
+---
+
+## Why CNI Upgrades Must Use `OnDelete`
+
+The Container Network Interface (CNI) plugin (such as Cilium or Calico) manages kernel routing tables, eBPF maps, and virtual ethernet pairs (`veth`) across every node.
+
+```text
+ The CNI Rolling Update Disaster Scenario:
+
+ 1. Team updates Cilium DaemonSet using default `RollingUpdate` with `maxUnavailable: 20%`.
+ 2. The new Cilium image has a configuration bug or eBPF kernel compatibility issue.
+ 3. Within seconds, 20% of worker nodes have their CNI agent crashed.
+ 4. As the controller continues rolling, Pod-to-Pod and Pod-to-API-Server networking breaks 
+    across the ENTIRE cluster simultaneously!
+ 5. Cluster becomes completely unmanageable; nodes transition to `NotReady`.
+```
+
+### The Production CNI Upgrade Protocol:
+1. Always set `updateStrategy: type: OnDelete` on CNI DaemonSets.
+2. Apply the updated manifest. No Pods restart automatically.
+3. Select a non-critical canary worker node.
+4. Manually delete the CNI Pod on that specific node:
+   ```bash
+   kubectl delete pod cilium-9x4la -n kube-system
+   ```
+5. Monitor node health, network throughput, DNS latency, and eBPF compilation on the canary node for 30 minutes.
+6. Once verified, script the phased deletion of remaining nodes in controlled batches.
+
+---
+
+## Complete Production DaemonSet Manifest with Tuned RollingUpdate
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit-collector
+  namespace: logging
+  labels:
+    app: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+
+  # Tuned for high-speed rolling upgrades on a large cluster
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 15%    # Update 15% of nodes concurrently
+      maxSurge: 0            # Avoid host port collisions
+
+  minReadySeconds: 10        # Wait 10s after Ready before moving to next batch
+  revisionHistoryLimit: 10
+
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:2.2.0
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "250m"
+            memory: "256Mi"
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+```
+
+---
+
+## Hands-On Lab: Observing Rolling Updates & OnDelete Execution
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace ds-update-lab
+
+# Step 2: Deploy DaemonSet with OnDelete strategy
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: manual-daemon
+  namespace: ds-update-lab
+spec:
+  selector:
+    matchLabels:
+      app: manual-daemon
+  updateStrategy:
+    type: OnDelete    # <--- Manual control!
+  template:
+    metadata:
+      labels:
+        app: manual-daemon
+    spec:
+      containers:
+      - name: app
+        image: alpine:3.18
+        command: ["sh", "-c", "echo 'Running v3.18'; sleep 3600"]
+EOF
+
+# Step 3: Verify initial Pods are running alpine:3.18
+kubectl get pods -n ds-update-lab -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[0].image}{"\n"}{end}'
+
+# Step 4: Update DaemonSet image to alpine:3.19
+kubectl set image daemonset/manual-daemon app=alpine:3.19 -n ds-update-lab
+
+# Step 5: Observe that NO PODS HAVE CHANGED (OnDelete protects running pods!)
+sleep 5
+kubectl get pods -n ds-update-lab -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[0].image}{"\n"}{end}'
+
+# Step 6: Manually delete ONE Pod to trigger canary upgrade
+CANARY_POD=$(kubectl get pods -n ds-update-lab -o jsonpath='{.items[0].metadata.name}')
+echo "Manually deleting canary pod: $CANARY_POD"
+kubectl delete pod $CANARY_POD -n ds-update-lab
+
+# Step 7: Verify only the deleted pod was recreated with alpine:3.19!
+sleep 5
+kubectl get pods -n ds-update-lab -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[0].image}{"\n"}{end}'
+
+# Step 8: Switch strategy to RollingUpdate with maxUnavailable: 100%
+kubectl patch daemonset manual-daemon -n ds-update-lab -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":"100%"}}}}'
+
+# Step 9: Update image to alpine:latest and watch all remaining pods roll immediately
+kubectl set image daemonset/manual-daemon app=alpine:latest -n ds-update-lab
+kubectl rollout status daemonset/manual-daemon -n ds-update-lab
+
+# Step 10: Clean up lab
+kubectl delete namespace ds-update-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the two update strategies available for Kubernetes DaemonSets, and how do they differ?**
+
+The two update strategies are `RollingUpdate` (the default) and `OnDelete`. With `RollingUpdate`, as soon as `.spec.template` is modified, the DaemonSet controller automatically terminates old Pods and creates new Pods across cluster nodes according to the configured `maxUnavailable` and `maxSurge` parameters. With `OnDelete`, updating the manifest updates the desired state in `etcd`, but running Pods are not touched until an operator or script manually deletes each Pod individually.
+
+**Q2: How does `maxUnavailable` work in a DaemonSet, and how should it be tuned in large clusters?**
+
+`maxUnavailable` specifies the maximum number (or percentage) of DaemonSet Pods that can be unavailable during a rolling update. In a 500-node cluster, the default of `maxUnavailable: 1` updates nodes strictly one by one, which can take hours. Tuning `maxUnavailable` to a percentage (such as `10%`) allows 50 nodes to update in parallel, drastically reducing rollout time while ensuring that 90% of the cluster continues collecting logs or exporting metrics without disruption.
+
+**Q3: What is `maxSurge` in DaemonSets, and what architectural limitation prevents its use in certain workloads?**
+
+Introduced in Kubernetes 1.22, `maxSurge` allows the DaemonSet controller to create a new Pod on a node *before* terminating the old Pod, achieving true zero-downtime upgrades. However, `maxSurge` cannot be used on DaemonSets that bind to specific host ports (`hostPort` or `hostNetwork: true` listening on fixed TCP/UDP ports). When the new Pod launches on the same node, it will fail to bind the port because the old Pod is still actively using it (`Address already in use`).
+
+**Q4: Why is `updateStrategy: OnDelete` strongly recommended for CNI plugins (e.g. Cilium/Calico)?**
+
+CNI plugins manage node-level network routing, iptables/eBPF rules, and inter-pod connectivity. If a broken or misconfigured CNI image is rolled out using an automated `RollingUpdate`, a bug could immediately break network routing across all updated nodes simultaneously. This can sever communication between Kubelet and the API server, making it impossible for the control plane to remediate or roll back the cluster. `OnDelete` enforces a human-in-the-loop canary workflow where an engineer upgrades and validates a single node before proceeding.
+
+**Q5: How does `minReadySeconds` assist in detecting broken DaemonSet updates?**
+
+`minReadySeconds` specifies the minimum number of seconds a newly created DaemonSet Pod must remain running without crashing and pass its readiness checks before the controller considers it healthy and advances the rolling update to the next batch of nodes. If an application crashes 5 seconds after startup, setting `minReadySeconds: 30` ensures the controller detects the failure and halts the rollout before it impacts additional nodes across the cluster.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that DaemonSet `RollingUpdate` updates nodes automatically based on `maxUnavailable`
+- [ ] Know that `maxUnavailable` can be an absolute integer or a percentage (e.g. `10%`)
+- [ ] Know how `maxSurge` enables zero-downtime updates on nodes without hostPort conflicts
+- [ ] Know why CNI plugins and storage daemons should use `updateStrategy: OnDelete`
+- [ ] Know how to execute a canary upgrade on an `OnDelete` DaemonSet
+- [ ] Know how `minReadySeconds` prevents rollouts from proceeding if new Pods crash after boot
+- [ ] Can track DaemonSet upgrades using `kubectl rollout status daemonset/<name>`

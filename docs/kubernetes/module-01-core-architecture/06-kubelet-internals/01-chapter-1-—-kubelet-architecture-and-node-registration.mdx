@@ -1,0 +1,1412 @@
+---
+title: "Chapter 1 — kubelet Architecture & Node Registration"
+sidebar_position: 1
+module: "Module 1.6 — kubelet Internals"
+description: "> **Goal:** Understand the internal architecture of the Kubernetes **kubelet**, the primary Node Agent responsible for executing Pods on every Kubernetes Node. ..."
+---
+
+# Module 1.6 — kubelet Internals
+
+> **Deep Learning Guide (University-Level + Interview-Oriented)**
+
+---
+
+## Why We Study This Module
+
+Module 1.5 taught you how controllers reconcile desired state through the API Server. Module 1.6 teaches you what happens **on the Node itself** — how the kubelet takes a scheduled Pod assignment and turns it into running containers.
+
+---
+
+## Learning Roadmap
+
+```text
+Module 1.6 — kubelet Internals
+
+Chapter 1   kubelet Architecture & Node Registration
+Chapter 2   Pod Lifecycle & Pod Sync Loop
+Chapter 3   Static Pods
+Chapter 4   Health Probes
+Chapter 5   Node Pressure & Eviction
+```
+
+---
+
+# Chapter 1 — kubelet Architecture & Node Registration
+
+> **Goal:** Understand the internal architecture of the Kubernetes **kubelet**, the primary Node Agent responsible for executing Pods on every Kubernetes Node. Learn how kubelet starts, registers a Node, communicates with the control plane, maintains Node health, updates heartbeats, and continuously manages workloads.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What kubelet is and its role as the Node agent
+> 2. kubelet startup sequence: flags, config file, and kubeconfig
+> 3. Node self-registration: how kubelet creates the Node object
+> 4. Node status updates: capacity, allocatable, conditions
+> 5. Node Lease: efficient heartbeat in kube-node-lease namespace
+> 6. kubelet's API Server Watch: how it receives Pod assignments
+> 7. Internal managers: Pod Manager, Volume Manager, PLEG, Image GC
+> 8. kubelet communication: API Server, CRI, CNI, CSI
+> ```
+
+---
+
+---
+
+# Real-Life Analogy
+
+Think of the kubelet like a construction site foreman.
+
+```text
+Construction Site Foreman Analogy:
+
+Project headquarters (control plane) sends blueprints (Pod specs)
+Foreman (kubelet) on site receives the work orders
+Foreman translates blueprints into actual construction tasks
+Foreman assigns workers (containers) to specific jobs
+Foreman inspects work regularly and reports back to HQ
+Foreman replaces workers who stop working (restarts containers)
+HQ never directly touches the bricks (never talks to container runtime)
+```
+
+| Construction Site | kubelet |
+| :--- | :--- |
+| Project HQ (control plane) | API Server + Scheduler + Controller Manager |
+| Construction site | Worker Node |
+| Foreman | kubelet |
+| Blueprint / work order | Pod spec assigned via `spec.nodeName` |
+| Construction workers | Containers |
+| Daily progress report to HQ | Node status + Pod status updates |
+| Replacing underperforming workers | Container restart on failure |
+
+> **Important:** The kubelet is **the only Kubernetes control plane component that runs on worker Nodes**. All other control plane components (API Server, Scheduler, Controller Manager, etcd) run on control plane nodes. The kubelet is also unique because it can run **Static Pods** that are not managed by the API Server at all.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes Architecture
+- API Server
+- Scheduler
+- Controller Manager
+- Pods
+- Nodes
+- etcd
+- Container Runtime Interface (basic understanding)
+
+---
+
+# What is kubelet?
+
+The **kubelet** is the primary **Node Agent** that runs on **every Kubernetes Node**.
+
+Every Worker Node runs:
+
+```text
++------------------------+
+|        kubelet         |
++------------------------+
+|   Container Runtime    |
+|        kube-proxy      |
++------------------------+
+```
+
+The kubelet is responsible for ensuring that every Pod assigned to its Node is running exactly as described in Kubernetes.
+
+Think of kubelet as:
+
+```text
+Control Plane
+  |
+  v
+Desired State
+  |
+  v
+kubelet
+  |
+  v
+Actual Running Containers
+```
+
+It continuously converts the desired state into the actual running state.
+
+---
+
+# Why Does Kubernetes Need kubelet?
+
+Suppose a Deployment creates:
+
+```yaml
+replicas: 3
+```
+
+The Scheduler decides:
+
+```text
+Pod-1 → worker-01
+
+Pod-2 → worker-02
+
+Pod-3 → worker-03
+```
+
+Question:
+
+Who actually performs?
+
+- Pull image
+- Create Pod Sandbox
+- Configure networking
+- Mount volumes
+- Start containers
+- Restart crashed containers
+- Execute health probes
+- Update Pod status
+
+Answer:
+
+```text
+kubelet
+```
+
+Without kubelet:
+
+```text
+Scheduler
+  |
+  v
+Assign Pod
+  |
+  v
+Nothing Runs
+```
+
+The Scheduler **never** starts containers.
+
+---
+
+# Position of kubelet in Kubernetes
+
+```text
+                 User
+
+                   |
+
+           kubectl apply
+
+                   |
+
+             API Server
+
+                   |
+
+         Controller Manager
+
+                   |
+
+             Scheduler
+
+                   |
+
+       Assign Pod to Node
+
+                   |
+
+          ─────────────────
+
+             Worker Node
+
+          ─────────────────
+
+               kubelet
+
+                   |
+
+          Container Runtime
+
+                   |
+
+             Linux Kernel
+
+                   |
+
+            Running Process
+```
+
+Notice:
+
+The kubelet exists **only on Nodes**.
+
+It is **not** part of the Control Plane.
+
+---
+
+# kubelet Architecture
+
+Internally, kubelet consists of multiple cooperating components.
+
+High-Level Architecture:
+
+```text
+                 API Server
+
+                      ▲
+
+        Watch Pods    |    Update Status
+
+                      |
+
+                +-------------+
+
+                |   kubelet   |
+
+                +-------------+
+
+      ┌────────────┼────────────┐
+
+      ▼            ▼            ▼
+
+ Pod Manager   Volume Manager  Probe Manager
+
+      |            |            |
+
+      ▼            ▼            ▼
+
+ Container Runtime (CRI)
+
+      |
+
+      ▼
+
+ Linux Kernel
+```
+
+Each internal manager focuses on a specific responsibility.
+
+---
+
+# Major Internal Components
+
+Conceptually, kubelet includes:
+
+```text
+kubelet
+
++-- Pod Manager
+
++-- PodWorkers
+
++-- Sync Loop
+
++-- Probe Manager
+
++-- Volume Manager
+
++-- Secret Manager
+
++-- ConfigMap Manager
+
++-- Status Manager
+
++-- Eviction Manager
+
++-- Runtime Manager
+
++-- PLEG (Pod Lifecycle Event Generator)
+```
+
+These components work together continuously.
+
+Later chapters explore many of them individually.
+
+---
+
+# Primary Responsibilities of kubelet
+
+The kubelet has several major responsibilities.
+
+---
+
+## 1. Register the Node
+
+When kubelet starts:
+
+```text
+Collect Node Information
+  |
+  v
+Register Node
+  |
+  v
+API Server
+```
+
+Without registration:
+
+```text
+Node
+  |
+  v
+Unknown
+  |
+  v
+Scheduler Cannot Use It
+```
+
+---
+
+## 2. Watch Assigned Pods
+
+The kubelet watches the API Server.
+
+It receives only Pods assigned to its own Node.
+
+Example:
+
+```text
+worker-01
+  |
+  v
+Watch:
+
+nodeName=worker-01
+```
+
+It ignores Pods scheduled elsewhere.
+
+---
+
+## 3. Run Containers
+
+The kubelet asks the Container Runtime to:
+
+```text
+Pull Image
+  |
+  v
+Create Sandbox
+  |
+  v
+Create Container
+  |
+  v
+Start Container
+```
+
+The kubelet never runs containers directly.
+
+It delegates execution through the **Container Runtime Interface (CRI)**.
+
+---
+
+## 4. Monitor Containers
+
+The kubelet continuously checks:
+
+- Running state
+- Exit codes
+- Restart policy
+- Health probes
+- Resource usage
+
+It keeps comparing:
+
+```text
+Desired State
+  |
+  v
+Actual State
+```
+
+---
+
+## 5. Update Pod Status
+
+The kubelet reports:
+
+```text
+Pending
+
+Running
+
+Succeeded
+
+Failed
+```
+
+back to the API Server.
+
+---
+
+## 6. Update Node Health
+
+The kubelet periodically reports:
+
+```text
+Ready
+
+MemoryPressure
+
+DiskPressure
+
+PIDPressure
+```
+
+This information is stored in the Node object.
+
+---
+
+## 7. Execute Health Probes
+
+The kubelet runs:
+
+```text
+Readiness
+
+Liveness
+
+Startup
+```
+
+Probes are executed locally on the Node.
+
+No Control Plane component performs them.
+
+---
+
+## 8. Handle Graceful Shutdown
+
+When a Pod is deleted:
+
+```text
+SIGTERM
+  |
+  v
+Grace Period
+  |
+  v
+SIGKILL (if necessary)
+```
+
+The kubelet coordinates the shutdown.
+
+---
+
+## 9. Evict Pods During Resource Pressure
+
+If the Node experiences:
+
+```text
+Memory Pressure
+
+Disk Pressure
+
+PID Pressure
+```
+
+the kubelet may evict Pods to keep the Node healthy.
+
+---
+
+# What kubelet Does NOT Do
+
+A common interview topic.
+
+The kubelet does **not**:
+
+❌ Schedule Pods
+
+❌ Create Deployments
+
+❌ Create ReplicaSets
+
+❌ Store cluster state
+
+❌ Perform leader election
+
+❌ Manage etcd
+
+Those are responsibilities of other control plane components.
+
+---
+
+# kubelet Communication
+
+The kubelet communicates with several components.
+
+```text
+                 kubelet
+
+      ┌────────────┼────────────┐
+
+      ▼            ▼            ▼
+
+ API Server     CRI Runtime     CSI
+
+      |                           |
+
+      ▼                           ▼
+
+   Cluster State             Storage
+
+      ▲
+
+      |
+
+      ▼
+
+     CNI
+```
+
+Notice:
+
+The kubelet is the integration point for many Kubernetes subsystems.
+
+---
+
+# kubelet Startup Sequence
+
+When kubelet starts, several initialization steps occur before it begins managing Pods.
+
+---
+
+## Step 1 — Load Configuration
+
+The kubelet reads:
+
+```text
+Configuration File
+  |
+  v
+Command Line Flags
+  |
+  v
+Environment
+```
+
+Examples include:
+
+- Node name
+- Runtime endpoint
+- Authentication settings
+- Certificates
+- Eviction thresholds
+
+---
+
+## Step 2 — Initialize Internal Managers
+
+The kubelet creates:
+
+```text
+Pod Manager
+  |
+  v
+Volume Manager
+  |
+  v
+Probe Manager
+  |
+  v
+Status Manager
+  |
+  v
+Runtime Manager
+  |
+  v
+Eviction Manager
+```
+
+These managers remain active for the lifetime of kubelet.
+
+---
+
+## Step 3 — Connect to Container Runtime
+
+Using CRI:
+
+```text
+kubelet
+  |
+  v
+gRPC
+  |
+  v
+containerd
+
+or
+
+CRI-O
+```
+
+If the runtime cannot be reached:
+
+```text
+No Runtime
+  |
+  v
+No Pods Can Start
+```
+
+---
+
+## Step 4 — Discover Local State
+
+The kubelet examines:
+
+- Existing containers
+- Existing sandboxes
+- Mounted volumes
+- Static Pod manifests
+
+This enables recovery after restarts.
+
+---
+
+## Step 5 — Register the Node
+
+If registration is enabled:
+
+```text
+Gather Node Information
+  |
+  v
+Create Node Object
+  |
+  v
+API Server
+```
+
+The Scheduler can now see the Node.
+
+---
+
+## Step 6 — Start Watches
+
+The kubelet begins watching:
+
+```text
+Assigned Pods
+  |
+  v
+Secrets
+  |
+  v
+ConfigMaps
+```
+
+Changes are delivered as watch events.
+
+---
+
+## Step 7 — Start Sync Loop
+
+Finally:
+
+```text
+Pod Sync Loop
+  |
+  v
+Reconcile Desired State
+  |
+  v
+Manage Pods
+```
+
+At this point the Node becomes operational.
+
+---
+
+# Startup Sequence Diagram
+
+```text
+kubelet Starts
+  |
+  v
+Load Configuration
+  |
+  v
+Initialize Managers
+  |
+  v
+Connect CRI
+  |
+  v
+Discover Local State
+  |
+  v
+Register Node
+  |
+  v
+Start Watches
+  |
+  v
+Start Pod Sync Loop
+  |
+  v
+Node Ready
+```
+
+---
+
+# Node Registration
+
+Every Worker Node must appear inside Kubernetes as a Node object.
+
+The kubelet creates or updates this object.
+
+---
+
+# Why Register?
+
+Without registration:
+
+```text
+API Server
+  |
+  v
+No Node Object
+  |
+  v
+Scheduler Cannot Place Pods
+```
+
+The Node effectively does not exist from Kubernetes' perspective.
+
+---
+
+# Registration Workflow
+
+```text
+kubelet
+  |
+  v
+Collect System Information
+  |
+  v
+Create Node Object
+  |
+  v
+API Server
+  |
+  v
+etcd
+```
+
+---
+
+# Information Sent During Registration
+
+The kubelet reports information such as:
+
+```text
+Node Name
+
+Architecture
+
+Operating System
+
+Kernel Version
+
+Container Runtime
+
+CPU Capacity
+
+Memory Capacity
+
+Ephemeral Storage
+
+Internal IP
+
+Hostname
+
+Labels
+
+Taints
+```
+
+This becomes part of the Node object.
+
+---
+
+# Node Registration Example
+
+Conceptually:
+
+```yaml
+Node
+
+metadata:
+
+  name: worker-01
+
+status:
+
+  capacity:
+
+    cpu: 16
+
+    memory: 64Gi
+
+  nodeInfo:
+
+    kernelVersion: ...
+
+    containerRuntimeVersion: ...
+```
+
+The Scheduler later uses this information.
+
+---
+
+# Registration Architecture
+
+```text
+Worker Node
+  |
+  v
+kubelet
+  |
+  v
+Node Object
+  |
+  v
+API Server
+  |
+  v
+etcd
+  |
+  v
+Scheduler Can See Node
+```
+
+---
+
+# Node Status Updates
+
+Registration occurs once,
+
+but Node status is updated continuously.
+
+---
+
+# Why Update Status?
+
+Node conditions constantly change.
+
+Examples:
+
+```text
+Disk Usage
+
+Memory Usage
+
+Network Availability
+
+Runtime Health
+```
+
+The Control Plane must know the current health.
+
+---
+
+# Node Conditions
+
+The kubelet updates conditions such as:
+
+```text
+Ready
+
+MemoryPressure
+
+DiskPressure
+
+PIDPressure
+
+NetworkUnavailable
+```
+
+Each condition is either:
+
+```text
+True
+
+False
+
+Unknown
+```
+
+---
+
+# Ready Condition
+
+The most important condition is:
+
+```text
+Ready
+```
+
+Meaning:
+
+```text
+Can This Node
+
+Run Pods?
+```
+
+If Ready becomes:
+
+```text
+False
+
+or
+
+Unknown
+```
+
+the Node Controller eventually begins handling the failure.
+
+---
+
+# Status Update Workflow
+
+```text
+Node Metrics
+  |
+  v
+Evaluate Conditions
+  |
+  v
+Update Node Status
+  |
+  v
+API Server
+  |
+  v
+etcd
+```
+
+---
+
+# Node Lease (Heartbeat)
+
+Updating the full Node object frequently is expensive.
+
+Modern Kubernetes primarily uses:
+
+```text
+Node Lease
+```
+
+for heartbeats.
+
+---
+
+# What is a Node Lease?
+
+A Lease is a lightweight object in:
+
+```text
+coordination.k8s.io
+```
+
+It contains essentially:
+
+```text
+Node Name
+
+Renew Time
+```
+
+Nothing more.
+
+---
+
+# Why Use Node Leases?
+
+Without Leases:
+
+```text
+Every Heartbeat
+  |
+  v
+Update Entire Node Object
+  |
+  v
+Large API Traffic
+  |
+  v
+Higher etcd Load
+```
+
+With Leases:
+
+```text
+Heartbeat
+  |
+  v
+Tiny Lease Update
+  |
+  v
+Very Low Overhead
+```
+
+---
+
+# Heartbeat Workflow
+
+```text
+kubelet
+  |
+  v
+Renew Lease
+  |
+  v
+API Server
+  |
+  v
+Lease Updated
+  |
+  v
+Node Controller Watches Lease
+```
+
+If the Lease stops updating:
+
+```text
+Node Controller
+  |
+  v
+Heartbeat Missing
+  |
+  v
+Node May Be Unreachable
+```
+
+---
+
+# Node Lease vs Node Status
+
+These are often confused.
+
+| Node Status | Node Lease |
+|-------------|------------|
+| Full health information | Lightweight heartbeat |
+| Contains Conditions | Contains renewal timestamp |
+| Larger object | Very small object |
+| Updated less frequently | Updated frequently |
+| Used for Node health details | Used for liveness detection |
+
+Both work together.
+
+---
+
+# Complete Node Registration Workflow
+
+```text
+kubelet Starts
+  |
+  v
+Load Configuration
+  |
+  v
+Connect Runtime
+  |
+  v
+Collect Node Information
+  |
+  v
+Create Node Object
+  |
+  v
+API Server
+  |
+  v
+etcd
+  |
+  v
+Scheduler Discovers Node
+  |
+  v
+Start Lease Updates
+  |
+  v
+Start Status Updates
+  |
+  v
+Begin Managing Pods
+```
+
+---
+
+# Production Example 1 — New Worker Joins
+
+```text
+New VM
+  |
+  v
+Install kubelet
+  |
+  v
+Start kubelet
+  |
+  v
+Register Node
+  |
+  v
+Node Appears
+  |
+  v
+Scheduler Uses Node
+```
+
+---
+
+# Production Example 2 — Runtime Failure
+
+```text
+containerd Stops
+  |
+  v
+kubelet Detects Runtime Failure
+  |
+  v
+Ready=False
+  |
+  v
+Node Controller Observes
+  |
+  v
+Scheduler Avoids Node
+```
+
+---
+
+# Production Example 3 — Network Partition
+
+```text
+Worker Node
+  |
+  v
+Cannot Reach API Server
+  |
+  v
+Lease Stops Updating
+  |
+  v
+Node Controller
+  |
+  v
+Node Becomes NotReady
+```
+
+Existing Pods may continue running locally, but the Control Plane cannot communicate with the Node.
+
+---
+
+# Production Example 4 — Node Recovery
+
+```text
+Network Restored
+  |
+  v
+Lease Renewed
+  |
+  v
+Status Updated
+  |
+  v
+Ready=True
+  |
+  v
+Scheduler Can Use Node Again
+```
+
+---
+
+# Production Best Practices
+
+✔ Always enable Node Lease (default in modern Kubernetes).
+
+✔ Monitor kubelet health and logs.
+
+✔ Use TLS authentication between kubelet and API Server.
+
+✔ Ensure accurate Node labels and taints before scheduling workloads.
+
+✔ Monitor Node Conditions for early detection of hardware or runtime issues.
+
+✔ Keep kubelet and the container runtime version-compatible.
+
+✔ Avoid unnecessary kubelet restarts in production.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The Scheduler starts containers.
+
+**Correct:** The Scheduler only selects a Node. kubelet starts containers through the container runtime.
+
+---
+
+### ❌ Misconception 2
+
+The kubelet stores cluster state.
+
+**Correct:** etcd stores cluster state. kubelet only reports status.
+
+---
+
+### ❌ Misconception 3
+
+Node Registration happens continuously.
+
+**Correct:** Registration creates or updates the Node object initially. Afterwards, kubelet continuously updates Node Status and renews the Node Lease.
+
+---
+
+### ❌ Misconception 4
+
+Node Lease replaces Node Status.
+
+**Correct:** Node Lease provides lightweight heartbeats, while Node Status contains detailed health information. Both are required.
+
+---
+
+### ❌ Misconception 5
+
+The kubelet watches every Pod in the cluster.
+
+**Correct:** The kubelet watches only Pods assigned to its own Node.
+
+---
+
+### ❌ Misconception 6
+
+If kubelet stops, running containers stop immediately.
+
+**Correct:** Existing containers may continue running for some time, but they are no longer managed or reported correctly, and the Node will eventually become NotReady.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the primary role of kubelet?
+
+To ensure Pods assigned to its Node are running according to their desired state by interacting with the container runtime and updating the control plane.
+
+---
+
+### Q2. Does kubelet schedule Pods?
+
+No. Scheduling is performed by the Kubernetes Scheduler.
+
+---
+
+### Q3. Why does kubelet register the Node?
+
+So the API Server and Scheduler know the Node exists and can schedule workloads to it.
+
+---
+
+### Q4. What information is sent during Node registration?
+
+Node identity, capacity, operating system, runtime information, labels, taints, addresses, and other hardware/software metadata.
+
+---
+
+### Q5. What is the difference between Node Status and Node Lease?
+
+Node Status contains detailed health information, while Node Lease is a lightweight heartbeat mechanism used for fast liveness detection.
+
+---
+
+### Q6. Who monitors Node Leases?
+
+The Node Controller watches Lease objects to determine whether Nodes are still alive.
+
+---
+
+### Q7. Does kubelet execute health probes?
+
+Yes. Readiness, Liveness, and Startup Probes are executed locally by kubelet.
+
+---
+
+### Q8. Can a Node exist in Kubernetes without kubelet registration?
+
+No. Without a registered Node object, the Scheduler cannot place Pods on that machine.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Node never appears in the cluster | kubelet not running, authentication failure, or registration disabled |
+| Node remains NotReady | Runtime failure, network connectivity issues, certificate problems, or kubelet errors |
+| Scheduler does not schedule Pods to the Node | Node not registered, NotReady, tainted, or missing required labels |
+| Frequent Node heartbeat failures | API Server connectivity problems or kubelet instability |
+| Incorrect Node capacity | kubelet reporting incorrect hardware information or system configuration issues |
+| Lease updates stop | kubelet crashed, network partition, or API Server unreachable |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is the primary responsibility of kubelet?
+2. Why is kubelet required on every Kubernetes Node?
+3. What components does kubelet communicate with?
+4. What happens during kubelet startup?
+5. Why must a Node be registered?
+6. What information is included in Node registration?
+7. How are Node Status updates different from Node Lease updates?
+8. Why were Node Leases introduced?
+9. Which component watches Node Leases?
+10. What responsibilities belong to kubelet versus the Scheduler?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the **kubelet** serves as the execution engine of every Kubernetes Node.
+
+You learned:
+
+- The internal architecture of kubelet and its major managers
+- The responsibilities of kubelet in running and maintaining workloads
+- How kubelet starts and initializes its internal components
+- How a Node registers itself with the Kubernetes API
+- How kubelet continuously updates detailed Node Status information
+- Why Node Leases were introduced as lightweight heartbeats
+- How the Node Controller relies on Lease renewals to detect Node failures
+
+The kubelet is the bridge between the **Kubernetes Control Plane** and the **Linux operating system**. While the Scheduler decides **where** a Pod should run, the kubelet ensures that the Pod actually runs, remains healthy, reports its status, and responds correctly to changes in the cluster. Understanding kubelet is essential because every workload in Kubernetes ultimately depends on it for execution.
+
+---
+
+# Next Chapter
+
+**Chapter 2 — Pod Lifecycle & Pod Sync Loop**
+
+In the next chapter, we'll explore how kubelet continuously reconciles desired and actual Pod state.
+
+Topics include:
+
+- Pod Lifecycle
+- PodWorkers
+- Pod Sync Loop
+- SyncPod()
+- Desired vs Actual State
+- Restart Policies
+- Pod Status Updates
+- Internal Reconciliation Workflow
+
+You'll learn exactly how kubelet transforms a scheduled Pod into a running workload and keeps it synchronized throughout its lifecycle.
+```

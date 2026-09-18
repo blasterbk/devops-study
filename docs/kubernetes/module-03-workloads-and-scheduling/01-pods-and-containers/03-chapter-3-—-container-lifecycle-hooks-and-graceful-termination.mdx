@@ -1,0 +1,346 @@
+---
+title: "Chapter 3 — Container Lifecycle Hooks & Graceful Termination"
+sidebar_position: 3
+module: "Module 3.1 — Pods & Containers"
+description: "Deep dive into container lifecycle hooks (postStart, preStop), graceful termination mechanics, SIGTERM to SIGKILL timelines, connection draining patterns, and zero-downtime rolling updates."
+---
+
+# Chapter 3 — Container Lifecycle Hooks & Graceful Termination
+
+> **Goal:** Master the complete lifecycle hooks and graceful shutdown sequences in Kubernetes — understanding how `postStart` and `preStop` hooks execute, how Kubelet coordinates `SIGTERM` and `SIGKILL`, the critical race condition between EndpointSlice removal and pod termination, and how to engineer zero-downtime microservices.
+>
+> By the end of this chapter, you will understand:
+> 1. How `postStart` executes asynchronously alongside container `ENTRYPOINT`
+> 2. How `preStop` hooks block `SIGTERM` to enable connection draining and load balancer deregulation
+> 3. The exact timeline of Pod deletion across the Control Plane, Kubelet, and Kube-Proxy
+> 4. How `terminationGracePeriodSeconds` is calculated and enforced (including K8s 1.29+ per-container grace periods)
+> 5. What `kubectl delete pod --force --grace-period=0` actually does at the etcd layer
+> 6. Production patterns: The "sleep 5" preStop hack and why it prevents HTTP 502/504 errors
+
+---
+
+## Real-Life Analogy
+
+Imagine a **busy restaurant closing for the night**:
+
+- **Opening Checklist (`postStart` hook):** As soon as the doors unlock (`ENTRYPOINT` starts), the head chef turns on the ovens and sets out fresh cutlery (`postStart`). The restaurant operates immediately, but if the gas line fails during setup, management halts service and declares a failure.
+- **Closing Announcement (`preStop` hook):** At 10:00 PM, the host stops seating new walk-in guests at the door (removed from Service `EndpointSlice`), but the kitchen does **not** instantly shut off the power. Instead, the staff runs a 15-minute closing procedure (`preStop` hook): existing diners finish their meals, open bills are settled, and the remaining orders are completed.
+- **Polite Departure Request (`SIGTERM`):** At 10:15 PM, the manager politely asks remaining staff to pack up and exit.
+- **Security Lockup (`SIGKILL` after `terminationGracePeriodSeconds`):** At 10:30 PM sharp, if anyone is still lingering, the night security guard forcefully escorts them out and locks the deadbolt (`SIGKILL`).
+
+---
+
+## Architecture Diagram
+
+```text
+              Kubernetes Graceful Termination Timeline
+
+ User / CI runs: kubectl delete pod web-app-xxxx
+  │
+  ├─────────────────────────────────────────┬──────────────────────────────────────────┐
+  │ Parallel Path A: Control Plane Flow     │ Parallel Path B: Node / Kubelet Flow     │
+  ▼                                         ▼                                          │
+ API Server marks Pod "Terminating"        Kubelet detects Pod deletion                │
+  │                                         │                                          │
+  ├─► Endpoints / EndpointSlice updated     ├─► Executes `preStop` hook (if defined)   │
+  │   (Pod IP removed from list)            │   e.g., `sleep 10` or HTTP deregister    │
+  │                                         │   (Blocks SIGTERM until complete)        │
+  ├─► Kube-Proxy updates iptables/IPVS      │                                          │
+  │   (Takes 1-3 seconds to propagate)      │                                          │
+  │                                         ▼                                          │
+  ├─► Ingress / Service Mesh stops          Kubelet sends `SIGTERM` (Signal 15)        │
+  │   routing NEW requests to Pod IP        │ Application drains in-flight requests    │
+  │                                         │                                          │
+  │                                         ▼                                          │
+  │                                        Wait `terminationGracePeriodSeconds` (30s)  │
+  │                                         │                                          │
+  │                                         ▼                                          │
+  │                                        Kubelet sends `SIGKILL` (Signal 9)          │
+  │                                        (Process forcefully terminated)             │
+  │                                         │                                          │
+  └─────────────────────────────────────────┴──────────────────────────────────────────┘
+  ▼
+ Pod object completely removed from etcd
+```
+
+---
+
+## Container Lifecycle Hooks: `postStart` & `preStop`
+
+Kubernetes exposes two container lifecycle hooks under `.spec.containers[].lifecycle`:
+
+```text
+ ┌─────────────────┬──────────────────────────────────┬────────────────────────────────────────┐
+ │ Hook Name       │ Execution Point                  │ Behavior & Failure Semantics           │
+ │─────────────────┼──────────────────────────────────┼────────────────────────────────────────┤
+ │ **`postStart`** │ Immediately AFTER container is   │ Asynchronous with container ENTRYPOINT.│
+ │                 │ created on the node.             │ If it fails or exits non-zero, the     │
+ │                 │                                  │ container is killed and restarted.     │
+ │─────────────────┼──────────────────────────────────┼────────────────────────────────────────┤
+ │ **`preStop`**   │ Immediately BEFORE container is  │ Synchronous & blocking. Kubelet waits  │
+ │                 │ sent `SIGTERM`.                  │ for it to finish before sending        │
+ │                 │                                  │ SIGTERM. Consumes grace period time.   │
+ └─────────────────┴──────────────────────────────────┴────────────────────────────────────────┘
+```
+
+### Hook Delivery Handlers
+Lifecycle hooks support two handler types:
+1. **`exec`:** Runs a specific command inside the container's namespace and root filesystem.
+2. **`httpGet`:** Sends an HTTP GET request to an endpoint on the container's network interface.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lifecycle-demo
+spec:
+  containers:
+  - name: web
+    image: nginx:1.25-alpine
+    lifecycle:
+      # 1. Executed immediately upon container creation
+      postStart:
+        exec:
+          command: ["/bin/sh", "-c", "echo 'Container Booted' > /usr/share/nginx/html/status.html"]
+
+      # 2. Executed before SIGTERM when Pod is terminating
+      preStop:
+        exec:
+          command: ["/bin/sh", "-c", "sleep 10 && nginx -s quit"]
+```
+
+> [!WARNING]
+> `postStart` does **not** guarantee execution before the container's `ENTRYPOINT` runs; they start concurrently. If your application depends on tasks that must finish *before* the application starts, use an **Init Container** instead of `postStart`.
+
+---
+
+## The Network Propagation Race Condition & The "Sleep 5" Pattern
+
+One of the most common causes of intermittent HTTP `502 Bad Gateway` or `504 Gateway Timeout` errors during rolling deployments is the **asynchronous race condition** during Pod termination:
+
+```text
+ The Zero-Downtime Termination Race:
+
+ 1. API Server receives Pod deletion request.
+ 2. Event A (EndpointSlice Controller) and Event B (Kubelet on Node) are triggered IN PARALLEL.
+ 3. If Event B kills the container (0.1s) BEFORE Event A removes the Pod IP from Kube-Proxy 
+    and Ingress load balancers (1.5s):
+    ──► Ingress continues sending NEW requests to a DEAD Pod IP!
+    ──► Client receives connection refused (HTTP 502)!
+```
+
+### The Solution: The `preStop` Sleep Pattern
+By adding a short delay in the `preStop` hook, Kubelet waits before shutting down the container, giving Kube-Proxy and cloud load balancers enough time to remove the Pod IP from routing tables:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 10"]
+```
+
+```text
+ With preStop Sleep (Zero-Downtime Guarantee):
+
+ Second 0.0: Pod marked Terminating. preStop starts `sleep 10`.
+ Second 0.5: EndpointSlice controller removes Pod IP.
+ Second 1.5: Ingress / kube-proxy updates iptables. No more new traffic arrives.
+ Second 2.0-9.9: Application finishes processing any already in-flight requests.
+ Second 10.0: `sleep 10` finishes. Kubelet sends `SIGTERM`.
+ Second 10.5: Application exits cleanly with 0 dropped connections.
+```
+
+---
+
+## `terminationGracePeriodSeconds` Deep Dive
+
+The Pod-level setting `terminationGracePeriodSeconds` (default: **30 seconds**) defines the total time window granted for shutdown.
+
+```text
+ Total Grace Period Window = 30 seconds
+ ├─────────────────────────┼────────────────────────────────────┼─────────────►
+ │ preStop Hook Execution  │ SIGTERM Handling (App Draining)    │ SIGKILL     │
+ │ (e.g. 10s)              │ (e.g. 12s)                         │ (Forced)    │
+```
+
+### Rules Governing Grace Period Calculation:
+1. **Total Shared Budget:** The `preStop` hook and `SIGTERM` handling share the same grace period countdown. If `preStop` takes 25 seconds of a 30-second budget, the application process only has 5 seconds left to handle `SIGTERM` before `SIGKILL`.
+2. **If preStop Exceeds Budget:** Kubelet grants a tiny 2-second emergency grace period after preStop timeouts, then sends `SIGKILL` immediately.
+3. **Per-Container Grace Periods (Kubernetes 1.29+):** Containers can now override the Pod-level grace period via `terminationGracePeriodSeconds` inside the container spec.
+
+---
+
+## Force Deletion: What `kubectl delete --force` Actually Does
+
+When you run:
+```bash
+kubectl delete pod web-app-0 --force --grace-period=0
+```
+
+### Under the Hood:
+1. The API server **immediately deletes the Pod object from etcd** without waiting for confirmation from Kubelet.
+2. The API server issues a background delete command to Kubelet.
+3. **StatefulSet Danger:** For StatefulSets (like PostgreSQL or ZooKeeper), force deletion can lead to a **split-brain** or data corruption! If the node is partitioned (network cut off), the old Pod is still actively writing to the disk, while the API server schedules a new Pod (`web-app-0`) on another node using the same storage volume.
+
+> [!CAUTION]
+> Never use `--force --grace-period=0` on StatefulSet database pods unless you have physically verified that the underlying worker node or VM is powered off.
+
+---
+
+## Complete Production Graceful Termination Pod Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enterprise-api
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: enterprise-api
+  template:
+    metadata:
+      labels:
+        app: enterprise-api
+    spec:
+      # Total grace period allocated for teardown
+      terminationGracePeriodSeconds: 60
+
+      containers:
+      - name: api
+        image: node:18-alpine
+        ports:
+        - containerPort: 3000
+        
+        # Lifecycle hooks for zero-downtime draining
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - "/bin/sh"
+              - "-c"
+              # 1. Wait for Ingress/EndpointSlice removal (15s)
+              # 2. Touch a local file signaling app to return 503 on healthcheck
+              # 3. Wait another 5s for in-flight requests to clear
+              - "touch /tmp/draining && sleep 15"
+
+        # Liveness & Readiness Probes
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 2
+
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+```
+
+---
+
+## Hands-On Lab: Verifying Graceful Termination & Hooks
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace lifecycle-lab
+
+# Step 2: Deploy a Pod with postStart logging and preStop sleep
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: grace-demo
+  namespace: lifecycle-lab
+spec:
+  terminationGracePeriodSeconds: 20
+  containers:
+  - name: test-server
+    image: alpine:latest
+    command: ["sh", "-c", "trap 'echo Received SIGTERM >> /tmp/lifecycle.log; sleep 2; exit 0' TERM; while true; do sleep 1; done"]
+    lifecycle:
+      postStart:
+        exec:
+          command: ["sh", "-c", "echo 'postStart executed at '$(date) >> /tmp/lifecycle.log"]
+      preStop:
+        exec:
+          command: ["sh", "-c", "echo 'preStop started at '$(date) >> /tmp/lifecycle.log; sleep 8; echo 'preStop finished at '$(date) >> /tmp/lifecycle.log"]
+EOF
+
+# Step 3: Wait for Pod to enter Running state
+kubectl wait --for=condition=Ready pod/grace-demo -n lifecycle-lab --timeout=30s
+
+# Step 4: Verify postStart executed successfully
+kubectl exec -n lifecycle-lab grace-demo -- cat /tmp/lifecycle.log
+
+# Step 5: Open a second terminal window to watch timestamps during deletion
+# In Terminal 1: Trigger deletion
+time kubectl delete pod grace-demo -n lifecycle-lab
+
+# Notice the command takes approximately ~10-12 seconds to complete (8s preStop + 2s SIGTERM handler)!
+
+# Step 6: Verify behavior when grace period is exceeded
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stubborn-pod
+  namespace: lifecycle-lab
+spec:
+  terminationGracePeriodSeconds: 5  # Very short grace period
+  containers:
+  - name: stubborn
+    image: alpine:latest
+    command: ["sh", "-c", "trap 'echo Ignoring SIGTERM; sleep 60' TERM; while true; do sleep 1; done"]
+EOF
+
+kubectl wait --for=condition=Ready pod/stubborn-pod -n lifecycle-lab --timeout=30s
+
+# Trigger delete - observe it gets forcefully SIGKILL'd after ~5-7 seconds
+time kubectl delete pod stubborn-pod -n lifecycle-lab
+
+# Step 7: Clean up
+kubectl delete namespace lifecycle-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the exact sequence of events when a Pod is deleted in Kubernetes?**
+
+When a Pod deletion is initiated: (1) The API server sets `.metadata.deletionTimestamp` and marks the Pod as `Terminating`. (2) Concurrently, the EndpointSlice controller removes the Pod's IP from all Services, triggering `kube-proxy` and Ingress controllers to update routing tables. (3) Simultaneously, the `kubelet` on the node executes the `preStop` hook if configured. (4) Once `preStop` finishes, Kubelet sends `SIGTERM` (Signal 15) to process PID 1 in each container. (5) Kubelet waits for the remaining duration of `terminationGracePeriodSeconds`. (6) If any process is still running after the grace period expires, Kubelet sends `SIGKILL` (Signal 9). (7) Kubelet notifies the API server, which deletes the Pod record from `etcd`.
+
+**Q2: Why is a `preStop` sleep hook often necessary in production web services?**
+
+Pod deletion and EndpointSlice/iptables updates happen asynchronously and in parallel. When a Pod enters the `Terminating` state, Kubelet immediately sends `SIGTERM` to the container, which may cause the application to stop accepting new requests within milliseconds. However, it takes 1–3 seconds for the EndpointSlice controller, `kube-proxy`, and Ingress gateways to propagate the IP removal. During this window, incoming traffic is still routed to the Pod, causing HTTP 502/504 errors. A `preStop` hook containing `sleep 5` or `sleep 10` keeps the container alive and accepting connections while routing tables update.
+
+**Q3: How does the `postStart` hook behave if the script fails or runs indefinitely?**
+
+The `postStart` hook runs asynchronously with the container's `ENTRYPOINT`. However, the container's status is not set to `Running` (and therefore readiness/liveness probes do not advance) until the `postStart` handler completes. If the `postStart` hook exits with a non-zero status code or fails, Kubelet immediately kills the container and subjects it to the Pod's `restartPolicy`. If `postStart` hangs indefinitely, the container will never become `Ready`.
+
+**Q4: Does the `preStop` hook extend the `terminationGracePeriodSeconds`?**
+
+No. The `preStop` hook runs **inside** the time budget defined by `terminationGracePeriodSeconds`. If `terminationGracePeriodSeconds` is set to 30 seconds and the `preStop` hook takes 20 seconds to execute, the application only has 10 seconds remaining to handle `SIGTERM` and finish draining connections before `SIGKILL` is issued. If `preStop` takes longer than the total grace period, Kubelet allows a brief 2-second buffer and then immediately issues `SIGKILL`.
+
+**Q5: What are the severe risks of running `kubectl delete pod --force --grace-period=0` on stateful workloads?**
+
+Force-deleting a Pod immediately removes the object from `etcd` without waiting for the `kubelet` to confirm process termination on the node. For stateful workloads (such as databases or consensus clusters managed by StatefulSets), if the node is experiencing a network partition, the original Pod is still running and writing to attached storage. Because the API server believes the old Pod is gone, it will schedule a replacement Pod on a healthy node, causing two active instances to attach the same persistent volume and corrupt data (split-brain condition).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `postStart` runs concurrently with `ENTRYPOINT` and kills the container if it exits non-zero
+- [ ] Know that `preStop` executes BEFORE `SIGTERM` and blocks `SIGTERM` until completed
+- [ ] Know the default `terminationGracePeriodSeconds` is 30 seconds
+- [ ] Know that `preStop` execution consumes time from the `terminationGracePeriodSeconds` budget
+- [ ] Know why the `preStop: sleep 10` pattern prevents HTTP 502 errors during rolling updates
+- [ ] Know the difference between `SIGTERM` (polite shutdown, signal 15) and `SIGKILL` (forced termination, signal 9)
+- [ ] Know why `kubectl delete --force --grace-period=0` can cause split-brain data corruption on StatefulSets

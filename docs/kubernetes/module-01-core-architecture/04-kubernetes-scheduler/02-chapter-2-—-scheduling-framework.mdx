@@ -1,0 +1,1608 @@
+---
+title: "Chapter 2 — Scheduling Framework"
+sidebar_position: 2
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand the internal architecture of the Kubernetes Scheduling Framework. Learn why Kubernetes replaced its monolithic scheduler with a plugin-ba..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 2 — Scheduling Framework
+
+> **Goal:** Understand the internal architecture of the Kubernetes Scheduling Framework. Learn why Kubernetes replaced its monolithic scheduler with a plugin-based framework, how scheduling plugins work, what extension points exist, how plugins communicate through the Framework Handle, and how a complete scheduling decision flows through the framework.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why the monolithic scheduler was replaced by the Framework
+> 2. Plugin-based architecture and extension points
+> 3. Scheduling cycle extension points: PreFilter, Filter, Score, Reserve, Permit
+> 4. Binding cycle extension points: PreBind, Bind, PostBind
+> 5. Framework Handle — how plugins access shared scheduler state
+> 6. Plugin ordering and result propagation
+> 7. How to implement a custom plugin
+> 8. Production examples: Descheduler, cluster-autoscaler integration
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Scheduling Framework like a manufacturing assembly line with quality inspection stations.
+
+```text
+Assembly Line Analogy:
+
+Product (Pod) moves through fixed stations in order
+Each station (plugin) inspects and approves or rejects
+Any station can halt the line (plugin returns Unschedulable)
+Stations can be added/removed without rebuilding the entire line
+Last stations handle packaging and shipping (Bind phase)
+```
+
+| Assembly Line | Scheduling Framework |
+| :--- | :--- |
+| Product moving through stations | Pod passing through extension points |
+| Inspection station | Scheduling plugin |
+| Station rejects product | Plugin returns Unschedulable/Error |
+| Adding a new station | Registering a new plugin |
+| Quality control phase | Filter phase (elimination) |
+| Ranking/grading phase | Score phase (prioritization) |
+| Shipping phase | Bind phase (writing spec.nodeName) |
+
+> **Important:** The Scheduling Framework **replaced the old predicates and priorities system** entirely (removed in Kubernetes 1.23). Every built-in scheduling behavior is now implemented as Framework plugins. All modern schedulers — including the default `kube-scheduler` — use the Framework. Writing a scheduler without the Framework is now a last resort.
+
+---
+
+# Prerequisites
+
+You should already understand:
+
+- Scheduler Architecture
+- Scheduler Cache
+- Scheduling Queue
+- Kubernetes API Server
+- Informers
+- etcd
+
+---
+
+# Before Kubernetes v1.19
+
+Originally,
+
+the Kubernetes Scheduler was largely implemented as one large scheduling algorithm.
+
+Conceptually:
+
+```text
+Pod
+
+v
+
+Scheduler
+
+v
+
+Huge Scheduling Logic
+
+v
+
+Node
+```
+
+Everything happened inside one tightly coupled implementation.
+
+---
+
+# Problems with the Old Design
+
+Imagine adding support for:
+
+- GPUs
+- AI workloads
+- NUMA awareness
+- Custom hardware
+- Internal company policies
+
+Developers had to modify:
+
+```text
+Core Scheduler Code
+```
+
+Problems:
+
+- Difficult maintenance
+- Hard to test
+- Hard to extend
+- Vendor patches
+- Merge conflicts
+- Upgrade complexity
+
+---
+
+# Example
+
+Suppose NVIDIA wants:
+
+```text
+GPU Scheduling
+```
+
+Google wants:
+
+```text
+TPU Scheduling
+```
+
+A bank wants:
+
+```text
+Compliance Scheduling
+```
+
+A telecom company wants:
+
+```text
+Low-Latency Scheduling
+```
+
+Without plugins,
+
+every feature requires modifying:
+
+```text
+Scheduler Core
+```
+
+Not scalable.
+
+---
+
+# Why the Scheduling Framework Exists
+
+The Scheduling Framework solves one major problem:
+
+> **Allow scheduling behavior to be extended without rewriting the Scheduler itself.**
+
+Instead of changing Kubernetes,
+
+developers add:
+
+```text
+Plugins
+```
+
+---
+
+# Modern Scheduler
+
+Today,
+
+the Scheduler is:
+
+```text
+Scheduler
+
+v
+
+Framework
+
+v
+
+Plugins
+
+v
+
+Scheduling Decision
+```
+
+The Scheduler coordinates.
+
+Plugins perform the work.
+
+---
+
+# High-Level Architecture
+
+```text
+                     Scheduler
+
+                         |
+
+                         ▼
+
+               Scheduling Framework
+
+                         |
+
+      ┌──────────────────┼──────────────────┐
+
+      ▼                  ▼                  ▼
+
+  Built-in          Custom Plugin      Third-Party
+
+     Plugin              Plugin            Plugin
+```
+
+Everything passes through the framework.
+
+---
+
+# What is the Scheduling Framework?
+
+The Scheduling Framework is:
+
+> **A plugin execution engine that manages every scheduling decision.**
+
+Think of it as:
+
+```text
+Operating System
+
+v
+
+Applications
+```
+
+Or:
+
+```text
+Web Server
+
+v
+
+Middleware
+```
+
+The Framework doesn't decide.
+
+Plugins decide.
+
+---
+
+# Real-Life Analogy
+
+Imagine airport security.
+
+Passenger arrives.
+
+```text
+Passenger
+
+v
+
+Identity Check
+
+v
+
+Luggage Scan
+
+v
+
+Immigration
+
+v
+
+Boarding
+
+v
+
+Aircraft
+```
+
+Each checkpoint performs one job.
+
+Scheduling works similarly.
+
+---
+
+# Scheduling Pipeline
+
+```text
+Pod
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PostFilter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+PreBind
+
+v
+
+Bind
+
+v
+
+PostBind
+```
+
+Each stage is called an:
+
+```text
+Extension Point
+```
+
+---
+
+# What is an Extension Point?
+
+An Extension Point is:
+
+> **A predefined stage in the scheduling pipeline where one or more plugins can execute.**
+
+Instead of modifying Kubernetes,
+
+developers insert plugins into these stages.
+
+---
+
+# Extension Point Overview
+
+```text
+Scheduling Framework
+
++-- QueueSort
++-- PreFilter
++-- Filter
++-- PostFilter
++-- PreScore
++-- Score
++-- Reserve
++-- Permit
++-- PreBind
++-- Bind
++-- PostBind
+```
+
+Each serves a different purpose.
+
+---
+
+# Scheduling Plugins
+
+A Scheduling Plugin is:
+
+> **A modular component implementing one or more scheduling interfaces.**
+
+Example plugins:
+
+```text
+NodeResourcesFit
+
+NodeAffinity
+
+ImageLocality
+
+TaintToleration
+
+VolumeBinding
+
+PodTopologySpread
+```
+
+Each plugin performs one specialized task.
+
+---
+
+# Plugin Philosophy
+
+Instead of:
+
+```text
+One Plugin
+
+Does Everything
+```
+
+Kubernetes prefers:
+
+```text
+Many Small Plugins
+
+v
+
+Single Responsibility
+```
+
+Exactly like:
+
+- Unix philosophy
+- Kubernetes Controllers
+- Linux kernel modules
+
+---
+
+# Plugin Categories
+
+Plugins generally belong to:
+
+```text
+Queue
+
+Filtering
+
+Scoring
+
+Reservation
+
+Binding
+```
+
+Some plugins participate in multiple phases.
+
+---
+
+# Built-in Plugins
+
+Examples include:
+
+| Plugin | Responsibility |
+|----------|----------------|
+| NodeResourcesFit | CPU/Memory resource validation |
+| NodeAffinity | Node affinity rules |
+| TaintToleration | Taints and tolerations |
+| ImageLocality | Prefer nodes with cached images |
+| PodTopologySpread | Even distribution |
+| InterPodAffinity | Pod affinity and anti-affinity |
+| VolumeBinding | Persistent volume constraints |
+
+---
+
+# Plugin Registration
+
+When the Scheduler starts,
+
+it loads plugins.
+
+```text
+Scheduler
+
+v
+
+Framework
+
+v
+
+Register Plugin
+
+v
+
+Ready
+```
+
+Only registered plugins participate.
+
+---
+
+# Framework Handle
+
+Plugins occasionally need information.
+
+Instead of directly accessing Scheduler internals,
+
+they receive:
+
+```text
+Framework Handle
+```
+
+---
+
+# What is Framework Handle?
+
+Framework Handle is an interface exposing Scheduler services.
+
+It allows plugins to access:
+
+- Scheduler Cache
+- Shared Informers
+- ClientSet
+- Event Recorder
+- Shared Listers
+- Waiting Pods
+- Snapshot Data
+
+without tightly coupling to Scheduler implementation.
+
+---
+
+# Framework Handle Diagram
+
+```text
+Plugin
+
+v
+
+Framework Handle
+
++-- Cache
++-- Client
++-- Informers
++-- Event Recorder
++-- Snapshot
++-- Shared Listers
+```
+
+Think of it as a toolbox.
+
+---
+
+# Why Not Give Plugins Direct Access?
+
+Direct access would create:
+
+```text
+Plugin
+
+v
+
+Scheduler Internals
+```
+
+Problems:
+
+- Tight coupling
+- Version dependency
+- Hard upgrades
+- Hard testing
+
+Framework Handle provides abstraction.
+
+---
+
+# Scheduler Snapshot
+
+Before scheduling begins,
+
+the Framework builds a consistent snapshot.
+
+```text
+Scheduler Cache
+
+v
+
+Snapshot
+
+v
+
+Plugins
+```
+
+All plugins work from the same cluster view.
+
+---
+
+# Why Snapshot?
+
+Imagine:
+
+Plugin A sees:
+
+```text
+Node
+
+4 CPU Free
+```
+
+Plugin B sees:
+
+```text
+Node
+
+2 CPU Free
+```
+
+Different data.
+
+Scheduling becomes inconsistent.
+
+Snapshots guarantee consistency.
+
+---
+
+# Framework Pipeline
+
+The Scheduling Framework executes plugins in a fixed pipeline.
+
+```text
+QueueSort
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PostFilter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+PreBind
+
+v
+
+Bind
+
+v
+
+PostBind
+```
+
+Each stage has a specific purpose.
+
+---
+
+# Stage 1 — QueueSort
+
+Purpose:
+
+Determine:
+
+```text
+Which Pod
+
+Schedules First?
+```
+
+Example:
+
+High-priority Pod before low-priority Pod.
+
+---
+
+# Stage 2 — PreFilter
+
+Runs before evaluating Nodes.
+
+Typical work:
+
+- Parse Pod
+- Validate requests
+- Precompute expensive calculations
+
+Executed once per Pod.
+
+---
+
+# Stage 3 — Filter
+
+Runs for:
+
+```text
+Every Candidate Node
+```
+
+Question:
+
+```text
+Can
+
+This Pod
+
+Run Here?
+```
+
+Possible result:
+
+```text
+Pass
+
+or
+
+Reject
+```
+
+---
+
+# Stage 4 — PostFilter
+
+Runs only when:
+
+```text
+No Node
+
+Passed Filter
+```
+
+Typical responsibility:
+
+```text
+Preemption
+```
+
+We'll study this later.
+
+---
+
+# Stage 5 — PreScore
+
+Runs before scoring.
+
+Purpose:
+
+Prepare information required by Score plugins.
+
+Executed once.
+
+---
+
+# Stage 6 — Score
+
+Runs for every remaining Node.
+
+Example:
+
+```text
+Node A
+
+85
+
+Node B
+
+93
+
+Node C
+
+71
+```
+
+Highest score wins.
+
+---
+
+# Stage 7 — Reserve
+
+Temporarily reserves resources.
+
+Purpose:
+
+Avoid race conditions while binding.
+
+---
+
+# Stage 8 — Permit
+
+Optional approval phase.
+
+Can:
+
+```text
+Approve
+
+Reject
+
+Wait
+```
+
+Useful for:
+
+Gang Scheduling
+
+Batch Scheduling
+
+AI workloads
+
+---
+
+# Stage 9 — PreBind
+
+Runs immediately before binding.
+
+Final validation.
+
+---
+
+# Stage 10 — Bind
+
+Assigns:
+
+```yaml
+spec:
+  nodeName: worker-3
+```
+
+The Pod is officially scheduled.
+
+---
+
+# Stage 11 — PostBind
+
+Executed after successful binding.
+
+Typical usage:
+
+- Metrics
+- Logging
+- Notifications
+- Cleanup
+
+---
+
+# Complete Pipeline
+
+```text
+New Pod
+
+v
+
+QueueSort
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+Candidate Nodes
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Highest Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+PreBind
+
+v
+
+Bind
+
+v
+
+PostBind
+
+v
+
+Done
+```
+
+---
+
+# Scheduler Execution Flow
+
+Let's schedule a Pod.
+
+```yaml
+resources:
+  requests:
+    cpu: 2
+    memory: 4Gi
+```
+
+---
+
+# Step 1
+
+Pod enters:
+
+```text
+Scheduling Queue
+```
+
+---
+
+# Step 2
+
+QueueSort decides:
+
+```text
+Next Pod
+```
+
+---
+
+# Step 3
+
+PreFilter computes:
+
+```text
+CPU
+
+Memory
+
+Affinity
+
+Volumes
+```
+
+---
+
+# Step 4
+
+Filter evaluates:
+
+```text
+Node1
+
+Pass
+
+Node2
+
+Fail
+
+Node3
+
+Pass
+
+Node4
+
+Fail
+```
+
+Remaining:
+
+```text
+Node1
+
+Node3
+```
+
+---
+
+# Step 5
+
+Score plugins run.
+
+```text
+Node1
+
+88
+
+Node3
+
+96
+```
+
+Winner:
+
+```text
+Node3
+```
+
+---
+
+# Step 6
+
+Reserve:
+
+```text
+Reserve Resources
+
+Node3
+```
+
+---
+
+# Step 7
+
+Permit:
+
+```text
+Approved
+```
+
+---
+
+# Step 8
+
+Bind:
+
+```yaml
+spec:
+  nodeName: node3
+```
+
+Scheduling complete.
+
+---
+
+# Why Multiple Plugins?
+
+Imagine a Pod requiring:
+
+- GPU
+- SSD
+- Same Zone
+- Same Team
+- No Taints
+
+Instead of one algorithm,
+
+plugins collaborate.
+
+```text
+GPU Plugin
+
+v
+
+Affinity Plugin
+
+v
+
+Storage Plugin
+
+v
+
+Taint Plugin
+
+v
+
+Topology Plugin
+```
+
+Much simpler.
+
+---
+
+# Plugin Ordering
+
+Ordering matters.
+
+Example:
+
+Correct:
+
+```text
+Filter
+
+v
+
+Score
+
+v
+
+Bind
+```
+
+Incorrect:
+
+```text
+Score
+
+v
+
+Filter
+```
+
+Scoring invalid Nodes wastes computation.
+
+---
+
+# Another Ordering Example
+
+Wrong:
+
+```text
+Bind
+
+v
+
+Filter
+```
+
+Impossible.
+
+Binding requires:
+
+```text
+Valid Node
+```
+
+Therefore,
+
+execution order is fixed.
+
+---
+
+# Parallel Execution
+
+Important optimization.
+
+Some stages execute:
+
+```text
+Across Nodes
+
+In Parallel
+```
+
+Example:
+
+```text
+100 Nodes
+
+v
+
+Filter Plugin
+
+v
+
+100 Workers
+
+v
+
+Results
+```
+
+This dramatically improves scheduling throughput.
+
+---
+
+# Scheduling Snapshot
+
+Every scheduling cycle uses:
+
+```text
+Cluster Snapshot
+
+v
+
+Plugin Execution
+
+v
+
+Decision
+```
+
+The snapshot prevents inconsistent scheduling during cluster changes.
+
+---
+
+# Plugin Failure
+
+Suppose:
+
+```text
+Volume Plugin
+
+Fails
+```
+
+Framework decides:
+
+```text
+Scheduling Failed
+
+v
+
+Retry Later
+```
+
+One failed plugin can reject the scheduling attempt.
+
+---
+
+# Production Example 1
+
+GPU Cluster.
+
+Plugins:
+
+```text
+NodeResourcesFit
+
+v
+
+GPU Plugin
+
+v
+
+NodeAffinity
+
+v
+
+Score
+```
+
+Only GPU Nodes survive filtering.
+
+---
+
+# Production Example 2
+
+AI Training Cluster.
+
+Permit Plugin waits until:
+
+```text
+8 Pods
+
+Ready
+```
+
+Then:
+
+```text
+Approve
+
+All Together
+```
+
+Gang scheduling.
+
+---
+
+# Production Example 3
+
+Multi-Zone Cluster.
+
+Plugins:
+
+```text
+Topology Spread
+
+v
+
+Score
+
+v
+
+Best Zone
+```
+
+Pods distribute evenly across availability zones.
+
+---
+
+# Framework Architecture
+
+```text
+                    Scheduler
+
+                        |
+
+                        ▼
+
+             Scheduling Framework
+
+                        |
+
+        ┌───────────────┼─────────────────┐
+
+        ▼               ▼                 ▼
+
+ Queue Plugins   Scheduling Plugins   Bind Plugins
+
+        |               |                 |
+
+        +--─────────────┼─────────────────┘
+
+                        ▼
+
+                  Scheduling Decision
+```
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Pod
+
+v
+
+Informer
+
+v
+
+Scheduling Queue
+
+v
+
+Scheduling Framework
+
+v
+
+Plugins
+
+v
+
+Scheduler Cache
+
+v
+
+Bind
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+kubelet
+```
+
+Everything learned previously now enters the plugin pipeline.
+
+---
+
+# Production Best Practices
+
+✔ Keep plugin chains simple.
+
+✔ Avoid unnecessary custom plugins.
+
+✔ Reuse built-in plugins whenever possible.
+
+✔ Test custom plugins under production load.
+
+✔ Monitor scheduling latency.
+
+✔ Keep expensive work inside PreFilter instead of repeating it in Filter.
+
+✔ Avoid long-running Permit plugins unless necessary.
+
+✔ Profile scheduling performance in large clusters.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The Scheduling Framework replaces the Scheduler.
+
+Wrong.
+
+The Framework is part of the Scheduler.
+
+---
+
+### ❌ Misconception 2
+
+Plugins execute randomly.
+
+Wrong.
+
+Every extension point has a predefined execution order.
+
+---
+
+### ❌ Misconception 3
+
+One plugin decides everything.
+
+Wrong.
+
+Multiple plugins collaborate to produce the final decision.
+
+---
+
+### ❌ Misconception 4
+
+Plugins access Scheduler internals directly.
+
+Wrong.
+
+They communicate through the Framework Handle.
+
+---
+
+### ❌ Misconception 5
+
+Filtering and scoring are the same.
+
+Wrong.
+
+Filtering removes invalid Nodes.
+
+Scoring ranks valid Nodes.
+
+---
+
+### ❌ Misconception 6
+
+Every extension point is mandatory.
+
+Wrong.
+
+Some phases, such as Permit or PostBind, may have no active plugins.
+
+---
+
+### ❌ Misconception 7
+
+Plugins always execute sequentially.
+
+Wrong.
+
+Several plugin stages evaluate multiple candidate Nodes in parallel for better performance.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why was the Scheduling Framework introduced?
+
+To make the Scheduler extensible through plugins instead of modifying core scheduler code.
+
+---
+
+### Q2. What is an Extension Point?
+
+A predefined stage in the scheduling pipeline where one or more plugins can execute.
+
+---
+
+### Q3. What is the Framework Handle?
+
+An interface that gives plugins controlled access to Scheduler services such as the cache, client, informers, and event recorder.
+
+---
+
+### Q4. What is the difference between Filter and Score plugins?
+
+Filter plugins eliminate unsuitable Nodes, while Score plugins rank the remaining candidate Nodes.
+
+---
+
+### Q5. Why does the Scheduler create a snapshot before scheduling?
+
+To ensure all plugins evaluate the same consistent view of cluster state during one scheduling cycle.
+
+---
+
+### Q6. Why is plugin ordering important?
+
+Because later stages depend on the results of earlier stages. For example, only valid Nodes should be scored.
+
+---
+
+### Q7. Can a plugin participate in multiple extension points?
+
+Yes. A single plugin may implement multiple framework interfaces and execute in multiple stages.
+
+---
+
+### Q8. Why are some plugin executions parallel?
+
+To improve scheduling throughput by evaluating many candidate Nodes simultaneously.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Slow scheduling latency | Expensive Filter or Score plugins, large cluster, or excessive custom logic |
+| Pods remain Pending | Filter plugins rejected every candidate Node |
+| Unexpected Node selection | Plugin weights, scoring logic, or profile configuration |
+| Custom plugin not executing | Plugin not registered or not enabled in the Scheduler profile |
+| Different scheduling behavior after upgrade | Plugin configuration or enabled plugin set changed |
+| High CPU usage in Scheduler | Large node count, expensive scoring algorithms, or inefficient custom plugins |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why was the Scheduling Framework introduced?
+2. What problems did it solve?
+3. What is a Scheduling Plugin?
+4. What is an Extension Point?
+5. What does the Framework Handle provide?
+6. Why does the Scheduler build a snapshot before scheduling?
+7. What is the purpose of QueueSort?
+8. What is the difference between PreFilter and Filter?
+9. What is the difference between Filter and Score?
+10. What does the Reserve phase do?
+11. Why is the Permit phase optional?
+12. Why is plugin ordering important?
+13. Why are some plugin stages executed in parallel?
+14. How do production clusters benefit from the plugin architecture?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the Kubernetes Scheduler evolved from a monolithic implementation into a highly extensible, plugin-based framework.
+
+You learned:
+
+- Why the Scheduling Framework was introduced
+- How plugin-based scheduling improves extensibility and maintainability
+- The purpose of every extension point in the scheduling pipeline
+- How Scheduling Plugins cooperate to make placement decisions
+- How the Framework Handle provides controlled access to Scheduler services
+- Why the Scheduler creates a consistent snapshot before each scheduling cycle
+- How plugins execute in a defined order, with some stages running in parallel for performance
+- How production environments use built-in and custom plugins to implement sophisticated scheduling policies
+
+The Scheduling Framework is the core execution engine of the modern Kubernetes Scheduler. Every scheduling decision—from a simple web server Pod to a large AI training workload—passes through this framework before a Pod is assigned to a Node.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — Scheduling Cycle**
+
+We'll dive into the **Scheduling Cycle**, where the Scheduler transforms an unscheduled Pod into a placement decision.
+
+Topics include:
+
+- Scheduling Context
+- Node Snapshot Creation
+- Candidate Node Selection
+- Queue Processing
+- PreFilter Execution
+- Filter Execution
+- PreScore Execution
+- Score Execution
+- Selecting the Winning Node
+- Transition to the Binding Cycle
+
+This chapter will follow one Pod through every internal step of the scheduling decision process.
+```

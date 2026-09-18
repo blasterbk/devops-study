@@ -1,0 +1,228 @@
+---
+title: "Chapter 2 — Flux CRDs: GitRepository & Kustomization"
+sidebar_position: 2
+module: "Module 8.3 — Flux CD v2 & GOTK"
+description: "Master Flux CD v2 Custom Resources — GitRepository sources, Kustomization reconciliation pipelines, dependsOn dependency trees, and declarative HelmReleases."
+---
+
+# Chapter 2 — GitRepository, Kustomization & HelmRelease CRDs
+
+> **Goal:** Master declarative workload and infrastructure management in **Flux CD v2** using its core Custom Resources — authoring **`GitRepository`** and **`OCIRepository`** source definitions, building multi-tier dependency chains with **`Kustomization`** (`dependsOn`, `healthChecks`, `prune`), configuring inline Mozilla SOPS decryption, and orchestrating automated Helm chart releases with **`HelmRelease`** self-healing rollbacks.
+>
+> By the end of this chapter, you will understand:
+> 1. The schema and lifecycle of `GitRepository` and `OCIRepository` source objects
+> 2. How `Kustomization` reconciles Git directories using Server-Side Apply and pruning
+> 3. How `dependsOn` sequences infrastructure dependencies (Cert-Manager $\to$ Ingress $\to$ Apps)
+> 4. How `healthChecks` evaluate live workload readiness before progressing downstream reconciliations
+> 5. How to declare inline Helm chart value overrides and automated rollbacks via `HelmRelease`
+> 6. How to troubleshoot failing Flux reconciliation states using `flux get` and `kubectl describe`
+
+---
+
+## Real-Life Analogy
+
+Think of Flux's `GitRepository`, `Kustomization`, and `HelmRelease` as **a high-precision industrial construction supply chain and assembly workflow**:
+
+- **The Supply Warehouse Dock (`GitRepository` CRD):** A standing purchase order with the central supply factory (**GitHub**): *"Every 5 minutes (**`interval: 5m`**), check the master catalog on the `production` branch (**`ref.branch: main`**), download the latest blueprinted parts, and store them in the local staging dock."*
+- **The Assembly Line Order (`Kustomization` CRD):** The construction manager's instruction sheet: *"Take the blueprints from Box `./apps/production` in the staging dock, decrypt the security codes (**Mozilla SOPS**), and build the structure on the factory floor (**`prune: true`**)."*
+- **The Dependency Checkpoints (`dependsOn` & `healthChecks`):** The construction rule that says: *"Do NOT start installing the second-floor electrical wiring (**Application Kustomization**) until the municipal power substation (**Cert-Manager Kustomization**) is fully operational and passes health inspections (**`healthChecks`**)."*
+- **The Specialized Pre-Fabricated Module (`HelmRelease` CRD):** An automated contract to assemble a complex third-party industrial motor (**Prometheus or Redis**): *"Download Helm Chart version 6.2.0, apply our custom company power settings (**`values`**), and if the motor fails the startup test, immediately roll back to the previous stable model (**Automated Rollback**)."*
+
+---
+
+## Architecture Diagram
+
+```text
+               Flux CD v2 CRD Dependency Chain & Reconciliation Pipeline
+
+ 1. SOURCE DEFINITION (source.toolkit.fluxcd.io/v1)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GitRepository: `flux-system` (Interval: 1m, Branch: main)              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Generates Immutable Artifact Tarball
+                                    ▼
+ 2. INFRASTRUCTURE PREREQUISITES (kustomize.toolkit.fluxcd.io/v1)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kustomization: `infra-controllers`                                     │
+ │ - Path: `./infrastructure/cert-manager`                                │
+ │ - HealthChecks: Deployment `cert-manager` MUST BE READY!               │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ `dependsOn: [name: infra-controllers]`
+ 3. APPLICATION WORKLOADS (kustomize.toolkit.fluxcd.io/v1)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kustomization: `payment-workloads`                                     │
+ │ - Path: `./apps/production/payment`                                    │
+ │ - Prune: true (Deletes dead resources)                                 │
+ │ - Decryption: Mozilla SOPS with AWS KMS                                │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Instantiates Managed Helm Release
+                                    ▼
+ 4. HELM RELEASE (helm.toolkit.fluxcd.io/v2)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HelmRelease: `redis-cluster`                                           │
+ │ - Chart: `redis` (v18.5.0 from Bitnami HelmRepository)                 │
+ │ - Auto-Rollback: true (Reverts release if tests fail within 5m)        │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. `GitRepository` Source Manifest
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: podinfo-source
+  namespace: flux-system
+spec:
+  interval: 1m                         # Polls Git every 60 seconds
+  url: https://github.com/stefanprodan/podinfo
+  ref:
+    branch: master                     # Can also track tag: "v6.5.0" or semver: "^6.0.0"
+  secretRef:
+    name: github-deploy-key            # SSH Deploy Key or GitHub PAT
+  timeout: 60s
+  ignore: |
+    # Exclude files from artifact tarball to save memory!
+    /*
+    !/kustomize
+```
+
+---
+
+## 2. `Kustomization` Manifest with `dependsOn` & `healthChecks`
+
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: payment-production
+  namespace: flux-system
+spec:
+  # 1. Source Reference & Path
+  sourceRef:
+    kind: GitRepository
+    name: podinfo-source
+  path: ./kustomize
+  interval: 5m
+  timeout: 3m
+  prune: true                          # Automatically garbage-collects deleted resources!
+
+  # 2. Sequential Dependency Chaining
+  dependsOn:
+    - name: cert-manager-infra         # Pauses until cert-manager is 100% Healthy!
+
+  # 3. Live Health Evaluation
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: payment-api
+      namespace: production
+
+  # 4. Multi-Tenancy & SOPS Decryption
+  serviceAccountName: kustomize-controller
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-gpg-key
+```
+
+---
+
+## 3. `HelmRelease` Manifest with Automated Rollback
+
+```yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: redis-cache
+  namespace: production
+spec:
+  interval: 15m
+  chart:
+    spec:
+      chart: redis
+      version: "18.5.0"
+      sourceRef:
+        kind: HelmRepository
+        name: bitnami-charts
+        namespace: flux-system
+      interval: 1h
+  timeout: 5m
+
+  # 1. Automated Failure Handling
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      remediateLastFailure: true       # Automatically rolls back on failed upgrades!
+
+  # 2. Declarative Values Overrides
+  values:
+    architecture: replication
+    auth:
+      enabled: true
+      existingSecret: redis-auth-secret
+    master:
+      persistence:
+        size: 20Gi
+    replica:
+      replicaCount: 3
+```
+
+---
+
+## Hands-On Lab: Querying Flux CRDs & Tracing Dependencies
+
+```bash
+# Step 1: Query GitRepository sources and their latest artifact revision
+kubectl get gitrepositories.source.toolkit.fluxcd.io -A 2>/dev/null || echo "Flux CRDs active / simulated"
+
+# Step 2: Query Kustomization reconciliation status and health
+kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type==\"Ready\")].status,MESSAGE:.status.conditions[?(@.type==\"Ready\")].message
+
+# Step 3: Inspect active HelmReleases
+kubectl get helmreleases.helm.toolkit.fluxcd.io -A
+
+# Step 4: Trace reconciliation events for a specific Kustomization
+# flux get kustomizations --status-selector ready=false
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the relationship between `GitRepository` and `Kustomization` in Flux CD v2?**
+
+`GitRepository` is a **Source** resource managed by `source-controller` that handles connecting to Git, cloning commits, verifying cryptographic signatures, and packaging manifests into an immutable `.tar.gz` artifact. `Kustomization` is a **Reconciliation** resource managed by `kustomize-controller` that consumes the artifact produced by `GitRepository`, decrypts SOPS secrets, executes Kustomize overlays, and applies the rendered manifests to the Kubernetes API server using Server-Side Apply.
+
+**Q2: How does `dependsOn` in a Flux `Kustomization` prevent broken multi-tier deployments?**
+
+The `dependsOn` array allows platform engineers to define a Directed Acyclic Graph (DAG) of infrastructure dependencies. For example, an application `Kustomization` can specify `dependsOn: [{ name: cert-manager }]`. Flux's `kustomize-controller` will evaluate the status of the `cert-manager` Kustomization: if it is not in a `Ready: True` state, Flux blocks the application Kustomization from executing, ensuring prerequisite CRDs and certificates exist before workloads start.
+
+**Q3: How do `healthChecks` work inside a Flux `Kustomization`?**
+
+By default, Flux marks a Kustomization as `Ready` as soon as the Kubernetes API server accepts the manifests. Adding `spec.healthChecks` instructs the `kustomize-controller` to actively wait until the declared target resources (Deployments, StatefulSets, DaemonSets) have passed their readiness probes and reached a fully operational state (e.g. `status.readyReplicas == status.replicas`). If health checks time out, the Kustomization transitions to `Ready: False`, halting downstream deployments.
+
+**Q4: How does `HelmRelease` handle failed chart upgrades automatically?**
+
+When `spec.upgrade.remediation.remediateLastFailure: true` is configured, Flux's `helm-controller` executes an automated health check after running the Helm upgrade. If the new pods fail to start or Helm test hooks fail within the configured `timeout` (e.g. 5 minutes), the controller automatically triggers `helm rollback`, restoring the previous working release version and marking the `HelmRelease` status with an error event.
+
+**Q5: What is the difference between Flux `Kustomization` (`kustomize.toolkit.fluxcd.io`) and a standard `kustomization.yaml` file?**
+
+- `kustomization.yaml`: A static configuration file used by the open-source Kustomize CLI tool defining resources, patches, and generators.
+- `Kustomization` (CRD): A Kubernetes Custom Resource in Flux that directs the `kustomize-controller` on *how*, *when*, and *where* to apply a directory containing a `kustomization.yaml` file, configuring polling intervals, pruning, health checks, ServiceAccount impersonation, and dependency ordering.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `GitRepository` fetches and tarballs source code; `Kustomization` applies it
+- [ ] Know how `dependsOn` constructs strict dependency execution graphs across modules
+- [ ] Know that `healthChecks` ensure pods are Ready before marking Kustomizations successful
+- [ ] Know how `prune: true` eliminates orphaned resources deleted from Git
+- [ ] Know how `HelmRelease` automates Helm chart lifecycle and rollback on failure
+- [ ] Can inspect Flux resource trees using `kubectl get gitrepositories,kustomizations,helmreleases -A`

@@ -1,0 +1,211 @@
+---
+title: "Chapter 2 — Kueue Cohorts & GPU Borrowing"
+sidebar_position: 2
+module: "Module 10.4 — Kueue Batch Queuing"
+description: "Master multi-tenant GPU sharing in Kueue — Cohorts, nominal quotas, borrowing limits, fair-sharing algorithms, and automated preemption reclamation."
+---
+
+# Chapter 2 — Multi-Tenant GPU Sharing: Cohorts & Borrowing
+
+> **Goal:** Master multi-tenant GPU cost optimization, dynamic resource pooling, and fair-share scheduling in **CNCF Kueue** — grouping independent `ClusterQueues` into shared **Cohorts**, configuring **Nominal Quotas**, **Borrowing Limits**, and **Lending Limits**, analyzing how teams burst into idle GPU capacity without financial over-provisioning, and orchestrating automated **Preemption & Quota Reclamation** when lending teams reclaim their hardware.
+>
+> By the end of this chapter, you will understand:
+> 1. How Kueue Cohorts enable cooperative multi-tenant GPU sharing across engineering departments
+> 2. The mathematical mechanics of `nominalQuota`, `borrowingLimit`, and `lendingLimit`
+> 3. How borrowing allows high-priority AI workloads to burst beyond base allocations
+> 4. How Kueue executes automated preemption (`reclaimWithinCohort`) when lending teams submit jobs
+> 5. How PriorityClasses govern which workloads are suspended vs terminated during evictions
+> 6. How to author production Cohort configurations with guaranteed fair-sharing boundaries
+
+---
+
+## Real-Life Analogy
+
+Think of Kueue Cohorts and GPU Borrowing as **a cooperative corporate equipment lending program between two engineering departments in the same company**:
+
+- **The Rigid Partition Waste (Without Cohorts):**
+  - Team NLP has a budget for 8 GPUs (**`nominalQuota: 8`**).
+  - Team Vision has a budget for 8 GPUs (**`nominalQuota: 8`**).
+  - On Friday night, Team Vision goes home for the weekend (**8 GPUs sit 100% idle and wasted, costing \$5,000 in unused cloud fees**).
+  - Team NLP has a critical LLM training deadline, but their queue is blocked because they only have 8 GPUs (**Artificial Bottleneck**).
+- **The Cooperative Cohort Treaty (`cohort: research-rnd`):**
+  - Team NLP and Team Vision sign a sharing agreement (**Join the same Cohort**).
+  - The rule: *"If Team Vision is asleep, Team NLP is allowed to borrow their 8 idle GPUs (**`borrowingLimit: 8`**) and train on all 16 GPUs at double speed!"*
+- **The Automatic Reclamation Rule (Preemption & Eviction):**
+  - On Monday at 9:00 AM, Team Vision comes into work and submits a high-priority vision job.
+  - The maître d' (**Kueue**) politely walks up to Team NLP: *"Thank you for using the borrowed GPUs. Team Vision is back (**`reclaimWithinCohort`**)."*
+  - Kueue checkpoints Team NLP's lowest-priority batch job, pauses it, and hands the 8 GPUs back to Team Vision in **under 10 seconds**!
+
+---
+
+## Architecture Diagram
+
+```text
+               Kueue Cohorts: Dynamic GPU Borrowing & Quota Reclamation
+
+ COHORT POOL: `enterprise-ai-rnd` (Total Shared Physical Pool: 16x H100 GPUs)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TEAM NLP CLUSTERQUEUE                  TEAM VISION CLUSTERQUEUE        │
+ │ - Nominal Quota:  8 GPUs               - Nominal Quota:  8 GPUs        │
+ │ - Borrowing Limit: 8 GPUs (Max: 16)    - Borrowing Limit: 8 GPUs       │
+ └──────────────────┬───────────────────────────────────┬─────────────────┘
+                    │                                   │
+                    ▼ STATE 1: TEAM VISION IDLE         ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TEAM NLP BURSTS TO 16 GPUs! (Consumes 8 Nominal + 8 Borrowed GPUs!)    │
+ │ (100% Cluster Utilization achieved over the weekend!)                  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ STATE 2: TEAM VISION SUBMITS NEW JOB!
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUEUE COHORT RECLAMATION CONTROLLER (`reclaimWithinCohort`):           │
+ │ 1. Identifies that Team NLP is exceeding its 8-GPU nominal quota.      │
+ │ 2. Preempts / Suspends Team NLP's lowest-priority borrowing Workload.  │
+ │ 3. Returns 8 GPUs to Team Vision within seconds! (Zero starvation!)    │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Cohort Quota Terminology & Parameters
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Parameter            │ Configuration Level     │ Mathematical & Scheduling Meaning                 │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`nominalQuota`**   │ `ClusterQueue` Resource │ The guaranteed baseline capacity reserved for this│
+ │                      │                         │ team. The team can ALWAYS run this many GPUs.     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`borrowingLimit`** │ `ClusterQueue` Resource │ The maximum extra capacity this queue is permitted│
+ │                      │                         │ to borrow from idle siblings in the cohort.       │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`lendingLimit`**   │ `ClusterQueue` Resource │ The maximum capacity this queue is willing to lend│
+ │                      │                         │ to other teams (protects local reserve buffers).  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`cohort`**         │ `ClusterQueue` Metadata │ The string name grouping multiple queues into a   │
+ │                      │                         │ unified resource sharing pool.                    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Team NLP `ClusterQueue` with Borrowing Limits
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: nlp-cluster-queue
+spec:
+  cohort: enterprise-ai-rnd            # Binds to shared R&D Cohort!
+  queueingStrategy: BestEffortFIFO
+  # 1. Preemption & Fair-Sharing Policies
+  preemption:
+    reclaimWithinCohort: LowerPriority # Reclaims quota from lower priority borrowing jobs
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: nvidia-h100-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 8          # Guaranteed 8 GPUs
+              borrowingLimit: 8        # Can burst up to 16 GPUs if Vision is idle!
+```
+
+---
+
+## 2. Team Vision `ClusterQueue` in Same Cohort
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: vision-cluster-queue
+spec:
+  cohort: enterprise-ai-rnd            # Same Cohort name!
+  queueingStrategy: BestEffortFIFO
+  preemption:
+    reclaimWithinCohort: Any           # Reclaims quota from ANY borrowing workload!
+    withinClusterQueue: LowerPriority
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: nvidia-h100-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 8          # Guaranteed 8 GPUs
+              borrowingLimit: 8
+```
+
+---
+
+## Preemption & Eviction Mechanics
+
+```text
+ The 3-Step Kueue Preemption Algorithm:
+ 1. Workload Submission: Team Vision submits a Job requesting 8 GPUs.
+ 2. Quota Check: Vision has used 0/8 nominal quota, but all 16 cluster GPUs are busy (NLP is using 16).
+ 3. Target Selection & Preemption:
+    - Kueue identifies that NLP is currently borrowing 8 GPUs.
+    - Kueue locates NLP's lowest-priority Workloads.
+    - Kueue evicts/suspends NLP's borrowing Workload (`spec.suspend: true`).
+    - Kueue admits Vision's Workload immediately!
+```
+
+---
+
+## Hands-On Lab: Inspecting Cohort Quotas & Preemption Events
+
+```bash
+# Step 1: Query all ClusterQueues and inspect Cohort memberships
+kubectl get clusterqueues.kueue.x-k8s.io -o custom-columns=NAME:.metadata.name,COHORT:.spec.cohort,FLAVOR:.spec.resourceGroups[0].flavors[0].name,NOMINAL:.spec.resourceGroups[0].flavors[0].resources[0].nominalQuota,BORROWING_LIMIT:.spec.resourceGroups[0].flavors[0].resources[0].borrowingLimit 2>/dev/null || echo "Kueue Cohorts active"
+
+# Step 2: Query active Workloads currently borrowing quota
+kubectl get workloads.kueue.x-k8s.io -A -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace,ADMITTED_FLAVOR:.status.admission.clusterQueue
+
+# Step 3: Check Kueue preemption and eviction events in controller logs
+# kubectl logs -n kueue-system -l control-plane=controller-manager --tail=50 | grep -i "preempt"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a "Cohort" in CNCF Kueue, and what problem does it solve?**
+
+A **Cohort** is a grouping mechanism that binds multiple independent `ClusterQueues` into a shared, cooperative resource pool. In traditional static quota models, unused GPU quotas assigned to Team A sit idle even when Team B has a massive backlog of training jobs. By joining a Cohort, `ClusterQueues` can **lend their idle GPU capacity to sibling teams dynamically**, maximizing expensive GPU hardware utilization across the enterprise while strictly respecting guaranteed baseline quotas.
+
+**Q2: What is the difference between `nominalQuota` and `borrowingLimit` in Kueue?**
+
+- **`nominalQuota`**: The **guaranteed baseline capacity** assigned to a team's `ClusterQueue`. Workloads running within nominal quota cannot be preempted by sibling queues in the cohort.
+- **`borrowingLimit`**: The **maximum extra capacity** above nominal quota that a queue is allowed to borrow from idle cohort peers (e.g. `nominalQuota: 8`, `borrowingLimit: 8` allows bursting up to 16 total GPUs).
+
+**Q3: How does Kueue handle preemption when a lending queue requires its quota back?**
+
+When Team A is borrowing quota from Team B, and Team B submits a new job:
+1. Kueue's **`reclaimWithinCohort`** preemption engine detects that Team B is requesting resources within its own `nominalQuota`.
+2. Kueue identifies the active workloads in Team A that are currently consuming borrowed capacity.
+3. It selects Team A's lowest-priority borrowing workload, triggers a graceful eviction/suspension (`spec.suspend: true`), and instantly admits Team B's job.
+
+**Q4: What is the purpose of `lendingLimit` in a `ClusterQueue`?**
+
+`lendingLimit` defines the maximum amount of quota that a `ClusterQueue` is willing to share with other queues in the cohort. If Team A has a `nominalQuota: 16` and a `lendingLimit: 8`, it ensures that at least 8 GPUs will always remain physically reserved as a local buffer for Team A, preventing sibling teams from exhausting 100% of Team A's idle capacity.
+
+**Q5: How does Kueue prevent "Preemption Thrashing" (ping-pong evictions between teams)?**
+
+To prevent preemption thrashing (where two teams continuously evict each other's jobs in an infinite loop):
+1. Kueue enforces strict **Nominal Quota Immunity**: A workload running strictly within its own queue's `nominalQuota` is mathematically **immune from cohort preemption**.
+2. Only workloads that are actively consuming **borrowed capacity** can be targeted for reclamation preemption.
+3. Workloads can specify a `borrowingPreemptionCooldown` to prevent rapid re-borrowing cycles.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Cohorts pool idle GPU capacity across multiple `ClusterQueues`
+- [ ] Know the difference: `nominalQuota` (Guaranteed) vs `borrowingLimit` (Burst)
+- [ ] Know that workloads within nominal quota are immune from cohort preemption
+- [ ] Know how `reclaimWithinCohort` automatically returns GPUs to rightful owners
+- [ ] Know how `lendingLimit` protects local reserve buffers from full exhaustion
+- [ ] Can view active cohort borrowing using `kubectl get clusterqueues -o yaml`

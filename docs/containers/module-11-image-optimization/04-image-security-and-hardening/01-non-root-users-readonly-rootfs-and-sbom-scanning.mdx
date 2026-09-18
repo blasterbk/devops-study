@@ -1,0 +1,220 @@
+---
+title: "Chapter 1 — Image Hardening: Non-Root, Read-Only rootfs & SBOMs"
+sidebar_position: 1
+module: "Module 11.4 — Security & Hardening"
+description: "Master container image hardening — non-root execution (UID 10001), read-only root filesystems, Software Bill of Materials (SBOMs), and automated Trivy CVE scanning."
+---
+
+# Chapter 1 — Image Hardening: Non-Root, Read-Only rootfs & SBOMs
+
+> **Goal:** Master the security architecture, principle of least privilege, and supply chain inventory standards of **Container Image Hardening** — enforcing **Non-Root User Execution (`USER 10001`)**, locking containers with an immutable **Read-Only Root Filesystem (`readOnlyRootFilesystem: true`)**, generating machine-readable **Software Bill of Materials (SBOMs in SPDX/CycloneDX)**, and integrating automated **Trivy Vulnerability Scanning** into enterprise CI/CD gates.
+>
+> By the end of this chapter, you will understand:
+> 1. Why running container processes as `UID 0 (root)` is a critical security vulnerability
+> 2. How to create and enforce explicit unprivileged user accounts (`appuser`, `nonroot`)
+> 3. How Read-Only Root Filesystems prevent malware persistence and runtime tampers
+> 4. How to configure `tmpfs` mounts for temporary scratch writes in hardened pods
+> 5. How to generate signed SBOMs using Syft and Cosign attestations
+> 6. How to author production Kubernetes manifests with enterprise `securityContext` settings
+
+---
+
+## Real-Life Analogy
+
+Think of Container Image Hardening as **securing a modern automated teller machine (ATM)**:
+
+- **The Unhardened Container (An ATM with Root Admin Access & Writable Firmware):**
+  - The customer touches the screen with root privileges (**Container running as `UID 0`**).
+  - The operating system drive is completely writable (**Writable rootfs**).
+  - If a burglar finds a software bug, they can rewrite the ATM's internal code, install hidden keyloggers on the hard drive (**Malware persistence**), and command the ATM to dispense all cash (**Host takeover**)!
+- **The Hardened Container (The Fortified High-Security ATM):**
+  - **1. Non-Root User:** The customer interaction software runs as an unprivileged guest account (**`USER 10001:10001`**).
+  - **2. Read-Only Rootfs:** The entire operating system is burned into a read-only ROM chip (**`readOnlyRootFilesystem: true`**). Even if an attacker injects malicious code, they cannot write a single file to `/bin` or `/etc`!
+  - **3. The Software Bill of Materials (SBOM):** A signed, certified manifest taped to the circuit board listing every microchip, capacitor, and bolt inside the machine (**Detailed inventory of all open-source packages**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Hardened Container Security Architecture & Defense Layers
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES POD SECURITY CONTEXT (Deploy-Time Enforcement):             │
+ │                                                                        │
+ │ ├── 1. UNPRIVILEGED USER: `runAsNonRoot: true` & `runAsUser: 10001`    │
+ │ │   - Strips process of all host root capabilities!                    │
+ │ │                                                                      │
+ │ ├── 2. IMMUTABLE FILESYSTEM: `readOnlyRootFilesystem: true`            │
+ │ │   - Entire rootfs (`/`) is mounted read-only!                        │
+ │ │   - Writes to `/etc`, `/bin`, `/usr` return `EROFS` (Read-only fs)!  │
+ │ │                                                                      │
+ │ ├── 3. EPHEMERAL SCRATCH: `emptyDir: { medium: "Memory" }` on `/tmp`   │
+ │ │   - Temporary volatile RAM mount for scratch cache writes only       │
+ │ │                                                                      │
+ │ └── 4. CAPABILITY STRIPPING: `capabilities: { drop: ["ALL"] }`         │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Supply Chain Validation
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ SUPPLY CHAIN SECURITY (Build-Time):                                    │
+ │ ├── SBOM Generation: Syft / CycloneDX JSON inventory                   │
+ │ └── Vulnerability Gate: Trivy scan fails CI on CRITICAL CVEs!          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Enforcing Non-Root Execution
+
+By default, containers run as `UID 0 (root)`. If an attacker achieves Remote Code Execution (RCE), they operate with full administrative power inside the container and can exploit host kernel vulnerabilities.
+
+### The Dockerfile Non-Root Pattern:
+```dockerfile
+# Create an explicit unprivileged system group and user
+RUN groupadd -g 10001 appgroup && \
+    useradd -u 10001 -g appgroup -s /sbin/nologin -M appuser
+
+# Set ownership of application files
+WORKDIR /app
+COPY --chown=10001:10001 . .
+
+# Switch execution user to non-root!
+USER 10001:10001
+ENTRYPOINT ["/app/server"]
+```
+
+---
+
+## 2. Read-Only Root Filesystems
+
+Making the root filesystem read-only eliminates entire classes of attacks (e.g. downloading malware binaries to `/tmp` or altering `/etc/passwd`):
+
+### Kubernetes SecurityContext Manifest:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened-app
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: api
+    image: my-app:v1.0.0
+    securityContext:
+      readOnlyRootFilesystem: true      # 🔒 Immutable rootfs!
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]                   # 🛡️ Drop all Linux capabilities!
+    volumeMounts:
+    - name: tmp-scratch
+      mountPath: /tmp
+  volumes:
+  - name: tmp-scratch
+    emptyDir:
+      medium: Memory                    # Volatile RAM for temporary files
+      sizeLimit: 64Mi
+```
+
+---
+
+## 3. Software Bill of Materials (SBOM) & Trivy Scanning
+
+An **SBOM (Software Bill of Materials)** provides a complete, auditable list of all libraries, dependencies, and OS packages in an image:
+
+```bash
+# Generate a CycloneDX SBOM JSON using Syft
+syft my-app:v1.0.0 -o cyclonedx-json=sbom.json
+
+# Scan an image for CVEs and fail the build on Critical vulnerabilities!
+trivy image --exit-code 1 --severity CRITICAL my-app:v1.0.0
+```
+
+---
+
+## Enterprise Image Hardening Checklist
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Hardening Practice   │ Enterprise Implementation Standard                                          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Base Image**    │ Use Minimal Distroless (`gcr.io/distroless/static`) or Alpine.              │
+ │ **2. User Account**  │ Never run as root. Enforce explicit numeric UID (`USER 10001`).             │
+ │ **3. Root Filesystem**│ Enforce `readOnlyRootFilesystem: true` with `tmpfs` mounts for `/tmp`.     │
+ │ **4. Capabilities**  │ Drop all capabilities (`drop: ["ALL"]`); add only specific needed caps.     │
+ │ **5. Privilege Esc** │ Set `allowPrivilegeEscalation: false` to block setuid binaries.             │
+ │ **6. Seccomp**       │ Enforce `seccompProfile: { type: RuntimeDefault }`.                         │
+ │ **7. Supply Chain**  │ Generate CycloneDX SBOM and sign image with Sigstore Cosign.                │
+ │ **8. Vulnerability** │ Block CI deployments with unresolved CRITICAL or HIGH CVEs.                 │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Testing a Hardened Read-Only Container
+
+```bash
+# Step 1: Run a hardened container with read-only rootfs and dropped privileges
+docker run --rm -it \
+  --read-only \
+  --user 10001:10001 \
+  --cap-drop ALL \
+  --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+  alpine sh
+
+# Inside the container:
+# Attempt to write to root filesystem:
+# touch /etc/hacked.txt
+# Output: touch: /etc/hacked.txt: Read-only file system (Blocked!)
+
+# Attempt to write to temporary scratch mount:
+# touch /tmp/scratch.txt
+# Output: Success! (Volatile RAM only)
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is running containers as a non-root user (`USER 10001`) a mandatory security requirement in Kubernetes?**
+
+By default, container processes run as `UID 0 (root)`. If an attacker compromises an application running as root:
+1. Any directory mounted via host bind mounts can be overwritten by root on the host filesystem.
+2. If the container shares a host namespace (e.g. host PID or network), root processes can inspect and kill host processes.
+3. Any kernel vulnerability (e.g. dirty COW, dirty pipe, runc breakouts) requires root privileges to trigger privilege escalation to the host kernel.
+Running as an unprivileged UID (such as `10001`) eliminates these attack vectors by strictly enforcing standard Linux user permission boundaries.
+
+**Q2: What are the security benefits of configuring `readOnlyRootFilesystem: true`?**
+
+Setting `readOnlyRootFilesystem: true` mounts the container's root filesystem (`/`) as immutable and read-only:
+1. **Prevents Malware Persistence**: Attackers cannot download botnet binaries, coin miners, or backdoor web shells to `/var/www`, `/bin`, or `/usr`.
+2. **Prevents Privilege Modification**: Attackers cannot overwrite `/etc/passwd`, `/etc/shadow`, or `/etc/sudoers`.
+3. **Enforces Stateless Architecture**: Any temporary scratch data must be explicitly routed to ephemeral `tmpfs` mounts, ensuring container state is never accidentally coupled to local storage.
+
+**Q3: What is a Software Bill of Materials (SBOM), and why is it critical for enterprise compliance?**
+
+An SBOM is a formal, machine-readable inventory of all software components, third-party libraries, licenses, and dependencies bundled inside a container image (formatted in SPDX or CycloneDX JSON). When a major zero-day vulnerability (such as Log4j or OpenSSL vulnerabilities) is announced, security teams can **query their centralized SBOM database across millions of containers in seconds** to instantly identify every vulnerable container across the enterprise without needing to re-scan every running image from scratch.
+
+**Q4: Why should Dockerfile `USER` directives use numeric UIDs (e.g. `USER 10001`) instead of usernames (e.g. `USER appuser`)?**
+
+When a username like `USER appuser` is used, Kubernetes and container runtimes must read `/etc/passwd` inside the container image to resolve the numeric UID. If Kubernetes enforces a `PodSecurityStandard` policy requiring `runAsNonRoot: true`, the admission controller or Kubelet cannot verify that the user is non-root *before* pulling and unpacking the image. Specifying a **numeric UID (`USER 10001`)** allows Kubernetes admission controllers to validate compliance statically and immediately.
+
+**Q5: How does dropping all Linux capabilities (`drop: ["ALL"]`) protect the host system?**
+
+Even if an attacker gains root access (`UID 0`) inside a container, root's power in Linux is governed by POSIX capabilities (`CAP_*`). Dropping all capabilities (`capabilities: { drop: ["ALL"] }`) strips the process of abilities like `CAP_NET_RAW` (packet sniffing/spoofing), `CAP_SYS_ADMIN` (mounting filesystems/loading BPF), `CAP_CHOWN` (changing file ownership), and `CAP_KILL` (killing other processes). The process becomes functionally equivalent to an unprivileged user even if its UID is 0.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that non-root execution (`USER 10001`) prevents host privilege escalation
+- [ ] Know that `readOnlyRootFilesystem: true` stops malware persistence and file tampering
+- [ ] Know how to mount memory-backed `tmpfs` volumes for temporary `/tmp` writes
+- [ ] Know that `drop: ["ALL"]` strips all 40+ Linux kernel capabilities
+- [ ] Know that SBOMs (CycloneDX/SPDX) provide a complete dependency inventory
+- [ ] Can configure production Kubernetes `securityContext` settings

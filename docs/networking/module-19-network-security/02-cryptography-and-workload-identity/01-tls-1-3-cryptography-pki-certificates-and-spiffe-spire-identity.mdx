@@ -1,0 +1,154 @@
+---
+title: "Chapter 2 — Cryptography & Workload Identity: TLS 1.3, PKI, mTLS & SPIFFE/SPIRE"
+sidebar_position: 1
+module: "Module 19.2 — Cryptography & Identity"
+description: "Master enterprise network cryptography — TLS 1.3 cryptographic handshake (1-RTT), Public Key Infrastructure (PKI X.509 Certificate Authorities), Mutual TLS (mTLS), OCSP Stapling, and SPIFFE/SPIRE workload attestation."
+---
+
+# Chapter 2 — Cryptography & Workload Identity: TLS 1.3, PKI, mTLS & SPIFFE/SPIRE
+
+> **Goal:** Master the cryptographic foundations of modern network security. Dissect the **TLS 1.3 handshake (RFC 8446)**, Public Key Infrastructure (PKI) Certificate Authority (CA) hierarchies, X.509 certificate validation chains, OCSP Stapling vs CRLs, Mutual TLS (mTLS) enforcement, and the CNCF standard for cryptographic workload identity: **SPIFFE (Secure Production Identity Framework for Everyone)** and **SPIRE (the SPIFFE Runtime Environment)**.
+>
+> By the end of this chapter, you will understand:
+> 1. TLS 1.3 vs TLS 1.2: 1-RTT handshake latency, removal of obsolete broken ciphers (RSA key exchange, CBC mode, RC4, MD5, SHA-1), and mandatory Ephemeral Diffie-Hellman (ECDHE)
+> 2. The 5 standard TLS 1.3 Cipher Suites (e.g. `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`)
+> 3. X.509 PKI Chain of Trust: Root CA $\to$ Intermediate CA $\to$ Leaf (End-Entity) Certificate
+> 4. Certificate revocation: Certificate Revocation Lists (CRL) vs Online Certificate Status Protocol (OCSP) Stapling (RFC 6066)
+> 5. Mutual TLS (mTLS): Two-way cryptographic authentication where both client and server validate certificates
+> 6. SPIFFE/SPIRE architecture: SPIFFE IDs, SVIDs (X.509 / JWT), SPIRE Server, SPIRE Agent, and Node/Workload Attestation
+
+---
+
+## Real-Life Analogy
+
+Think of PKI and SPIFFE/SPIRE as **a government biometric passport issuing authority**:
+
+- **Root Certificate Authority (The Federal Department of State):**
+  - Stored in a bank vault with an air-gapped safe (**Offline Root CA**). It signs the credentials of the regional passport agency (**Intermediate CA**).
+- **TLS 1.3 (Instant Identity Verification):**
+  - You hand your passport to a border guard. In 1 single conversation step (**1-RTT Handshake**), you exchange temporary encryption codes (**Diffie-Hellman**) and prove the passport is genuine without revealing your secret master signature.
+- **SPIFFE / SPIRE (Automated Microservice Biometrics):**
+  - Instead of forcing developers to hardcode API passwords in text files, an in-kernel security officer (**SPIRE Agent**) inspects the running container's Linux UID, cgroup, and namespace (**Workload Attestation**).
+  - The officer issues a short-lived, 1-hour cryptographic passport (**X.509 SVID**) directly into the container's memory socket, automatically renewing it every 30 minutes!
+
+---
+
+## Architecture Diagram
+
+```text
+                  TLS 1.3 1-RTT Handshake & SPIRE Workload Attestation
+                  
+ 1. TLS 1.3 1-RTT HANDSHAKE (Full Encryption in 1 Network Round-Trip):
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ Client                                                               Server │
+ │    │                                                                   │    │
+ │    │─── ClientHello (Key Share: ECDHE + Supported Ciphers) ───────────►│    │
+ │    │                                                                   │    │
+ │    │◄── ServerHello (Key Share: ECDHE) + EncryptedExtensions ──────────│    │
+ │    │    + Certificate (X.509) + CertificateVerify + Finished           │    │
+ │    ▼                                                                   ▼    │
+ │ [ 1 RTT: Shared AES-256-GCM Session Key Established -> Encrypted Data Streams ]
+ └─────────────────────────────────────────────────────────────────────────────┘
+ 
+ 2. SPIRE WORKLOAD ATTESTATION ARCHITECTURE:
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES WORKER NODE                                                      │
+ │                                                                             │
+ │ ┌──────────────────────┐                      ┌───────────────────────────┐ │
+ │ │ [Microservice Pod A] │                      │ [SPIRE Agent DaemonSet]   │ │
+ │ │ - Wants SPIFFE ID    │                      │ - Queries Kernel: UID,    │ │
+ │ │                      │                      │   Cgroups, K8s Pod labels │ │
+ │ │ Calls Workload API   ├────── Unix Socket ──►│ (Workload Attestation)    │ │
+ │ │ (/tmp/spire-agent)   │◄───── SVID (X.509) ──┤                           │ │
+ │ └──────────────────────┘   (Valid 1 Hour)     └─────────────┬─────────────┘ │
+ └─────────────────────────────────────────────────────────────┼───────────────┘
+                                                               │ Node Attest
+                                                               ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ SPIRE SERVER (Central Identity Authority & Root CA)                         │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. TLS 1.3 vs TLS 1.2: Modern Cryptographic Primitives
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Feature              │ Legacy TLS 1.2                           │ Modern TLS 1.3 (RFC 8446)                │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **Handshake Latency**│ **2 RTT** (Initial setup)                │ **1 RTT** (or 0-RTT Resumption)          │
+ │ **Forward Secrecy**  │ Optional (Static RSA permitted)          │ **Mandatory (Strictly ECDHE / DHE)**     │
+ │ **Obsolete Ciphers** │ Permitted (RC4, 3DES, CBC mode, SHA-1)   │ **Completely Removed from Spec**         │
+ │ **Handshake Privacy**│ Server Certificate sent in plain text    │ **Server Certificate fully ENCRYPTED**   │
+ │ **Supported Ciphers**│ 30+ complex combinations                 │ **5 Clean AEAD Ciphers Only**            │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 2. SPIFFE ID URI & SVID Formats
+
+A SPIFFE ID is a standardized URI:
+
+$$\text{spiffe://}\underbrace{\text{prod.acme.corp}}_{\text{Trust Domain}}/\underbrace{\text{ns/payment/sa/checkout-service}}_{\text{Workload Path}}$$
+
+- **X.509 SVID (SPIFFE Verifiable Identity Document):** An X.509 leaf certificate with the SPIFFE ID encoded inside the `Subject Alternative Name (SAN)` URI field.
+- **JWT SVID:** A signed JSON Web Token with `sub: "spiffe://..."` for Layer 7 HTTP header authorization.
+
+---
+
+## Hands-On Lab: Inspecting TLS 1.3 Handshakes & X.509 Certificates
+
+```bash
+# Step 1: Query an endpoint and force TLS 1.3 to inspect cipher suite and handshake
+openssl s_client -connect google.com:443 -tls1_3 -brief
+
+# Step 2: Inspect X.509 certificate subject, issuer, and SAN extensions
+echo | openssl s_client -connect google.com:443 2>/dev/null | openssl x509 -noout -text | grep -E "(Subject:|Issuer:|DNS:)"
+
+# Step 3: Verify OCSP Stapling response from a public web server
+echo | openssl s_client -connect cloudflare.com:443 -status 2>/dev/null | grep -A 10 "OCSP response:"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why did TLS 1.3 eliminate static RSA key exchange in favor of mandatory Ephemeral Diffie-Hellman (ECDHE)?**
+
+In static RSA key exchange, if an attacker records encrypted network traffic for months and later steals the server's private RSA key, they can **retroactively decrypt all historical captured sessions**. **Ephemeral Diffie-Hellman (ECDHE)** generates temporary, disposable cryptographic keys for every individual session (**Perfect Forward Secrecy**). Even if the server's master private key is compromised in the future, past recorded sessions remain permanently mathematically unbreakable.
+
+**Q2: What is OCSP Stapling and why is it superior to traditional Certificate Revocation Lists (CRLs)?**
+
+- **CRL:** The browser downloads a massive multi-megabyte list of all revoked certificates from the CA on every connection (slow, bandwidth-heavy).
+- **OCSP Query:** The browser queries the CA's OCSP server directly for every website visited (leaks user browsing history to the CA and adds 100ms latency).
+- **OCSP Stapling (RFC 6066):** The **web server itself** queries the CA periodically, gets a cryptographically timestamped OCSP proof, and "staples" it directly to the TLS handshake. The browser verifies revocation in **0ms with zero CA queries and complete privacy**.
+
+**Q3: What is the difference between Mutual TLS (mTLS) and standard one-way TLS?**
+
+- **Standard TLS (One-Way):** Only the server presents a certificate. The client verifies the server's identity (e.g. your browser verifies it is connected to `bank.com`), but the server does not know who the client is until the user enters a password.
+- **Mutual TLS (mTLS / Two-Way):** Both the server AND the client present X.509 certificates during the TLS handshake. The server verifies the client's certificate against its trusted Root CA before allowing any TCP bytes to flow, providing strong cryptographic authentication at the transport layer.
+
+**Q4: How does SPIRE perform Workload Attestation on a Kubernetes node?**
+
+1. A container calls the local SPIRE Agent over a Unix domain socket (`/tmp/spire-agent/public/api.sock`).
+2. The SPIRE Agent queries the Linux kernel to inspect the caller's process ID (PID), User ID (UID), cgroup paths, and container namespace.
+3. The SPIRE Agent queries the local `kubelet` API to match the PID to Kubernetes metadata (Namespace, ServiceAccount, Pod Labels).
+4. If the metadata matches a configured SPIFFE Registration Entry, SPIRE issues an in-memory **X.509 SVID** without passwords or static secrets.
+
+**Q5: What is SPIFFE Federation and how does it enable multi-cloud zero-trust communication?**
+
+SPIFFE Federation connects two independent Trust Domains (e.g. `spiffe://aws.acme.corp` and `spiffe://gcp.acme.corp`). The SPIRE servers securely exchange their public Root CA bundles. When a microservice in AWS calls a microservice in GCP via mTLS, the GCP server validates the AWS workload's SVID against the federated AWS Root CA, enabling **seamless, zero-trust cross-cloud authentication with zero shared passwords**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master TLS 1.3 (1-RTT handshake, mandatory ECDHE, encrypted certs)
+- [ ] Understand PKI Chain of Trust: Root CA $\to$ Intermediate CA $\to$ Leaf Cert
+- [ ] Master OCSP Stapling (RFC 6066) for zero-latency certificate revocation
+- [ ] Understand Mutual TLS (mTLS) two-way cryptographic verification
+- [ ] Master SPIFFE IDs (`spiffe://trust-domain/...`) and SPIRE workload attestation

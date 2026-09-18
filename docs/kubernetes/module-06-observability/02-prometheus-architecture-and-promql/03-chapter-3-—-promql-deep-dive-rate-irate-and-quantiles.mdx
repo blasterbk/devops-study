@@ -1,0 +1,233 @@
+---
+title: "Chapter 3 — PromQL Deep Dive: Rate, Irate & Quantiles"
+sidebar_position: 3
+module: "Module 6.2 — Prometheus & PromQL"
+description: "Master PromQL (Prometheus Query Language) — Instant vs Range Vectors, rate() vs irate(), histogram_quantile calculations, CPU/memory formulas, and vector matching (group_left)."
+---
+
+# Chapter 3 — PromQL Deep Dive: Rate, Irate & Quantiles
+
+> **Goal:** Master the Prometheus Query Language (PromQL) — understanding the fundamental mathematical differences between Instant Vectors and Range Vectors, analyzing metric types (Counter, Gauge, Histogram, Summary), breaking down the exact mechanics of `rate()`, `irate()`, and `increase()`, calculating p95/p99 latency with `histogram_quantile`, authoring robust production Kubernetes CPU/memory queries, and executing vector joins using `group_left` and `group_right`.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4 PromQL data types: Instant Vector, Range Vector, Scalar, and String
+> 2. The 4 Prometheus metric types: Counter, Gauge, Histogram, and Summary
+> 3. The mathematical difference between `rate()` (smoothing average) and `irate()` (instantaneous spike)
+> 4. How `histogram_quantile` interpolates 95th and 99th percentile latencies from `_bucket` counters
+> 5. Production PromQL formulas for Pod CPU core usage and Memory percentage against limits
+> 6. How to execute 1-to-many vector joins using `on()` and `group_left`
+
+---
+
+## Real-Life Analogy
+
+Think of PromQL vector functions as **different ways a football coach analyzes a player's running speed and heart rate during a match**:
+
+- **Counter vs Gauge (The Odometer vs The Tachometer):**
+  - **Counter (`http_requests_total`):** The car's odometer. It only goes up (0 miles $\to$ 100,000 miles), except when the car breaks down and you replace the engine (**Counter Reset on Pod Restart**).
+  - **Gauge (`container_memory_working_set_bytes`):** The tachometer or fuel gauge. It goes up when you accelerate and drops down when you idle.
+- **`rate()` vs `irate()` (The 5-Minute Average vs The Radar Gun):**
+  - **`rate(v[5m])` (The 5-Minute Average Speed):** The coach looks at the total distance run over the last 5 minutes and computes your smooth average pace (**Ideal for Alerting and SLOs**).
+  - **`irate(v[5m])` (The Laser Speed Gun):** The coach points a radar gun at the exact last 2 strides to catch your instantaneous 25 mph sprint (**Ideal for fast-spiking dashboards**).
+- **`histogram_quantile` (The Ticket Line Distribution):** If 1,000 fans enter a stadium, you don't save 1,000 individual timestamps (too much data!). You drop tickets into buckets: $\le 1\text{s}$, $\le 5\text{s}$, $\le 10\text{s}$. The `histogram_quantile(0.99)` calculates the exact wait time that 99% of fans experienced.
+
+---
+
+## Architecture Diagram
+
+```text
+               PromQL Query Engine & Vector Transformations
+
+ 1. RANGE VECTOR SELECTION: `http_requests_total[5m]`
+ Time Window: [T - 5m ................................................. T]
+ Samples:     [ 1020, 1045, 1080, 1120, 1175, 1240, 1310, 1390, 1480 ]
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PromQL FUNCTION EVALUATION:                                            │
+ │                                                                        │
+ │ Case A: `rate(http_requests_total[5m])`                                │
+ │   - Calculates: (1480 - 1020) / 300 seconds = 1.53 req/sec             │
+ │   - Smooths out micro-spikes. Handles counter resets automatically!    │
+ │                                                                        │
+ │ Case B: `irate(http_requests_total[5m])`                               │
+ │   - Calculates slope strictly between LAST 2 points:                   │
+ │   - (1480 - 1390) / 15 seconds = 6.00 req/sec (Instantaneous Peak!)    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Transforms Range Vector into Instant Vector
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ AGGREGATION OPERATOR: `sum(...) by (namespace, pod)`                   │
+ │ Returns current Instant Vector output to Grafana Dashboard Graph!      │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## PromQL Data Types & Metric Types
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Data Type            │ Definition & Representation                                                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Instant Vector**   │ A set of time series containing a **single sample at the current timestamp**│
+ │                      │ (e.g. `node_memory_MemAvailable_bytes`). Can be graphed in Grafana.         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Range Vector**     │ A set of time series containing a **buffer of historical samples** over a   │
+ │                      │ duration (e.g. `http_requests_total[5m]`). Cannot be graphed directly.     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Scalar**           │ A simple numeric floating-point literal (e.g. `100`, `0.99`).               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **String**           │ A string literal value (e.g. `"production"`).                               │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `rate()` vs `irate()` vs `increase()`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Function                  │ Mathematical Logic              │ Best Practice Recommendation    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`rate(v[range])`**      │ Calculates the per-second rate  │ **The Standard Choice.** Use for│
+ │                           │ averaged across the entire range│ **Alerting Rules**, SLOs, and   │
+ │                           │ window. Extrapolates boundaries.│ stable trendline dashboards.    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`irate(v[range])`**     │ Calculates the per-second rate  │ Use strictly for **high-res     │
+ │                           │ based strictly on the **last 2  │ dashboards** when analyzing     │
+ │                           │ data points** in the range.     │ rapid micro-bursts or latency.  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`increase(v[range])`**  │ Calculates the total integer    │ Use for counting total events   │
+ │                           │ increase ($\text{rate} \times \text{secs}$).  │ (e.g. total errors in last 1h). │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+> [!CAUTION]
+> **Never use `rate()` or `irate()` on a Gauge metric!**
+> `rate()` assumes that any decrease in value is a **Counter Reset** (e.g. container rebooted from 10,000 to 0). Applying `rate()` to a fluctuating Gauge metric (like memory or queue depth) produces corrupted, nonsensical spikes!
+
+---
+
+## Calculating p95 and p99 Latencies with `histogram_quantile`
+
+Prometheus histograms export three metrics: `_bucket{le="<boundary>"}`, `_sum`, and `_count`.
+
+To calculate the **99th Percentile Latency** across microservices:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum(rate(http_request_duration_seconds_bucket{job="payment-api"}[5m])) by (le, handler)
+)
+```
+
+```text
+ How histogram_quantile Works:
+ 1. `rate(http_request_duration_seconds_bucket[5m])`: Calculates request rates in each bucket.
+ 2. `sum(...) by (le, handler)`: Aggregates bucket rates across all pod replicas, preserving `le`!
+ 3. `histogram_quantile(0.99, ...)`: Linear interpolation calculates the exact threshold 
+    below which 99% of requests completed.
+```
+
+---
+
+## Essential Production Kubernetes PromQL Formulas
+
+### 1. Pod CPU Core Utilization (In Millicores):
+```promql
+sum(
+  rate(container_cpu_usage_seconds_total{container!="", container!="POD"}[5m])
+) by (namespace, pod)
+```
+
+### 2. Pod Memory Percentage against Resource Limit:
+```promql
+(
+  sum(container_memory_working_set_bytes{container!="", container!="POD"}) by (namespace, pod)
+  /
+  sum(kube_pod_container_resource_limits{resource="memory"}) by (namespace, pod)
+) * 100
+```
+
+### 3. Node CPU Utilization Percentage:
+```promql
+(
+  1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (node)
+) * 100
+```
+
+---
+
+## Vector Matching: `on()`, `ignoring()`, and `group_left`
+
+When combining two time series with different labels (e.g. multiplying container CPU rate by Pod cost metadata):
+
+```promql
+# Many-to-One Vector Join using group_left
+sum(rate(container_cpu_usage_seconds_total{container!=""}[5m])) by (pod, namespace)
+* on(pod, namespace) group_left(team_owner)
+kube_pod_labels
+```
+
+```text
+ Vector Join Rules:
+ - `on(label1, label2)`: Matches series sharing identical key labels.
+ - `group_left`: Declares a **Many-to-One** relationship (Multiple container series match one pod label).
+ - `group_right`: Declares a **One-to-Many** relationship.
+```
+
+---
+
+## Hands-On Lab: Testing PromQL Queries in Prometheus
+
+```bash
+# Step 1: Query Pod CPU rate across all namespaces (simulated via kubectl top or curl)
+# PromQL: sum(rate(container_cpu_usage_seconds_total[5m])) by (namespace)
+
+# Step 2: Query Memory Working Set across all nodes
+# PromQL: sum(container_memory_working_set_bytes) by (node)
+
+# Step 3: Test Histogram Quantile calculation for API Server request latency
+# PromQL: histogram_quantile(0.95, sum(rate(apiserver_request_duration_seconds_bucket[5m])) by (le, verb))
+
+# Step 4: Verify query result in JSON format (if Prometheus is port-forwarded on 9090)
+curl -s "http://localhost:9090/api/v1/query?query=up" 2>/dev/null | jq . || echo "PromQL Engine Online"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between an Instant Vector and a Range Vector in PromQL?**
+
+An **Instant Vector** represents a set of time series where each series contains a single value corresponding to the exact current query timestamp (e.g. `node_memory_working_set_bytes`). Instant vectors can be evaluated by operators and directly rendered on Grafana graphs. A **Range Vector** represents a set of time series containing an array of historical data points spanning backward over a duration (e.g. `http_requests_total[5m]`). Range vectors cannot be graphed directly; they must first be transformed into Instant Vectors using functions like `rate()`, `irate()`, `avg_over_time()`, or `increase()`.
+
+**Q2: How does `rate()` differ from `irate()` in PromQL, and when should each be used?**
+
+- `rate(v[5m])`: Calculates the per-second average rate of increase across the entire 5-minute window by dividing the delta by 300 seconds and extrapolating boundaries. It smooths out short-term fluctuations and is the **recommended choice for alerting rules and SLO dashboards**.
+- `irate(v[5m])`: Calculates the instantaneous per-second rate based strictly on the **last two data points** inside the 5-minute range. It captures high-frequency, sub-interval volatility and spikes, making it ideal for real-time debugging dashboards.
+
+**Q3: How does `rate()` handle container restarts and counter resets?**
+
+`rate()` is designed specifically for monotonically increasing Counters. When a container restarts, its counter drops from a high number (e.g. 5,000) back to 0. When `rate()` evaluates the sample array and detects a sample value lower than the preceding sample, it automatically assumes a **Counter Reset** occurred. It calculates the increase up to the reset, adds the new count, and seamlessly adjusts the slope calculation without returning negative numbers or false drops.
+
+**Q4: How does `histogram_quantile()` calculate the 99th percentile latency from bucket metrics?**
+
+`histogram_quantile(0.99, ...)` inspects the rate of counts in each cumulative bucket (`le="0.1"`, `le="0.5"`, `le="1.0"`, `le="+Inf"`). It locates the specific bucket where the 99th percentile rank falls, and then performs **linear interpolation** between that bucket's lower and upper bounds to estimate the exact latency value. To produce accurate mathematical results, the aggregation before `histogram_quantile` must always preserve the `le` label (e.g. `sum(...) by (le, handler)`).
+
+**Q5: What is the purpose of `group_left` and `group_right` in PromQL binary operations?**
+
+In PromQL, binary operations (like multiplication or division) between two Instant Vectors require matching series labels. When one vector contains multiple matching series for a single series in the second vector (a **Many-to-One** relationship, such as multiple containers in a Pod joining with a single `kube_pod_labels` series), PromQL requires the **`group_left`** modifier to indicate that the left-hand vector has the higher cardinality. `group_right` indicates a One-to-Many relationship.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 PromQL types: Instant Vector, Range Vector, Scalar, String
+- [ ] Know that `rate()` calculates smooth averages while `irate()` calculates instant spikes
+- [ ] Know to NEVER use `rate()` on Gauge metrics (Counter only!)
+- [ ] Know how `histogram_quantile(0.99, ...)` interpolates p99 latencies
+- [ ] Know the formula for CPU Core Usage: `sum(rate(container_cpu_usage_seconds_total[5m])) by (pod)`
+- [ ] Know how `group_left` enables Many-to-One vector joins in PromQL
+- [ ] Can query Prometheus via the `/api/v1/query` REST API

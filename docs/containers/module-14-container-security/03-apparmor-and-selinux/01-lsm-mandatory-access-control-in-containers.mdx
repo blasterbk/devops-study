@@ -1,0 +1,169 @@
+---
+title: "Chapter 1 — LSM in Containers: AppArmor & SELinux"
+sidebar_position: 1
+module: "Module 14.3 — AppArmor & SELinux"
+description: "Master Linux Security Modules (LSM) in containers — path-based AppArmor profiles, SELinux Multi-Category Security (MCS), and :z vs :Z volume relabeling."
+---
+
+# Chapter 1 — LSM in Containers: AppArmor & SELinux
+
+> **Goal:** Master the kernel-level Mandatory Access Control (MAC) frameworks, security contexts, and container isolation policies of **Linux Security Modules (LSM)** — contrasting **Discretionary Access Control (DAC)** with MAC, dissecting **AppArmor Path-Based Profiles** (Ubuntu/Debian standard), mastering **SELinux Type Enforcement & Multi-Category Security (MCS)** (RHEL/OpenShift standard), and mastering **`:z` vs `:Z` Volume Relabeling**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why Discretionary Access Control (DAC) fails to contain compromised root processes
+> 2. How the LSM hook framework intercepts kernel object operations after DAC checks pass
+> 3. How AppArmor enforces path-based restrictions on `/proc` and `/sys` filesystems
+> 4. How SELinux MCS categories prevent container-to-container cross-talk on the same host
+> 5. Why mounting host volumes fails under SELinux without `:z` or `:Z` flags
+> 6. How to author and apply custom AppArmor profiles and SELinux policies in Kubernetes
+
+---
+
+## Real-Life Analogy
+
+Think of Mandatory Access Control (MAC) as **a top-secret government military intelligence facility versus a private residential home**:
+
+- **Discretionary Access Control - DAC (The Private Home):**
+  - The homeowner (**The file owner / root user**) can change the door locks (**`chmod 777`**) and invite anyone into any room.
+  - If a burglar steals the master key (**Root process compromised**), they can open every door, read every diary, and set the house on fire!
+- **Mandatory Access Control - MAC / LSM (The Military Facility):**
+  - **AppArmor (The Path-Based Sentry):** The sentry has a strict map: *"You are allowed to walk down Corridor B to Room 12. If your foot steps 1 millimeter into Corridor C, you are tackled instantly regardless of your rank!"*
+  - **SELinux (The Multi-Category Security Badge System):** Every document is stamped with a colored cryptographic label (**`container_file_t`**), and every soldier wears a colored badge (**`c123,c456`**). Even if a General (**Root UID 0**) tries to open a folder with a different color tag (**`c789,c999`**), the magnetic lock refuses to open!
+
+---
+
+## Architecture Diagram
+
+```text
+               Linux Security Module (LSM) System Call Verification Hook
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER APPLICATION: System Call `open("/etc/shadow", O_RDWR)`       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 1. Standard DAC Check (UID / GID / `chmod` bits)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. DISCRETIONARY ACCESS CONTROL (DAC): Passed! (Process is UID 0)      │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 2. Linux Security Module (LSM) Interception Hook
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. MANDATORY ACCESS CONTROL (MAC) EVALUATOR:                           │
+ │                                                                        │
+ │ ├── UBUNTU / DEBIAN: AppArmor Path Profile (`docker-default`)          │
+ │ │   - Rule: `deny /etc/shadow` ──► 🛑 DENIED (EACCES / Permission)!    │
+ │ │                                                                      │
+ │ └── RHEL / OPENSHIFT: SELinux Type Enforcement + MCS Categories        │
+ │     - Process Context: `system_u:system_r:container_t:s0:c12,c34`      │
+ │     - Target Context:  `system_u:object_r:shadow_t:s0`                 │
+ │     - Rule: `container_t` CANNOT access `shadow_t`! ──► 🛑 DENIED!     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Returns Error Code! Host protected even against root!
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PROCESS RECEIVES: `Permission denied` (Exploit completely blocked!)    │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## AppArmor vs SELinux Architectural Matrix
+
+```text
+ ┌──────────────────────┬───────────────────────────────────┬─────────────────────────────────────┐
+ │ Technical Dimension  │ AppArmor                          │ SELinux (Security-Enhanced Linux)   │
+ │──────────────────────┼───────────────────────────────────┼─────────────────────────────────────┤
+ │ **Primary Mechanism**│ **Path-Based Access Control**     │ **Label / Type Enforcement (TE)**   │
+ │ **Default Distros**  │ **Ubuntu, Debian, SUSE**          │ **RHEL, CentOS, Fedora, OpenShift** │
+ │ **Default Profile**  │ `docker-default` / `cri-containerd│ `container_t` type                  │
+ │ **Container-to-Cont**│ Restricted by path                │ **Multi-Category Security (MCS)**   │
+ │ **Enforcement Modes**│ `enforce` / `complain` (audit)    │ `Enforcing` / `Permissive` (audit)  │
+ │ **Host Mount Flag**  │ Handled via path profile rules    │ **Requires `:z` (shared) or `:Z`**  │
+ └──────────────────────┴───────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## SELinux Multi-Category Security (MCS)
+
+How does SELinux prevent Container A from reading Container B's files on the host disk when both containers run as the same `container_t` SELinux type?
+
+### The MCS Category Pair Solution:
+Every container is assigned a **unique pair of random categories** at startup:
+- **Container A:** `system_u:system_r:container_t:s0:c100,c200`
+- **Container B:** `system_u:system_r:container_t:s0:c300,c400`
+- Even if Container A escapes its namespace and tries to access Container B's filesystem, the SELinux kernel hook compares `(c100,c200)` against `(c300,c400)`. Because the categories do not match, the kernel **rejects the access with `Permission Denied`**!
+
+---
+
+## Volume Mount Relabeling: `:z` vs `:Z`
+
+When mounting a host directory into a container on an SELinux-enabled system, the host directory usually has the label `unconfined_u:object_r:var_t:s0`. The container running as `container_t` cannot read it!
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Mount Flag           │ SELinux Relabeling Action & Isolation Boundary                              │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`-v /data:/app:z`**│ **Shared Relabeling.** Labels the host folder as `container_file_t:s0`.     │
+ │                      │ Multiple different containers can read and write to this folder!            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`-v /data:/app:Z`**│ **Private Relabeling.** Labels the host folder with the container's unique  │
+ │                      │ MCS category pair (`container_file_t:s0:c100,c200`). ONLY THIS CONTAINER can│
+ │                      │ access the directory!                                                       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Checking AppArmor and SELinux Labels
+
+```bash
+# Step 1: Check AppArmor status (Ubuntu/Debian)
+sudo aa-status 2>/dev/null || echo "AppArmor status checked"
+
+# Step 2: Check SELinux status and file labels (RHEL/Fedora)
+ls -laZ / 2>/dev/null || echo "SELinux labels checked"
+
+# Step 3: Run a container with an explicit SELinux volume relabel flag
+# docker run --rm -v $(pwd)/data:/data:Z alpine touch /data/test.txt
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between Discretionary Access Control (DAC) and Mandatory Access Control (MAC)?**
+
+- **DAC (Discretionary Access Control)**: The traditional Linux security model based on User/Group IDs and permission bits (`chmod 755`). The owner of an object has full discretion to grant or revoke access. The fatal flaw of DAC is that `root (UID 0)` can bypass all permission checks.
+- **MAC (Mandatory Access Control)**: Enforced by Linux Security Modules (LSM) like AppArmor and SELinux. Security policies are centrally defined by system administrators and hardcoded into the kernel. **Even if a process runs as root (UID 0), MAC rules strictly override and block prohibited actions**.
+
+**Q2: How does AppArmor protect containerized environments?**
+
+AppArmor enforces **Path-Based Mandatory Access Control**. The default container profile (`docker-default`) restricts container processes from accessing dangerous host filesystems and device nodes regardless of user permissions. For example, it explicitly blocks writes to `/proc/sysrq-trigger`, `/proc/kcore`, `/sys/firmware`, and prevents mounting raw physical disk devices (`/dev/sda`), stopping container escape exploits that rely on pseudo-filesystem manipulation.
+
+**Q3: How does SELinux Multi-Category Security (MCS) isolate containers from one another?**
+
+In SELinux, all container processes run under the same base domain (`container_t`). To prevent multi-tenant containers from reading each other's storage, SELinux uses **MCS (Multi-Category Security)**:
+1. Each container is assigned a unique random combination of two categories (e.g. `c12,c45` vs `c78,c90`).
+2. When the container creates files, the kernel stamps them with that container's category pair.
+3. The SELinux policy allows a process to access a file **only if its category set is a complete match or superset of the file's category set**. This mathematically isolates containers on the same host.
+
+**Q4: What is the difference between the `:z` and `:Z` flags when bind-mounting host directories?**
+
+- **`:z` (Shared)**: Automatically relabels the host directory with `container_file_t:s0` without specific category constraints. This allows **multiple different containers** to concurrently read and write to the shared volume.
+- **`:Z` (Private)**: Automatically relabels the host directory with the **exact, unique MCS category pair of that specific container** (e.g. `container_file_t:s0:c12,c45`). Only that specific container can access the files; all other containers are blocked.
+
+**Q5: What happens if you apply the `:Z` flag to a critical host directory like `/etc` or `/var`?**
+
+Applying `:Z` to a system directory like `docker run -v /etc:/data:Z` will **relabel the entire host `/etc` directory** with the container's private SELinux context. Host daemons (like `sshd`, `systemd`, and `login`) will immediately be blocked from reading `/etc/passwd` and `/etc/shadow`, causing the host operating system to crash or lock out all administrators! Never use `:Z` or `:z` on root host system directories.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that MAC (LSM) overrides and restricts even root (`UID 0`) processes
+- [ ] Know that AppArmor uses path-based rules to protect `/proc` and `/sys`
+- [ ] Know that SELinux uses Type Enforcement (`container_t`) and labels
+- [ ] Know that SELinux MCS categories prevent container-to-container cross-talk
+- [ ] Know that `:z` relabels for shared access and `:Z` relabels for private access
+- [ ] Never apply `:z` or `:Z` to core host directories like `/etc` or `/var`

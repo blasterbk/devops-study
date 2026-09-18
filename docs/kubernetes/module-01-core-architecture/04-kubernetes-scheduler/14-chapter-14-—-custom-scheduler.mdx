@@ -1,0 +1,1333 @@
+---
+title: "Chapter 14 — Custom Scheduler"
+sidebar_position: 14
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand how to build a Custom Kubernetes Scheduler, how it interacts with the Kubernetes API, how it watches Pods, selects Nodes, performs bindin..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 14 — Custom Scheduler
+
+> **Goal:** Understand how to build a Custom Kubernetes Scheduler, how it interacts with the Kubernetes API, how it watches Pods, selects Nodes, performs binding, and how the modern Scheduler Framework provides a better alternative to writing an entire scheduler from scratch. Learn when to build a custom scheduler, when to use Scheduler Framework plugins, and how production organizations implement specialized scheduling solutions.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. When and why to build a Custom Scheduler vs using Framework plugins
+> 2. schedulerName: directing Pods to a specific scheduler
+> 3. Custom Scheduler architecture: Informers, WorkQueue, Reconcile loop
+> 4. Watching unscheduled Pods (no spec.nodeName, matching schedulerName)
+> 5. Custom node selection logic
+> 6. Binding: writing spec.nodeName via Binding subresource
+> 7. Scheduler Extenders: webhook-based extension (legacy approach)
+> 8. Framework plugins vs full custom scheduler: decision guide
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of building a Custom Scheduler like building your own GPS routing app.
+
+```text
+Custom GPS App Analogy:
+
+Google Maps exists (default kube-scheduler) and works for most users
+Some users need specialized routing (toll avoidance, truck height limits)
+They can use Google Maps plugins/settings (Scheduler Framework plugins)
+Or build their own GPS app from scratch (Custom Scheduler)
+Both apps read the same road network (Kubernetes API / cluster state)
+Both output the same result: a route (a binding: Pod -> Node)
+Building from scratch = maximum control, maximum complexity
+```
+
+| Custom GPS App | Custom Scheduler |
+| :--- | :--- |
+| Google Maps (default) | Default `kube-scheduler` |
+| Custom routing app | Custom Scheduler binary |
+| Specialized routing rules | Custom node selection logic |
+| Road network data | Kubernetes API (Nodes, Pods, etc.) |
+| Outputting a route | Binding Pod to Node |
+| Plugin settings | Scheduler Framework plugins (preferred) |
+
+> **Important:** For **99% of production use cases**, extending the default scheduler via **Scheduler Framework plugins** is the correct approach. A full Custom Scheduler is only justified when you need a **completely different scheduling loop** — for example, a separate scheduler for IoT edge nodes, custom binpacking for specialized hardware, or integration with an external resource management system.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes Scheduler Architecture
+- Scheduling Cycle
+- Filter Plugins
+- Score Plugins
+- Reserve
+- Permit
+- Bind
+- Scheduler Profiles
+- Kubernetes API Server
+- Informers & Watches
+
+---
+
+# What is a Custom Scheduler?
+
+A Custom Scheduler is:
+
+> **A scheduler implementation that makes Pod placement decisions instead of (or alongside) the default Kubernetes Scheduler for selected Pods.**
+
+It follows the same fundamental workflow:
+
+```text
+Watch Pods
+
+v
+
+Find Candidate Nodes
+
+v
+
+Choose Best Node
+
+v
+
+Bind Pod
+```
+
+The scheduling policy is what changes.
+
+---
+
+# Why Build a Custom Scheduler?
+
+The default Scheduler is designed for **general-purpose** workloads.
+
+Most organizations never need another scheduler.
+
+However,
+
+some workloads have unique scheduling requirements.
+
+Examples:
+
+- AI/ML clusters
+- High Performance Computing (HPC)
+- Telecom infrastructure
+- Edge computing
+- FPGA scheduling
+- Scientific computing
+- Regulatory or compliance placement
+- Custom hardware allocation
+
+---
+
+# When Should You NOT Build One?
+
+Many scheduling requirements can already be implemented using:
+
+- Node Affinity
+- Taints & Tolerations
+- Topology Spread Constraints
+- Priority Classes
+- Scheduler Profiles
+- Scheduler Framework Plugins
+
+A completely new Scheduler should usually be the **last option**.
+
+---
+
+# Decision Tree
+
+```text
+Need Different Scheduling?
+
+        |
+
+        ▼
+
+Built-in Features Enough?
+
+        |
+
+ ┌──────┴──────┐
+
+ ▼             ▼
+
+Yes            No
+
+ |             |
+
+ ▼             ▼
+
+Use Built-in   Scheduler Framework Plugin
+
+                      |
+
+                      ▼
+
+Still Impossible?
+
+                      |
+
+              ┌───────┴────────┐
+
+              ▼                ▼
+
+            Yes               No
+
+              |                |
+
+              ▼                ▼
+
+ Build Custom Scheduler    Use Plugins
+```
+
+---
+
+# Default Scheduler vs Custom Scheduler
+
+| Default Scheduler | Custom Scheduler |
+|-------------------|------------------|
+| Built into Kubernetes | User-developed |
+| General-purpose | Specialized policies |
+| Uses built-in plugins | Can use custom logic |
+| Schedules most Pods | Schedules selected Pods |
+| Production ready | Organization specific |
+
+---
+
+# High-Level Architecture
+
+```text
+                 Kubernetes Cluster
+
+                        |
+
+        ┌───────────────┼────────────────┐
+
+        ▼                                ▼
+
+Default Scheduler              Custom Scheduler
+
+        |                                |
+
+Pods with                       Pods with
+
+default-scheduler               custom-scheduler
+
+        |                                |
+
+        ▼                                ▼
+
+Bind Pods                      Bind Pods
+```
+
+Both schedulers communicate with the same API Server.
+
+---
+
+# schedulerName
+
+How does Kubernetes know which Scheduler should process a Pod?
+
+Every Pod contains:
+
+```yaml
+spec:
+  schedulerName: default-scheduler
+```
+
+or
+
+```yaml
+spec:
+  schedulerName: custom-scheduler
+```
+
+The Scheduler only processes Pods matching its configured scheduler name.
+
+---
+
+# Example
+
+General application:
+
+```yaml
+spec:
+  schedulerName: default-scheduler
+```
+
+AI workload:
+
+```yaml
+spec:
+  schedulerName: ai-scheduler
+```
+
+Research workload:
+
+```yaml
+spec:
+  schedulerName: research-scheduler
+```
+
+Each Scheduler ignores Pods intended for other schedulers.
+
+---
+
+# Scheduler Startup
+
+When a Custom Scheduler starts,
+
+it typically performs:
+
+```text
+Connect API Server
+
+v
+
+Start Informers
+
+v
+
+Watch Pods
+
+v
+
+Watch Nodes
+
+v
+
+Watch PersistentVolumes
+
+v
+
+Watch Other Resources
+
+v
+
+Begin Scheduling Loop
+```
+
+---
+
+# Scheduler API
+
+The Scheduler does not communicate directly with Nodes.
+
+Instead,
+
+everything happens through:
+
+```text
+Kubernetes API Server
+```
+
+---
+
+# Scheduler API Responsibilities
+
+The Scheduler reads:
+
+- Pods
+- Nodes
+- PersistentVolumes
+- PersistentVolumeClaims
+- PriorityClasses
+- CSINodes
+- RuntimeClasses
+- StorageClasses
+
+The Scheduler writes:
+
+- Pod Binding
+- Events
+- Leader Election information (if enabled)
+
+---
+
+# API Interaction
+
+```text
+Custom Scheduler
+
+        |
+
+        ▼
+
+API Server
+
+        |
+
+ ┌──────┼──────────┐
+
+ ▼      ▼          ▼
+
+Pods   Nodes    Storage
+```
+
+The API Server is the single source of truth.
+
+---
+
+# Watching Pods
+
+Scheduling begins by watching for:
+
+```text
+Pending Pods
+```
+
+The Scheduler continuously observes:
+
+```text
+Pod Added
+
+v
+
+Pending
+
+v
+
+schedulerName Matches?
+
+v
+
+Yes
+
+v
+
+Schedule
+```
+
+---
+
+# Watch-Based Architecture
+
+Instead of polling:
+
+```text
+Every 5 Seconds
+
+v
+
+Check Pods
+```
+
+Kubernetes uses:
+
+```text
+Watch
+
+v
+
+Instant Notification
+```
+
+This provides low scheduling latency.
+
+---
+
+# Pod Watch Workflow
+
+```text
+User Creates Pod
+
+v
+
+API Server
+
+v
+
+Watch Event
+
+v
+
+Custom Scheduler
+
+v
+
+Scheduling Starts
+```
+
+---
+
+# Watching Nodes
+
+The Scheduler also watches:
+
+```text
+Node Added
+
+Node Updated
+
+Node Deleted
+```
+
+Why?
+
+Because scheduling decisions depend on:
+
+- Available CPU
+- Available Memory
+- Labels
+- Taints
+- Conditions
+- Capacity
+- Allocatable Resources
+
+---
+
+# Scheduler Cache
+
+Like the default Scheduler,
+
+a custom Scheduler typically maintains an internal cache.
+
+```text
+API Server
+
+v
+
+Informers
+
+v
+
+Scheduler Cache
+
+v
+
+Scheduling Decisions
+```
+
+This avoids querying the API Server for every Pod.
+
+---
+
+# Selecting Nodes
+
+Once a Pending Pod is received,
+
+the Scheduler performs:
+
+```text
+Candidate Discovery
+
+v
+
+Filtering
+
+v
+
+Scoring
+
+v
+
+Best Node
+```
+
+This logic is entirely customizable.
+
+---
+
+# Example
+
+Cluster:
+
+```text
+Node A
+
+GPU
+
+Node B
+
+CPU
+
+Node C
+
+GPU
+```
+
+Incoming Pod:
+
+```text
+Requires GPU
+```
+
+Scheduler:
+
+```text
+Filter
+
+v
+
+Node A
+
+Node C
+
+v
+
+Score
+
+v
+
+Choose Node A
+```
+
+---
+
+# Selection Workflow
+
+```text
+Pending Pod
+
+v
+
+List Nodes
+
+v
+
+Apply Scheduling Rules
+
+v
+
+Rank Nodes
+
+v
+
+Best Node
+```
+
+---
+
+# Binding Pods
+
+After selecting a Node,
+
+the Scheduler commits the decision.
+
+Workflow:
+
+```text
+Selected Node
+
+v
+
+Binding Request
+
+v
+
+API Server
+
+v
+
+Pod Updated
+
+v
+
+kubelet Watch
+
+v
+
+Container Starts
+```
+
+This is the same Binding process used by the default Scheduler.
+
+---
+
+# Complete Scheduling Loop
+
+```text
+Watch Pending Pod
+
+v
+
+Read Scheduler Cache
+
+v
+
+Filter Nodes
+
+v
+
+Score Nodes
+
+v
+
+Select Winner
+
+v
+
+Bind Pod
+
+v
+
+Wait For Next Pod
+```
+
+This loop runs continuously.
+
+---
+
+# Scheduler Extenders
+
+Before the Scheduler Framework existed,
+
+Kubernetes introduced:
+
+```text
+Scheduler Extenders
+```
+
+---
+
+# What is a Scheduler Extender?
+
+A Scheduler Extender is:
+
+> **An external HTTP service that assists the Scheduler with filtering and/or prioritizing Nodes.**
+
+Instead of replacing the Scheduler,
+
+it extends it.
+
+---
+
+# Extender Architecture
+
+```text
+Default Scheduler
+
+        |
+
+        ▼
+
+HTTP Request
+
+        |
+
+        ▼
+
+Extender Service
+
+        |
+
+        ▼
+
+Filtered Nodes
+
+        |
+
+        ▼
+
+Scheduler Continues
+```
+
+---
+
+# Typical Use Cases
+
+Historically,
+
+Extenders were used for:
+
+- GPU scheduling
+- Storage-aware scheduling
+- Network-aware scheduling
+- Specialized hardware
+- Enterprise infrastructure
+
+---
+
+# Limitations of Extenders
+
+Extenders introduced several challenges:
+
+- Additional network latency
+- External service availability
+- More operational complexity
+- Separate deployment lifecycle
+
+Because of these limitations,
+
+the Scheduler Framework became the preferred extension mechanism.
+
+---
+
+# Scheduler Framework Plugins
+
+Modern Kubernetes recommends:
+
+```text
+Scheduler Framework Plugins
+```
+
+instead of building a completely new Scheduler in most cases.
+
+---
+
+# Why?
+
+Plugins execute:
+
+```text
+Inside
+
+kube-scheduler
+```
+
+Benefits:
+
+- No network hop
+- Lower latency
+- Better integration
+- Easier maintenance
+- Native Scheduler APIs
+
+---
+
+# Comparison
+
+| Scheduler Extender | Scheduler Framework Plugin |
+|--------------------|----------------------------|
+| External HTTP service | Runs inside Scheduler |
+| Network communication | In-process execution |
+| Higher latency | Lower latency |
+| More operational overhead | Easier to maintain |
+| Legacy extension model | Recommended modern approach |
+
+---
+
+# Custom Scheduler vs Scheduler Framework
+
+| Custom Scheduler | Scheduler Framework |
+|------------------|---------------------|
+| Entire scheduling loop | Extend existing Scheduler |
+| Watches Pods | Built into Scheduler |
+| Maintains cache | Shared cache |
+| Performs binding | Built-in binding support |
+| Highest flexibility | Preferred for most extensions |
+| Highest maintenance | Lower maintenance |
+
+---
+
+# Production Architecture
+
+Large organizations often use:
+
+```text
+                    API Server
+
+                        |
+
+        ┌───────────────┼────────────────┐
+
+        ▼                                ▼
+
+Default Scheduler              AI Scheduler
+
+        |                                |
+
+ General Workloads          GPU Workloads
+
+        |                                |
+
+        ▼                                ▼
+
+Shared Kubernetes Cluster
+```
+
+Both Schedulers coordinate through the same API Server.
+
+---
+
+# Leader Election
+
+Production Custom Schedulers typically support:
+
+```text
+Leader Election
+```
+
+Multiple Scheduler instances run,
+
+but only one actively schedules Pods.
+
+```text
+Scheduler A
+
+Leader
+
+v
+
+Scheduling
+
+Scheduler B
+
+Standby
+```
+
+If the leader fails,
+
+another instance becomes leader.
+
+---
+
+# Production Example 1
+
+AI Infrastructure
+
+Workloads:
+
+```text
+Large Language Models
+
+v
+
+Custom Scheduler
+
+v
+
+GPU Selection
+
+v
+
+NUMA Optimization
+
+v
+
+Bind
+```
+
+The Scheduler prioritizes accelerator efficiency.
+
+---
+
+# Production Example 2
+
+Telecom Platform
+
+Requirements:
+
+- Edge locality
+- Radio hardware
+- Low latency
+- Regulatory placement
+
+Workflow:
+
+```text
+Pending Pod
+
+v
+
+Edge Scheduler
+
+v
+
+Nearest Cell Site
+
+v
+
+Bind
+```
+
+---
+
+# Production Example 3
+
+Financial Trading
+
+Requirements:
+
+- Low latency
+- NUMA locality
+- CPU pinning
+- Dedicated hardware
+
+Custom Scheduler:
+
+```text
+Topology Filter
+
+v
+
+Latency Score
+
+v
+
+Bind
+```
+
+---
+
+# Production Example 4
+
+Research Cluster
+
+Users:
+
+```text
+Scientists
+
+v
+
+Research Scheduler
+
+v
+
+Reserve HPC Nodes
+
+v
+
+Bind
+```
+
+Special scheduling policies improve expensive compute utilization.
+
+---
+
+# End-to-End Custom Scheduler Workflow
+
+```text
+Pod Created
+
+v
+
+API Server
+
+v
+
+Watch Event
+
+v
+
+Custom Scheduler
+
+v
+
+Read Scheduler Cache
+
+v
+
+Filter Nodes
+
+v
+
+Score Nodes
+
+v
+
+Choose Node
+
+v
+
+Bind
+
+v
+
+API Server
+
+v
+
+Watch Event
+
+v
+
+kubelet
+
+v
+
+Run Containers
+```
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Pod
+
+v
+
+schedulerName
+
+v
+
+Selected Scheduler
+
+v
+
+Filter
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+
+v
+
+kubelet
+```
+
+A Custom Scheduler implements or extends this workflow according to its own scheduling policies.
+
+---
+
+# Performance Considerations
+
+A production-quality Scheduler should:
+
+- Use Informers instead of polling.
+- Maintain an internal Scheduler Cache.
+- Minimize API Server requests.
+- Avoid long-running scheduling decisions.
+- Support leader election.
+- Handle thousands of scheduling events per second.
+
+Poor Scheduler design can become a cluster-wide bottleneck.
+
+---
+
+# Production Best Practices
+
+✔ Use the default Scheduler whenever possible.
+
+✔ Prefer Scheduler Framework Plugins over building a new Scheduler.
+
+✔ Use a unique `schedulerName`.
+
+✔ Use Informers and Watches instead of polling.
+
+✔ Maintain an internal cache for scheduling decisions.
+
+✔ Implement leader election for high availability.
+
+✔ Keep scheduling decisions deterministic and fast.
+
+✔ Thoroughly test under production-scale workloads before deployment.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+A Custom Scheduler replaces Kubernetes.
+
+Wrong.
+
+It only replaces or supplements the scheduling component.
+
+---
+
+### ❌ Misconception 2
+
+Every Pod is scheduled by the Custom Scheduler.
+
+Wrong.
+
+Only Pods whose `schedulerName` matches the Custom Scheduler are processed.
+
+---
+
+### ❌ Misconception 3
+
+A Custom Scheduler communicates directly with kubelet.
+
+Wrong.
+
+Like the default Scheduler, it binds Pods through the API Server, and kubelet learns about assignments via Watch events.
+
+---
+
+### ❌ Misconception 4
+
+Scheduler Extenders are the recommended way to customize scheduling.
+
+Wrong.
+
+The Scheduler Framework is the preferred extension mechanism for modern Kubernetes.
+
+---
+
+### ❌ Misconception 5
+
+A Custom Scheduler must poll the API Server continuously.
+
+Wrong.
+
+Production schedulers use Informers and Watch streams.
+
+---
+
+### ❌ Misconception 6
+
+Building a Custom Scheduler is easier than writing a plugin.
+
+Wrong.
+
+Writing a complete Scheduler is significantly more complex than extending the Scheduler Framework.
+
+---
+
+### ❌ Misconception 7
+
+Every organization needs a Custom Scheduler.
+
+Wrong.
+
+Most scheduling requirements can be satisfied using built-in features, Scheduler Profiles, or Scheduler Framework Plugins.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why would you build a Custom Scheduler?
+
+To implement scheduling policies that cannot be achieved using built-in features or Scheduler Framework plugins.
+
+---
+
+### Q2. How does a Pod choose a Custom Scheduler?
+
+By setting the appropriate `schedulerName` in its specification.
+
+---
+
+### Q3. What resources does a Scheduler watch?
+
+Typically Pods, Nodes, PersistentVolumes, PersistentVolumeClaims, and other scheduling-related resources through Informers and Watch APIs.
+
+---
+
+### Q4. How does a Custom Scheduler assign a Pod to a Node?
+
+It sends a binding request to the Kubernetes API Server after selecting the target Node.
+
+---
+
+### Q5. Does a Custom Scheduler communicate directly with kubelet?
+
+No. kubelet receives the Pod assignment through API Server Watch events.
+
+---
+
+### Q6. What is a Scheduler Extender?
+
+An external HTTP service that extends the Scheduler with additional filtering or prioritization logic.
+
+---
+
+### Q7. Why is the Scheduler Framework preferred over Scheduler Extenders?
+
+Because plugins run inside the Scheduler process, avoiding network overhead and providing tighter integration.
+
+---
+
+### Q8. What are the main responsibilities of a production-quality Custom Scheduler?
+
+Watching resources, maintaining a cache, selecting Nodes efficiently, binding Pods correctly, and supporting high availability through leader election.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pods remain Pending indefinitely | `schedulerName` does not match any running Scheduler |
+| Custom Scheduler sees no Pods | Watch configuration or RBAC permissions are incorrect |
+| Scheduler makes slow decisions | Missing cache, inefficient algorithms, or excessive API calls |
+| Pods never start after scheduling | Binding failed or kubelet has not received the updated Pod assignment |
+| Scheduler becomes unavailable | Leader election not configured or Scheduler process failed |
+| Specialized workloads scheduled incorrectly | Custom scheduling logic or plugin configuration is incomplete |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why would an organization build a Custom Scheduler?
+2. When is a Custom Scheduler preferable to Scheduler Framework plugins?
+3. How does `schedulerName` determine which Scheduler processes a Pod?
+4. Why does a Scheduler use Informers and Watches?
+5. What information does a Scheduler read from the API Server?
+6. How does a Scheduler select the best Node?
+7. How does a Scheduler bind a Pod?
+8. What is a Scheduler Extender?
+9. Why are Scheduler Framework plugins preferred over Extenders?
+10. What does a production Custom Scheduler architecture look like?
+11. Why is leader election important?
+12. What are the most common real-world use cases for Custom Schedulers?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes can be extended through **Custom Schedulers** to support highly specialized scheduling requirements.
+
+You learned:
+
+- Why organizations build Custom Schedulers
+- How `schedulerName` directs Pods to the appropriate Scheduler
+- How a Scheduler interacts with the Kubernetes API
+- How Informers and Watch APIs provide real-time scheduling events
+- How Nodes are filtered, scored, and selected
+- How binding commits scheduling decisions through the API Server
+- How Scheduler Extenders evolved into the modern Scheduler Framework
+- How production systems implement scalable, highly available Custom Scheduler architectures
+- Why most organizations should prefer Scheduler Framework plugins unless a completely different scheduling loop is required
+
+A Custom Scheduler gives complete control over the scheduling lifecycle, from watching Pods to binding them to Nodes. While this flexibility is powerful, it comes with significant operational complexity. For most production environments, extending the existing Scheduler through the Scheduler Framework provides a simpler and more maintainable solution, reserving fully custom schedulers for truly specialized infrastructure.
+
+---
+
+# Module 1.4 Complete
+
+You have completed **Module 1.4 — Kubernetes Scheduler Internals**.
+
+You now have a production-level understanding of:
+
+```text
+Chapter 1   Scheduler Architecture   — control tower, Informers, HA leader election
+Chapter 2   Scheduling Framework     — plugin-based extension points (replaced predicates)
+Chapter 3   Scheduling Cycle         — PreFilter -> Filter -> Score -> Reserve -> Permit
+Chapter 4   Binding Cycle            — async binding, spec.nodeName, PostBind
+Chapter 5   Scheduler Cache          — NodeInfo, assumed state, in-memory cluster view
+Chapter 6   Scheduling Queue         — ActiveQ, BackoffQ, UnschedulableQ, event-driven flush
+Chapter 7   Filter Plugins           — parallel node elimination (NodeResourcesFit, Taints, Affinity)
+Chapter 8   Score Plugins            — normalized weighted ranking (LeastAllocated, ImageLocality)
+Chapter 9   Reserve Phase            — in-memory resource hold, Unreserve rollback
+Chapter 10  Permit Phase             — Wait/Approve/Reject, gang scheduling, timeout
+Chapter 11  Bind Phase               — binding subresource, kubelet Watch notification
+Chapter 12  Preemption               — victim selection, PDB respect, nominatedNodeName
+Chapter 13  Scheduler Profiles       — per-workload plugin chains, schedulerName routing
+Chapter 14  Custom Scheduler         — when to build, Framework plugins vs full scheduler
+```
+
+You now understand not just **how the Kubernetes Scheduler works** but **why every design decision exists** — from the separation of scheduling and binding cycles to the event-driven queue design to the in-memory assumed state model.
+
+---
+
+# Next Module
+
+## Module 1.5 — Controller Manager Internals
+
+The next module explores **how Kubernetes controllers reconcile desired state with actual state**.
+
+Upcoming chapters will cover the ReplicaSet Controller, Deployment Controller, StatefulSet Controller, DaemonSet Controller, Job Controller, EndpointSlice Controller, and the generic controller pattern that powers all of Kubernetes.

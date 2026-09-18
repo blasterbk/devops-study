@@ -1,0 +1,271 @@
+---
+title: "Chapter 3 — NodeStageVolume vs NodePublishVolume"
+sidebar_position: 3
+module: "Module 4.4 — CSI Internals"
+description: "Master the node-level volume mount sequence — NodeStageVolume global staging and formatting vs NodePublishVolume container bind-mounting, and mount propagation mechanics."
+---
+
+# Chapter 3 — NodeStageVolume vs NodePublishVolume
+
+> **Goal:** Master the node-level storage lifecycle in Kubernetes — understanding why the Container Storage Interface (CSI) splits node mounting into a two-step sequence (`NodeStageVolume` $\to$ `NodePublishVolume`), how global staging directories prevent filesystem corruption when multiple Pods share storage, how formatting checks prevent data overwrites, and how Linux bind-mounts isolate container storage.
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural necessity of separating `NodeStageVolume` from `NodePublishVolume`
+> 2. How `NodeStageVolume` formats raw block devices (`mkfs.ext4`/`xfs`) and mounts to a global staging path
+> 3. How `NodePublishVolume` creates per-pod Linux bind-mounts into container root filesystems
+> 4. The reverse teardown lifecycle: `NodeUnpublishVolume` vs `NodeUnstageVolume`
+> 5. How mount propagation modes (`None`, `HostToContainer`, `Bidirectional`) function
+> 6. How to diagnose and clean up orphaned global mount points on worker nodes
+
+---
+
+## Real-Life Analogy
+
+Think of node volume mounting as **unloading a shipping container at an apartment complex**:
+
+- **`NodeStageVolume` (The Central Unloading Loading Dock):** A semi-truck arrives with a heavy shipping container (the raw cloud block storage volume). The moving crew does not drag the massive shipping container up the elevator stairs. Instead, they park the truck at the building's central loading dock (`/var/lib/kubelet/plugins/.../globalmount`), break the seal, and organize the boxes on pallets. This is done **only once per building (Node)**.
+- **`NodePublishVolume` (Carrying Boxes into Specific Apartments):** Individual tenants in Apartment 3A and Apartment 3B (Pods sharing the volume on the same node) need access to the inventory. The crew carries boxes from the central loading dock directly into Apartment 3A's living room (Linux `mount --bind` into the Pod directory).
+- **`NodeUnpublishVolume`:** Tenant 3A moves out; the crew removes boxes from Apartment 3A. But the central loading dock remains active because Tenant 3B is still using their boxes.
+- **`NodeUnstageVolume`:** Only when **all** tenants in the building have moved out does the crew pack up the central loading dock and send the semi-truck on its way.
+
+---
+
+## Architecture Diagram
+
+```text
+               NodeStageVolume vs NodePublishVolume Flow
+
+ Physical Cloud Block Device Attached to Node: `/dev/xvdf`
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Step 1: CSI NodeStageVolume (Executed ONCE per Node)                   │
+ │                                                                        │
+ │ 1. Checks if disk is formatted. If unformatted ──► Runs `mkfs.ext4`   │
+ │ 2. Mounts block device to Global Staging Directory:                    │
+ │    `/var/lib/kubelet/plugins/kubernetes.io/csi/pv-123/globalmount`     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           │ Linux Kernel Bind-Mount (`mount --bind`)         │
+           ▼                                                 ▼
+ ┌──────────────────────────────────┐     ┌──────────────────────────────────┐
+ │ Step 2: CSI NodePublishVolume    │     │ Step 2: CSI NodePublishVolume    │
+ │ (Executed for Pod A)             │     │ (Executed for Pod B)             │
+ │                                  │     │                                  │
+ │ Mounts staging dir into Pod A:   │     │ Mounts staging dir into Pod B:   │
+ │ `/var/lib/kubelet/pods/uid-A/    │     │ `/var/lib/kubelet/pods/uid-B/    │
+ │  volumes/kubernetes.io~csi/data` │     │  volumes/kubernetes.io~csi/data` │
+ └──────────────────────────────────┘     └──────────────────────────────────┘
+```
+
+---
+
+## Why Staging is Decoupled from Publishing
+
+Why does CSI split mounting into two distinct gRPC calls?
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ The 3 Architectural Reasons for NodeStage vs NodePublish:                                          │
+ ├────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1. Format-Once Safety: A raw block device must be formatted (`mkfs.ext4`) exactly once. Formatting │
+ │    a disk twice would wipe all existing data. Staging isolates formatting to the global path.      │
+ │ 2. Multi-Pod Sharing on Same Node: If 2 Pods on the same node mount the same RWO volume, Kubelet   │
+ │    stages the physical device ONCE, then simply executes 2 lightweight bind-mounts (Publish).      │
+ │ 3. Read-Only Mount Options: A volume can be staged read-write globally, but published read-only    │
+ │    (`mount -o remount,ro,bind`) to specific containers.                                            │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `NodeStageVolume` vs `NodePublishVolume`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ `NodeStageVolume`               │ `NodePublishVolume`             │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Target Path**           │ Global host staging directory   │ Pod-specific volume directory   │
+ │ **Action Performed**      │ Formats disk & mounts device    │ Linux bind-mount (`mount --bind`│
+ │ **Execution Frequency**   │ Once per volume per Node        │ Once per Pod referencing volume │
+ │ **Block Device Access**   │ Interacts directly with `/dev/` │ Interacts with global mount path│
+ │ **Teardown RPC**          │ `NodeUnstageVolume()`           │ `NodeUnpublishVolume()`         │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Linux Bind-Mounts & Mount Propagation
+
+When `NodePublishVolume` runs, it executes a kernel **bind-mount** (`MS_BIND`).
+
+### Mount Propagation Modes:
+Configured under `.spec.containers[].volumeMounts[].mountPropagation`:
+
+```text
+ ┌───────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ Mount Propagation Mode    │ Operational Behavior & Use Cases                                       │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`None`** (Default)      │ No mounts created inside the container are visible to the host, and no │
+ │                           │ subsequent host mounts are visible inside the container.               │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`HostToContainer`**     │ Mounts added to the host directory *after* container startup become    │
+ │                           │ visible inside the container. (Used by logging sidecars).              │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`Bidirectional`**       │ Mounts created inside the container are propagated back to the host OS.│
+ │                           │ **Mandatory for CSI Node Plugins** to expose mounts back to Kubelet!   │
+ └───────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+> [!WARNING]
+> `mountPropagation: Bidirectional` requires the container to run in **privileged mode** (`securityContext.privileged: true`) because creating host-visible mounts is a high-privilege kernel operation.
+
+---
+
+## The Teardown Sequence: Unpublish vs Unstage
+
+When a Pod terminates:
+1. **`NodeUnpublishVolume`:** Kubelet calls `NodeUnpublishVolume(target_path: "/var/lib/kubelet/pods/uid-A/...")`. The CSI driver unmounts the bind-mount and removes the container mount point directory.
+2. **Reference Counting:** Kubelet checks if any other active Pods on that worker node are still referencing the volume.
+3. **`NodeUnstageVolume`:** If the reference count drops to **zero**, Kubelet calls `NodeUnstageVolume(staging_path: "...")`. The driver unmounts the global staging directory and releases the kernel block device lock (`/dev/xvdf`), allowing the cloud provider to safely detach the volume.
+
+---
+
+## Complete CSI Node DaemonSet Manifest with Bidirectional Mounts
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aws-ebs-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: aws-ebs-csi-node
+  template:
+    metadata:
+      labels:
+        app: aws-ebs-csi-node
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+
+      containers:
+      # CSI Node Driver Container
+      - name: ebs-plugin
+        image: registry.k8s.io/provider-aws/aws-ebs-csi-driver:v1.25.0
+        securityContext:
+          privileged: true    # Mandatory for Bidirectional mount propagation!
+        volumeMounts:
+          # Global Kubelet directory (Bidirectional propagation!)
+          - name: kubelet-dir
+            mountPath: /var/lib/kubelet
+            mountPropagation: Bidirectional
+          # Host /dev access for formatting block devices
+          - name: dev-dir
+            mountPath: /dev
+
+      volumes:
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+```
+
+---
+
+## Hands-On Lab: Inspecting Global Staging Paths & Bind-Mounts
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace stage-lab
+
+# Step 2: Deploy a PVC and Pod
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: stage-pvc
+  namespace: stage-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: stage-demo-pod
+  namespace: stage-lab
+spec:
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: stage-pvc
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts:
+    - name: data
+      mountPath: /var/data
+EOF
+
+# Step 3: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/stage-demo-pod -n stage-lab --timeout=30s
+
+# Step 4: Inspect the Pod's private mount points from inside the container
+kubectl exec -n stage-lab stage-demo-pod -- mount | grep /var/data
+
+# Step 5: (Optional/Admin) If on control-plane/worker node, inspect Kubelet global mounts
+# ls -la /var/lib/kubelet/plugins/kubernetes.io/csi/ 2>/dev/null || echo "Run on worker node to see global mount hierarchy"
+
+# Step 6: Clean up lab
+kubectl delete namespace stage-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does CSI divide node mounting into `NodeStageVolume` and `NodePublishVolume`?**
+
+CSI separates staging from publishing for three reasons: (1) **Format-Once Safety**: Raw block devices must be formatted with a filesystem (ext4/XFS) only once globally; performing format checks during individual container launches risks race conditions and data loss; (2) **Multi-Pod Co-Location**: Multiple Pods on the same node sharing a volume only require one physical device mount (`NodeStageVolume`) and multiple lightweight Linux bind-mounts (`NodePublishVolume`); (3) **Read-Only Enforcements**: Staging mounts the storage globally, while publishing allows individual containers to bind-mount with custom read-only permissions.
+
+**Q2: What is the difference between `NodeUnpublishVolume` and `NodeUnstageVolume`?**
+
+`NodeUnpublishVolume` is called whenever an individual Pod terminates; it unbinds and removes the container's private bind-mount while leaving the global device staging mount intact. `NodeUnstageVolume` is called only when the last Pod on the node referencing that volume has terminated; it unmounts the global staging directory from the host filesystem and releases the block device lock.
+
+**Q3: What does `mountPropagation: Bidirectional` mean, and why is it mandatory for CSI Node plugins?**
+
+`mountPropagation: Bidirectional` allows filesystem mounts created *inside* a container's mount namespace to propagate back to the host operating system's root mount namespace. This is strictly mandatory for CSI Node plugins because when the CSI driver executes `mount` or `mkfs` inside its container, that new mount point must become visible on the host OS so that Kubelet and other user Pods can access the mounted storage.
+
+**Q4: How does `NodeStageVolume` prevent accidental reformatting of existing data disks?**
+
+Before invoking filesystem creation utilities (`mkfs.ext4` or `mkfs.xfs`), the CSI driver's `NodeStageVolume` implementation executes a block probe (e.g. using `blkid` or Linux filesystem signature scanners). If an existing filesystem signature is detected on the device, the driver skips formatting and proceeds directly to mounting the global staging directory, ensuring that re-attached persistent disks never lose their stored data.
+
+**Q5: What causes a volume to be stuck in `VolumeInUse` or unmount timeout errors during Pod termination?**
+
+This error occurs when Kubelet attempts to invoke `NodeUnstageVolume` or `ControllerUnpublishVolume`, but processes on the worker node are still holding open file descriptors on the mount path (e.g. an un-drained sidecar container or a hung process). The Linux kernel returns `device or resource busy` (`EBUSY`), preventing unmounting. Kubelet repeatedly retries until the processes are terminated or the grace period expires.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `NodeStageVolume` formats and mounts the block device to a global host path
+- [ ] Know that `NodePublishVolume` creates per-pod Linux bind-mounts into containers
+- [ ] Know why staging is separated from publishing (format-once safety, multi-pod sharing)
+- [ ] Know that `NodeUnstageVolume` only runs when reference count on the node drops to zero
+- [ ] Know that CSI Node plugins require `mountPropagation: Bidirectional` and privileged mode
+- [ ] Know how `NodeStageVolume` uses `blkid` to prevent formatting disks containing data
+- [ ] Can verify volume mounts using `kubectl exec <pod> -- mount`

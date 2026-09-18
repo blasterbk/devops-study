@@ -1,0 +1,272 @@
+---
+title: "Chapter 2 — NodeLocal DNSCache"
+sidebar_position: 2
+module: "Module 2.7 — DNS"
+description: "Deep dive into NodeLocal DNSCache — the per-node DNS caching agent that eliminates the conntrack table bottleneck for DNS traffic and reduces DNS lookup latency by keeping a local cache on every node."
+---
+
+# Chapter 2 — NodeLocal DNSCache
+
+> **Goal:** Understand why NodeLocal DNSCache was introduced, what the conntrack table problem is for DNS traffic, how the link-local IP trick works, and how to deploy and verify NodeLocal DNSCache in production clusters.
+>
+> By the end of this chapter, you will understand:
+> 1. The conntrack table bottleneck: why UDP DNS through kube-proxy causes problems
+> 2. What NodeLocal DNSCache is and how it creates a local cache on every node
+> 3. The link-local IP address (169.254.20.10) trick that bypasses kube-proxy
+> 4. How NodeLocal DNSCache changes the DNS query path
+> 5. How to deploy and validate NodeLocal DNSCache
+> 6. The trade-off: stale cache risk vs latency improvement
+
+---
+
+## Real-Life Analogy
+
+Without NodeLocal DNSCache: imagine every office employee calling the **central HR office** (CoreDNS ClusterIP) for every HR question. The reception desk (conntrack table) must log every call in/out to route it correctly. When 500 employees all call simultaneously, the reception log (conntrack table) gets overwhelmed — race conditions cause some calls to fail (DNS errors).
+
+With NodeLocal DNSCache: each floor of the office gets its **own HR assistant** (local cache agent). For common questions ("What's the medical benefits phone number?"), the floor assistant answers immediately from memory. Only novel questions go to central HR. The reception desk (conntrack table) is no longer overwhelmed — only cache misses ever reach it.
+
+---
+
+## Architecture Diagram
+
+```text
+          DNS Query Path: Without vs With NodeLocal DNSCache
+
+WITHOUT NodeLocal DNSCache:
+  Pod
+   │ UDP query → 10.96.0.10 (kube-dns ClusterIP)
+   │
+   ▼
+  iptables (kube-proxy)
+   │ DNAT: 10.96.0.10 → CoreDNS Pod IP (one of N replicas)
+   │ conntrack entry created: track this UDP flow
+   ▼
+  CoreDNS Pod
+  Problem: Thousands of short UDP DNS flows → conntrack table exhaustion
+           Race condition: multiple queries for same 5-tuple → dropped
+
+WITH NodeLocal DNSCache:
+  Pod /etc/resolv.conf: nameserver 169.254.20.10
+   │ UDP query → 169.254.20.10 (link-local IP, node-local)
+   │
+   ▼
+  NodeLocal DNSCache DaemonSet Pod (same node)
+   │ Listens on 169.254.20.10 (bound to dummy interface)
+   │ Check local cache:
+   │   HIT:  return cached response immediately (no conntrack involved!)
+   │   MISS: forward to CoreDNS 10.96.0.10 (TCP connection, persistent)
+   ▼
+  CoreDNS (only for cache misses — much less load)
+```
+
+---
+
+## The Conntrack Problem
+
+UDP DNS traffic through kube-proxy creates a specific failure mode:
+
+```text
+Conntrack race condition (also called UDP conntrack collision):
+  Time 0: Pod A sends query #1 → conntrack creates entry
+  Time 0: Pod A sends query #2 (same 5-tuple: src-ip:src-port → 10.96.0.10:53)
+           conntrack receives BOTH before either reply
+           Two simultaneous packets with same 5-tuple → race condition
+           One packet's conntrack entry overwrites the other
+           One DNS response is misrouted → client receives SERVFAIL
+
+Scale problem:
+  A node with 100 Pods, each making 10 DNS queries/second
+  = 1000 UDP flows/second through conntrack
+  Conntrack table default size: 131072 entries
+  Short TTL UDP DNS fills and evicts entries rapidly
+  → conntrack table exhaustion → DNS errors cluster-wide
+```
+
+NodeLocal DNSCache uses `iptables -j NOTRACK` to mark DNS traffic to `169.254.20.10` as NOT going through conntrack — **completely bypassing the conntrack problem**.
+
+---
+
+## How the Link-Local IP Works
+
+```text
+169.254.20.10 is a link-local IP:
+  - Not routable outside a single host (link scope only)
+  - Doesn't need a route — any packet to 169.254.x.x stays local
+  - The NodeLocal DaemonSet Pod adds a dummy network interface
+    and binds to this IP on each node
+  - iptables rules mark DNS traffic to 169.254.20.10 as NOTRACK
+
+Result:
+  - DNS queries never leave the node for cached entries
+  - No kube-proxy DNAT, no conntrack, no NAT
+  - Direct kernel call to the local cache process
+  - Cache miss: NodeLocal DNSCache → CoreDNS via TCP (persistent connection)
+    TCP is not affected by the UDP conntrack race condition
+```
+
+---
+
+## Installing NodeLocal DNSCache
+
+```bash
+# Download the NodeLocal DNSCache DaemonSet spec
+curl -O https://raw.githubusercontent.com/kubernetes/kubernetes/master/cluster/addons/dns/nodelocaldns/nodelocaldns.yaml
+
+# The spec uses templating. Set variables:
+KUBEDNS_SVC_IP="10.96.0.10"           # kube-dns ClusterIP
+LOCALDNS_IP="169.254.20.10"           # Link-local cache IP
+UPSTREAM="__PILLAR__CLUSTER__DNS__"   # CoreDNS ClusterIP
+
+sed -i "s/__PILLAR__LOCAL__DNS__/$LOCALDNS_IP/g" nodelocaldns.yaml
+sed -i "s/__PILLAR__DNS__DOMAIN__/cluster.local/g" nodelocaldns.yaml
+sed -i "s/__PILLAR__DNS__SERVER__/$KUBEDNS_SVC_IP/g" nodelocaldns.yaml
+sed -i "s/__PILLAR__UPSTREAM__SERVERS__/$KUBEDNS_SVC_IP/g" nodelocaldns.yaml
+
+kubectl apply -f nodelocaldns.yaml
+
+# Verify DaemonSet is running on all nodes
+kubectl get daemonset node-local-dns -n kube-system
+# NAME             DESIRED  CURRENT  READY  NODE SELECTOR   AGE
+# node-local-dns   3        3        3      <none>          5m
+```
+
+---
+
+## Configuring Pods to Use NodeLocal DNSCache
+
+After deployment, new Pods on nodes with NodeLocal DNSCache will automatically use `169.254.20.10` if the kubelet is configured with `--cluster-dns=169.254.20.10`. Without kubelet reconfiguration, Pods keep using the old `10.96.0.10`:
+
+```bash
+# Option 1: Reconfigure kubelet (requires node restart)
+# In kubelet config:
+clusterDNS:
+- "169.254.20.10"
+
+# Option 2: Manual dnsConfig override per Pod (no kubelet change needed)
+spec:
+  dnsConfig:
+    nameservers:
+    - 169.254.20.10
+  dnsPolicy: None
+```
+
+For managed clusters (GKE, EKS, AKS), NodeLocal DNSCache is typically enabled via cluster configuration and the kubelet is automatically reconfigured.
+
+---
+
+## NodeLocal DNSCache Corefile
+
+The cache agent has its own Corefile defining how it handles queries:
+
+```
+# NodeLocal DNSCache Corefile
+cluster.local:53 {
+    errors
+    cache {
+        success 9984 30    # Cache up to 9984 successful responses for 30s
+        denial 9984 5      # Cache NXDOMAIN for 5s
+    }
+    reload
+    loop
+    bind 169.254.20.10     # Only listen on link-local IP
+    forward . __PILLAR__CLUSTER__DNS__ {   # Forward to CoreDNS ClusterIP
+        force_tcp                          # Use TCP (avoids UDP conntrack)
+    }
+    prometheus :9253
+    health 169.254.20.10:8080
+    }
+in-addr.arpa:53 {
+    errors
+    cache 30
+    reload
+    loop
+    bind 169.254.20.10
+    forward . __PILLAR__CLUSTER__DNS__ { force_tcp }
+    prometheus :9253
+    }
+.:53 {
+    errors
+    cache 30
+    reload
+    loop
+    bind 169.254.20.10
+    forward . __PILLAR__UPSTREAM__SERVERS__    # External DNS
+    prometheus :9253
+    }
+```
+
+---
+
+## Verifying NodeLocal DNSCache is Working
+
+```bash
+# 1. Check the dummy network interface on a node
+kubectl debug node/node-1 -it --image=ubuntu
+ip addr | grep 169.254.20.10
+# inet 169.254.20.10/32 scope link nodelocaldns
+
+# 2. Verify iptables NOTRACK rules
+iptables -t raw -L PREROUTING -n | grep 169.254.20.10
+
+# 3. Check that a Pod uses the local cache
+kubectl exec my-pod -- cat /etc/resolv.conf
+# nameserver 169.254.20.10   ← Local cache!
+
+# 4. Test DNS latency difference
+# Without cache (cold):
+kubectl exec my-pod -- time nslookup api-service.production.svc.cluster.local
+# ~2-5ms (network + CoreDNS processing)
+
+# With cache hit:
+kubectl exec my-pod -- time nslookup api-service.production.svc.cluster.local
+# ~0.1-0.5ms (local cache, no network)
+
+# 5. View NodeLocal DNSCache metrics
+kubectl port-forward -n kube-system daemonset/node-local-dns 9253:9253
+curl http://localhost:9253/metrics | grep -E "coredns_cache_hits|coredns_cache_misses"
+# coredns_cache_hits_total{server="dns://169.254.20.10:53",type="success"} 1423
+# coredns_cache_misses_total{...} 87
+
+# 6. Check cache hit rate
+# Hit rate = hits / (hits + misses)
+# A healthy production cluster should have >90% cache hit rate
+
+# 7. NodeLocal DNSCache logs
+kubectl logs -n kube-system -l k8s-app=node-local-dns -f
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What problem does NodeLocal DNSCache solve?**
+
+Two main problems: (1) **conntrack race condition** — DNS uses UDP, and multiple simultaneous DNS queries from the same source port create conntrack 5-tuple collisions, causing packets to be dropped and DNS failures under high load. NodeLocal DNSCache bypasses conntrack entirely using `iptables NOTRACK` for traffic to `169.254.20.10`. (2) **DNS latency and CoreDNS overload** — without caching, every DNS query crosses the network to CoreDNS. With NodeLocal DNSCache, hits are served from the local node cache in <1ms, dramatically reducing CoreDNS load and query latency.
+
+**Q2: Why is `169.254.20.10` used as the cache IP?**
+
+`169.254.0.0/16` is the IANA link-local address range — packets to these addresses are never routed off the host. NodeLocal DNSCache DaemonSet Pods bind to `169.254.20.10` on a dummy network interface. Since this IP is link-local, no external routing is needed — the kernel delivers packets directly to the local process. Additionally, iptables rules mark this traffic as `NOTRACK`, so it completely bypasses the conntrack table — eliminating the UDP conntrack race condition.
+
+**Q3: How does NodeLocal DNSCache avoid the conntrack problem for cache misses?**
+
+For cache misses, NodeLocal DNSCache forwards the query to CoreDNS using **TCP** (`force_tcp` in the Corefile), not UDP. TCP connections are stateful by nature and don't suffer from the same race conditions as UDP. Furthermore, NodeLocal DNSCache maintains **persistent TCP connections** to CoreDNS — instead of creating a new UDP flow per query (which stresses conntrack), it reuses long-lived TCP connections. This drastically reduces conntrack churn even for cache misses.
+
+**Q4: What is the trade-off of using NodeLocal DNSCache?**
+
+**Benefit**: Sub-millisecond DNS resolution for cached entries, eliminates conntrack pressure, reduces CoreDNS load. **Trade-off**: **Stale cache risk** — if a Service changes its ClusterIP or a Pod's IP changes, the node-local cache may return stale data for up to `TTL` seconds (30s default). This is normally acceptable since DNS TTLs already allow for stale data windows. Another consideration: NodeLocal DNSCache is a DaemonSet — it adds a Pod to every node, consuming some CPU/memory (typically minimal: ~50MB RAM per node).
+
+**Q5: How does NodeLocal DNSCache change the Pod's `/etc/resolv.conf`?**
+
+When NodeLocal DNSCache is active and the kubelet is configured with `--cluster-dns=169.254.20.10`, Pods receive `nameserver 169.254.20.10` instead of the kube-dns ClusterIP. The search domains and ndots remain the same — only the nameserver changes. Queries go to the local cache first; cache misses are forwarded to CoreDNS via persistent TCP. If NodeLocal DNSCache DaemonSet Pod is not running on a node (e.g., evicted), DNS completely fails for Pods on that node since `169.254.20.10` is unreachable — this is a trade-off for the performance gain.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know NodeLocal DNSCache solves: UDP conntrack race condition + CoreDNS overload
+- [ ] Know `169.254.20.10` is a link-local IP — stays on the node, never routed externally
+- [ ] Know cache traffic bypasses conntrack via `iptables NOTRACK`
+- [ ] Know cache misses use TCP (not UDP) to CoreDNS — avoids conntrack for forwarded queries
+- [ ] Know deployment: DaemonSet on all nodes + kubelet `--cluster-dns=169.254.20.10`
+- [ ] Know the trade-off: stale cache risk (up to 30s TTL window) for latency gains
+- [ ] Can verify with `ip addr` on node (dummy interface), `/etc/resolv.conf` in Pod, and Prometheus metrics

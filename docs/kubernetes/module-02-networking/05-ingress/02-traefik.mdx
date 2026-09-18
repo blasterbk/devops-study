@@ -1,0 +1,421 @@
+---
+title: "Chapter 2 — Traefik"
+sidebar_position: 2
+module: "Module 2.5 — Ingress"
+description: "Deep dive into Traefik as a Kubernetes Ingress Controller — its provider model, automatic service discovery via Kubernetes CRDs (IngressRoute), middleware pipeline, Let's Encrypt integration, and the Traefik dashboard for real-time observability."
+---
+
+# Chapter 2 — Traefik Ingress Controller
+
+> **Goal:** Understand Traefik's unique provider-based architecture, how IngressRoute CRDs give more expressive routing than standard Ingress, how the middleware pipeline enables request transformation, and Traefik's built-in Let's Encrypt integration.
+>
+> By the end of this chapter, you will understand:
+> 1. Traefik's provider model and how it discovers routes dynamically
+> 2. The difference between standard Ingress and Traefik's IngressRoute CRD
+> 3. The middleware pipeline: authentication, rate limiting, headers, circuit breaking
+> 4. Automatic TLS certificate management via Let's Encrypt (ACME)
+> 5. The Traefik dashboard for real-time routing visualization
+> 6. When to choose Traefik vs NGINX Ingress
+
+---
+
+## Real-Life Analogy
+
+NGINX Ingress is like a **traditional post office**: configured by static rulebooks (nginx.conf). Someone has to manually update the rulebook when routes change. Changes require a brief service interruption (reload).
+
+Traefik is like a **smart GPS navigator**: it continuously discovers roads (Kubernetes Services, Ingress objects, CRDs) in real-time, automatically recalculates routes without stopping, and applies traffic rules (middlewares) without configuration files. Plug in a new service — Traefik finds and routes it automatically.
+
+Traefik also has a **live map dashboard** showing all current routes, their health, and real-time traffic counters.
+
+---
+
+## Architecture Diagram
+
+```text
+                    Traefik Architecture
+
+  Kubernetes API Server
+  ┌──────────────────────────────────────────────────────┐
+  │  Ingress resources                                   │
+  │  IngressRoute CRDs (Traefik-specific)                │
+  │  Services, EndpointSlices                            │
+  └──────────────────────────┬───────────────────────────┘
+                             │ Continuous watch
+  ┌──────────────────────────▼───────────────────────────┐
+  │  Traefik (single binary)                             │
+  │                                                      │
+  │  ┌──────────────────────────────────────────────┐    │
+  │  │  Providers (discovery sources)               │    │
+  │  │  - Kubernetes Ingress provider               │    │
+  │  │  - Kubernetes CRD provider (IngressRoute)    │    │
+  │  │  - Docker provider (for docker-compose)      │    │
+  │  └──────────────────┬───────────────────────────┘    │
+  │                     │                                │
+  │  ┌──────────────────▼───────────────────────────┐    │
+  │  │  Routing Engine                              │    │
+  │  │  Routers → Middlewares → Services            │    │
+  │  │  (L7 matching → transform → upstream)        │    │
+  │  └──────────────────┬───────────────────────────┘    │
+  │                     │                                │
+  │  ┌──────────────────▼───────────────────────────┐    │
+  │  │  Entrypoints                                 │    │
+  │  │  web: :80   websecure: :443   traefik: :8080 │    │
+  │  └──────────────────────────────────────────────┘    │
+  └──────────────────────────────────────────────────────┘
+```
+
+---
+
+## Installing Traefik
+
+```bash
+# Install Traefik via Helm
+helm repo add traefik https://traefik.github.io/charts
+helm repo update
+
+helm install traefik traefik/traefik \
+  --namespace traefik \
+  --create-namespace \
+  --set deployment.replicas=2 \
+  --set ingressClass.enabled=true \
+  --set ingressClass.isDefaultClass=false \
+  --set dashboard.enabled=true \
+  --set ports.web.redirectTo.port=websecure  # HTTP → HTTPS redirect
+
+# Verify installation
+kubectl get pods -n traefik
+kubectl get svc traefik -n traefik
+
+# Access dashboard (port-forward)
+kubectl port-forward -n traefik svc/traefik 9000:9000
+# Open: http://localhost:9000/dashboard/
+```
+
+---
+
+## Standard Ingress with Traefik
+
+Traefik supports the standard Kubernetes Ingress resource:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: default-auth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls-cert
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+---
+
+## IngressRoute: Traefik's Native CRD
+
+For more expressive routing, use Traefik's `IngressRoute` CRD:
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: api-ingress-route
+  namespace: production
+spec:
+  entryPoints:
+  - websecure          # Only accept on HTTPS port
+
+  routes:
+  - kind: Rule
+    match: Host(`api.example.com`) && PathPrefix(`/v1`)
+    middlewares:
+    - name: rate-limit
+    - name: auth-middleware
+    services:
+    - name: api-v1-service
+      port: 8080
+      weight: 100        # For weighted load balancing
+
+  - kind: Rule
+    match: Host(`api.example.com`) && PathPrefix(`/v2`)
+    services:
+    - name: api-v2-service
+      port: 8080
+
+  tls:
+    secretName: api-tls-cert
+    # or for Let's Encrypt:
+    certResolver: letsencrypt
+```
+
+### Advanced Route Matching
+
+```yaml
+# Traefik's rule syntax supports rich expressions:
+match: |
+  Host(`api.example.com`) &&
+  PathPrefix(`/admin`) &&
+  Headers(`X-API-Key`, `secret-key`)
+
+# Header-based routing (for A/B testing or canary)
+match: Host(`app.example.com`) && HeadersRegexp(`User-Agent`, `.*Mobile.*`)
+
+# Method-based routing
+match: Host(`api.example.com`) && Method(`GET`, `POST`)
+
+# Query parameter routing
+match: Host(`api.example.com`) && Query(`version`, `v2`)
+```
+
+---
+
+## Middleware Pipeline
+
+Middlewares are request/response transformations applied between the router and the service:
+
+### Rate Limiting
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+  namespace: production
+spec:
+  rateLimit:
+    average: 100         # requests per period
+    period: 1m           # measurement window
+    burst: 50            # burst capacity above average
+    sourceCriterion:
+      ipStrategy:
+        depth: 1         # use first IP in X-Forwarded-For
+```
+
+### Basic Auth
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-auth
+spec:
+  basicAuth:
+    secret: auth-credentials  # Kubernetes Secret with htpasswd format
+```
+
+### Headers Manipulation
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+spec:
+  headers:
+    customRequestHeaders:
+      X-Forwarded-Proto: "https"
+      X-Real-IP: ""              # Empty removes the header
+    customResponseHeaders:
+      X-Content-Type-Options: "nosniff"
+      X-Frame-Options: "DENY"
+      Strict-Transport-Security: "max-age=31536000; includeSubDomains"
+    accessControlAllowMethods:
+    - GET
+    - POST
+    - OPTIONS
+    accessControlAllowOriginList:
+    - "https://app.example.com"
+```
+
+### Circuit Breaker
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: circuit-breaker
+spec:
+  circuitBreaker:
+    expression: ResponseCodeRatio(500, 600, 0, 600) > 0.30
+    # Opens circuit if >30% of responses are 5xx
+    checkPeriod: 10s
+    fallbackDuration: 30s
+    recoveryDuration: 10s
+```
+
+### Chaining Middlewares
+
+```yaml
+# Apply middlewares in order on a route:
+routes:
+- kind: Rule
+  match: Host(`api.example.com`)
+  middlewares:
+  - name: security-headers    # Applied first
+  - name: rate-limit          # Applied second
+  - name: basic-auth          # Applied third
+  services:
+  - name: api-service
+    port: 80
+```
+
+---
+
+## Let's Encrypt Automatic TLS
+
+Traefik has built-in ACME (Let's Encrypt) support:
+
+```yaml
+# Traefik values.yaml for Helm
+additionalArguments:
+  # ACME HTTP challenge (Let's Encrypt)
+  - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+  - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+  - "--certificatesresolvers.letsencrypt.acme.email=admin@example.com"
+  - "--certificatesresolvers.letsencrypt.acme.storage=/data/acme.json"
+
+# Or DNS challenge (works behind firewalls):
+  - "--certificatesresolvers.letsencrypt.acme.dnschallenge=true"
+  - "--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=route53"
+```
+
+```yaml
+# IngressRoute with automatic cert:
+spec:
+  tls:
+    certResolver: letsencrypt   # Traefik requests cert from Let's Encrypt
+    domains:
+    - main: api.example.com
+      sans:
+      - www.api.example.com
+```
+
+Traefik handles:
+- Initial certificate issuance via ACME HTTP-01 or DNS-01 challenge
+- Certificate storage (file or Kubernetes Secret)
+- Automatic renewal (60 days before expiry)
+
+---
+
+## The Traefik Dashboard
+
+The dashboard provides real-time visibility:
+
+```text
+Dashboard sections:
+  ├── Entrypoints: web(:80), websecure(:443), traefik(:8080)
+  ├── Routers: all active routing rules, their status (enabled/error)
+  ├── Services: all upstream services with current backend count
+  ├── Middlewares: all active middlewares with their types
+  └── Features: enabled/disabled features (metrics, tracing, etc.)
+```
+
+```bash
+# Secure the dashboard (production)
+kubectl create secret generic traefik-dashboard-auth \
+  --from-literal=users='admin:$apr1$...(htpasswd hash)' \
+  -n traefik
+
+# Port-forward for local access
+kubectl port-forward -n traefik \
+  $(kubectl get pods -n traefik -o name | head -1) 9000:9000
+```
+
+---
+
+## Traefik vs NGINX Ingress
+
+| Feature | NGINX Ingress | Traefik |
+|---------|--------------|---------|
+| **Config reload** | Requires nginx reload (fast) | No reload — dynamic |
+| **TLS management** | Manual / cert-manager | Built-in Let's Encrypt |
+| **Native CRD routing** | Via annotations | IngressRoute CRD |
+| **Middleware pipeline** | Annotations | Dedicated Middleware CRDs |
+| **Dashboard** | Third-party (Prometheus) | Built-in |
+| **gRPC support** | Via annotation | Native |
+| **Circuit breaking** | Via nginx module | Native CRD |
+| **Weighted routing** | Canary via annotations | Native in IngressRoute |
+| **Community size** | Very large | Large |
+| **Performance** | Excellent (NGINX core) | Good (Go-based) |
+
+---
+
+## Hands-On: Traefik Debugging
+
+```bash
+# 1. Check Traefik configuration
+kubectl logs -n traefik -l app.kubernetes.io/name=traefik | grep -i error
+
+# 2. View all active routes via API
+kubectl port-forward -n traefik svc/traefik 9000:9000 &
+curl http://localhost:9000/api/http/routers | python3 -m json.tool
+curl http://localhost:9000/api/http/services | python3 -m json.tool
+curl http://localhost:9000/api/http/middlewares | python3 -m json.tool
+
+# 3. Check if IngressRoute was picked up
+curl http://localhost:9000/api/http/routers | \
+  jq '.[] | select(.name == "production-api-ingress-route@kubernetescrd")'
+
+# 4. Test routing
+curl -H "Host: api.example.com" http://<traefik-node-ip>:80/v1/health
+
+# 5. Check certificate status (Let's Encrypt)
+kubectl get secret -n traefik | grep acme
+kubectl exec -n traefik traefik-<id> -- cat /data/acme.json | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); print([c['domain']['main'] for c in d.get('letsencrypt',{}).get('Certificates',[])])"
+
+# 6. Enable debug logging
+helm upgrade traefik traefik/traefik \
+  --set additionalArguments[0]="--log.level=DEBUG"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Traefik's provider model and how does it enable dynamic configuration?**
+
+Traefik's provider model abstracts configuration sources. Each provider watches a specific system for routing configuration: the Kubernetes Ingress provider watches standard Ingress objects, the Kubernetes CRD provider watches IngressRoute/Middleware CRDs, and so on. Providers can be enabled/disabled and combined. When any provider detects a change (new Ingress, new Service endpoint), Traefik instantly updates its routing table in-memory — no file write, no reload. This makes Traefik naturally dynamic in container environments.
+
+**Q2: What advantages does IngressRoute offer over standard Kubernetes Ingress?**
+
+IngressRoute supports: complex boolean route matching (Host AND PathPrefix AND Headers), weighted load balancing across multiple services, native middleware chaining, per-route TLS configuration, gRPC routing, and TCP/UDP routing — all in a structured CRD rather than string annotations. Standard Ingress is limited to host/path matching and requires controller-specific annotations for advanced features. The trade-off: IngressRoute is Traefik-specific — not portable to other controllers.
+
+**Q3: How does Traefik's circuit breaker middleware work?**
+
+The `circuitBreaker` middleware wraps a backend service. When the circuit is closed (normal), requests pass through. Traefik monitors the backend's response metrics (error rate, response time). If the `expression` evaluates to true (e.g., >30% 5xx responses), the circuit opens and Traefik immediately returns a 503 without forwarding to the broken backend. After `fallbackDuration`, Traefik allows test requests through (half-open state). If they succeed for `recoveryDuration`, the circuit closes again.
+
+**Q4: How does Traefik handle Let's Encrypt certificate renewal automatically?**
+
+Traefik runs an ACME client internally. It stores certificate data (including renewal timestamps) in `acme.json` or a Kubernetes Secret. Traefik checks certificate expiry continuously. When a certificate is within 60 days of expiry, it initiates an ACME challenge (HTTP-01 or DNS-01) to request a new certificate from Let's Encrypt. The new certificate is stored and immediately used — without any configuration reload or service interruption.
+
+**Q5: When would you choose Traefik over NGINX Ingress Controller?**
+
+Choose Traefik when: you want built-in Let's Encrypt integration (avoiding cert-manager setup), you need dynamic routing without config reloads in highly dynamic environments, you want native circuit breaking and weighted routing without controller-specific annotation complexity, you prefer the IngressRoute CRD approach over annotations, or you value the built-in dashboard. Choose NGINX when: you need battle-tested performance at very high throughput, your team has deep NGINX expertise, you need maximum compatibility with the standard Ingress spec, or you're in a large organization where portability between controllers matters.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know Traefik's provider model: multiple config sources (Kubernetes Ingress, CRD, Docker)
+- [ ] Understand IngressRoute CRD supports rich boolean matching (Host AND Path AND Headers)
+- [ ] Know the middleware pipeline: rate limit, auth, headers, circuit breaker — chainable
+- [ ] Understand Traefik's built-in Let's Encrypt via ACME (HTTP-01 and DNS-01 challenges)
+- [ ] Know the Traefik dashboard provides real-time routing visibility
+- [ ] Can debug Traefik via the `/api/http/routers` REST API and dashboard
+- [ ] Know when to choose Traefik vs NGINX: dynamic config vs raw performance, built-in TLS vs cert-manager

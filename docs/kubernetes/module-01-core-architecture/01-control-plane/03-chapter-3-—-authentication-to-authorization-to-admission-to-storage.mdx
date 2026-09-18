@@ -1,0 +1,657 @@
+---
+title: "Chapter 3 — Authentication → Authorization → Admission → Storage"
+sidebar_position: 3
+module: "Module 1.1 — Kubernetes Control Plane"
+description: "> **Goal:** Understand the complete Kubernetes security and request-processing pipeline."
+---
+
+# Chapter 3 — Authentication → Authorization → Admission → Storage
+
+> **Goal:** Understand the complete Kubernetes security and request-processing pipeline.
+>
+> For a typical **write request** sent to the Kubernetes API Server, the request passes through several major stages:
+>
+> ```text
+> 1. Authentication
+> 2. Authorization
+> 3. Admission
+> 4. Validation
+> 5. Object Conversion
+> 6. Serialization
+> 7. Storage (etcd)
+> ```
+>
+> By the end of this chapter, you'll understand **how Kubernetes verifies identity, checks permissions, applies policies, validates objects, and stores API state** before it becomes part of the cluster state.
+>
+> **Important:** Not every API request follows exactly the same path. In particular, read-only requests such as `GET`, `LIST`, and `WATCH` do not go through the admission phase.
+
+---
+
+# Why Should You Learn This?
+
+Most Kubernetes security issues happen because people misunderstand one of these stages.
+
+Examples:
+- Why am I getting **401 Unauthorized**?
+- Why am I getting **403 Forbidden**?
+- Why did my Pod get rejected?
+- Why was my YAML automatically modified?
+- Why is my Deployment not stored?
+- Why can't my ServiceAccount create Pods?
+
+If you understand this pipeline, you'll be able to troubleshoot many Kubernetes API errors.
+
+---
+
+# The Complete Security Pipeline
+
+Whenever someone sends a **write request**, such as:
+
+```bash
+kubectl apply -f deployment.yaml
+```
+
+Kubernetes conceptually processes it like this:
+
+```text
+Client
+  |
+  v
+API Server
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Admission
+  |
+  +── Mutating
+  |
+  +── Validating
+  |
+  v
+Resource / Schema Validation
+  |
+  v
+Internal Object Conversion
+  |
+  v
+Storage Version Conversion
+  |
+  v
+Serialization
+  |
+  v
+Storage Layer
+  |
+  v
+etcd
+```
+
+> **Important:** This is a conceptual flow for a write request. Read-only requests such as `GET`, `LIST`, and `WATCH` do not pass through the admission phase.
+
+---
+
+# Real-Life Analogy
+
+Imagine entering a secure office building:
+
+```text
+Office Building
+  |
+  v
+Security Guard
+  |
+  v
+Reception Check
+  |
+  v
+Manager Approval
+  |
+  v
+File Validation
+  |
+  v
+Document Archive
+```
+
+Each checkpoint has a different responsibility:
+
+| Office Building Checkpoint | Kubernetes Stage |
+| :--- | :--- |
+| **Security Guard** | Authentication |
+| **Reception Permission Check** | Authorization |
+| **Manager Approval** | Admission |
+| **File Validation** | Validation |
+| **File Archive** | Storage |
+
+Let's study each checkpoint in detail.
+
+---
+
+# Part 1 — Authentication
+
+## What is Authentication?
+
+Authentication answers one question:
+
+> **Who are you?**
+
+It does **not** answer:
+
+> **What are you allowed to do?**
+
+That comes later.
+
+---
+
+## Example
+
+Suppose Alice runs:
+
+```bash
+kubectl get pods
+```
+
+The API Server first asks: *"Who is making this request?"*
+
+Alice presents credentials. If Kubernetes successfully verifies the credentials, Alice is authenticated.
+
+### Real-Life Example
+When you log in to Gmail:
+1. You enter Email & Password.
+2. Google verifies: *"Are you really Alice?"*
+3. Only after verifying identity does it check what you are allowed to access.
+
+Authentication works the same way.
+
+---
+
+## Supported Authentication Methods
+
+Kubernetes supports multiple authentication mechanisms.
+
+### 1. Client Certificates
+Client certificates are commonly used for Kubernetes administrative access and component-to-component authentication.
+
+```text
+kubectl
+  |
+  v
+Client Certificate
+  |
+  v
+API Server
+  |
+  v
+Certificate Verification
+  |
+  v
+Authenticated Identity
+```
+
+If the certificate is valid and trusted by the configured Certificate Authority (CA), the request is authenticated.
+
+### 2. Bearer Token
+Instead of certificates, the client sends an HTTP header:
+
+```http
+Authorization: Bearer <token>
+```
+
+The API Server validates the token using the configured authentication mechanism. Commonly used by applications, automation, and CI/CD pipelines.
+
+### 3. Service Account Tokens
+Pods normally run under a Kubernetes `ServiceAccount`.
+
+```text
+Pod
+  |
+  v
+ServiceAccount
+  |
+  v
+ServiceAccount Credentials
+  |
+  v
+API Server
+```
+
+By default, Kubernetes makes `ServiceAccount` credentials available to containers unless token automounting is disabled. Modern Kubernetes normally uses short-lived, projected ServiceAccount tokens rather than older long-lived Secret-based tokens.
+
+### 4. OpenID Connect (OIDC)
+Large organizations often integrate Kubernetes with identity providers such as Microsoft Entra ID, Okta, Keycloak, Google Identity, or Auth0:
+
+```text
+User
+  |
+  v
+Identity Provider
+  |
+  v
+OIDC Token
+  |
+  v
+API Server
+```
+
+### 5. Webhook Authentication
+Instead of verifying credentials entirely by itself, the API Server can delegate authentication to an external system:
+
+```text
+API Server
+  |
+  v
+Webhook Authentication Server
+  |
+  v
+Authentication Response
+```
+
+---
+
+## What Happens if Authentication Fails?
+
+If the request cannot be authenticated and cannot be accepted as an anonymous request, the request is rejected immediately with:
+
+```http
+HTTP 401 Unauthorized
+```
+
+The request does not proceed to authorization or admission processing.
+
+---
+
+# Part 2 — Authorization
+
+Now Kubernetes knows **who you are**. The next question is:
+
+> **Are you allowed to perform this action?**
+
+---
+
+## Example
+
+Suppose user `john` tries to run:
+
+```bash
+kubectl delete deployment nginx
+```
+
+1. Authentication succeeds.
+2. Kubernetes checks permissions for user `john` to `delete` resources of type `deployments` in the target namespace.
+
+---
+
+## RBAC (Role-Based Access Control)
+
+The most common authorization mechanism is RBAC:
+
+```text
+User
+  |
+  v
+RoleBinding / ClusterRoleBinding
+  |
+  v
+Role / ClusterRole
+  |
+  v
+Permissions (Rules)
+  |
+  v
+Allowed / Denied
+```
+
+### Example Role
+
+```yaml
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+```
+
+This Role allows `get` and `list` operations on Pods. It does **not** allow `create`, `update`, or `delete`.
+
+---
+
+## Authorization Decision
+
+- **If allowed:** Request proceeds to the next stage (`Continue`).
+- **If denied:** Request is rejected immediately with:
+  ```http
+  HTTP 403 Forbidden
+  ```
+
+---
+
+## Authorization Modules
+
+Kubernetes supports multiple authorization mechanisms:
+- **RBAC** (Role-Based Access Control — default/standard)
+- **Node Authorizer** (authorizes kubelet requests for its own node)
+- **Webhook Authorizer** (delegates authorization to an external HTTP webhook)
+- **ABAC** (Attribute-Based Access Control — legacy)
+
+When multiple authorizers are configured, they are evaluated in sequence until one explicitly allows or denies the request.
+
+---
+
+# Part 3 — Admission
+
+Authentication passed. Authorization passed. Now Kubernetes asks:
+
+> **Should this request be modified or rejected before storing it?**
+
+This is the job of **Admission Controllers**.
+
+---
+
+## Why Admission Exists
+
+RBAC primarily checks **who** is allowed to perform an action. Admission inspects **the request object itself** and applies policies and defaults.
+
+Examples:
+- Is the container image coming from an approved registry?
+- Is a required label or annotation missing?
+- Should default CPU/Memory requests be added?
+- Should privileged Pods be blocked?
+- Does the object violate configured ResourceQuotas?
+
+```text
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Admission
+      |
+      +── Mutating Admission Phase
+      |
+      +── Validating Admission Phase
+  |
+  v
+Validation & Storage
+```
+
+> **Important:** Admission primarily applies to write requests (`CREATE`, `UPDATE`, `DELETE`, `CONNECT`). Read-only requests (`GET`, `LIST`, `WATCH`) bypass admission.
+
+---
+
+## Two Types of Admission Controllers
+
+### 1. Mutating Admission
+Mutating admission controllers can modify the object.
+
+```text
+User Submits Pod Manifest
+  |
+  v
+Mutating Admission
+       |
+       +── Inject sidecar containers (e.g., Service Mesh proxy)
+       +── Apply default labels & annotations
+       +── Set default resource limits
+  |
+  v
+Mutated Pod Object
+```
+
+### 2. Validating Admission
+Validating admission controllers do not modify the object; they inspect it and either **accept** or **reject** the request.
+
+```text
+Mutated Pod Object
+  |
+  v
+Validating Admission
+  |
+  v
+Policy Evaluation (e.g., check security contexts)
+  |
+  v
+Accepted  OR  Rejected (Error 400/422)
+```
+
+---
+
+## Built-in Admission Controllers
+
+Examples:
+- `NamespaceLifecycle` (prevents creating objects in terminating namespaces)
+- `LimitRanger` (enforces default resource limits)
+- `ResourceQuota` (enforces namespace resource usage caps)
+- `DefaultStorageClass` (assigns default storage classes to PVCs)
+- `PodSecurity` (enforces Pod Security Standards)
+- `MutatingAdmissionWebhook` & `ValidatingAdmissionWebhook`
+- `ValidatingAdmissionPolicy` (in-process CEL-based validation)
+
+---
+
+## Dynamic Admission Webhooks
+
+Organizations enforce custom governance policies via admission webhooks:
+
+```text
+1. Pod Write Request
+  |
+  v
+2. API Server Invokes Webhook
+  |
+  v
+3. External Policy Server Evaluates Object (OPA/Gatekeeper, Kyverno)
+  |
+  v
+4. Allow / Mutate / Reject Response
+```
+
+---
+
+## What Happens if Admission Fails?
+
+The API Server rejects the request immediately. The object is not persisted to `etcd`, and no watch events are generated for downstream controllers.
+
+---
+
+# Part 4 — Object Validation and Storage
+
+Only after passing authentication, authorization, and admission does the API Server proceed to final resource validation and storage.
+
+---
+
+## 1. Object Validation
+
+The API Server performs schema and resource-specific semantic validation:
+
+```text
+Object
+  |
+  v
+Schema / Structural Validation (OpenAPI data types)
+  |
+  v
+Resource-Specific Validation (IP format, label syntax, immutability)
+  |
+  v
+Valid Object
+```
+
+If validation fails, the API Server rejects the request and the object is not persisted.
+
+---
+
+## 2. Internal Object Conversion
+
+If a client submits a versioned object (e.g., `apps/v1` Deployment), the API Server converts it into an unversioned **internal representation** used by the Go API machinery.
+
+```text
+External Object (apps/v1)
+  |
+  v
+Internal Object Representation
+```
+
+This decouples internal cluster logic from external API version variations.
+
+---
+
+## 3. Storage Version & Serialization
+
+Before persistence, the object is converted into the configured **Storage Version** for that resource and serialized into bytes (using Protobuf for built-in resources or JSON for CRDs):
+
+```text
+Internal Object
+  |
+  v
+Storage Version Conversion
+  |
+  v
+Serialization (Protobuf / JSON)
+```
+
+---
+
+## 4. Persisting to etcd
+
+Finally, the serialized bytes are written to `etcd` via the storage layer:
+
+```text
+API Server Storage Layer
+  |
+  v
+etcd (/registry/deployments/default/nginx)
+```
+
+`etcd` is the durable backing store and source of truth for Kubernetes API state.
+
+---
+
+# Complete End-to-End Write Request Flow
+
+```text
+1. kubectl
+  |
+  v
+2. Load kubeconfig
+  |
+  v
+3. TLS Connection
+  |
+  v
+4. kube-apiserver
+  |
+  v
+5. Authentication
+  |
+  v
+6. Authorization
+  |
+  v
+7. Admission
+       |
+       +── Mutating Phase
+       |
+       +── Validating Phase
+  |
+  v
+8. Schema & Resource Validation
+  |
+  v
+9. Internal Object Conversion
+  |
+  v
+10. Storage Version Conversion
+  |
+  v
+11. Serialization (Protobuf / JSON)
+  |
+  v
+12. Storage Layer
+  |
+  v
+13. etcd Persistence
+  |
+  v
+14. Watch Event Generated
+  |
+  v
+15. Controllers (Informer / Reconcile)
+  |
+  v
+16. Scheduler (Filter / Score / Bind)
+  |
+  v
+17. kubelet (Sync Loop / CRI)
+  |
+  v
+18. Container Runtime (containerd / runc)
+  |
+  v
+19. Running Pod
+```
+
+---
+
+# Common Error Codes
+
+| HTTP Code | Meaning | Typical Stage |
+| :--- | :--- | :--- |
+| **401** | Unauthorized (Unauthenticated) | Authentication |
+| **403** | Forbidden (Permission Denied) | Authorization |
+| **400 / 422** | Bad Request / Invalid Object | Validation / Admission |
+| **500** | Internal Server Error | API Server / etcd storage failure |
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the difference between Authentication and Authorization?
+Authentication verifies identity ("Who are you?"). Authorization verifies permissions ("What are you allowed to do?").
+
+### Q2. Do GET or LIST requests go through Admission?
+No. Admission controllers only run on write requests (`CREATE`, `UPDATE`, `DELETE`, `CONNECT`). Read-only requests bypass admission.
+
+### Q3. Can Admission Controllers modify incoming objects?
+Yes. Mutating admission controllers can add fields, injected sidecars, or labels. Validating admission controllers can only accept or reject requests.
+
+### Q4. Does RBAC validate object YAML syntax?
+No. RBAC checks permissions only. Object schema and business rule validation are handled by schema validation and admission controllers.
+
+### Q5. What happens if Admission rejects a request?
+The request is rejected immediately, returning an HTTP error. The object is not persisted to `etcd`, and downstream controllers receive no event.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause | Resolution |
+| :--- | :--- | :--- |
+| `401 Unauthorized` | Invalid/expired client certificate or token | Check kubeconfig credentials or ServiceAccount token |
+| `403 Forbidden` | Missing RBAC Role / ClusterRole permissions | Inspect RBAC bindings for target resource and verb |
+| Pod creation rejected | Admission webhook policy failure | Check Gatekeeper/Kyverno policy logs or PodSecurityStandards |
+| Missing default fields | Mutating admission webhook offline | Check status of mutating webhook pods & endpoints |
+| Controller not reacting | Object not persisted or Watch broken | Verify API Server persistence & controller Informer logs |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Distinguish between Authentication, Authorization, Admission, and Validation.
+2. Explain why read-only requests bypass the admission stage.
+3. List the 5 authentication methods supported by Kubernetes.
+4. Explain the difference between Mutating and Validating admission webhooks.
+5. Trace a write request from `kubectl apply` down to `etcd` persistence.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — API Aggregation Layer**
+
+In the next chapter, we will explore how Kubernetes extends its API beyond built-in resources using `kube-aggregator`, `APIService` objects, and extension API servers like Metrics Server.

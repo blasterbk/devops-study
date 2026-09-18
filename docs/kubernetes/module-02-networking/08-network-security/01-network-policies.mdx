@@ -1,0 +1,340 @@
+---
+title: "Chapter 1 — Network Policies"
+sidebar_position: 1
+module: "Module 2.8 — Network Security"
+description: "Deep dive into Kubernetes NetworkPolicy — how they define L3/L4 firewall rules for Pod traffic, the podSelector and peerSelectors model, ingress and egress rules, and how CNI plugins enforce policies using iptables, eBPF, or OVS."
+---
+
+# Chapter 1 — Network Policies
+
+> **Goal:** Understand Kubernetes NetworkPolicy as the primitive for controlling Pod-to-Pod and Pod-to-external traffic, master the selector-based matching model, and understand how CNI plugins translate declarative policies into kernel-level firewall rules.
+>
+> By the end of this chapter, you will understand:
+> 1. What NetworkPolicy does and what it doesn't do (L3/L4 only, no L7)
+> 2. The default behavior: all traffic allowed until a policy selects a Pod
+> 3. `podSelector` — which Pods the policy applies to
+> 4. `namespaceSelector` and `ipBlock` for peer specification
+> 5. Ingress and egress rules with ports
+> 6. How CNI plugins enforce policies (iptables, eBPF, OVS)
+
+---
+
+## Real-Life Analogy
+
+Without NetworkPolicy: every employee in an open office can walk to anyone else's desk and read their documents (all traffic allowed).
+
+NetworkPolicy is like **installing door locks on every room**: you explicitly declare who gets a key. "The Marketing team (podSelector: app=marketing) can only be visited by the Sales team (from: namespaceSelector: team=sales) through the front door (port 8080). Everyone else is locked out."
+
+Crucially: the locks only work if the building has a **lock enforcement system** (CNI plugin that supports NetworkPolicy). Without it, the policy declarations are ignored — like having keys that fit no locks.
+
+---
+
+## Architecture Diagram
+
+```text
+              NetworkPolicy — Enforcement Flow
+
+  Pod A (app: frontend) → Pod B (app: api, port 8080)
+
+  NetworkPolicy "allow-frontend-to-api":
+  ┌──────────────────────────────────────────────────────────┐
+  │  podSelector: {app: api}      ← Applies to: Pod B       │
+  │  ingress:                                                │
+  │  - from:                                                 │
+  │    - podSelector: {app: frontend}   ← Allowed peer       │
+  │    ports:                                                │
+  │    - port: 8080                                          │
+  └──────────────────────────────────────────────────────────┘
+
+  CNI plugin enforces:
+  Node with Pod B:
+    iptables (Calico) or eBPF (Cilium) rule:
+    ALLOW src=Pod_A_IP dst=Pod_B_IP:8080
+    DROP  src=*        dst=Pod_B_IP (everything else)
+```
+
+---
+
+## The Default: All Traffic Allowed
+
+```text
+Without any NetworkPolicy:
+  - Every Pod can reach every other Pod on any port
+  - Pods can reach any external IP
+  - This is the "flat network" default
+
+Once a NetworkPolicy selects a Pod (via podSelector):
+  - All traffic NOT matching a rule is DENIED for that Pod
+  - Implicit default deny for the selected traffic direction
+
+IMPORTANT: NetworkPolicy is additive.
+  - Multiple policies selecting the same Pod are OR'd together
+  - A packet is allowed if ANY policy permits it
+  - Never write "deny" rules — absence of a rule means deny
+```
+
+---
+
+## NetworkPolicy Structure
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-network-policy
+  namespace: production        # Policies are namespace-scoped
+spec:
+  # Which Pods this policy applies to (this policy's "subject")
+  podSelector:
+    matchLabels:
+      app: api
+
+  # Which traffic directions to control
+  policyTypes:
+  - Ingress     # Control incoming traffic to selected Pods
+  - Egress      # Control outgoing traffic from selected Pods
+
+  # Ingress rules: who can reach the api Pods
+  ingress:
+  - from:
+    # Peer 1: frontend Pods in the same namespace
+    - podSelector:
+        matchLabels:
+          app: frontend
+    # Peer 2: monitoring Pods in any namespace labeled 'monitoring'
+    - namespaceSelector:
+        matchLabels:
+          purpose: monitoring
+    ports:
+    - protocol: TCP
+      port: 8080
+
+  # Egress rules: where api Pods can reach out to
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow database
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+```
+
+---
+
+## `from` and `to` Peer Selectors
+
+### podSelector
+
+```yaml
+# Allow from Pods with label app=frontend in the SAME namespace
+from:
+- podSelector:
+    matchLabels:
+      app: frontend
+```
+
+### namespaceSelector
+
+```yaml
+# Allow from ALL Pods in namespaces labeled team=backend
+from:
+- namespaceSelector:
+    matchLabels:
+      team: backend
+```
+
+### Combined podSelector + namespaceSelector (AND logic)
+
+```yaml
+# Allow ONLY from Pods labeled app=frontend IN namespaces labeled env=prod
+# Both conditions must be true (AND)
+from:
+- podSelector:
+    matchLabels:
+      app: frontend
+  namespaceSelector:
+    matchLabels:
+      env: production
+```
+
+> [!IMPORTANT]
+> When `podSelector` and `namespaceSelector` are in the **same list item** (no `-` separator), they are AND'd. When in **separate list items** (each with a `-`), they are OR'd. This is a common source of mistakes.
+
+```yaml
+# OR: frontend pods OR any pod in monitoring namespace
+from:
+- podSelector:
+    matchLabels:
+      app: frontend
+- namespaceSelector:
+    matchLabels:
+      purpose: monitoring
+
+# AND: frontend pods that are ALSO in monitoring namespace
+from:
+- podSelector:
+    matchLabels:
+      app: frontend
+  namespaceSelector:     # Same dash level = AND
+    matchLabels:
+      purpose: monitoring
+```
+
+### ipBlock (CIDR-based)
+
+```yaml
+# Allow from external IP ranges (e.g., corporate VPN)
+from:
+- ipBlock:
+    cidr: 10.0.0.0/8
+    except:
+    - 10.50.0.0/16    # Exclude a sub-range
+```
+
+---
+
+## Ports and Protocol
+
+```yaml
+ports:
+- protocol: TCP
+  port: 8080            # Specific port
+- protocol: TCP
+  port: 8000
+  endPort: 9000         # Port range (8000-9000) — Kubernetes 1.25+
+- protocol: UDP
+  port: 53
+# Empty ports list means: all ports
+```
+
+---
+
+## How CNI Plugins Enforce NetworkPolicy
+
+NetworkPolicy declarations are just Kubernetes objects — they do nothing without a CNI plugin that implements enforcement:
+
+```text
+Calico (iptables mode):
+  ├── Reads NetworkPolicy objects via Kubernetes API watch
+  ├── Generates iptables rules in FORWARD chain:
+  │   -A CALICO-FW-xxx -s 10.244.1.5 -d 10.244.2.3 -p tcp --dport 8080 -j ACCEPT
+  │   -A CALICO-FW-xxx -d 10.244.2.3 -j DROP (default deny)
+  └── Rules applied on the node hosting Pod B (ingress direction)
+
+Cilium (eBPF mode):
+  ├── Reads NetworkPolicy + CiliumNetworkPolicy objects
+  ├── Compiles policies to eBPF programs
+  ├── Attaches eBPF programs to each Pod's veth interface
+  └── eBPF does policy enforcement at wire speed in kernel
+
+Flannel (NO enforcement):
+  └── Flannel does NOT implement NetworkPolicy enforcement
+      Policies are accepted by Kubernetes API but silently ignored
+      Must pair with Calico (Canal) for policy enforcement with Flannel
+```
+
+---
+
+## Hands-On: Network Policy Testing
+
+```bash
+# 1. Create a test setup
+kubectl create namespace netpol-test
+kubectl run server --image=nginx -n netpol-test --labels="app=server" --port=80
+kubectl expose pod server --port=80 -n netpol-test
+kubectl run client --image=curlimages/curl -n netpol-test --labels="app=client" \
+  --command -- sleep 3600
+
+# 2. Before policy: curl succeeds
+kubectl exec client -n netpol-test -- curl -s http://server/
+
+# 3. Apply a NetworkPolicy that allows only 'client' label
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-client-only
+  namespace: netpol-test
+spec:
+  podSelector:
+    matchLabels:
+      app: server
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: client
+    ports:
+    - port: 80
+EOF
+
+# 4. After policy: client can still reach server
+kubectl exec client -n netpol-test -- curl -s --max-time 3 http://server/
+# Should succeed (client label matches)
+
+# 5. Create a non-matching Pod and test
+kubectl run stranger --image=curlimages/curl -n netpol-test \
+  --command -- sleep 3600
+kubectl exec stranger -n netpol-test -- curl -s --max-time 3 http://server/
+# Should timeout/fail (stranger has no 'app: client' label)
+
+# 6. Verify NetworkPolicy is applied
+kubectl describe networkpolicy allow-client-only -n netpol-test
+
+# 7. Use Cilium's policy trace (if using Cilium)
+kubectl exec -n kube-system cilium-<id> -- \
+  cilium policy trace --src-k8s-pod netpol-test:client \
+                      --dst-k8s-pod netpol-test:server \
+                      --dport 80
+# Shows: ALLOWED or DENIED and which policy matched
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the default behavior for Pod traffic in Kubernetes (without any NetworkPolicy)?**
+
+By default, all traffic is allowed — any Pod can reach any other Pod or external IP on any port. Kubernetes has a flat network model. NetworkPolicy changes this: once **any** NetworkPolicy selects a Pod via `podSelector`, all traffic not explicitly permitted by a policy is denied for that direction (ingress/egress). The `policyTypes` field controls which directions are restricted. If only `Ingress` is specified, egress remains fully open; if `Egress` is also specified, egress is restricted to explicit allows.
+
+**Q2: How do `podSelector` and `namespaceSelector` interact in a `from` rule?**
+
+When a `from` list item contains **both** `podSelector` and `namespaceSelector` (same list item, no extra `-`), they are AND'd — the source must be a Pod matching the podSelector AND be in a namespace matching the namespaceSelector. When they are in **separate list items** (each with its own `-`), they are OR'd — traffic is allowed from any Pod matching the podSelector OR from any Pod in a matching namespace. This AND/OR distinction based on YAML list structure is one of the most common NetworkPolicy mistakes.
+
+**Q3: Does NetworkPolicy work with all CNI plugins?**
+
+No. NetworkPolicy is a Kubernetes API resource but enforcement requires a CNI plugin that implements it. Flannel does NOT enforce NetworkPolicy — policies are accepted but silently ignored. Calico, Cilium, Weave Net, and Antrea all implement NetworkPolicy enforcement. The CNI plugin watches NetworkPolicy objects and programs kernel-level rules (iptables with Calico/Weave, eBPF with Cilium, OVS with Antrea). Choosing a CNI plugin that supports NetworkPolicy is required for any security-sensitive cluster.
+
+**Q4: Why must egress NetworkPolicy always explicitly allow DNS?**
+
+If you add an `Egress` policyType to a NetworkPolicy, all egress traffic from the selected Pods is denied by default. DNS queries go to CoreDNS on port 53 (UDP and TCP). If the policy doesn't include an egress rule allowing port 53 to kube-system (where CoreDNS runs), the Pod's DNS queries are blocked — it cannot resolve Service names and effectively cannot communicate with any Service. This is a very common mistake when adding egress policies: forgetting the DNS egress rule.
+
+**Q5: How does Cilium differ from Calico in enforcing NetworkPolicy?**
+
+Calico (in iptables mode) enforces NetworkPolicy by generating and maintaining iptables rules in the FORWARD chain. For every policy change, iptables rules are updated. This works well but has scaling limitations: iptables uses linear rule matching (O(n) lookup for large rule sets). Cilium uses eBPF programs attached to each Pod's veth interface — network policy enforcement happens at wire speed in the kernel, with O(1) lookup via eBPF hash maps. Cilium also supports L7 policy (HTTP method/path-level) which is beyond what NetworkPolicy (L3/L4 only) can express.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know default behavior: all traffic allowed until a NetworkPolicy selects a Pod
+- [ ] Know `podSelector` = which Pods the policy applies to (subject)
+- [ ] Know `from`/`to` peers: podSelector, namespaceSelector, ipBlock
+- [ ] Know AND vs OR for combined podSelector + namespaceSelector (same dash vs separate dashes)
+- [ ] Know `policyTypes`: Ingress, Egress — missing type means that direction is unrestricted
+- [ ] Know that Flannel does NOT enforce NetworkPolicy — must use Calico, Cilium, Antrea, etc.
+- [ ] Know to always allow DNS egress (port 53 UDP+TCP to kube-system) in egress policies

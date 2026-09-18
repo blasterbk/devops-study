@@ -1,0 +1,202 @@
+---
+title: "Chapter 3 — TCP Protocol Internals: Handshake, Flow Control & Congestion Algorithms"
+sidebar_position: 1
+module: "Module 3.3 — TCP Protocol"
+description: "Master TCP mechanics — 3-way handshake, 4-way termination, sliding window flow control, Reno/Cubic/BBR congestion control algorithms, MTU/MSS tuning, and socket states."
+---
+
+# Chapter 3 — TCP Protocol Internals: Handshake, Flow Control & Congestion Algorithms
+
+> **Goal:** Dissect the transmission control protocol (TCP) at the Linux kernel level. Master state machine transitions, the 3-way handshake and 4-way termination, sliding window flow control, congestion avoidance algorithms (Reno, CUBIC, BBR), TCP header flags, and MTU/MSS tuning.
+>
+> By the end of this chapter, you will understand:
+> 1. The 20-byte TCP header anatomy, sequence/acknowledgment numbers, and control flags (SYN, ACK, FIN, RST, PSH, URG)
+> 2. The 3-way handshake state machine (`SYN_SENT`, `SYN_RECV`, `ESTABLISHED`) and SYN flood defense with SYN cookies
+> 3. The 4-way connection termination teardown and why `TIME_WAIT` (2MSL) state is required
+> 4. Flow Control: Receive Window (`rwnd`), TCP Window Scale option, and zero-window probes
+> 5. Congestion Control: Congestion Window (`cwnd`), Slow Start, Congestion Avoidance, Fast Retransmit/Fast Recovery, and BBR (Bottleneck Bandwidth and RTT)
+> 6. Maximum Transmission Unit (MTU), Maximum Segment Size (MSS), and Path MTU Discovery (PMTUD)
+
+---
+
+## Real-Life Analogy
+
+Think of TCP communication as **a formal registered legal correspondence protocol**:
+
+- **The 3-Way Handshake (Agreement to Transcribe):**
+  - Sender: *"I wish to transmit document series starting at Page #100. Do you accept?"* (**SYN=1, Seq=100**)
+  - Receiver: *"I agree to receive Page #100. I will start my reply series at Page #500."* (**SYN=1, ACK=101, Seq=500**)
+  - Sender: *"Acknowledged. I am sending the document now."* (**ACK=501**)
+- **Flow Control & Sliding Window (The In-Box Capacity):**
+  - The receiver states: *"My desk in-box can only hold 5 pages at a time (**Receive Window = 5**). Do not send more than 5 pages until I sign off on the first batch."*
+- **Congestion Control (Highway Traffic Adaptation):**
+  - If the delivery truck gets stuck in traffic or loses a page, TCP does not blindly push more trucks; it throttles its speed in half (**Multiplicative Decrease**) and gradually ramps back up as the road clears.
+
+---
+
+## Architecture Diagram
+
+```text
+                     TCP 3-Way Handshake & 4-Way Termination
+                     
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. THREE-WAY ESTABLISHMENT:                                                 │
+ │                                                                             │
+ │    Client (Active Open)                               Server (Passive Open) │
+ │     [CLOSED]                                            [LISTEN]            │
+ │        │                                                    │               │
+ │        │──── [SYN] Seq=1000 ───────────────────────────────►│ [SYN_RCVD]    │
+ │        │     (State: SYN_SENT)                              │               │
+ │        │                                                    │               │
+ │        │◄─── [SYN, ACK] Seq=5000, Ack=1001 ─────────────────│               │
+ │        │                                                    │               │
+ │        │──── [ACK] Seq=1001, Ack=5001 ─────────────────────►│ [ESTABLISHED] │
+ │        ▼                                                    ▼               │
+ │   [ESTABLISHED] ◄──────── Full Duplex Data Stream ────────► [ESTABLISHED]   │
+ └─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 2. FOUR-WAY TERMINATION:                                                    │
+ │                                                                             │
+ │    Client (Active Close)                              Server (Passive Close)│
+ │     [ESTABLISHED]                                       [ESTABLISHED]       │
+ │        │                                                    │               │
+ │        │──── [FIN] Seq=2000 ───────────────────────────────►│ [CLOSE_WAIT]  │
+ │        │     (State: FIN_WAIT_1)                            │               │
+ │        │                                                    │               │
+ │        │◄─── [ACK] Ack=2001 ────────────────────────────────│               │
+ │        │     (State: FIN_WAIT_2)                            │               │
+ │        │                                                    │               │
+ │        │◄─── [FIN] Seq=6000 ────────────────────────────────│ [LAST_ACK]    │
+ │        │                                                    │               │
+ │        │──── [ACK] Ack=6001 ───────────────────────────────►│ [CLOSED]      │
+ │        ▼                                                                    │
+ │   [TIME_WAIT] (Wait 2MSL = 60s) ──► [CLOSED]                                │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. TCP Header Anatomy (20 Bytes Base)
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Source Port          |       Destination Port        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Sequence Number                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Acknowledgment Number                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Data |           |U|A|P|R|S|F|                               |
+| Offset| Reserved  |R|C|S|S|Y|I|            Window             |
+| (4b)  |   (3b)    |G|K|H|T|N|N|                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|           Checksum            |         Urgent Pointer        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Options (0 - 40 bytes)                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+---
+
+### 2. Flow Control vs Congestion Control
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Metric / Concept     │ Flow Control (`rwnd`)                    │ Congestion Control (`cwnd`)              │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **Regulated By**     │ Receiver buffer capacity                 │ Intermediate network path congestion     │
+ │ **Feedback Signal**  │ `Window` field in TCP ACK headers        │ Packet loss (Reno/Cubic) or RTT delta(BBR)│
+ │ **Formula**          │ $\text{Effective Window} = \min(\text{cwnd}, \text{rwnd})$                          │
+ │ **Failure State**    │ Receiver buffer overrun (Dropped frames) │ Router queue bufferbloat & dropped pkts  │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 3. Congestion Control Algorithms (Reno vs CUBIC vs BBR)
+
+1. **TCP Reno (Loss-Based Linear):**
+   - **Slow Start:** Exponential growth ($\text{cwnd} = \text{cwnd} \times 2$ per RTT) until `ssthresh`.
+   - **Congestion Avoidance:** Additive Increase ($\text{cwnd} = \text{cwnd} + 1$ MSS per RTT).
+   - **On Packet Loss:** Multiplicative Decrease ($\text{cwnd} = \text{cwnd} / 2$).
+2. **TCP CUBIC (Linux Default):**
+   - Uses a cubic function of elapsed time since last congestion event. Quickly scales up window in high-bandwidth-delay product (BDP) networks and slows down near saturation.
+3. **Google BBR (Model-Based Bottleneck Bandwidth & RTT):**
+   - Does **not** treat packet loss as congestion. Continuously measures maximum delivery rate and minimum Round Trip Time, preventing **bufferbloat** on congested router buffers.
+
+---
+
+### 4. MTU, MSS, and Path MTU Discovery (PMTUD)
+
+- **MTU (Maximum Transmission Unit):** Maximum Layer 2 payload size (Default Ethernet = `1500` bytes).
+- **MSS (Maximum Segment Size):** Maximum TCP payload:
+
+$$\text{MSS} = \text{MTU} - (\text{IP Header [20B]} + \text{TCP Header [20B]}) = 1500 - 40 = 1460 \text{ bytes}$$
+
+- **Path MTU Discovery (PMTUD):** Host sets Don't Fragment (`DF=1`) flag. If a router link has MTU < 1500 (e.g., VPN tunnel with 1420 MTU), it drops the packet and returns **ICMP Type 3 Code 4 (Fragmentation Needed)** with its MTU.
+
+---
+
+## Hands-On Lab: TCP Socket States, Buffer Tuning & Packet Analysis
+
+```bash
+# Step 1: Display socket statistics, connection states, and TCP timers
+ss -tan state established
+ss -s
+
+# Step 2: Inspect TCP kernel buffer limits (read/write min, default, max bytes)
+sysctl net.ipv4.tcp_rmem
+sysctl net.ipv4.tcp_wmem
+
+# Step 3: View current congestion control algorithm in Linux kernel
+sysctl net.ipv4.tcp_congestion_control
+
+# Step 4: Switch congestion control algorithm to Google BBR
+sudo modprobe tcp_bbr
+sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+
+# Step 5: Capture a live TCP 3-way handshake with tcpdump
+sudo tcpdump -nn -i any "tcp[tcpflags] & (tcp-syn|tcp-ack) != 0" -c 6
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does TCP require a 3-Way Handshake instead of a 2-Way Handshake?**
+
+A 2-way handshake allows the client to verify the server is ready, but does not allow the server to confirm that the client acknowledged its Initial Sequence Number (ISN). In a 2-way handshake, if an old delayed SYN packet arrives at the server from a previously closed session, the server would open a connection and allocate resources for a phantom client, resulting in resource exhaustion.
+
+**Q2: What is the purpose of the `TIME_WAIT` state and why does it last for 2MSL?**
+
+`TIME_WAIT` is entered by the endpoint that initiates the active close. It lasts for 2 Maximum Segment Lifetimes ($2 \times \text{MSL} \approx 60\text{–}120\text{s}$) to:
+1. Ensure the final `ACK` is received by the server (if lost, server retransmits `FIN`, which client can re-ACK).
+2. Allow all delayed, in-flight duplicate segments from the old connection to expire in the network before a new socket can reuse the identical 4-tuple IP/Port.
+
+**Q3: How do TCP SYN Cookies protect against SYN Flood DDoS attacks?**
+
+In a standard SYN flood, an attacker sends thousands of spoofed SYNs, filling the server's backlog queue (`SYN_RCVD`). When SYN Cookies are enabled (`net.ipv4.tcp_syncookies=1`), the server does not allocate memory for half-open sockets; instead, it encodes the connection state, timestamp, and MSS into the Initial Sequence Number (ISN) cryptographically. When the legitimate client sends the final `ACK`, the server verifies the cookie hash and allocates the socket only upon completed handshake.
+
+**Q4: What is Head-of-Line (HoL) blocking in TCP and how does QUIC solve it?**
+
+TCP delivers an ordered byte stream. If a single packet in the sequence is lost, the receiver buffer must hold all subsequent packets and cannot deliver them to the application layer until the missing packet is retransmitted. In HTTP/2 multiplexing over a single TCP connection, 1 lost packet halts all 100 concurrent streams. QUIC (HTTP/3 over UDP) solves this by maintaining independent stream-level state machines, ensuring loss in Stream A never blocks Stream B.
+
+**Q5: What is an MTU Black Hole and how is it caused?**
+
+An MTU black hole occurs when a packet with `DF=1` exceeds a path link MTU (e.g., inside an IPsec/VXLAN tunnel), and the intermediate router drops the packet and sends an ICMP Type 3 Code 4 message, but an upstream enterprise firewall blocks all ICMP packets. The sender never receives the MTU feedback, keeps retransmitting 1500-byte packets, and the connection hangs indefinitely on large file transfers.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master 3-way handshake and 4-way termination state transitions
+- [ ] Understand why `TIME_WAIT` (2MSL) and `SYN Cookies` are critical
+- [ ] Differentiate Flow Control (`rwnd`) from Congestion Control (`cwnd`)
+- [ ] Understand Reno vs CUBIC vs BBR congestion control principles
+- [ ] Know how MTU, MSS ($1500-40=1460$), and PMTUD operate

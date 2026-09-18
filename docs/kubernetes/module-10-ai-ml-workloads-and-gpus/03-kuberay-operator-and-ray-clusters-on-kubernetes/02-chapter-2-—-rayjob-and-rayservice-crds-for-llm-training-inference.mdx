@@ -1,0 +1,238 @@
+---
+title: "Chapter 2 — RayJob & RayService for LLMs"
+sidebar_position: 2
+module: "Module 10.3 — KubeRay Operator & Ray Clusters"
+description: "Master KubeRay workload abstractions — RayJob for ephemeral batch LLM training, RayService for high-throughput Ray Serve inference, and zero-downtime rolling upgrades."
+---
+
+# Chapter 2 — RayJob & RayService CRDs for LLM Training & Inference
+
+> **Goal:** Master declarative AI workload execution, distributed deep learning fine-tuning, and zero-downtime model serving using KubeRay's high-level Custom Resources — orchestrating ephemeral, cost-optimized batch training workflows via **`RayJob`**, deploying high-throughput, multi-model serving endpoints using **`RayService` (Ray Serve)**, and executing seamless **Zero-Downtime Rolling Model Upgrades** with automated cluster traffic switching.
+>
+> By the end of this chapter, you will understand:
+> 1. The operational differences between `RayCluster`, `RayJob`, and `RayService`
+> 2. How `RayJob` automates ephemeral cluster creation, execution, and automatic deletion
+> 3. How `RayService` wraps Ray Serve to deliver scalable, dynamic-batched LLM inference
+> 4. How `RayService` orchestrates zero-downtime rolling upgrades across two Ray clusters
+> 5. How to stream model training checkpoints and weights to S3/GCS object storage
+> 6. How to author production `RayJob` and `RayService` manifests for LLaMA-3 serving
+
+---
+
+## Real-Life Analogy
+
+Think of `RayJob` and `RayService` as **the difference between hiring a specialized film production crew for a 2-month movie shoot versus operating a permanent 24/7 IMAX movie theater**:
+
+- **The Ephemeral Shoot (`RayJob` - Batch LLM Training / Fine-Tuning):**
+  - A studio wants to film a blockbuster movie (**Fine-tune LLaMA-3 on proprietary enterprise data**).
+  - The studio hires 50 actors, cameras, and trailers for 3 weeks (**`RayJob` automatically provisions an 8x H100 Ray Cluster**).
+  - The crew shoots the film, delivers the finished master tape to the vault (**Uploads model weights to Amazon S3**), packs up their gear, and leaves (**`shutdownAfterJobFinishes: true`**).
+  - **Zero Waste:** The studio pays for the expensive equipment strictly while filming!
+- **The Permanent 24/7 Theater (`RayService` - Online Model Inference):**
+  - A permanent movie theater is open 24/7 to serve paying customers (**Streaming live chat tokens to 10,000 web users**).
+  - The theater manager (**Ray Serve**) scales up extra ticket booths during peak hours and routes lines dynamically (**Dynamic Request Batching & Autoscaling**).
+- **The Zero-Downtime Projector Upgrade:** When the theater updates to a 4K laser projector (**Deploying a new model weight checkpoint**), it builds a second auditorium next door, tests the sound, politely transfers the audience, and tears down the old room with **Zero Cancelled Screenings**!
+
+---
+
+## Architecture Diagram
+
+```text
+               RayJob (Batch Training) vs RayService (Real-Time Inference)
+
+ 1. RAYJOB WORKFLOW (Ephemeral Batch LLM Fine-Tuning):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Developer submits `kind: RayJob` (Entrypoint: `python train.py`)   │
+ │ 2. KubeRay provisions dedicated `RayCluster` (8x H100 GPU Workers)     │
+ │ 3. Executes distributed PyTorch training ──► Saves weights to S3       │
+ │ 4. Auto-Deletes RayCluster! (Zero idle GPU cost!)                      │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. RAYSERVICE ZERO-DOWNTIME ROLLING UPGRADE WORKFLOW:
+ KUBERAY OPERATOR: Updates model version in `RayService` spec
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Provisions NEW PENDING CLUSTER (Cluster B with Model v2.0)          │
+ │ 2. Warms up model weights in VRAM & executes health checks             │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Health Checks PASS! Shifts Traffic via Kubernetes Service
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES SERVICE: Reroutes live traffic to Cluster B!                │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 3. Drains and deletes old Cluster A
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TERMINATES OLD CLUSTER A (Zero downtime experienced by end users!)     │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Ray Workload CRD Comparison Matrix
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ `RayJob` Custom Resource        │ `RayService` Custom Resource    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Workload Type**         │ **Batch Processing.** Training, │ **Online Serving.** Real-time   │
+ │                           │ fine-tuning, data ETL, RLHF.    │ REST/gRPC API model inferencing.│
+ │ **Cluster Lifecycle**     │ **Ephemeral.** Auto-created on  │ **Long-Running.** Highly        │
+ │                           │ start; auto-deleted on finish.  │ available, permanent cluster.   │
+ │ **Upgrade Strategy**      │ Rerun new Job instance.         │ **Zero-Downtime Rolling**       │
+ │                           │                                 │ cluster traffic switching.      │
+ │ **Traffic Routing**       │ None (Non-serving).             │ Managed by **Ray Serve** router │
+ │                           │                                 │ and Kubernetes Service/Ingress. │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## 1. Production `RayJob` Manifest (Ephemeral LLM Training)
+
+```yaml
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: llama3-8b-finetune-job
+  namespace: ai-training
+spec:
+  # 1. Python Execution Entrypoint
+  entrypoint: "python3 finetune.py --model meta-llama/Meta-Llama-3-8B --output-s3 s3://models-archive/llama3-v1"
+  shutdownAfterJobFinishes: true       # Destroys cluster immediately when done!
+  ttlSecondsAfterFinished: 300         # Retains logs for 5 minutes before cleanup
+  # 2. Ephemeral RayCluster Blueprint
+  rayClusterSpec:
+    rayVersion: "2.30.0"
+    headGroupSpec:
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: rayproject/ray-ml:2.30.0-gpu
+            resources:
+              limits: { cpu: "8", memory: "32Gi" }
+    workerGroupSpecs:
+      - groupName: gpu-trainers
+        replicas: 2
+        template:
+          spec:
+            containers:
+            - name: ray-worker
+              image: rayproject/ray-ml:2.30.0-gpu
+              resources:
+                limits:
+                  nvidia.com/gpu: 8    # Total: 16x GPUs for distributed training!
+                  cpu: "64"
+                  memory: "256Gi"
+```
+
+---
+
+## 2. Production `RayService` Manifest (Ray Serve LLM Inference)
+
+```yaml
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: llama3-online-inference
+  namespace: ai-inference
+spec:
+  # 1. Ray Serve Application Deployment Configuration
+  serveConfigV2: |
+    applications:
+      - name: llama_chat_app
+        route_prefix: /v1/chat
+        import_path: serve_model:app
+        runtime_env:
+          pip: ["vllm==0.4.2", "transformers>=4.40.0"]
+        deployments:
+          - name: LlamaModelDeployment
+            num_replicas: 2            # 2 Serving Replicas
+            max_replicas: 10           # Autoscales to 10 under high traffic!
+            ray_actor_options:
+              num_gpus: 2              # 2 GPUs per replica for Tensor Parallelism
+  # 2. Dedicated Serving RayCluster Spec
+  rayClusterConfig:
+    rayVersion: "2.30.0"
+    headGroupSpec:
+      template:
+        spec:
+          containers:
+          - name: ray-head
+            image: rayproject/ray-ml:2.30.0-gpu
+            resources: { limits: { cpu: "4", memory: "16Gi" } }
+    workerGroupSpecs:
+      - groupName: gpu-serving-pool
+        replicas: 2
+        template:
+          spec:
+            containers:
+            - name: ray-worker
+              image: rayproject/ray-ml:2.30.0-gpu
+              resources:
+                limits:
+                  nvidia.com/gpu: 4
+                  cpu: "32"
+                  memory: "128Gi"
+```
+
+---
+
+## Hands-On Lab: Submitting a RayJob & Monitoring Progress
+
+```bash
+# Step 1: Query active RayJobs in the cluster
+kubectl get rayjobs.ray.io -n ai-training 2>/dev/null || echo "RayJob CRDs active / simulated"
+
+# Step 2: Query active RayServices and serving deployment status
+kubectl get rayservices.ray.io -n ai-inference -o custom-columns=NAME:.metadata.name,SERVICE_STATUS:.status.serviceStatus,ACTIVE_CLUSTER:.status.activeRayClusterInfo.rayClusterName
+
+# Step 3: Stream RayJob execution logs
+# kubectl logs -n ai-training -l ray.io/job-name=llama3-8b-finetune-job -c ray-job-submitter -f
+
+# Step 4: Test querying the RayService HTTP inference endpoint
+# curl -X POST http://llama3-online-inference-serve-svc.ai-inference.svc:8000/v1/chat -d '{"prompt": "Hello Ray!"}'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the operational difference between `RayJob` and `RayService` in KubeRay?**
+
+- **`RayJob`**: Designed for **Batch asynchronous workloads** (such as distributed pre-training, fine-tuning, or offline batch embedding generation). It automatically provisions an ephemeral RayCluster, submits the job entrypoint, monitors progress, and destroys the entire cluster when execution completes (`shutdownAfterJobFinishes: true`), preventing idle GPU billing waste.
+- **`RayService`**: Designed for **Online real-time inference** (such as REST/gRPC LLM serving APIs). It manages a persistent, highly available RayCluster with **Ray Serve**, supporting dynamic request batching, model-level autoscaling, and zero-downtime rolling upgrades.
+
+**Q2: How does `RayService` achieve zero-downtime rolling upgrades during model deployments?**
+
+When the model weight path or configuration is updated in a `RayService` manifest:
+1. The KubeRay operator does **not** update the live running cluster in place.
+2. It provisions a **brand-new pending RayCluster (Cluster B)** with the updated model weights.
+3. It waits until all Ray Serve replicas in Cluster B pass their internal health probes.
+4. It updates the frontend Kubernetes `Service` selector to route 100% of incoming live API traffic to Cluster B.
+5. It drains and gracefully deletes the old Cluster A, guaranteeing zero dropped HTTP requests during model updates.
+
+**Q3: How does `RayJob` handle job failures and retries?**
+
+In the `RayJob` spec, administrators can configure `spec.backoffLimit` (e.g. `backoffLimit: 3`). If a distributed PyTorch script crashes due to a transient CUDA error or hardware fault, KubeRay cleans up the failed run, restarts the entrypoint on the cluster, and re-executes up to the specified limit. If the job exceeds `backoffLimit`, KubeRay marks the `RayJob` status as `Failed` and triggers alerting hooks.
+
+**Q4: What is the role of Ray Serve's "Dynamic Request Batching" in `RayService`?**
+
+In online LLM inference, individual user requests arrive at random millisecond intervals. Processing each request individually wastes GPU compute tensor cores. **Ray Serve's Dynamic Batching** (`@serve.batch(max_batch_size=32, batch_wait_timeout_s=0.05)`) automatically queues individual incoming requests and groups them into a single batched tensor computation. This increases GPU throughput by **5x to 10x** with negligible latency overhead.
+
+**Q5: How do you stream checkpoints to cloud object storage (S3/GCS) in a `RayJob`?**
+
+In the `RayJob` container specification, attach an IAM Role for Service Accounts (IRSA on AWS or Workload Identity on GCP) to the pod's `serviceAccountName`. The training script uses PyTorch Lightning or HuggingFace Accelerate with native S3 connectors (e.g. `boto3` or `s3fs`). Checkpoints are written asynchronously to `s3://models-bucket/checkpoints/` during training, ensuring that if a node crashes, the job can resume from the latest epoch.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `RayJob` automates ephemeral batch AI training and auto-deletion
+- [ ] Know that `RayService` manages long-running real-time Ray Serve inference
+- [ ] Know how `RayService` executes zero-downtime rolling upgrades across clusters
+- [ ] Know that Ray Serve Dynamic Batching increases GPU serving throughput by 10x
+- [ ] Know how `shutdownAfterJobFinishes` eliminates idle GPU cloud billing
+- [ ] Can view active RayJobs using `kubectl get rayjobs -A`

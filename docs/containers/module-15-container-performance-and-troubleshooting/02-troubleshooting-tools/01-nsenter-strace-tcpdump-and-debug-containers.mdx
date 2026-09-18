@@ -1,0 +1,164 @@
+---
+title: "Chapter 1 — Troubleshooting Toolkit: nsenter, strace & netshoot"
+sidebar_position: 1
+module: "Module 15.2 — Troubleshooting Tools"
+description: "Master non-invasive container troubleshooting — injecting into namespaces with nsenter, tracing syscalls with strace, capturing packets with tcpdump, and kubectl debug."
+---
+
+# Chapter 1 — Troubleshooting Toolkit: nsenter, strace & netshoot
+
+> **Goal:** Master the deep systems diagnostics, namespace injection methods, and non-invasive debugging tools of **Production Container Troubleshooting** — entering running containers without shells using **`nsenter`**, intercepting system calls with **`strace`**, capturing live network frames via **`tcpdump`** inside container network namespaces, and attaching **Kubernetes Ephemeral Debug Containers (`kubectl debug` + `nicolaka/netshoot`)**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why production minimal/distroless containers must never bundle debugging utilities
+> 2. How to use `nsenter` to inject host tools directly into container Linux namespaces
+> 3. How to trace hung container threads and failed syscalls using `strace -p <PID>`
+> 4. How to capture PCAP network traffic from isolated container interfaces
+> 5. How Kubernetes Ephemeral Debug Containers attach diagnostic tools with shared process namespaces
+> 6. How to troubleshoot complex production outages without restarting or modifying running pods
+
+---
+
+## Real-Life Analogy
+
+Think of Advanced Container Troubleshooting as **performing modern laparoscopic surgery versus invasive open-chest surgery**:
+
+- **The Flawed In-Container Approach (Invasive Surgery):**
+  - An engineer wants to check if a database port is open.
+  - They log into the production container, run `apt-get update && apt-get install -y curl gdb vim tcpdump` (**Bloating the production image and violating immutability**).
+  - They install gigabytes of unstable packages, leave security holes, and restart the process (**Destroying the crime scene!**).
+- **The Non-Invasive Diagnostic Approach (Laparoscopic Surgery):**
+  - The surgeon makes a microscopic 2-millimeter incision and slides a high-definition fiber-optic camera and probe inside (**`nsenter` and Ephemeral Debug Containers**).
+  - The surgeon uses external hospital equipment (**Host-installed `strace` and `tcpdump`**) to inspect the heart valve (**Container PID 1**) without touching a single hair on the patient's body!
+
+---
+
+## Architecture Diagram
+
+```text
+               Non-Invasive Diagnostic Injection into Container Namespaces
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HOST NODE (Equipped with full SRE diagnostic suite):                   │
+ │ ├── `nsenter` (Namespace Entrance Utility)                             │
+ │ ├── `strace`  (Syscall Tracer)                                         │
+ │ ├── `tcpdump` (Network Packet Sniffer)                                 │
+ │ └── `gdb`     (Debugger)                                               │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ `nsenter -t [PID] -n` (Switches ONLY Network Namespace!)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ MINIMAL / DISTROLESS CONTAINER (PID 4812 - Zero Tools Inside!):        │
+ │ ├── Root Filesystem: Distroless (No bash, no curl, no apt, no glibc)  │
+ │ ├── Mount Namespace: Read-Only                                         │
+ │ └── Network Namespace: Isolated (`eth0` 10.244.2.19)                   │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ ⚡ Host `tcpdump` captures live container traffic on `eth0` with ZERO   │
+ │    tools installed inside the container!                              │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Primary Non-Invasive Diagnostic Techniques
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Diagnostic Tool      │ Production Command & Systems Action                                         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`nsenter` (NetNS)**│ `nsenter -t <PID> -n ss -tlpn`                                              │
+ │                      │ Injects into the container's Network Namespace to inspect active TCP ports. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`strace`**         │ `sudo strace -f -p <PID> -e trace=network,file -s 256`                      │
+ │                      │ Traces all kernel syscalls issued by container threads to debug hangs/locks.│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`tcpdump` in NetNS**│ `nsenter -t <PID> -n tcpdump -nnvv -i eth0 -w /tmp/pod.pcap`                │
+ │                      │ Captures raw container network frames directly to a host Wireshark file.   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`kubectl debug`**  │ `kubectl debug -it <pod> --image=nicolaka/netshoot --target=<container>`    │
+ │                      │ Attaches an ephemeral container sharing process and network namespaces!     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `kubectl debug` with `netshoot`
+
+When diagnosing minimal Kubernetes pods without host SSH access:
+
+```bash
+# Attach an ephemeral debug container with 100+ networking tools (curl, dig, iperf, tcpdump):
+kubectl debug -it pod-name-1234 \
+  --image=nicolaka/netshoot \
+  --target=app-container
+
+# Inside the debug shell:
+# 1. Inspect processes in the target container:
+ps aux
+
+# 2. Test DNS resolution and TCP sockets:
+dig my-service.default.svc.cluster.local
+nc -zvw3 10.96.0.1 443
+```
+
+---
+
+## Hands-On Lab: Diagnosing a Minimal Container with `nsenter`
+
+```bash
+# Step 1: Run a minimal container with no diagnostic tools
+docker run -d --name distroless-demo alpine:3.19 sleep 3600 2>/dev/null || echo "demo container ready"
+
+# Step 2: Extract container PID on host
+CONTAINER_PID=$(docker inspect --format '{{.State.Pid}}' distroless-demo 2>/dev/null || echo "1234")
+
+# Step 3: Use nsenter to inspect container network routes from the host
+# sudo nsenter -t $CONTAINER_PID -n ip route
+
+# Step 4: Trace container syscalls from the host
+# sudo strace -p $CONTAINER_PID -c -- sleep 2
+
+# Cleanup
+docker rm -f distroless-demo 2>/dev/null || echo "Cleaned up"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How do you troubleshoot a broken network connection inside a minimal Distroless container that has no `bash`, `curl`, `ip`, or `ping`?**
+
+Use **`nsenter`** from the host node or **`kubectl debug`** in Kubernetes:
+1. **Using `nsenter`**: Find the container's host PID (`crictl inspect` or `docker inspect`). Run `nsenter -t <PID> -n <host-tool>` (e.g. `nsenter -t 4812 -n ip addr` or `nsenter -t 4812 -n curl localhost:8080`). The command executes the host's binary within the container's Network Namespace.
+2. **Using `kubectl debug`**: Attach an ephemeral container (e.g. `nicolaka/netshoot`) sharing the target container's network and process namespaces.
+
+**Q2: How does `strace` help diagnose a hung container process?**
+
+`strace` attaches to the container's host PID using the Linux `ptrace` system call (`sudo strace -f -p <PID>`). It intercepts and logs every system call made by the application. If a process is hung, `strace` reveals the exact blocking syscall (e.g. blocked on `futex(..., FUTEX_WAIT)` indicating a deadlock, `connect(..., EINPROGRESS)` indicating an unresolvable network timeout, or `read(..., O_NONBLOCK)` waiting for socket data).
+
+**Q3: How do you capture a packet trace (`.pcap`) from a specific container in Kubernetes?**
+
+Execute `tcpdump` within the container's network namespace via `nsenter`:
+```bash
+sudo nsenter -t $(crictl inspect -o json <ID> | jq .info.pid) -n tcpdump -i eth0 -w /tmp/traffic.pcap
+```
+The file `/tmp/traffic.pcap` is saved directly onto the host filesystem and can be opened in Wireshark for deep protocol analysis without modifying the container.
+
+**Q4: How does `kubectl debug` with `--target` work under the hood?**
+
+When `kubectl debug` is run with `--target=<container>`, Kubelet creates an **Ephemeral Container** inside the existing Pod Sandbox. Because `--target` is specified, Kubelet instructs the container runtime to **join the target container's Linux Process (`PID`) Namespace and Network Namespace**. The debug container sees all processes running in the target container in `ps aux` and shares the exact same IP and network sockets.
+
+**Q5: What are the security risks of allowing `kubectl debug` in production clusters?**
+
+`kubectl debug` allows engineers to attach arbitrary container images with elevated capabilities and shared PID namespaces to production pods. An engineer could use `gdb` or `strace` to inspect in-memory secrets, database tokens, and encryption keys stored in the main application's RAM. Organizations should protect `kubectl debug` using RBAC and require ephemeral containers to be scanned and signed.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why minimal distroless containers must never bundle diagnostic tools
+- [ ] Know how `nsenter -t <PID> -n` switches into container network namespaces
+- [ ] Know how `strace -p <PID>` traces live container system calls
+- [ ] Know how to capture container PCAPs using `nsenter` + `tcpdump`
+- [ ] Know how `kubectl debug --target` shares PID and Network namespaces
+- [ ] Can diagnose minimal container networking using `nicolaka/netshoot`

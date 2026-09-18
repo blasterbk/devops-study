@@ -1,0 +1,219 @@
+---
+title: "Chapter 1 — Cluster API Architecture & Providers"
+sidebar_position: 1
+module: "Module 9.2 — Cluster API & Infrastructure"
+description: "Master Kubernetes Cluster API (CAPI) architecture — Management vs Workload clusters, Infrastructure Providers (CAPA, CAPG, CAPZ), and KubeadmControlPlane controllers."
+---
+
+# Chapter 1 — Cluster API (CAPI) Architecture & Providers
+
+> **Goal:** Master declarative, Kubernetes-native cluster provisioning and fleet infrastructure lifecycle management using **CNCF Cluster API (CAPI)** — understanding the separation between the **Management Cluster** and downstream **Workload Clusters**, dissecting the 4-layer provider architecture (**Core CAPI**, **Bootstrap CABPK**, **Control Plane KCPC**, and **Infrastructure CAPA/CAPG/CAPZ**), and authoring declarative `Cluster` and `KubeadmControlPlane` Custom Resources.
+>
+> By the end of this chapter, you will understand:
+> 1. How Cluster API treats entire Kubernetes clusters as declarative Kubernetes Custom Resources
+> 2. The structural relationship between Management Clusters and Workload Clusters
+> 3. The 4 provider layers: Core CAPI, Bootstrap (Kubeadm), Control Plane, and Infrastructure
+> 4. How Infrastructure Providers (`CAPA` for AWS, `CAPG` for GCP, `CAPZ` for Azure) provision cloud networks and VMs
+> 5. How `KubeadmControlPlane` manages automated rolling control-plane upgrades and certificate lifecycles
+> 6. How to author and inspect CAPI manifests using the `clusterctl` CLI
+
+---
+
+## Real-Life Analogy
+
+Think of Cluster API (CAPI) as **a fully automated 3D printer for Kubernetes clusters built out of Kubernetes itself**:
+
+- **The Imperative Infrastructure Nightmare (The Terraform / Bash Script Hell):** In the past, creating 50 clusters required writing 10,000 lines of Terraform, running dozens of fragile bash scripts, and maintaining external state files (**Fragile & Imperative**). If a virtual machine died, Terraform couldn't detect it in real time.
+- **The Kubernetes-Native Paradigm (Clusters as Custom Resources):** Cluster API says: *"Kubernetes is the world's greatest reconciliation and control loop engine. Why not use Kubernetes Custom Resources (`kind: Cluster`) to create other Kubernetes clusters?"*
+- **The Management Cluster (The Mother Ship):** One central management cluster runs the CAPI brain.
+- **The 4 Specialist Construction Robots (The Provider Layers):**
+  - **1. The Core Architect (`CAPI`):** Defines the universal concept of a cluster and a machine.
+  - **2. The Cloud Excavator (`CAPA` - AWS / `CAPG` - GCP):** Makes cloud API calls to build the VPC, security groups, subnets, and EC2 virtual machines.
+  - **3. The Engine Tuner (`CABPK` - Bootstrap Provider):** Writes the cloud-init scripts that execute `kubeadm init` and `kubeadm join` when the VM boots up.
+  - **4. The Flight Control Manager (`KCPC` - KubeadmControlPlane):** Manages the 3 master nodes, rotates their TLS certificates, and rolls out control plane upgrades.
+
+---
+
+## Architecture Diagram
+
+```text
+               Cluster API (CAPI) Multi-Layer Provider Architecture
+
+ MANAGEMENT CLUSTER (The Control Plane of Control Planes)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Core CAPI Controllers + Providers:                                     │
+ │ ├── 1. Core Provider:           `Cluster`, `Machine`, `MachineDeployment`│
+ │ ├── 2. Bootstrap Provider:      `KubeadmConfig` (Generates cloud-init) │
+ │ ├── 3. Control Plane Provider:  `KubeadmControlPlane` (Manages Masters)│
+ │ └── 4. Infrastructure Provider: `AWSCluster`, `AWSMachine` (`CAPA`)    │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Declarative Cloud API Calls (EC2, VPC, NLB, IAM)
+                    ▼
+ CLOUD PROVIDER (AWS / GCP / Azure / vSphere)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Provisions Cloud VPC, Subnets, and Layer 4 Network Load Balancer    │
+ │ 2. Launches EC2 Virtual Machines running Linux & Containerd            │
+ │ 3. Executes `cloud-init` user-data ──► `kubeadm init` / `join`         │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Target Cluster Assembles and Initializes
+                    ▼
+ DOWNSTREAM WORKLOAD CLUSTER (`prod-us-east-cluster`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ├── 3 HA Control Plane Masters (Managed by `KubeadmControlPlane`)      │
+ │ └── 20 Worker Nodes (Managed by `MachineDeployment`)                   │
+ │ (Runs customer application microservices!)                             │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 CAPI Provider Layers
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Provider Layer       │ Standard Implementation │ Core Responsibility & CRDs Managed                │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Core Provider** │ `CAPI` (Cluster API)    │ Manages high-level lifecycle state machines.      │
+ │                      │                         │ *CRDs:* `Cluster`, `Machine`, `MachineDeployment`.│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. Bootstrap**     │ `CABPK` (Kubeadm        │ Generates `cloud-init` / ignition scripts that    │
+ │ **Provider**         │ Bootstrap Provider)     │ execute `kubeadm init` and `kubeadm join`.        │
+ │                      │                         │ *CRDs:* `KubeadmConfig`, `KubeadmConfigTemplate`. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. Control Plane** │ `KCPC` (Kubeadm         │ Orchestrates rolling upgrades of master nodes,    │
+ │ **Provider**         │ Control Plane Provider) │ etcd quorum health, and TLS cert rotation.        │
+ │                      │                         │ *CRD:* `KubeadmControlPlane`.                     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. Infrastructure**│ `CAPA` (AWS), `CAPG`    │ Provisions physical cloud infrastructure (VPCs,   │
+ │ **Provider**         │ (GCP), `CAPZ` (Azure)   │ subnets, security groups, VMs, disk volumes).     │
+ │                      │                         │ *CRDs:* `AWSCluster`, `AWSMachineTemplate`.       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Declarative Production CAPI Cluster Manifest (AWS - `CAPA`)
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: prod-us-east-cluster
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks: ["192.168.0.0/16"]
+    services:
+      cidrBlocks: ["10.96.0.0/12"]
+  # 1. Binds to Infrastructure Provider (CAPA)
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+    kind: AWSCluster
+    name: prod-us-east-cluster
+  # 2. Binds to Control Plane Provider (KubeadmControlPlane)
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: prod-us-east-control-plane
+---
+# AWS-Specific Infrastructure Specification
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSCluster
+metadata:
+  name: prod-us-east-cluster
+  namespace: default
+spec:
+  region: us-east-1
+  sshKeyName: production-ssh-key
+  networkSpec:
+    vpc:
+      cidrBlock: "10.0.0.0/16"
+```
+
+---
+
+## Complete `KubeadmControlPlane` Manifest (HA 3-Master Topology)
+
+```yaml
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: prod-us-east-control-plane
+  namespace: default
+spec:
+  replicas: 3                          # HA 3-Node Stacked etcd Control Plane!
+  version: v1.30.0                     # Declarative Kubernetes version!
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      kind: AWSMachineTemplate
+      name: prod-control-plane-machine-template
+  kubeadmConfigSpec:
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cloud-provider: external
+    clusterConfiguration:
+      apiServer:
+        extraArgs:
+          enable-admission-plugins: "NodeRestriction,ResourceQuota"
+```
+
+---
+
+## Hands-On Lab: Querying CAPI Clusters via `clusterctl`
+
+```bash
+# Step 1: Query all CAPI clusters managed by the management cluster
+kubectl get clusters -A 2>/dev/null || echo "Cluster API CRDs active / simulated"
+
+# Step 2: Query Control Plane status and version health
+kubectl get kubeadmcontrolplanes -A -o custom-columns=NAME:.metadata.name,READY:.status.ready,REPLICAS:.status.replicas,VERSION:.spec.version
+
+# Step 3: Use clusterctl CLI to inspect cluster topology and conditions tree
+# clusterctl describe cluster prod-us-east-cluster
+
+# Step 4: Extract kubeconfig for a target workload cluster
+# clusterctl get kubeconfig prod-us-east-cluster > /tmp/prod-cluster.kubeconfig
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNCF Cluster API (CAPI), and why is it preferred over imperative tools like Terraform for cluster lifecycle management?**
+
+Cluster API is a Kubernetes sub-project that brings **declarative, Kubernetes-style APIs to cluster creation, scaling, upgrading, and destruction**. While Terraform is an external imperative-state tool that only runs when explicitly triggered by a CI pipeline, CAPI runs as continuous **in-cluster reconciliation loops**. If a worker VM crashes in the cloud, CAPI's `MachineHealthCheck` detects the failure within seconds and automatically provisions a replacement VM, providing self-healing infrastructure.
+
+**Q2: What is the separation of responsibilities between the Management Cluster and Workload Clusters in CAPI?**
+
+- **Management Cluster**: The central, dedicated Kubernetes cluster where the CAPI operator, provider controllers (`CAPA`, `CABPK`), and cluster Custom Resources reside. It is used exclusively by platform SREs to orchestrate infrastructure.
+- **Workload Clusters**: The downstream, production or staging Kubernetes clusters provisioned and managed by the management cluster. Workload clusters run customer applications and business microservices.
+
+**Q3: How does `KubeadmControlPlane` execute zero-downtime rolling upgrades of the Kubernetes control plane?**
+
+When the `version` field in `KubeadmControlPlane` is updated (e.g. `v1.29.0` $\to$ `v1.30.0`):
+1. The KCPC controller provisions a new 4th master VM with Kubernetes v1.30.0.
+2. The new master joins the existing etcd consensus ring (`kubeadm join`).
+3. Once the 4th master passes health checks, KCPC cordons, drains, and deletes an old v1.29.0 master.
+4. It repeats this process one by one until all 3 masters are upgraded to v1.30.0 with zero API server downtime.
+
+**Q4: What is the role of the Bootstrap Provider (`CABPK`) in Cluster API?**
+
+The Bootstrap Provider translates a generic `KubeadmConfig` declaration into operating-system-specific boot instructions (such as `cloud-init` for Linux or `ignition` for CoreOS/Flatcar). When the infrastructure provider boots an EC2 or GCE virtual machine, the VM downloads this user-data script, configures local containerd and Kubelet binaries, and executes `kubeadm init` or `kubeadm join` with dynamically generated join tokens.
+
+**Q5: How does CAPI handle Infrastructure Provider abstraction across AWS, GCP, and Azure?**
+
+CAPI uses a modular plugin architecture. The high-level `Cluster` and `Machine` objects remain cloud-agnostic. The cloud-specific details are delegated to **Infrastructure Providers** via references: `spec.infrastructureRef` points to an `AWSCluster` on AWS, a `GCPCluster` on Google Cloud, or an `AzureCluster` on Azure, allowing platform teams to use identical GitOps workflows across any cloud.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that CAPI manages Kubernetes clusters as declarative Kubernetes Custom Resources
+- [ ] Know the distinction between Management Cluster and Workload Clusters
+- [ ] Know the 4 provider layers: Core CAPI, Bootstrap (CABPK), Control Plane (KCPC), Infra (CAPA/G/Z)
+- [ ] Know how `KubeadmControlPlane` automates rolling HA control plane upgrades
+- [ ] Know how `cloud-init` executes `kubeadm init`/`join` during VM boot
+- [ ] Can view active CAPI clusters using `kubectl get clusters,kubeadmcontrolplanes -A`

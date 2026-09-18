@@ -1,0 +1,346 @@
+---
+title: "Chapter 3 — KEDA: Event-Driven Autoscaling"
+sidebar_position: 3
+module: "Module 3.8 — Autoscaling: HPA, VPA, KEDA"
+description: "Master KEDA (Kubernetes Event-driven Autoscaling) — ScaledObject vs ScaledJob, Scale-to-Zero mechanics, Kafka/RabbitMQ/SQS trigger scalers, TriggerAuthentication, and External Metrics API adapters."
+---
+
+# Chapter 3 — KEDA: Event-Driven Autoscaling
+
+> **Goal:** Master event-driven autoscaling with KEDA (Kubernetes Event-driven Autoscaling) — understanding the decoupled architecture (Operator, Metrics Adapter), achieving true Scale-to-Zero ($0 \to 1 \to N$), configuring `ScaledObject` vs `ScaledJob`, authenticating with cloud message queues via `TriggerAuthentication`, and scaling on message lag (Kafka, RabbitMQ, AWS SQS).
+>
+> By the end of this chapter, you will understand:
+> 1. Why standard HPA cannot scale to zero ($0 \leftrightarrow 1$) and how KEDA overcomes this limitation
+> 2. The internal architecture of KEDA: Operator vs External Metrics Server vs Admission Webhook
+> 3. How `ScaledObject` dynamically creates and manages underlying `HorizontalPodAutoscaler` objects
+> 4. How `ScaledJob` launches batch Jobs directly from event stream queues
+> 5. Production trigger scalers: Kafka consumer group lag, RabbitMQ queues, and Prometheus PromQL queries
+> 6. How `TriggerAuthentication` integrates with AWS IAM Roles for Service Accounts (IRSA)
+
+---
+
+## Real-Life Analogy
+
+Think of KEDA as an **on-demand emergency tow truck dispatch service**:
+
+- **Standard HPA (Always-On Minimum Staff):** The towing company keeps at least 1 tow truck idling in the parking lot 24/7 (`minReplicas: 1`), burning gas and costing money even at 3:00 AM when zero accidents have occurred.
+- **KEDA Scale-to-Zero ($0 \to 1$):** At night, all tow trucks are turned off and all drivers are asleep at home (`replicas: 0`). The company pays $0 in fuel and compute costs.
+- **The Event Trigger (The 911 Dispatch Switchboard):** An accident occurs on the highway (a message arrives in an AWS SQS queue or Kafka topic).
+  - The KEDA Operator spots the message, dials Driver #1, and wakes them up (**$0 \to 1$ Scale-Up**).
+  - If 50 more accidents are reported (queue depth surges to 500), KEDA hands the reins to the HPA, which rapidly deploys 10 tow trucks (**$1 \to N$ Scaling**).
+  - When all highways are cleared and the queue is empty for 5 minutes (`cooldownPeriod: 300s`), KEDA sends all drivers back to sleep (**$1 \to 0$ Scale-to-Zero**).
+
+---
+
+## Architecture Diagram
+
+```text
+               KEDA Event-Driven Autoscaling Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ External Event Sources                                                 │
+ │ (Kafka Consumer Lag, AWS SQS Depth, RabbitMQ Messages, Prometheus)     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌──────────────────────────────────┴─────────────────────────────────────┐
+ │ KEDA Controller Architecture                                           │
+ │                                                                        │
+ │  ┌─────────────────────────────────┐ ┌───────────────────────────────┐ │
+ │  │ 1. KEDA Operator (Scale-to-Zero)│ │ 2. KEDA External Metrics Server│
+ │  │    - Watches `ScaledObject`     │ │    - Implements               │ │
+ │  │    - Scales Deployments:        │ │      external.metrics.k8s.io  │ │
+ │  │      0 ──► 1 and 1 ──► 0        │ │    - Feeds metric values to   │ │
+ │  │    - Creates underlying HPA     │ │      native HPA controller    │ │
+ │  └────────────────┬────────────────┘ └──────────────┬────────────────┘ │
+ └───────────────────┼─────────────────────────────────┼──────────────────┘
+                     │ (When count >= 1)               │ (Feeds metrics)
+                     ▼                                 ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Native Kubernetes HorizontalPodAutoscaler                              │
+ │ Scales Deployment from 1 ◄──► N replicas based on KEDA external metric!│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Target Workload: Deployment: payment-consumer (Pods: 0 to 25)          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Scale-to-Zero Mechanism ($0 \to 1 \to N$)
+
+Standard Kubernetes HPAs **cannot scale down to 0** (`minReplicas` must be $\ge 1$). KEDA achieves Scale-to-Zero using a clever two-phase handoff:
+
+```text
+ The 2-Phase KEDA Scaling Lifecycle:
+
+ Phase 1: Zero Load (Replicas = 0)
+ - Queue is empty (0 messages).
+ - KEDA scales Deployment to `replicas: 0`.
+ - KEDA pauses / removes the active HPA to prevent conflict.
+
+ Phase 2: Event Arrives (0 -> 1 Handoff)
+ - Message arrives in queue (Depth > 0).
+ - KEDA Operator directly patches Deployment `.spec.replicas = 1`.
+ - KEDA creates/activates the underlying HPA object.
+
+ Phase 3: High Load (1 <-> N Scaling)
+ - KEDA Metrics Server translates queue depth into `external.metrics.k8s.io`.
+ - Standard HPA scales the Deployment from 1 to N based on the metric target.
+
+ Phase 4: Cooldown & Sleep (1 -> 0)
+ - Queue remains 0 for `cooldownPeriod: 300s`.
+ - KEDA Operator directly scales Deployment back down to 0.
+```
+
+---
+
+## `ScaledObject` vs `ScaledJob`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ `ScaledObject`                  │ `ScaledJob`                     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Target Workload**       │ Deployments, StatefulSets, CRDs │ Kubernetes `Job` resources      │
+ │ **Execution Model**       │ Continuously running consumers  │ Discrete, one-off batch workers │
+ │ **Scaling Primitive**     │ Modifies `.spec.replicas`       │ Spawns new Job objects directly │
+ │ **HPA Dependency**        │ Uses underlying HPA ($1 \to N$) │ Bypasses HPA completely         │
+ │ **Best For**              │ Fast message consumers (HTTP,   │ Heavy, long-running processing  │
+ │                           │ RabbitMQ event handlers)        │ (Video render per queue item)   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Production Event Scalers
+
+KEDA provides over **60+ built-in scalers**:
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Scaler Type          │ Trigger Metric          │ Example Target Configuration                      │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Apache Kafka**     │ Consumer Group Lag      │ `lagThreshold: "50"`, `topic: orders`             │
+ │ **RabbitMQ**         │ Queue Message Count     │ `queueLength: "20"`, `queueName: tasks`           │
+ │ **AWS SQS**          │ Approximate Message Count│ `queueLength: "10"`, `queueURL: https://sqs...`  │
+ │ **Prometheus**       │ Custom PromQL query     │ `threshold: "100"`, `query: sum(rate(...))`       │
+ │ **PostgreSQL / SQL** │ Scalar query result     │ `queryValue: "5"`, `query: SELECT count(*) FROM...│
+ │ **Redis**            │ List length / Stream lag│ `listLength: "30"`, `listName: job_queue`         │
+ └──────────────────────┴─────────────────────────┴───────────────────────────────────────────────────┘
+```
+
+---
+
+## Secure Cloud Credentials: `TriggerAuthentication`
+
+Never store cloud API keys or passwords inside the `ScaledObject`. Use `TriggerAuthentication` to bind to IAM roles:
+
+```yaml
+# 1. TriggerAuthentication using AWS IAM Roles for Service Accounts (IRSA)
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: aws-sqs-auth
+  namespace: production
+spec:
+  podIdentity:
+    provider: aws-k8s     # AWS IRSA / EKS Pod Identity
+---
+# 2. ScaledObject referencing TriggerAuthentication
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sqs-orders-scaler
+  namespace: production
+spec:
+  scaleTargetRef:
+    name: order-processor
+  minReplicaCount: 0      # True Scale-to-Zero!
+  maxReplicaCount: 30
+  pollingInterval: 15     # Check queue every 15s
+  cooldownPeriod: 300     # Wait 5m before scaling to 0
+
+  triggers:
+  - type: aws-sqs
+    authenticationRef:
+      name: aws-sqs-auth
+    metadata:
+      queueURL: https://sqs.us-east-1.amazonaws.com/123456789/order-queue
+      queueLength: "25"   # 1 Pod for every 25 messages in queue
+      awsRegion: "us-east-1"
+```
+
+---
+
+## Batch Queue Processing with `ScaledJob`
+
+For tasks that take several minutes per message (e.g. video rendering or PDF generation), running a continuous consumer wastes memory. `ScaledJob` launches one Job per $M$ messages:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: video-transcode-scaledjob
+  namespace: media
+spec:
+  jobTargetRef:
+    parallelism: 1
+    completions: 1
+    template:
+      spec:
+        restartPolicy: OnFailure
+        containers:
+        - name: transcoder
+          image: ffmpeg-processor:latest
+          command: ["python", "process_next_video.py"]
+
+  pollingInterval: 10
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 2
+  maxReplicaCount: 50
+
+  scalingStrategy:
+    strategy: "default"
+
+  triggers:
+  - type: rabbitmq
+    metadata:
+      protocol: amqp
+      queueName: raw-videos
+      mode: QueueLength
+      value: "1"          # Spawn 1 Job for every 1 pending video in queue!
+    authenticationRef:
+      name: rabbitmq-auth
+```
+
+---
+
+## Complete Production Kafka ScaledObject Manifest
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: kafka-telemetry-scaler
+  namespace: telemetry
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: telemetry-consumer
+  minReplicaCount: 0
+  maxReplicaCount: 40
+  pollingInterval: 10
+  cooldownPeriod: 180
+
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-cluster-headless.messaging:9092
+      topic: device-telemetry
+      consumerGroup: telemetry-analytics-group
+      lagThreshold: "100"    # Add 1 Pod for every 100 uncommitted messages
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: kafka-auth
+```
+
+---
+
+## Hands-On Lab: Observing Scale-to-Zero with KEDA
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace keda-lab
+
+# Step 2: Deploy a mock consumer Deployment starting with 0 replicas
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: queue-consumer
+  namespace: keda-lab
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: queue-consumer
+  template:
+    metadata:
+      labels:
+        app: queue-consumer
+    spec:
+      containers:
+      - name: worker
+        image: alpine:latest
+        command: ["sh", "-c", "echo 'Consuming messages...'; sleep 3600"]
+EOF
+
+# Step 3: Deploy a ScaledObject using Cron scaler to simulate time-based scale-up
+cat <<EOF | kubectl apply -f -
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: cron-scaledobject
+  namespace: keda-lab
+spec:
+  scaleTargetRef:
+    name: queue-consumer
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  cooldownPeriod: 30
+  triggers:
+  - type: cron
+    metadata:
+      timezone: UTC
+      start: "* * * * *"     # Active all the time for testing
+      end: "* * * * *"
+      desiredReplicas: "3"
+EOF
+
+# Step 4: Watch KEDA scale the Deployment from 0 to 3 automatically!
+sleep 5
+kubectl get pods -n keda-lab
+kubectl get hpa -n keda-lab
+
+# Step 5: Clean up lab
+kubectl delete namespace keda-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is KEDA, and what fundamental limitation of the standard HPA does it solve?**
+
+KEDA (Kubernetes Event-driven Autoscaling) is a CNCF graduated project that brings fine-grained event-driven scaling to Kubernetes. The standard Kubernetes HPA has two major limitations: (1) It cannot scale workloads down to zero (`minReplicas` $\ge 1$), forcing idle consumers to consume compute 24/7; and (2) It relies primarily on resource metrics (CPU/RAM), which lag significantly behind sudden queue backlogs. KEDA enables true Scale-to-Zero ($0 \leftrightarrow 1$) and scales directly on external message lag (e.g. Kafka consumer lag, AWS SQS queue depth).
+
+**Q2: How does KEDA achieve Scale-to-Zero without breaking standard HPA mechanics?**
+
+KEDA uses a two-phase architecture: When load is zero (empty queue), the KEDA Operator directly scales the target Deployment to `replicas: 0` and removes or deactivates the HPA. When an event arrives in the queue, the KEDA Operator directly scales the Deployment from `0 \to 1` and creates/activates an underlying standard `HorizontalPodAutoscaler`. The KEDA External Metrics Server translates external event lag into `external.metrics.k8s.io`, allowing the native HPA to manage scaling between $1 \leftrightarrow N$.
+
+**Q3: What is the difference between a `ScaledObject` and a `ScaledJob` in KEDA?**
+
+A `ScaledObject` targets continuously running workloads (Deployments, StatefulSets) and adjusts their `.spec.replicas` using an underlying HPA. A `ScaledJob` targets batch workloads: instead of scaling running Pod replicas, it directly spawns discrete Kubernetes `Job` objects for pending queue messages. `ScaledJob` is ideal for long-running, resource-heavy tasks (such as video rendering or machine learning batch inference) where each message should be processed in an isolated run-to-completion container.
+
+**Q4: How does KEDA scale on Apache Kafka consumer group lag?**
+
+The KEDA Kafka scaler queries the Kafka cluster's broker API or Prometheus metrics to compute the current **consumer group lag** ($\text{Lag} = \text{Latest Partition Offset} - \text{Current Committed Consumer Offset}$). In the `ScaledObject`, the operator defines a `lagThreshold` (e.g. 50). If the total uncommitted lag across all partitions is 250 messages, KEDA computes that $\lceil 250 / 50 \rceil = 5$ consumer Pods are required, driving the HPA to scale the consumer Deployment accordingly.
+
+**Q5: How does `TriggerAuthentication` handle cloud credentials securely?**
+
+`TriggerAuthentication` decouples authentication secrets from workload definitions. Instead of hardcoding API keys or connection strings in the `ScaledObject`, `TriggerAuthentication` references Kubernetes Secrets, HashiCorp Vault, or cloud native identity mechanisms (such as AWS IAM Roles for Service Accounts - IRSA, Azure Workload Identity, or GCP Workload Identity). The `ScaledObject` simply references the `TriggerAuthentication` object by name.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that KEDA enables true Scale-to-Zero ($0 \to 1 \to 0$) for Kubernetes workloads
+- [ ] Know the difference between `ScaledObject` (Deployments) and `ScaledJob` (Batch Jobs)
+- [ ] Know that KEDA implements the `external.metrics.k8s.io` adapter for native HPA
+- [ ] Know how `pollingInterval` and `cooldownPeriod` govern scaling responsiveness
+- [ ] Know how Kafka scaler uses consumer group lag to calculate target replicas
+- [ ] Know how `TriggerAuthentication` integrates with AWS IRSA and cloud identities
+- [ ] Can view active KEDA scalers using `kubectl get scaledobject -A`

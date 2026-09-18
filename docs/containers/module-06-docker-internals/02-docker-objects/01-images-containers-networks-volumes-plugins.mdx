@@ -1,0 +1,179 @@
+---
+title: "Chapter 1 — Docker Objects: Internals of /var/lib/docker"
+sidebar_position: 1
+module: "Module 6.2 — Docker Objects"
+description: "Master Docker object persistence and filesystem layout — dissecting /var/lib/docker directories, config.v2.json, hostconfig.json, JSON log drivers, and BoltDB network state."
+---
+
+# Chapter 1 — Docker Objects: Internals of /var/lib/docker
+
+> **Goal:** Master the internal persistence models, directory structures, and metadata schemas stored within the **`/var/lib/docker/`** filesystem — dissecting how Docker manages **Images**, **Containers**, **Volumes**, **Networks**, and **Plugins**, analyzing **`config.v2.json`** and **`hostconfig.json`**, exploring the **JSON logging engine**, and understanding **libnetwork BoltDB state storage**.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural layout of all subdirectories inside `/var/lib/docker/`
+> 2. What metadata is stored inside `config.v2.json` vs `hostconfig.json`
+> 3. How Docker persists container stdout/stderr output in `*-json.log` files
+> 4. How Named Volumes are stored on disk in `/var/lib/docker/volumes/<name>/_data`
+> 5. How Docker tracks bridge networks and IPAM allocations in `local-kv.db`
+> 6. How to inspect and recover raw container metadata directly from disk
+
+---
+
+## Real-Life Analogy
+
+Think of `/var/lib/docker` as **the master vault, parts inventory, and records filing room inside a manufacturing automobile garage**:
+
+- **1. The Factory Blueprints (`/image/`):**
+  - Filing cabinets containing laminated engineering specifications for each car model (**Image Config Blobs and Layer Chain IDs**).
+- **2. The Parts Warehouse Shelves (`/overlay2/`):**
+  - Heavy industrial steel shelves holding individual boxed auto components: engines, doors, transmissions (**Immutable Layer Tarball Directories**).
+- **3. The Active Assembly Bays (`/containers/<id>/`):**
+  - Each car currently being assembled in the garage has a dedicated clipboard hanging on the wall (**The Container Directory**).
+  - The clipboard contains:
+    - The car's internal settings: dashboard clock, radio presets (**`config.v2.json`**).
+    - The external road regulations: maximum speed governor, tire limits (**`hostconfig.json`**).
+    - The black box driving recorder log (**`<id>-json.log`**).
+- **4. The Private Cargo Trunks (`/volumes/`):**
+  - Locked wooden storage trunks bolted to the back of the car where the driver stores permanent luggage (**Named Volumes `_data/`**).
+- **5. The Garage Dispatch Logbook (`/network/`):**
+  - A digital ledger (**BoltDB `local-kv.db`**) tracking which private garage radio frequency and license plate number was issued to which car.
+
+---
+
+## Architecture Diagram
+
+```text
+               The Directory Layout of `/var/lib/docker/` on Host Disk
+
+ /var/lib/docker/
+ ├── buildkit/                         ◄── BuildKit cache, snapshotters, & metadata
+ ├── containers/                       ◄── 1 Subdirectory per Container instance!
+ │   └── <64-char-container-id>/
+ │       ├── config.v2.json            ◄── Container state, env, ports, paths
+ │       ├── hostconfig.json           ◄── cgroup limits, restarts, volume binds
+ │       ├── <id>-json.log             ◄── Raw stdout/stderr JSON log output!
+ │       ├── hosts                     ◄── Container's private `/etc/hosts`
+ │       └── resolv.conf               ◄── Container's DNS resolver config
+ ├── image/
+ │   └── overlay2/
+ │       ├── imagedb/content/sha256/   ◄── Image Config JSON blobs
+ │       └── layerdb/sha256/           ◄── Layer parent-child chain tracking
+ ├── network/files/
+ │   └── local-kv.db                   ◄── Embedded BoltDB: Libnetwork IPAM & bridges
+ ├── overlay2/                         ◄── OverlayFS layer directories & `/l/` symlinks
+ └── volumes/
+     └── <volume-name>/
+         └── _data/                    ◄── Bare-metal persistent volume files!
+```
+
+---
+
+## Deep Dive: `config.v2.json` vs `hostconfig.json`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+ │ Metadata File             │ Internal Contents & Purpose                                             │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **`config.v2.json`**      │ **Container-Internal Configuration.** Stores image ID, working dir,     │
+ │                           │ environment variables (`Env[]`), entrypoint command (`Path`, `Args[]`), │
+ │                           │ network endpoint settings, and active execution state (`Running: true`).│
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **`hostconfig.json`**     │ **Host-Level Isolation Policies.** Stores cgroup parameters (memory     │
+ │                           │ limit, CPU quotas), volume bind mounts (`Binds[]`), published port      │
+ │                           │ mappings (`PortBindings`), restart policies, and privileged flags.      │
+ └───────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Docker JSON Logging Engine (`*-json.log`)
+
+By default, Docker captures all standard output (`stdout`) and standard error (`stderr`) emitted by container processes and writes them to a JSON log file on disk:
+
+```json
+{"log":"2026-08-18T10:15:22.102Z [INFO] HTTP Server listening on port 8080\n","stream":"stdout","time":"2026-08-18T10:15:22.102341205Z"}
+{"log":"2026-08-18T10:15:23.401Z [ERROR] Database connection timed out!\n","stream":"stderr","time":"2026-08-18T10:15:23.401829102Z"}
+```
+
+> [!CAUTION]
+> **Disk Exhaustion Hazard:** If an application prints verbose debug logs in an infinite loop and no log rotation is configured, `<id>-json.log` will grow until it consumes **100% of the host root filesystem**. Always enforce `"max-size"` and `"max-file"` in `/etc/docker/daemon.json`!
+
+---
+
+## Network State Persistence: `libnetwork` & BoltDB
+
+Docker manages container networking using an embedded key-value database (**BoltDB**) located at `/var/lib/docker/network/files/local-kv.db`:
+- It stores IP address pool reservations (IPAM).
+- It tracks active bridge networks (`bridge`, `docker0`) and container endpoint attachments.
+- When the Docker daemon restarts, it reads `local-kv.db` to reconstruct its virtual network interfaces without losing IP allocations.
+
+---
+
+## Hands-On Lab: Inspecting Container Metadata in `/var/lib/docker/`
+
+```bash
+# Step 1: Run a background test container
+docker run -d --name obj-demo -e MY_SECRET_VAR=ContainerRocks123 -p 8088:80 nginx:alpine
+
+# Step 2: Extract the full 64-character container ID
+CID=$(docker inspect obj-demo --format '{{.Id}}')
+echo "Container Full ID: $CID"
+
+# Step 3: Inspect the raw config.v2.json file on host disk
+sudo cat /var/lib/docker/containers/$CID/config.v2.json 2>/dev/null | jq '.Config.Env' || \
+  docker inspect obj-demo --format '{{.Config.Env}}'
+
+# Step 4: Inspect the raw stdout/stderr JSON log file on host disk
+sudo head -n 5 /var/lib/docker/containers/$CID/$CID-json.log 2>/dev/null || \
+  docker logs obj-demo | head -n 5
+
+# Step 5: Clean up
+docker rm -f obj-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the directory structure of `/var/lib/docker/`, and what is stored in each major folder?**
+
+- **`/containers/<id>/`**: Stores per-container configuration (`config.v2.json`), host isolation policies (`hostconfig.json`), and raw logs (`<id>-json.log`).
+- **`/overlay2/`**: Stores unpacked image layer tarballs and container writable layer diffs.
+- **`/image/overlay2/`**: Stores cryptographic image metadata, config blobs (`imagedb`), and layer parent-child chain IDs (`layerdb`).
+- **`/volumes/<name>/_data/`**: Stores raw files for Docker Named Volumes on native host storage.
+- **`/network/files/local-kv.db`**: An embedded BoltDB key-value store persisting libnetwork IP allocations and bridge configurations.
+
+**Q2: What is the difference between `config.v2.json` and `hostconfig.json` in a container's state directory?**
+
+- **`config.v2.json`**: Describes the **internal environment of the container**. It defines the container's environment variables, working directory, entrypoint command, open exposed ports, and current runtime state (`Running`, `Pid`, `ExitCode`).
+- **`hostconfig.json`**: Describes **how the host manages the container**. It defines host-specific policies: cgroup limits (memory, CPU shares), volume bind mounts, port mapping rules to host interfaces, restart policies, and security privileges.
+
+**Q3: How does Docker implement Named Volumes on disk?**
+
+When you create a named volume (`docker volume create my-vol`), Docker creates a dedicated directory at **`/var/lib/docker/volumes/my-vol/_data`**. When a container mounts this volume (`-v my-vol:/app/data`), Docker executes a native Linux **Bind Mount** mapping `/var/lib/docker/volumes/my-vol/_data` directly into the container's mount namespace at `/app/data`. Writes to this directory bypass the OverlayFS storage driver and write directly to host disk at bare-metal speeds.
+
+**Q4: How do you recover access to a Docker container or extract its data if the Docker daemon fails to start?**
+
+Because Docker stores all data as standard Linux files under `/var/lib/docker/`:
+1. **To extract volume data**: Navigate directly to `/var/lib/docker/volumes/<volume-name>/_data/` and copy the files.
+2. **To inspect container files**: Discover the container's upper layer ID from `config.v2.json` and mount the layer using native Linux `mount -t overlay` or inspect `/var/lib/docker/overlay2/<layer-id>/diff/`.
+3. **To recover environment variables**: Read `/var/lib/docker/containers/<id>/config.v2.json`.
+
+**Q5: What causes `/var/lib/docker/` to run out of disk space, and how do you audit it?**
+
+The most common causes of disk exhaustion in `/var/lib/docker/` are:
+1. **Unrotated JSON Logs (`<id>-json.log`)**: Containers printing continuous logs can generate multi-gigabyte log files.
+2. **Dangling / Unused Images & Build Caches**: Accumulated old image layers from continuous CI/CD deployments.
+3. **Orphaned Stopped Containers & Volumes**: Uncleaned writable layers.
+DevOps engineers audit this using **`docker system df -v`** and clean it using **`docker system prune -a --volumes`**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `/var/lib/docker/containers/<id>/` holds container configs and logs
+- [ ] Know the difference: `config.v2.json` (Container internal) vs `hostconfig.json` (Host limits)
+- [ ] Know that stdout/stderr logs are stored in `<id>-json.log` on host disk
+- [ ] Know that Named Volumes live in `/var/lib/docker/volumes/<name>/_data`
+- [ ] Know that network IPAM allocations are persisted in `local-kv.db` (BoltDB)
+- [ ] Can find a container's full 64-char ID using `docker inspect --format '{{.Id}}'`

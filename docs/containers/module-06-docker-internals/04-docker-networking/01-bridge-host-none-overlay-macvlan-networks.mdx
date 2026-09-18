@@ -1,0 +1,189 @@
+---
+title: "Chapter 1 — Docker Networking: bridge, host, overlay & macvlan"
+sidebar_position: 1
+module: "Module 6.4 — Docker Networking"
+description: "Master Docker networking internals — default bridge (docker0) vs custom bridges with embedded DNS (127.0.0.11), host mode, overlay VXLAN, macvlan, and iptables NAT."
+---
+
+# Chapter 1 — Docker Networking: bridge, host, overlay & macvlan
+
+> **Goal:** Master the kernel networking interfaces, packet routing paths, and virtual device topologies of **Docker Networking** — dissecting the **Default Bridge (`docker0`)**, mastering **Custom User Bridges** with **Embedded DNS Resolution (`127.0.0.11`)**, analyzing zero-overhead **Host Mode (`--net=host`)**, configuring **Air-Gapped Isolation (`--net=none`)**, inspecting multi-host **Overlay VXLAN Encapsulation**, and provisioning enterprise **Macvlan / IPvlan** interfaces.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural differences between the default `docker0` bridge and custom user-defined bridges
+> 2. How the Docker embedded DNS server (`127.0.0.11`) resolves container names automatically
+> 3. How Linux `iptables` rules implement container internet egress (MASQUERADE) and port forwarding (DNAT)
+> 4. When to deploy Host Mode for maximum packet throughput and ultra-low latency
+> 5. How Overlay networks tunnel L2 Ethernet frames across multi-host clusters using VXLAN
+> 6. How Macvlan assigns physical enterprise LAN IP and MAC addresses to containers
+
+---
+
+## Real-Life Analogy
+
+Think of the 5 Docker Network Drivers as **different communication methods inside a secure enterprise corporate headquarters**:
+
+- **1. The Default Bridge / `docker0` (The Old Switchboard):**
+  - All office desks are plugged into an old hallway switchboard (**The `docker0` Linux Bridge**).
+  - To call another desk, you must know their exact numerical phone extension (**Direct IP address**). If you dial their name, the operator fails because there is no corporate phonebook (**No automatic DNS**).
+- **2. The Custom User Bridge (The Modern Smart VOIP System):**
+  - You install a private departmental router with a smart digital directory (**The Embedded DNS Resolver `127.0.0.11`**).
+  - You simply dial *"Finance-Service"* or *"Database"*, and the system instantly connects your call (**Automatic Service Discovery**)!
+- **3. Host Mode / `--net=host` (The Megaphone in the Main Lobby):**
+  - The worker has no private telephone.
+  - They stand in the main lobby with a megaphone, speaking directly to the outside street (**Direct Host NIC access; Zero latency, but zero isolation**).
+- **4. None Mode / `--net=none` (The Underground SCIF Bunker):**
+  - A soundproof bunker with all cables cut. Zero communication can enter or leave (**Complete Air-Gapped Security**).
+- **5. Overlay Mode (The Encrypted Trans-Atlantic Satellite Link):**
+  - Encapsulates private internal office mail inside courier envelopes (**VXLAN tunnels**) to communicate with branch offices across the world.
+
+---
+
+## Architecture Diagram
+
+```text
+               The 5 Docker Network Drivers & Packet Plumbing
+
+ 1. CUSTOM USER BRIDGE (Automatic DNS `127.0.0.11` + iptables NAT):
+ ┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
+ │ CONTAINER A (`web-app`)              │  │ CONTAINER B (`database`)             │
+ │ - IP: `172.20.0.2`                   │  │ - IP: `172.20.0.3`                   │
+ │ - DNS: Resolves `database` ──► .3!   │  │ - Listening on port 5432             │
+ └──────────────────┬───────────────────┘  └──────────────────┬───────────────────┘
+                    │ `veth` pair                             │ `veth` pair
+                    ▼                                         ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CUSTOM LINUX BRIDGE (`br-1a2b3c...`): L2 Virtual Switch                │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ LINUX KERNEL iptables:                                                 │
+ │ ├── PREROUTING (DNAT): Host `0.0.0.0:8080` ──► Forwarded to `172.20.0.2:80`
+ │ └── POSTROUTING (MASQUERADE): Container outbound traffic NATed to Host IP!
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. HOST MODE vs NONE MODE vs MACVLAN:
+ - Host Mode (`--net=host`): Direct access to host `eth0`; zero namespace isolation.
+ - None Mode (`--net=none`): Only loopback `lo`; 100% air-gapped from network.
+ - Macvlan (`--driver macvlan`): Container gets a real physical MAC & IP on corporate LAN!
+```
+
+---
+
+## 5-Way Docker Network Driver Comparison Matrix
+
+```text
+ ┌───────────────────────────┬───────────────────┬───────────────────┬───────────────────┬───────────────────┬───────────────────┐
+ │ Technical Dimension       │ Default Bridge    │ Custom Bridge     │ Host Mode         │ Overlay (VXLAN)   │ Macvlan / IPvlan  │
+ │───────────────────────────┼───────────────────┼───────────────────┼───────────────────┼───────────────────┼───────────────────┤
+ │ **Driver Name**           │ `bridge`          │ `bridge` (custom) │ `host`            │ `overlay`         │ `macvlan`         │
+ │ **Automatic DNS?**        │ **NO** (IPs only) │ **YES** (`127.0.0.11`)| N/A (Host DNS)│ **YES** (Multi)   │ **YES** (Optional)│
+ │ **Port Mapping (`-p`)**   │ Required (NAT)    │ Required (NAT)    │ **Not Used** (All)│ Required (Ingress)│ **Not Used** (Direct)
+ │ **Multi-Host Clustering** │ No (Single Host)  │ No (Single Host)  │ No                │ **YES** (Swarm/K8s)│ **YES** (Direct) │
+ │ **Network Performance**   │ High (iptables)   │ High (iptables)   │ **Native Wire**   │ Moderate (Tunnel) │ **Near-Native**   │
+ │ **Isolation Level**       │ High (Net NS)     │ High (Net NS)     │ **Zero Isolation**│ High (VXLAN VNI)  │ High (L2/L3 MAC)  │
+ └───────────────────────────┴───────────────────┴───────────────────┴───────────────────┴───────────────────┴───────────────────┘
+```
+
+---
+
+## Default Bridge vs Custom User Bridge
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ Feature                              │ Default Bridge (`docker0`) vs Custom Bridge (`my-net`)      │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **Automatic DNS Resolution**         │ ❌ **Disabled.** Must use IP addresses or legacy `--link`.   │
+ │                                      │ ✅ **Enabled.** Resolves container names automatically!     │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **Network Isolation Boundary**       │ ❌ All unassigned containers land on `docker0` (Shared risk)│
+ │                                      │ ✅ Containers on different user bridges CANNOT communicate. │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **Dynamic Interface Attachment**     │ ❌ Must specify network at creation time.                   │
+ │                                      │ ✅ Can attach/detach running containers live (`connect`).   │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How iptables Powers Container Networking
+
+When Docker launches a bridge network, it injects rules into Linux **`iptables` (filter and nat tables)**:
+
+### 1. Inbound Port Forwarding (`-p 8080:80`):
+Uses Destination Network Address Translation (**DNAT**):
+```text
+-A DOCKER -p tcp -m tcp --dport 8080 -j DNAT --to-destination 172.20.0.2:80
+```
+
+### 2. Outbound Internet Access:
+Uses Source Network Address Translation (**MASQUERADE**):
+```text
+-A POSTROUTING -s 172.20.0.0/16 ! -o br-1a2b3c -j MASQUERADE
+```
+
+---
+
+## Hands-On Lab: Custom Bridge & Embedded DNS Discovery
+
+```bash
+# Step 1: Create a custom user-defined bridge network
+docker network create my-app-net
+
+# Step 2: Launch a backend database container attached to the network
+docker run -d --name db-service --network my-app-net redis:alpine
+
+# Step 3: Launch a frontend container and PING the database by its NAME!
+docker run --rm --network my-app-net alpine ping -c 3 db-service
+# Notice: Automatic DNS resolution (127.0.0.11) resolves 'db-service' to its container IP!
+
+# Step 4: Inspect the custom network to view connected containers and IP allocations
+docker network inspect my-app-net | jq '.[0].Containers'
+
+# Step 5: Clean up
+docker rm -f db-service
+docker network rm my-app-net
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the critical difference between the default `docker0` bridge and custom user-defined bridges?**
+
+The primary difference is **Automatic Service Discovery (Embedded DNS)**:
+- **Default Bridge (`docker0`)**: Does **not** support automatic DNS resolution. Containers cannot discover each other by container name and must communicate via hardcoded IP addresses or legacy, brittle `--link` flags.
+- **Custom User Bridges (`docker network create`)**: Automatically configure Docker's internal **Embedded DNS Server (`127.0.0.11`)**. Any container attached to the network can discover and communicate with sibling containers simply by using their container names or network aliases.
+
+**Q2: How does Docker implement outbound internet access for containers on a bridge network?**
+
+Docker implements outbound internet routing using **Source Network Address Translation (SNAT / MASQUERADE)** in the Linux kernel `iptables` subsystem. When a container sends a packet to an external public IP address (e.g. `8.8.8.8`), the packet leaves the container's `eth0` interface with private IP `172.17.0.2`. As the packet exits the host's physical network interface (`eth0`), the kernel's `POSTROUTING` iptables rule rewrites the source IP to the host's public IP address, allowing return packets to be routed back seamlessly.
+
+**Q3: When should a DevOps engineer choose `--net=host` over bridge networking?**
+
+Choose **Host Network Mode (`--net=host`)** when:
+1. **Ultra-Low Latency & High Bandwidth**: Bypasses the network namespace, `veth` pairs, and `iptables` NAT entirely, achieving **bare-metal wire-speed network performance** (ideal for high-frequency trading, video streaming, or multi-gigabit load balancers).
+2. **Dynamic Port Range Workloads**: Applications that dynamically bind hundreds of unpredictable UDP/TCP ports (e.g. WebRTC or VoIP media gateways) where specifying thousands of `-p` flags is impractical.
+
+**Q4: How does Docker Overlay networking enable multi-host container communication?**
+
+Docker Overlay networking uses **Virtual Extensible LAN (VXLAN)** encapsulation:
+1. When Container A on Host 1 sends an Ethernet frame to Container B on Host 2, the kernel Overlay driver intercepts the frame.
+2. The driver wraps the inner L2 Ethernet frame inside a standard **UDP packet (destination port 4789)** addressed to Host 2's physical IP.
+3. The packet travels across the underlying physical L3 network.
+4. On Host 2, the kernel decapsulates the UDP packet and injects the original Ethernet frame directly into Container B's network namespace.
+
+**Q5: What is Macvlan networking, and when is it required in enterprise environments?**
+
+Macvlan is a Linux network driver that allows an administrator to assign a **unique, dedicated MAC address and physical IP address from the corporate LAN/VLAN directly to a container**. From the perspective of physical network switches, routers, and firewalls, the container appears as a **physical bare-metal server connected to the network**. It is required for legacy enterprise applications that reject NAT or require direct layer-2 network connectivity and network monitoring policies.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Custom User Bridges provide automatic DNS discovery (`127.0.0.11`)
+- [ ] Know that default `docker0` does NOT support automatic DNS resolution
+- [ ] Know that outbound internet access uses `iptables` MASQUERADE
+- [ ] Know that Host mode (`--net=host`) eliminates NAT for bare-metal network speeds
+- [ ] Know that Overlay networks tunnel multi-host traffic using VXLAN (UDP 4789)
+- [ ] Can create a custom bridge using `docker network create <name>`

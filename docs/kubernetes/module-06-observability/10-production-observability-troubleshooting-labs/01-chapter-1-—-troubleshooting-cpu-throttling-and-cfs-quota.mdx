@@ -1,0 +1,225 @@
+---
+title: "Chapter 1 — CPU Throttling & CFS Quotas"
+sidebar_position: 1
+module: "Module 6.10 — Troubleshooting Labs"
+description: "Master debugging Linux CFS CPU throttling in Kubernetes — multi-threaded burst traps, container_cpu_cfs_throttled_periods_total metrics, and the CPU limits architectural debate."
+---
+
+# Chapter 1 — Troubleshooting CPU Throttling & CFS Quota
+
+> **Goal:** Master the deep technical diagnosis and remediation of **CPU Throttling** in Kubernetes — understanding the internal mechanics of the Linux Completely Fair Scheduler (CFS) bandwidth control (`cpu.cfs_quota_us` over 100ms periods), analyzing why multi-threaded applications (Java, Go, Node.js) experience severe p99 latency spikes and thread starvation even at 20% average CPU usage, computing throttle percentages in PromQL, and navigating the industry debate on removing CPU limits.
+>
+> By the end of this chapter, you will understand:
+> 1. How Linux cgroups enforce CPU limits using CFS period and quota parameters
+> 2. Why multi-threaded runtimes exhaust their 100ms quota in 10ms, freezing threads for 90ms
+> 3. How to detect throttling using `container_cpu_cfs_throttled_periods_total`
+> 4. The PromQL formula to calculate CPU throttle percentage across microservices
+> 5. The architectural pros and cons of omitting `resources.limits.cpu` in production
+> 6. How to troubleshoot latency spikes caused by kernel CFS bandwidth enforcement
+
+---
+
+## Real-Life Analogy
+
+Think of Linux CFS CPU throttling as **an arcade ticket machine that allows you to play 2 minutes of video games every 10-minute period**:
+
+- **The Single-Threaded Player (1 Player on 1 Machine):** You sit down at 1 arcade machine and play continuously for 2 minutes. For the next 8 minutes, the machine locks you out. Your game is paused.
+- **The Multi-Threaded Swarm (16 Players sharing 1 Token Bag):** You bring 16 friends (**16 Application Threads**) to the arcade. All 16 friends play simultaneously on 16 machines (**16 CPU Host Cores**). 
+  - In just **7.5 seconds** ($7.5\text{s} \times 16 = 120\text{ seconds}$), your entire group has spent all 2 minutes of allotted play time (**The 100ms Quota is Exhausted**)!
+  - For the next **9 minutes and 52.5 seconds** (**The Remaining 92.5ms of the Period**), the arcade manager freezes all 16 players in place. Customers waiting for answers (**Incoming HTTP Requests**) stand in line screaming (**p99 Latency Spikes!**), even though the overall arcade was only 15% busy all day.
+- **The Solution (Unlimited Arcade Wristband - Omitting CPU Limits):** Instead of counting minutes with a stopwatch, the arcade gives you a standard wristband (**CPU Requests**). You can play as fast as you want as long as there is an open machine, and nobody freezes your hands mid-game!
+
+---
+
+## Architecture Diagram
+
+```text
+       Linux CFS Bandwidth Enforcement: The Multi-Threaded Throttling Trap
+
+ SCENARIO: Container has `resources.limits.cpu: 2.0` (Quota: 200ms per 100ms Period)
+ App spawns 16 active worker threads on a 64-core Kubernetes Node.
+
+ 100 MILLISECOND CFS PERIOD WINDOW:
+ [ 0ms .......................... 12.5ms .................................... 100ms ]
+ ┌───────────────────────────────┬─────────────────────────────────────────────────┐
+ │ 16 Threads Run Simultaneously │ ALL 16 THREADS COMPLETELY FROZEN / THROTTLED!   │
+ │ 12.5ms x 16 Threads = 200ms   │ Linux Kernel suspends process execution!        │
+ │ ──► CPU QUOTA EXHAUSTED!      │ Incoming HTTP Requests Queue Up (500ms Latency!)│
+ └───────────────────────────────┴─────────────────────────────────────────────────┘
+  ▲                               ▲
+  │ Start of 100ms Period         │ Quota exhausted at T+12.5ms ──► Throttled for 87.5ms!
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ PROMETHEUS METRIC IMPACT:
+ - `container_cpu_usage_seconds_total`: Reports ONLY 20% average CPU utilization!
+ - `container_cpu_cfs_throttled_periods_total`: Explodes to 85% Throttling!
+```
+
+---
+
+## Linux CFS Quotas Under the Hood
+
+Kubernetes translates `resources.limits.cpu` directly into Linux CFS cgroup parameters:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ cgroup Parameter     │ Value & Kernel Enforcement                                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`cpu.cfs_period_us`**│ Fixed at **100,000 $\mu\text{s}$ ($100\text{ms}$)**. The standard scheduling window.│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`cpu.cfs_quota_us`** │ $\text{Limit in Cores} \times 100,000 \mu\text{s}$.                        │
+ │                      │ - `limits.cpu: 0.5` $\to 50,000 \mu\text{s}$ per 100ms period.              │
+ │                      │ - `limits.cpu: 2.0` $\to 200,000 \mu\text{s}$ per 100ms period.             │
+ │                      │ - `limits.cpu: 4.0` $\to 400,000 \mu\text{s}$ per 100ms period.             │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Diagnosing Throttling with PromQL
+
+Never rely on average CPU usage graphs to diagnose performance slowdowns; monitor **CPU Throttle Percentage**:
+
+```promql
+# CPU Throttle Percentage (Target: < 5% in Production!)
+(
+  sum(rate(container_cpu_cfs_throttled_periods_total{container!=""}[5m])) by (namespace, pod)
+  /
+  sum(rate(container_cpu_cfs_periods_total{container!=""}[5m])) by (namespace, pod)
+) * 100
+```
+
+```promql
+# Total Throttled Time in Seconds
+sum(rate(container_cpu_cfs_throttled_seconds_total{container!=""}[5m])) by (namespace, pod)
+```
+
+---
+
+## The "Remove CPU Limits" Architectural Debate
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Strategy                  │ Pros                            │ Cons / Risks                    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Setting Strict CPU**    │ Prevents a single rogue container│ Causes severe **p99 latency     │
+ │ **Limits**                │ from consuming 100% of host CPU.│ spikes** and thread throttling  │
+ │ (`requests` + `limits`)   │ Strict multi-tenant isolation.  │ on multi-threaded runtimes.     │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Omitting CPU Limits**   │ **Zero CPU Throttling.** Ultra- │ A CPU-leaking container can hog │
+ │ **(Industry Standard)**   │ low p99 latency; allows fast    │ unused host CPU (Mitigated by   │
+ │ (`requests` ONLY)         │ bursts into unused host CPU.    │ strict `requests` and CFS shares│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+> [!TIP]
+> **Production Best Practice:** For latency-sensitive microservices (Go, Java, Node.js web APIs), **omit `resources.limits.cpu` entirely** while setting accurate `resources.requests.cpu`. However, **always enforce `resources.limits.memory`** because memory is a non-compressible resource that triggers OOM panics!
+
+---
+
+## Complete Production Manifest: Throttling-Immune Microservice
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: low-latency-payment-api
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payment-api
+  template:
+    metadata:
+      labels:
+        app: payment-api
+    spec:
+      containers:
+      - name: api
+        image: payment-api:v2.0
+        resources:
+          requests:
+            cpu: "2000m"               # 2 Cores guaranteed (Determines scheduling & CFS shares)
+            memory: "2Gi"              # 2 GiB guaranteed
+          limits:
+            # cpu limit OMITTED! ──► Completely eliminates CFS throttling latency spikes!
+            memory: "4Gi"              # Enforces strict ceiling to prevent host OOM panic!
+```
+
+---
+
+## Hands-On Lab: Simulating and Diagnosing CPU Throttling
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace throttle-lab
+
+# Step 2: Deploy a multi-threaded workload with a restrictive CPU limit
+cat <<EOF | kubectl apply -f - -n throttle-lab
+apiVersion: v1
+kind: Pod
+metadata:
+  name: throttled-worker
+  labels:
+    app: throttled
+spec:
+  containers:
+  - name: stress
+    image: vish/stress
+    args: ["-cpus", "8"]              # Spawns 8 concurrent threads!
+    resources:
+      requests:
+        cpu: "100m"
+      limits:
+        cpu: "200m"                    # Restricts to 200m (Severe Throttling!)
+EOF
+
+# Step 3: Wait 15 seconds for stress test to generate cgroup metrics
+sleep 15
+
+# Step 4: Query cAdvisor raw cgroup metrics directly on the node
+kubectl get --raw "/api/v1/nodes/$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')/proxy/metrics/cadvisor" | grep -E "container_cpu_cfs_throttled_periods_total.*throttled-worker" | head -n 5
+
+# Step 5: Observe the massive throttle count!
+# Step 6: Clean up lab
+kubectl delete namespace throttle-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the Linux Completely Fair Scheduler (CFS) enforce CPU limits in Kubernetes?**
+
+Kubernetes maps `resources.limits.cpu` to the Linux CFS bandwidth control subsystem. The CFS scheduling window is fixed at 100ms (`cpu.cfs_period_us = 100000`). If a container has `limits.cpu: 2.0`, it is allocated a quota of 200ms of execution time per 100ms period (`cpu.cfs_quota_us = 200000`). When the cumulative CPU time across all container threads hits 200ms within that 100ms window, the Linux kernel puts all container threads to sleep until the start of the next 100ms period.
+
+**Q2: Why do multi-threaded applications experience severe CPU throttling even when overall CPU utilization is below 25%?**
+
+Multi-threaded runtimes (such as Java JVMs, Go goroutines, and Node.js worker pools) schedule tasks across all available CPU cores on the host. If a host has 64 CPU cores and an application with a 2-core limit spawns 16 active threads, all 16 threads run concurrently on 16 separate cores. In a sudden burst, the 16 threads burn through the entire 200ms quota in just 12.5 milliseconds ($12.5\text{ms} \times 16 = 200\text{ms}$). For the remaining 87.5ms of the period, the kernel freezes the container, causing severe p99 latency spikes despite a 1-minute average CPU utilization of only 15%.
+
+**Q3: What PromQL query accurately measures the percentage of CPU throttling?**
+
+$$\text{Throttle \%} = \frac{\sum \text{rate}(\text{container\_cpu\_cfs\_throttled\_periods\_total}[5\text{m}])}{\sum \text{rate}(\text{container\_cpu\_cfs\_periods\_total}[5\text{m}])} \times 100$$
+
+This formula divides the number of periods where the container was throttled by the total number of scheduling periods, providing an accurate percentage ($0\%$ to $100\%$) of time the application spent frozen.
+
+**Q4: What is the primary architectural argument for removing `resources.limits.cpu` in production?**
+
+Removing CPU limits eliminates the artificial 100ms CFS quota ceiling, completely preventing latency spikes caused by multi-threaded burst throttling. In Linux, `resources.requests.cpu` maps to `cpu.shares` (relative CPU weight). Under CPU contention, the Linux kernel guarantees each container its requested CPU shares; during idle periods, containers are permitted to burst into unused node CPU capacity with zero throttling, maximizing cluster performance and hardware efficiency.
+
+**Q5: If you remove `resources.limits.cpu`, should you also remove `resources.limits.memory`?**
+
+**No! Never remove memory limits.** CPU is a **compressible resource**; if a container overuses CPU, the OS kernel simply slows it down. Memory is a **non-compressible resource**; if a container experiences a memory leak without a limit, it will consume all physical host RAM, triggering a Kernel Out-Of-Memory (OOM) panic that kills random host processes and destabilizes the entire worker node.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that CFS enforces CPU limits in 100ms periods (`cpu.cfs_period_us`)
+- [ ] Know that multi-threaded bursts exhaust CPU quota in milliseconds, causing p99 latency spikes
+- [ ] Know how to compute CPU Throttle % via `container_cpu_cfs_throttled_periods_total`
+- [ ] Know why omitting `limits.cpu` eliminates throttling for latency-sensitive APIs
+- [ ] Know that `limits.memory` must ALWAYS be retained to prevent host OOM panics
+- [ ] Can query cAdvisor CFS metrics directly from the Kubelet API

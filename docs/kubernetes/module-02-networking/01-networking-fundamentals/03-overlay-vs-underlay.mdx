@@ -1,0 +1,249 @@
+---
+title: "Chapter 3 — Overlay vs Underlay Networking"
+sidebar_position: 3
+module: "Module 2.1 — Networking Fundamentals"
+description: "Compare overlay (VXLAN, IPIP) and underlay (BGP native routing) networking approaches — understand the MTU overhead, CPU cost, infrastructure requirements, and when to choose each."
+---
+
+# Chapter 3 — Overlay vs Underlay Networking
+
+> **Goal:** Understand the two fundamental approaches to cross-node Pod networking — overlay encapsulation and underlay direct routing — including their trade-offs in MTU, CPU overhead, infrastructure complexity, and operational visibility.
+>
+> By the end of this chapter, you will understand:
+> 1. What overlay networking is and how encapsulation works
+> 2. What underlay (native/direct) routing is and when it's possible
+> 3. The MTU overhead of VXLAN and IPIP encapsulation
+> 4. CPU cost of encap/decap versus BGP routing
+> 5. Infrastructure requirements for each approach
+> 6. Which CNI plugins use which approach and when to choose each
+
+---
+
+## Real-Life Analogy
+
+Imagine shipping packages between two warehouses (nodes) across a city:
+
+**Overlay (like VXLAN):** You put the original package **inside a second outer box**, address the outer box to the destination warehouse's loading dock, and ship it. At the destination, someone unpacks the outer box and delivers the original package inside. Extra cardboard (overhead), extra packing time (CPU), but it works with any shipping company — they only see the outer box.
+
+**Underlay (like BGP):** You know the city's street layout. You put the original package directly on a truck, address it to the final destination, and the driver navigates directly. No outer box, no repacking, no overhead — but the driver needs to know the street map (your network infrastructure must support direct routing).
+
+---
+
+## Architecture Diagram
+
+```text
+OVERLAY (VXLAN):
+Node A                                    Node B
+┌──────────────────┐                    ┌──────────────────┐
+│ Pod A            │                    │ Pod B            │
+│ src: 10.244.1.5  │                    │ dst: 10.244.2.7  │
+│       ↓          │                    │       ↑          │
+│  [Inner Packet]  │                    │  [Inner Packet]  │
+│  10.1.5→10.2.7   │                    │  10.1.5→10.2.7   │
+│       ↓          │                    │       ↑          │
+│  [VXLAN Header]  │                    │  [VXLAN Header]  │
+│  [Outer UDP/IP]  │   Physical Wire   │  stripped here   │
+│  192.168.1.10    │ ─────────────────▶ │  192.168.1.11   │
+└──────────────────┘                    └──────────────────┘
+
+UNDERLAY (BGP):
+Node A                                    Node B
+┌──────────────────┐                    ┌──────────────────┐
+│ Pod A            │                    │ Pod B            │
+│ src: 10.244.1.5  │                    │ dst: 10.244.2.7  │
+│       ↓          │                    │       ↑          │
+│  [Packet]        │   Physical Wire   │  [Packet]        │
+│  10.1.5→10.2.7   │ ─────────────────▶ │  10.1.5→10.2.7   │
+└──────────────────┘   (no wrapping)    └──────────────────┘
+    BGP tells Node B: "10.244.2.0/24 is reachable via Node B's IP"
+    Router/switch knows the path. No encapsulation needed.
+```
+
+---
+
+## Overlay Networking: Encapsulation-Based
+
+In overlay networking, cross-node Pod packets are **wrapped inside another packet**. The outer packet uses the node IP addresses (which the physical network knows how to route). The inner packet contains the original Pod IP addresses.
+
+### How encapsulation works
+
+```text
+Original Pod packet:
+┌────────────────────────────────────────┐
+│ Src IP: 10.244.1.5  Dst IP: 10.244.2.7│
+│ TCP SYN (payload)                      │
+└────────────────────────────────────────┘
+
+After VXLAN encapsulation on Node A:
+┌────────────────────────────────────────┐
+│ Outer Ethernet Header                  │
+│ Outer IP: Src 192.168.1.10 → Dst 192.168.1.11 │
+│ Outer UDP: Port 4789 (VXLAN)           │
+│ VXLAN Header: VNI                      │
+├────────────────────────────────────────┤
+│ Inner Ethernet Header                  │
+│ Inner IP: Src 10.244.1.5 → Dst 10.244.2.7 │
+│ TCP SYN (original payload)             │
+└────────────────────────────────────────┘
+```
+
+**Encapsulation happens in the kernel** (via the `vxlan` kernel module or eBPF programs) — the Pod does not know this is happening.
+
+### MTU Overhead of Overlay
+
+The added headers consume space in each packet:
+
+| Protocol | Header Size | Effective MTU (if NIC MTU=1500) |
+|----------|------------|--------------------------------|
+| VXLAN | 50 bytes (14 ETH + 20 IP + 8 UDP + 8 VXLAN) | **1450 bytes** |
+| IPIP | 20 bytes (outer IP only) | **1480 bytes** |
+| Geneve | 30-50 bytes | **1450-1470 bytes** |
+| BGP (no encap) | 0 bytes | **1500 bytes** |
+
+> [!IMPORTANT]
+> If your CNI is using VXLAN and you don't configure Pod MTU to 1450, large packets will be **silently fragmented or dropped**, causing intermittent failures on file uploads, large HTTP responses, or database replication.
+
+```bash
+# Check current Pod MTU
+kubectl exec -it nginx -- ip link show eth0 | grep mtu
+
+# Correct CNI MTU config for VXLAN (example: Flannel)
+cat /etc/cni/net.d/10-flannel.conflist
+# Look for "mtu" field — should be 1450 for VXLAN
+```
+
+### CPU Cost
+
+Encapsulation and decapsulation require the kernel to:
+1. Allocate a new packet buffer for the outer packet
+2. Copy inner headers + payload
+3. Compute new checksums (UDP for VXLAN)
+4. Reverse this process on the receiving node
+
+At 100Gbps line rates or millions of packets per second, this adds measurable CPU cycles. eBPF-based encapsulation (Cilium) is faster than iptables/kernel module approaches.
+
+---
+
+## Underlay Networking: Direct Routing
+
+In underlay networking, Pod packets are sent **without encapsulation**. The physical network's routers and switches learn Pod subnet routes and forward packets directly.
+
+### How BGP-based direct routing works
+
+```text
+1. Each node runs a BGP speaker (e.g., Calico's BIRD daemon)
+
+2. Node A announces to the network:
+   "I own subnet 10.244.1.0/24 — route traffic here to me (192.168.1.10)"
+
+3. Node B announces:
+   "I own subnet 10.244.2.0/24 — route traffic here to me (192.168.1.11)"
+
+4. Physical routers/switches learn these routes via BGP
+
+5. When Pod A (10.244.1.5) sends to Pod B (10.244.2.7):
+   - Node A's kernel: "10.244.2.0/24 → gateway 192.168.1.11" (learned via BGP)
+   - Packet sent directly: src 10.244.1.5, dst 10.244.2.7
+   - Router forwards based on its BGP routing table to Node B
+   - Node B: "10.244.2.7 is in my subnet" → delivers to Pod B
+```
+
+No encapsulation, no overhead, full 1500 byte MTU, near wire-speed.
+
+### Infrastructure Requirements for Underlay
+
+- **Your physical switches must support BGP** (or at least static routes)
+- Pod CIDR ranges must be **advertised** to the physical network
+- On cloud providers (AWS, GCP, Azure), this requires peering with the VPC router — some clouds support this natively (AWS VPC CNI, GKE native routing)
+- In bare-metal environments: requires ToR (Top of Rack) switches with BGP support
+
+---
+
+## Comparison Table
+
+| Dimension | Overlay (VXLAN/IPIP) | Underlay (BGP/Direct) |
+|-----------|---------------------|----------------------|
+| **MTU** | -50 bytes (VXLAN) or -20 bytes (IPIP) | Full 1500 bytes |
+| **CPU overhead** | Encap/decap per packet | Minimal |
+| **Infrastructure** | Works on any network | Requires BGP-capable switches |
+| **Cloud support** | Any VPC, any cloud | Cloud-specific (VPC native routing) |
+| **Debugging** | Packets hidden inside outer headers | Pod IPs visible in tcpdump/logs |
+| **Performance** | Good (eBPF reduces overhead) | Excellent (near wire-speed) |
+| **Setup complexity** | Low (CNI handles it all) | Higher (network team involvement) |
+| **Pod IP visibility** | Pod IPs not routable outside cluster | Pod IPs directly reachable (security concern) |
+
+---
+
+## When to Choose Each
+
+**Choose Overlay when:**
+- Running on a cloud provider's VPC where you don't control routing
+- You want zero infrastructure requirements (just deploy CNI and go)
+- Your workloads are latency-tolerant and not at 100Gbps line rates
+- You want Pod IPs hidden from the physical network (security isolation)
+- You need a quick setup without coordinating with the network team
+
+**Choose Underlay when:**
+- You're running bare-metal with BGP-capable ToR switches
+- You need maximum throughput (HPC, AI/ML training, high-frequency trading)
+- Your cloud provider supports VPC native routing (AWS VPC CNI, GKE native)
+- You want Pod IPs visible in network monitoring tools
+- You're operating at very large scale (thousands of nodes) where overlay CPU overhead accumulates
+
+---
+
+## Hybrid Approach
+
+Most production CNI plugins support **both modes** and can switch:
+
+```bash
+# Calico: switch from VXLAN to BGP (on supported infrastructure)
+calicoctl patch felixconfiguration default \
+  --patch='{"spec": {"vxlanEnabled": false}}'
+
+# Calico: enable BGP peering with physical router
+cat <<EOF | calicoctl apply -f -
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: my-global-peer
+spec:
+  peerIP: 192.168.1.1
+  asNumber: 64512
+EOF
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the MTU overhead of VXLAN and why does it matter?**
+
+VXLAN adds 50 bytes of headers (Ethernet 14 + IP 20 + UDP 8 + VXLAN 8). On a network with 1500 byte MTU, this leaves 1450 bytes for the inner Pod packet. If not configured correctly, large packets get fragmented or dropped, causing silent failures for large file transfers or database operations. CNI plugins must set Pod MTU to 1450 when using VXLAN.
+
+**Q2: What infrastructure is required for BGP underlay networking?**
+
+The physical network infrastructure (switches, routers) must support BGP and be willing to peer with the node's BGP speaker (e.g., Calico's BIRD). In cloud environments, this requires VPC-level native routing support (e.g., AWS VPC CNI uses the VPC's own routing table). In bare metal, ToR switches must be configured to peer with nodes.
+
+**Q3: Can overlay and underlay be mixed in the same cluster?**
+
+Calico supports a hybrid mode where some nodes use VXLAN (for nodes where BGP peering isn't available) and others use direct routing. In practice, most clusters standardize on one approach for operational simplicity.
+
+**Q4: Why might a cluster administrator choose overlay even if underlay is available?**
+
+Security isolation: with overlay, Pod IPs are not routable on the physical network — external systems can't directly reach Pod IPs. Simplicity: overlay requires no network team involvement. Portability: overlay works identically on-premise and in the cloud.
+
+**Q5: How does eBPF reduce the CPU overhead of overlay networking?**
+
+eBPF programs (used by Cilium) can perform encapsulation directly in the kernel's TC (traffic control) layer without going through the full kernel network stack. This avoids memory copies, skips iptables, and can leverage hardware offloading. The result is significantly lower per-packet CPU cost compared to traditional kernel module-based VXLAN.
+
+---
+
+## Summary Checksheet
+
+- [ ] Understand what overlay encapsulation is (outer packet wrapping inner packet)
+- [ ] Know the exact MTU overhead of VXLAN (50 bytes) and IPIP (20 bytes)
+- [ ] Understand how BGP underlay routing works (nodes advertise their Pod subnets)
+- [ ] Know the infrastructure requirements for underlay (BGP-capable switches/routers)
+- [ ] Can explain the trade-offs between overlay and underlay in terms of CPU, MTU, and complexity
+- [ ] Know when to choose each approach based on infrastructure and performance requirements

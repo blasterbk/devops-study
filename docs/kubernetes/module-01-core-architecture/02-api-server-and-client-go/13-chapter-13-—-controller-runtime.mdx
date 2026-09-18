@@ -1,0 +1,428 @@
+---
+title: "Chapter 13 — controller-runtime"
+sidebar_position: 13
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand controller-runtime, the framework built on top of client-go that simplifies writing Kubernetes controllers and operators — used by Kubebuilder, Operator SDK, cert-manager, and most production Operators."
+---
+
+# Chapter 13 — controller-runtime
+
+> **Goal:** Understand **controller-runtime**, the framework built on top of `client-go` that simplifies writing Kubernetes Controllers and Operators. Learn how Manager, Cache, Client, Controller, Reconciler, and the Builder Pattern work together.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. What controller-runtime is and why it exists
+> 2. The Manager — central coordinator
+> 3. The Cache — SharedInformer abstraction
+> 4. The Client — unified read/write interface
+> 5. The Controller and Reconciler pattern
+> 6. The Builder Pattern (For/Owns/Watches)
+> 7. Complete Operator architecture with controller-runtime
+> ```
+
+---
+
+# Why Should You Learn This?
+
+If you are writing Kubernetes Operators today, you almost certainly use **controller-runtime**.
+
+It is the foundation for:
+- **Kubebuilder** (official Kubernetes project for building operators)
+- **Operator SDK** (Red Hat's operator framework)
+- **Crossplane** (cloud control plane)
+- **cert-manager**
+- **External Secrets Operator**
+- **Cluster API**
+- Most CNCF-ecosystem Operators
+
+Without controller-runtime, you wire everything manually with `client-go`:
+
+```text
+Manual client-go wiring:
+  rest.Config
+  -> Clientset
+  -> SharedInformerFactory
+  -> Per-resource Informers + Listers
+  -> DeltaFIFO
+  -> Event Handlers
+  -> Work Queue
+  -> Worker goroutines
+  -> Reconciliation loop
+  -> Leader Election
+  -> Health/Readiness probe endpoints
+  -> Metrics server
+```
+
+controller-runtime provides all of this in a clean, declarative framework:
+
+```text
+controller-runtime:
+  ctrl.NewManager(config, opts) -> Manager
+  ctrl.NewControllerManagedBy(mgr).For(&MyResource{}).Complete(reconciler)
+  mgr.Start(ctx)
+```
+
+---
+
+# Real-Life Analogy
+
+Think of controller-runtime like a web framework vs raw HTTP.
+
+```text
+Without framework (raw client-go):
+  Write raw TCP socket code
+  Parse HTTP headers manually
+  Implement routing, middleware, sessions manually
+
+With framework (controller-runtime):
+  Declare routes and handlers
+  Framework handles routing, middleware, retries
+```
+
+| Web Framework Analogy | Kubernetes |
+| :--- | :--- |
+| Raw HTTP socket code | Raw `client-go` wiring |
+| Web framework (Express, Django) | `controller-runtime` |
+| Route declaration | `For(&MyResource{})` |
+| Request handler | `Reconciler.Reconcile()` |
+| Middleware (auth, logging) | Manager (leader election, metrics, health) |
+| Request queue | Internal Work Queue |
+
+---
+
+# Before controller-runtime
+
+A minimal controller with raw `client-go` requires:
+
+```text
+rest.Config
+  |
+  v
+Clientset
+  |
+  v
+SharedInformerFactory
+  |
+  v
+Informer registration + event handlers
+  |
+  v
+Work Queue setup
+  |
+  v
+Worker goroutines
+  |
+  v
+Reconciliation function
+  |
+  v
+Leader election setup
+  |
+  v
+Health endpoint setup
+  |
+  v
+Metrics endpoint setup
+```
+
+That's easily 300–500 lines of boilerplate.
+
+With controller-runtime, the same functionality is approximately 50–80 lines.
+
+---
+
+# controller-runtime Architecture
+
+```text
+Manager (ctrl.Manager)
+        |
+        +-- Cache (SharedInformerFactory abstraction)
+        |       -> Watches resources for registered controllers
+        |
+        +-- Client (unified read/write via cache + API Server)
+        |
+        +-- Controller 1
+        |       -> For(&MyResource{})
+        |       -> Reconciler: MyReconciler{}
+        |       -> Internal Work Queue
+        |
+        +-- Controller 2
+        |       -> For(&MyOtherResource{})
+        |
+        +-- Health/Readiness probes (/healthz, /readyz)
+        |
+        +-- Metrics server (/metrics — Prometheus)
+        |
+        +-- Leader Election (via Lease object)
+```
+
+---
+
+# 1. Manager
+
+The Manager is the central coordinator. It:
+- Creates and manages the Cache (shared Informers)
+- Creates the Client
+- Runs all registered Controllers
+- Manages leader election
+- Exposes health and metrics endpoints
+
+```go
+mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme:                 scheme,
+    MetricsBindAddress:     ":8080",
+    HealthProbeBindAddress: ":8081",
+    LeaderElection:         true,
+    LeaderElectionID:       "my-operator-leader",
+})
+```
+
+---
+
+# 2. Cache
+
+The Cache is controller-runtime's abstraction over `SharedInformerFactory`. It:
+- Creates SharedIndexInformers for resources watched by registered controllers
+- Provides `List` and `Get` backed by the cache
+
+```text
+Cache starts when mgr.Start() is called
+  |
+  v
+One SharedIndexInformer per watched resource type
+  |
+  v
+All controllers share the same Cache
+```
+
+---
+
+# 3. Client
+
+controller-runtime provides a single `client.Client` interface for all reads and writes:
+
+```go
+// client.Client is injected into Reconcilers automatically
+
+// Read from Cache (fast, no API call)
+obj := &appsv1.Deployment{}
+err := r.Client.Get(ctx, types.NamespacedName{
+    Namespace: "default", Name: "nginx",
+}, obj)
+
+// List from Cache
+podList := &corev1.PodList{}
+err = r.Client.List(ctx, podList,
+    client.InNamespace("default"),
+    client.MatchingLabels{"app": "nginx"})
+
+// Write to API Server
+err = r.Client.Create(ctx, newDeployment)
+err = r.Client.Update(ctx, deployment)
+err = r.Client.Patch(ctx, obj, patch)
+err = r.Client.Delete(ctx, obj)
+```
+
+> **Important:** `client.Get()` and `client.List()` read from the Cache by default (same as Lister). `Create`, `Update`, `Patch`, and `Delete` always go to the API Server.
+
+---
+
+# 4. Controller and Reconciler
+
+The **Reconciler** interface is the core of controller-runtime:
+
+```go
+type Reconciler interface {
+    Reconcile(ctx context.Context, req Request) (Result, error)
+}
+```
+
+`Request` contains the namespace and name of the object that triggered reconciliation:
+```go
+type Request struct {
+    types.NamespacedName
+}
+```
+
+`Result` controls re-queuing:
+```go
+// Success, no re-queue
+return ctrl.Result{}, nil
+
+// Re-queue after 30 seconds
+return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+
+// Immediate re-queue (triggers backoff if repeated)
+return ctrl.Result{Requeue: true}, nil
+```
+
+---
+
+# 5. Builder Pattern
+
+The Builder pattern declaratively wires resources to controllers:
+
+```go
+err = ctrl.NewControllerManagedBy(mgr).
+    For(&myv1.MyResource{}).           // Primary resource (trigger reconcile)
+    Owns(&appsv1.Deployment{}).        // Child resource (changes trigger reconcile)
+    Owns(&corev1.Service{}).           // Another child resource
+    Watches(&corev1.Pod{}, handler).   // External resource watch
+    Complete(&MyReconciler{Client: mgr.GetClient()})
+```
+
+- **For()**: The primary resource type. Changes trigger `Reconcile()`.
+- **Owns()**: Child resources created/managed by this controller. Changes on owned objects re-trigger reconciliation of the owner.
+- **Watches()**: Any other resource to watch, with a custom event mapper.
+
+---
+
+# Complete Operator Example
+
+```go
+// 1. Define custom resource types and register with scheme
+scheme := runtime.NewScheme()
+myv1.AddToScheme(scheme)
+clientgoscheme.AddToScheme(scheme)
+
+// 2. Create Manager
+mgr, _ := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+    Scheme:             scheme,
+    LeaderElection:     true,
+    LeaderElectionID:   "my-operator",
+})
+
+// 3. Register Controller
+ctrl.NewControllerManagedBy(mgr).
+    For(&myv1.MyResource{}).
+    Owns(&appsv1.Deployment{}).
+    Complete(&MyReconciler{Client: mgr.GetClient()})
+
+// 4. Start Manager (blocks until context cancelled)
+mgr.Start(ctrl.SetupSignalHandler())
+```
+
+```go
+// 5. Reconciler implementation
+type MyReconciler struct {
+    client.Client
+}
+
+func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+
+    // Read object from cache
+    obj := &myv1.MyResource{}
+    if err := r.Get(ctx, req.NamespacedName, obj); err != nil {
+        if errors.IsNotFound(err) {
+            return ctrl.Result{}, nil  // Deleted; nothing to do
+        }
+        return ctrl.Result{}, err
+    }
+
+    // Reconcile logic: ensure Deployment exists with correct spec
+    desired := buildDeployment(obj)
+    existing := &appsv1.Deployment{}
+    err := r.Get(ctx, types.NamespacedName{Namespace: obj.Namespace, Name: obj.Name}, existing)
+    if errors.IsNotFound(err) {
+        log.Info("Creating Deployment", "name", desired.Name)
+        return ctrl.Result{}, r.Create(ctx, desired)
+    }
+
+    // Update if needed
+    existing.Spec = desired.Spec
+    return ctrl.Result{}, r.Update(ctx, existing)
+}
+```
+
+---
+
+# Leader Election
+
+When multiple replicas of an operator run (for HA), leader election ensures only one reconciles at a time:
+
+```text
+Operator Pod 1 (Leader)     -> Reconciles actively
+Operator Pod 2 (Standby)    -> Watches leader lease
+Operator Pod 3 (Standby)    -> Watches leader lease
+
+Pod 1 crashes:
+  Pod 2 acquires lease -> becomes Leader
+  Pod 3 remains Standby
+```
+
+controller-runtime integrates leader election transparently via `ctrl.Options{LeaderElection: true}`.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is controller-runtime?
+`controller-runtime` is a Go framework built on top of `client-go` that provides Manager, Cache, Client, Controller, and Reconciler abstractions for building Kubernetes controllers and operators. It is used by Kubebuilder, Operator SDK, and most modern operators.
+
+### Q2. What does the Manager do?
+The Manager coordinates all components: creates the shared Cache (backed by SharedInformerFactory), provides the Client, runs all registered controllers, manages leader election, and exposes health/metrics endpoints.
+
+### Q3. What is a Reconciler?
+A `Reconciler` is a struct implementing `Reconcile(ctx, Request) (Result, error)`. It contains the core business logic: given an object name, compare desired vs actual state and make the API Server calls needed to reconcile them.
+
+### Q4. What does `For()` vs `Owns()` do in the Builder pattern?
+`For(&MyResource{})` specifies the primary resource — changes to it trigger reconciliation. `Owns(&Deployment{})` specifies child resources managed by the controller — changes to owned objects re-trigger reconciliation of their owner (the primary resource).
+
+### Q5. Does client.Get() in controller-runtime hit the API Server?
+By default, `client.Get()` and `client.List()` read from the Manager's Cache (in-memory, no network I/O). Write operations (`Create`, `Update`, `Patch`, `Delete`) always go to the API Server.
+
+### Q6. How does controller-runtime handle leader election?
+Via `ctrl.Options{LeaderElection: true}`. The Manager uses a Kubernetes `Lease` object as a distributed lock. Only the pod holding the lease runs the reconciliation loop. On leader failure, another pod acquires the lease and becomes the new leader.
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| `controller-runtime` reconciler never called | `For()` resource not registered in scheme | Add resource type to scheme with `AddToScheme` |
+| Cache read returns stale data | Cache not yet synced at startup | Manager.Start() syncs cache before running reconcilers |
+| `IsNotFound` never returned | Wrong NamespacedName passed to `Get()` | Verify namespace and name from `req.NamespacedName` |
+| Operator reconciles in multiple pods simultaneously | Leader election disabled | Enable `LeaderElection: true` in `ctrl.Options` |
+| `Owns()` not triggering reconciliation | Child resource missing `ownerReferences` | Ensure child resources have ownerReferences set to the parent |
+
+---
+
+# Knowledge Check
+
+Before completing Module 1.2, verify that you can:
+1. Explain what controller-runtime is and why it exists over raw `client-go`.
+2. Describe the Manager and its responsibilities.
+3. Explain the difference between the Cache Client reads and API Server writes.
+4. Write a minimal Reconciler implementation with correct error and re-queue handling.
+5. Explain `For()`, `Owns()`, and `Watches()` in the Builder pattern.
+6. Explain how leader election works in controller-runtime.
+7. Trace the complete event-to-reconciliation flow in a controller-runtime operator.
+
+---
+
+# Module 1.2 Complete 🎉
+
+Congratulations! You have completed **Module 1.2 — API Server Deep Dive & client-go**.
+
+You now understand the complete Kubernetes API machinery:
+
+```text
+REST API         (Chapter 1)  — how operations become HTTP requests
+API Groups       (Chapter 2)  — how resources are organized
+API Versions     (Chapter 3)  — how APIs evolve safely
+OpenAPI          (Chapter 4)  — how schemas power validation and tooling
+Discovery API    (Chapter 5)  — how clients find available resources
+ResourceVersion  (Chapter 6)  — how concurrency and watches are consistent
+Watches          (Chapter 7)  — how events are delivered in real-time
+Informers        (Chapter 8)  — how controllers get a local cache + events
+Shared Informers (Chapter 9)  — how multiple controllers share one stream
+Listers          (Chapter 10) — how controllers read from cache type-safely
+Work Queues      (Chapter 11) — how reconciliation is decoupled and rate-limited
+client-go        (Chapter 12) — the complete Go SDK for Kubernetes
+controller-runtime (Chapter 13) — the modern operator framework
+```
+
+This knowledge is the foundation for writing production-grade Kubernetes controllers, operators, and platform automation.

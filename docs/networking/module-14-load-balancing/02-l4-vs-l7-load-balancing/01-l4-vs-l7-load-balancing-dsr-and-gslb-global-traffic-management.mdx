@@ -1,0 +1,145 @@
+---
+title: "Chapter 2 — L4 vs L7 Load Balancing: DSR, SNI Routing & Global Server Load Balancing (GSLB)"
+sidebar_position: 1
+module: "Module 14.2 — L4 vs L7 & GSLB"
+description: "Master Layer 4 vs Layer 7 load balancing architectures — Direct Server Return (DSR), SNI TLS pass-through, Layer 7 header/path routing, and Global Server Load Balancing (GSLB) with Anycast DNS."
+---
+
+# Chapter 2 — L4 vs L7 Load Balancing: DSR, SNI Routing & Global Server Load Balancing (GSLB)
+
+> **Goal:** Master the structural and operational differences between **Layer 4 (Transport / TCP/UDP)** and **Layer 7 (Application / HTTP/gRPC)** load balancers. Understand Direct Server Return (DSR / Layer 2 MAC rewriting / IP-GRE tunnels), TLS Termination vs SNI Pass-Through, reverse proxy buffering, and Global Server Load Balancing (GSLB via GeoDNS and BGP Anycast).
+>
+> By the end of this chapter, you will understand:
+> 1. Layer 4 Load Balancing (AWS NLB, IPVS, HAProxy TCP mode, Katran) vs Layer 7 Load Balancing (AWS ALB, NGINX, Envoy, Traefik)
+> 2. Direct Server Return (DSR): bypassing egress load balancer bandwidth bottlenecks
+> 3. TLS Architectures: TLS Offloading/Termination at Edge vs End-to-End TLS vs SNI Routing
+> 4. Layer 7 Advanced Routing: Path-based (`/api` vs `/static`), Header-based (`Host`, `User-Agent`), and Cookie affinity
+> 5. Global Server Load Balancing (GSLB): GeoDNS resolution vs BGP Anycast edge routing
+> 6. CLI diagnostic commands and benchmarks
+
+---
+
+## Real-Life Analogy
+
+Think of L4 vs L7 Load Balancing as **a mail distribution warehouse vs a specialized customs package inspector**:
+
+- **Layer 4 Load Balancer (The High-Speed Conveyor Belt):**
+  - Only looks at the outside shipping label: *"Destination Port 443, TCP packet"*.
+  - It pushes the unopened box down Chute #3 at **100 Gbps speed** (**Sub-microsecond latency, 0 inspection of payload contents**).
+- **Layer 7 Load Balancer (The Customs Inspector):**
+  - Opens the box, decrypts the TLS certificate, reads the JSON invoice, inspects the HTTP headers: *"This request is asking for `/api/v1/checkout` and has an Admin cookie"*.
+  - Routes the request to the high-security payment cluster (**Intelligent application routing, higher CPU cost**).
+- **Direct Server Return (DSR — The One-Way Valet):**
+  - A small 1KB valet parking slip is handed to the valet (Request). When the driver returns, the valet delivers a massive 50-passenger luxury tour bus (Response) **directly to the highway**, bypassing the small parking ticket booth completely!
+
+---
+
+## Architecture Diagram
+
+```text
+                  Layer 4 DSR vs Layer 7 Full-Proxy Architectures
+                  
+ 1. LAYER 7 FULL-PROXY (Two Independent TCP Connections):
+   [Client] ──(TCP 1: TLS Handshake)──► [L7 Load Balancer] ──(TCP 2: Unencrypted)──► [Backend Pod]
+   [Client] ◄─────────────────────────── [L7 Load Balancer] ◄─────────────────────── [Backend Pod]
+                               (Both Ingress & Egress traverse L7 proxy)
+ 
+ 2. LAYER 4 DIRECT SERVER RETURN (DSR - Ingress Only through LB):
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ [Client] ──── Ingress Request (Small 1KB) ────► [L4 DSR Load Balancer]      │
+ │    ▲                                                   │                    │
+ │    │                                                   ▼ (Layer 2 Rewrite)  │
+ │    └──────── Egress Response (Large 10MB Video) ────── [Backend Server]     │
+ │              (Direct back to client, bypassing LB!)                         │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Layer 4 vs Layer 7 Architectural Comparison
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Feature              │ Layer 4 Load Balancer                    │ Layer 7 Load Balancer                    │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **Protocol Level**   │ IP, TCP, UDP, SCTP                       │ HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSockets│
+ │ **Inspection Depth** │ 5-Tuple (IPs, Ports, Protocol)           │ Headers, Cookies, URI Path, JSON Payload │
+ │ **TLS Processing**   │ Passthrough (Cannot inspect HTTPS)       │ Terminates TLS or SNI pass-through       │
+ │ **Throughput**       │ Ultra-High (10M – 100M PPS line rate)    │ High (100k – 2M RPS, CPU bound)          │
+ │ **Latency**          │ Sub-microsecond (Zero TCP termination)   │ 1 – 5 milliseconds (Full proxy overhead) │
+ │ **Examples**         │ AWS NLB, Linux IPVS, Meta Katran, DPDK   │ AWS ALB, NGINX, HAProxy, Envoy, Traefik  │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 2. Direct Server Return (DSR) Implementation Mechanics
+
+In DSR, backend servers configure the **Service VIP on a local Loopback interface (`lo:0`)** with ARP suppression enabled (`arp_ignore=1`, `arp_announce=2`):
+1. Client sends request to VIP `203.0.113.10`.
+2. L4 Load Balancer rewrites **only the Destination MAC address** to Backend 1's MAC without touching the Destination IP (`203.0.113.10`).
+3. Backend 1 receives the packet; because VIP `203.0.113.10` is on its loopback, the kernel accepts the packet and processes it.
+4. Backend 1 transmits the response packet with Source IP `203.0.113.10` **directly out its physical default gateway to the client**, bypassing the load balancer completely.
+
+---
+
+### 3. Global Server Load Balancing (GSLB)
+
+GSLB routes users across geographically distributed data centers (e.g. US-East, EU-Central, AP-South):
+- **GeoDNS GSLB:** DNS server returns the IP of the closest datacenter based on client IP or EDNS Client Subnet (ECS).
+- **Anycast BGP GSLB:** Single IP announced worldwide via BGP; Internet routing automatically sends packets to the closest physical edge POP.
+
+---
+
+## Hands-On Lab: Configuring DSR Loopback & HAProxy L4/L7
+
+```bash
+# Step 1: Configure Linux kernel ARP suppression on backend server for DSR
+sudo sysctl -w net.ipv4.conf.all.arp_ignore=1
+sudo sysctl -w net.ipv4.conf.all.arp_announce=2
+
+# Step 2: Add the Service VIP to the local loopback interface for DSR
+sudo ip addr add 198.51.100.50/32 dev lo:0
+
+# Step 3: Inspect active IPVS Layer 4 load balancing tables (if ipvsadm active)
+sudo ipvsadm -L -n 2>/dev/null || echo "ipvsadm can manage in-kernel L4 IPVS tables"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the main benefits and drawbacks of Direct Server Return (DSR)?**
+
+- **Benefits:** Massive throughput scalability. Because response traffic (which is often $50\times\text{ to }100\times$ larger than requests) bypasses the load balancer and flows directly out the backend NICs, a modest 10 Gbps load balancer can serve 500+ Gbps of egress video/web traffic.
+- **Drawbacks:** Cannot perform Layer 7 routing, cannot terminate TLS, cannot inspect HTTP headers/cookies, and requires custom host OS configuration (loopback VIP assignment and ARP suppression) on all backend servers.
+
+**Q2: What is the difference between TLS Termination, TLS Bridging, and TLS Pass-Through?**
+
+- **TLS Termination (Offloading):** Load balancer decrypts HTTPS, inspects L7 headers, and sends unencrypted plain HTTP over private VPC links to backends (reduces backend CPU load).
+- **TLS Bridging:** Load balancer decrypts HTTPS to inspect L7 rules/WAF, then re-encrypts the connection to the backend server.
+- **TLS Pass-Through:** Load balancer acts as a pure Layer 4 proxy, passing raw encrypted bytes directly to the backend without decrypting (maximizes zero-trust privacy, but disables L7 inspection).
+
+**Q3: How does Server Name Indication (SNI) allow Layer 4 load balancers to route HTTPS traffic without decrypting TLS?**
+
+SNI (RFC 6066) is an extension in the TLS handshake where the client includes the requested hostname (e.g. `api.customer.com`) in plain text inside the `ClientHello` packet. A Layer 4 / Layer 7 proxy (like HAProxy or NGINX `ssl_preread`) can parse the SNI hostname from the first packet and forward the raw encrypted TCP stream to the correct backend server **without possessing the private SSL certificate**.
+
+**Q4: How does GeoDNS GSLB handle failover when an entire datacenter region experiences an outage?**
+
+The GSLB health-checking engine continuously monitors all datacenter endpoints (via HTTP health probes). When the US-East datacenter fails health checks, the GSLB system dynamically updates its DNS zone records, purging the US-East IP and returning the EU-West or US-West IP for all subsequent queries within the DNS TTL window (typically 30–60 seconds).
+
+**Q5: Why do Layer 7 load balancers require the `X-Forwarded-For` and `X-Forwarded-Proto` headers?**
+
+Because Layer 7 load balancers act as full reverse proxies, they establish a brand-new TCP connection from their own IP to the backend server. The backend server sees the load balancer's private IP as the remote address. To preserve the original client's public IP and protocol (HTTP vs HTTPS), the proxy appends `X-Forwarded-For: <Client_IP>` and `X-Forwarded-Proto: https` to the HTTP request headers before forwarding.
+
+---
+
+## Summary Checksheet
+
+- [ ] Differentiate Layer 4 (Transport/5-tuple) vs Layer 7 (Application/HTTP) proxying
+- [ ] Master Direct Server Return (DSR) mechanics and ARP suppression
+- [ ] Understand TLS Termination vs SNI Pass-Through
+- [ ] Master GSLB architectures (GeoDNS vs BGP Anycast)
+- [ ] Know why `X-Forwarded-For` and `X-Forwarded-Proto` are required

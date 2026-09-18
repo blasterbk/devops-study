@@ -1,0 +1,382 @@
+---
+title: "Chapter 6 — EndpointSlices"
+sidebar_position: 6
+module: "Module 2.4 — Services"
+description: "Deep dive into EndpointSlices — the scalable replacement for Endpoints objects. Covers the scaling problem with Endpoints, EndpointSlice's sharding model, topology hints for zone-aware routing, and how kube-proxy and Cilium consume EndpointSlices."
+---
+
+# Chapter 6 — EndpointSlices
+
+> **Goal:** Understand why the original Endpoints object doesn't scale, how EndpointSlices solve this with sharding, how topology hints enable zone-aware routing, and how kube-proxy and CNI plugins consume EndpointSlices to implement Service routing.
+>
+> By the end of this chapter, you will understand:
+> 1. What the original Endpoints object is and why it's a scaling bottleneck
+> 2. How EndpointSlices shard endpoints into smaller groups (default 100 per slice)
+> 3. The EndpointSlice data model: addresses, conditions, topology, hints
+> 4. Topology-aware routing — how kube-proxy routes to same-zone endpoints preferentially
+> 5. How to inspect EndpointSlices and understand their relationship to Services
+> 6. EndpointSlice mirroring for manually managed Endpoints
+
+---
+
+## Real-Life Analogy
+
+Imagine a **company employee directory** maintained as a single laminated sheet of paper:
+
+**Old approach (Endpoints):** Every time any employee joins, leaves, or changes desk, the entire sheet must be reprinted and distributed to all 500 office floors (nodes). Even if only one employee moved desks, all 500 floors get a new complete sheet. At 1,000 employees, this sheet is huge — redistributing it becomes the main job.
+
+**New approach (EndpointSlices):** The directory is split into 10 pages, each covering 100 employees. When someone joins Marketing (page 5), only page 5 is reprinted and redistributed. The other 9 pages are unchanged. Floors that only needed Marketing never had to process the Sales or Engineering page updates.
+
+---
+
+## Architecture Diagram
+
+```text
+              Endpoints vs EndpointSlices
+
+Service: "my-service" (1000 backends)
+
+Old: Single Endpoints object
+┌────────────────────────────────────────────────┐
+│ Endpoints: my-service                          │
+│   subsets:                                     │
+│     - addresses: [IP1, IP2, ... IP1000]        │
+│       ports: [{port: 8080}]                    │
+└────────────────────────────────────────────────┘
+Size: ~100KB object
+Every Pod add/remove: entire object replaced → 100KB etcd write
+                                              → propagated to all nodes
+
+New: EndpointSlice sharding
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  Slice 1     │ │  Slice 2     │ │  Slice 10    │
+│  IP1-IP100   │ │  IP101-IP200 │ │  IP901-IP1000│
+│  (100 each)  │ │              │ │              │
+└──────────────┘ └──────────────┘ └──────────────┘
+Each slice: ~10KB object
+1 Pod add/remove: update 1 slice → ~10KB etcd write
+                               → propagated to affected nodes
+```
+
+---
+
+## The Endpoints Scaling Problem
+
+The original `Endpoints` object stores all backend Pod IPs in a **single API object**:
+
+```bash
+kubectl get endpoints my-service -o yaml
+# apiVersion: v1
+# kind: Endpoints
+# metadata:
+#   name: my-service
+# subsets:
+# - addresses:
+#   - ip: 10.244.1.5
+#     nodeName: node-a
+#   - ip: 10.244.2.3
+#     nodeName: node-b
+#   - ... (all 1000 Pod IPs)
+#   ports:
+#   - port: 8080
+```
+
+Problems at scale:
+
+```text
+1. Object size:
+   1000 endpoints × ~100 bytes each = ~100KB single etcd entry
+
+2. Update amplification:
+   1 Pod change → rewrite entire 100KB object
+   → etcd write: 100KB
+   → API server propagation: 100KB to every node
+   → kube-proxy processes: 100KB update on every node
+   → With 1000 nodes: 100KB × 1000 = 100MB of network traffic
+     for a SINGLE Pod restart
+
+3. Kubernetes has a 1.5MB limit on etcd values:
+   Service with >10,000 endpoints → may exceed the limit
+```
+
+---
+
+## EndpointSlice Data Model
+
+EndpointSlices were introduced in Kubernetes 1.17 (GA in 1.21):
+
+```yaml
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: my-service-abc12      # Auto-generated name
+  namespace: default
+  labels:
+    kubernetes.io/service-name: my-service   # Links to Service
+    endpointslice.kubernetes.io/managed-by: endpointslice-controller.k8s.io
+  ownerReferences:
+  - apiVersion: v1
+    kind: Service
+    name: my-service
+addressType: IPv4      # IPv4 | IPv6 | FQDN
+endpoints:
+- addresses:
+  - "10.244.1.5"
+  conditions:
+    ready: true          # Is the Pod ready to serve traffic?
+    serving: true        # Is the Pod currently serving (even if terminating)?
+    terminating: false   # Is the Pod in termination?
+  nodeName: node-a
+  zone: us-east-1a       # Topology information
+  targetRef:
+    kind: Pod
+    name: my-deployment-abc12
+    namespace: default
+- addresses:
+  - "10.244.2.3"
+  conditions:
+    ready: true
+    serving: true
+    terminating: false
+  nodeName: node-b
+  zone: us-east-1b
+ports:
+- name: http
+  port: 8080
+  protocol: TCP
+```
+
+### Endpoint Conditions
+
+| Condition | Meaning | kube-proxy behavior |
+|-----------|---------|---------------------|
+| `ready: true` | Pod passed readiness probe | Route traffic |
+| `ready: false, serving: false` | Pod failed readiness | Don't route |
+| `ready: false, serving: true, terminating: true` | Pod is terminating but still serving | Route only if no other backends (connection draining) |
+
+---
+
+## Sharding: One Service, Many Slices
+
+The EndpointSlice controller automatically manages how endpoints are distributed across slices:
+
+```text
+Default: max 100 endpoints per slice
+
+Service with 350 backends:
+  Slice 1: endpoints 1-100   (full)
+  Slice 2: endpoints 101-200 (full)
+  Slice 3: endpoints 201-300 (full)
+  Slice 4: endpoints 301-350 (50/100 capacity)
+
+When Pod 351 starts:
+  Slice 4 is not full → add to Slice 4 (update only Slice 4)
+  No other slices touched!
+
+When Pod 150 terminates:
+  Slice 2 updated to remove 10.244.x.x
+  Slices 1, 3, 4 unchanged
+```
+
+```bash
+# Configure max endpoints per slice (kube-controller-manager flag)
+--max-endpoints-per-slice=100  # Default
+
+# List all slices for a Service
+kubectl get endpointslices -n default \
+  -l kubernetes.io/service-name=my-service
+
+# Output (for 350 endpoints):
+# NAME               ADDRESSTYPE  PORTS  ENDPOINTS  AGE
+# my-service-abc12   IPv4         8080   100        5m
+# my-service-def34   IPv4         8080   100        5m
+# my-service-ghi56   IPv4         8080   100        5m
+# my-service-jkl78   IPv4         8080   50         5m
+```
+
+---
+
+## Topology-Aware Routing
+
+Introduced in Kubernetes 1.21, topology hints allow kube-proxy to **preferentially route to endpoints in the same zone** (availability zone), reducing cross-zone data transfer costs and latency:
+
+```yaml
+# Enable topology hints on a Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    service.kubernetes.io/topology-mode: "Auto"
+spec:
+  selector:
+    app: myapp
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+With `topology-mode: Auto`, the EndpointSlice controller adds hints to each endpoint:
+
+```yaml
+endpoints:
+- addresses: ["10.244.1.5"]
+  zone: us-east-1a
+  hints:
+    forZones:
+    - name: us-east-1a     # This endpoint should be used by proxies in us-east-1a
+- addresses: ["10.244.2.3"]
+  zone: us-east-1b
+  hints:
+    forZones:
+    - name: us-east-1b
+```
+
+kube-proxy on a node in `us-east-1a` will **only route to endpoints with hints for `us-east-1a`**:
+
+```text
+Benefits:
+  - No cross-zone network traffic (saves cloud egress costs)
+  - Lower latency (same AZ = same datacenter)
+
+Fallback:
+  - If no hints are set, or the zone doesn't have enough endpoints:
+    kube-proxy falls back to cluster-wide routing
+  - Requires balanced replicas across zones for hints to work properly
+```
+
+---
+
+## How kube-proxy Consumes EndpointSlices
+
+```text
+kube-proxy watch loop:
+  1. Watch EndpointSlice objects (watches the label selector)
+  2. On change: collect all slices for the Service
+  3. Merge slices into a single endpoint list
+  4. Update iptables/IPVS rules with the new backend list
+
+Watch filter:
+  kube-proxy only watches slices where:
+  - The node hostname matches an endpoint's nodeName (for local-only policy)
+  - OR the slice has relevant topology hints
+
+This is more efficient than watching a single large Endpoints object —
+kube-proxy gets granular change notifications.
+```
+
+---
+
+## EndpointSlice Mirroring
+
+For manually managed `Endpoints` objects (no selector, used for external services), Kubernetes automatically mirrors them to EndpointSlices:
+
+```bash
+# Old-style manual Endpoints (deprecated but still supported)
+kubectl create -f - <<EOF
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-db
+subsets:
+- addresses:
+  - ip: "54.123.45.67"
+  ports:
+  - port: 5432
+EOF
+
+# Kubernetes automatically creates a mirrored EndpointSlice
+kubectl get endpointslices -l kubernetes.io/service-name=external-db
+# external-db-xxxxx  IPv4  5432  54.123.45.67  10s
+```
+
+New deployments should use EndpointSlice directly (skip Endpoints entirely):
+
+```yaml
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: external-db-slice
+  labels:
+    kubernetes.io/service-name: external-db
+addressType: IPv4
+ports:
+- port: 5432
+  protocol: TCP
+endpoints:
+- addresses: ["54.123.45.67"]
+  conditions:
+    ready: true
+```
+
+---
+
+## Hands-On: Working with EndpointSlices
+
+```bash
+# 1. List EndpointSlices for a Service
+kubectl get endpointslices -n production \
+  -l kubernetes.io/service-name=my-service -o wide
+
+# 2. Inspect slice details (topology, conditions)
+kubectl describe endpointslice my-service-abc12 -n production
+
+# 3. Watch slice updates in real-time
+kubectl get endpointslices -n production --watch
+
+# 4. Check endpoint readiness conditions
+kubectl get endpointslice my-service-abc12 -o json | \
+  jq '.endpoints[] | {ip: .addresses[0], ready: .conditions.ready, terminating: .conditions.terminating}'
+
+# 5. Verify topology hints are set
+kubectl get endpointslice my-service-abc12 -o json | \
+  jq '.endpoints[] | {ip: .addresses[0], zone: .zone, hints: .hints}'
+
+# 6. Count total endpoints across all slices
+kubectl get endpointslices -n production \
+  -l kubernetes.io/service-name=my-service -o json | \
+  jq '[.items[].endpoints[]] | length'
+
+# 7. Find which node hosts a specific endpoint
+kubectl get endpointslice -A -o json | \
+  jq '.items[].endpoints[] | select(.addresses[] == "10.244.1.5") | .nodeName'
+
+# 8. Check if EndpointSlice controller is running
+kubectl get deployment endpointslicemirroring-controller -n kube-system
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What problem does EndpointSlice solve that the original Endpoints object cannot?**
+
+The original Endpoints object stores all backend IPs in a single Kubernetes object. At large scale (1000+ endpoints), this causes: large etcd writes (100KB+) on every Pod change, propagation of the entire object to all nodes, and potential exceeding of the 1.5MB etcd object size limit. EndpointSlices shard endpoints into groups (default 100 per slice), so a single Pod change only updates one small slice (~10KB) instead of the entire backend list — reducing write amplification by 10-100x.
+
+**Q2: How does kube-proxy know which EndpointSlices belong to a Service?**
+
+EndpointSlices have the label `kubernetes.io/service-name: <service-name>`. kube-proxy watches EndpointSlice objects with this label to find all slices belonging to a Service. The EndpointSlice controller (part of kube-controller-manager) is responsible for creating, updating, and deleting slices and keeping the label consistent.
+
+**Q3: What does the `serving` endpoint condition mean and when is it used?**
+
+`serving: true` indicates the endpoint can currently serve traffic — even if `ready: false` (which happens during graceful termination). When a Pod is terminating, Kubernetes sets `ready: false` but `serving: true` and `terminating: true`. kube-proxy uses `serving` condition to implement connection draining: if all `ready: true` endpoints are gone (all Pods are terminating), kube-proxy falls back to `serving: true` endpoints to avoid complete traffic loss during rolling updates.
+
+**Q4: What is topology-aware routing and how is it enabled?**
+
+Topology-aware routing (via `service.kubernetes.io/topology-mode: Auto` annotation) causes kube-proxy to preferentially route Service traffic to endpoints in the same availability zone as the requesting Pod. The EndpointSlice controller adds `hints.forZones` to each endpoint based on zone distribution. kube-proxy reads these hints and restricts its routing table to same-zone endpoints. Benefits: lower latency, reduced cross-zone data transfer costs. Requires balanced Pod distribution across zones to work correctly.
+
+**Q5: What is the maximum number of endpoints per EndpointSlice and can it be changed?**
+
+The default maximum is 100 endpoints per slice, configurable via `--max-endpoints-per-slice` on the `kube-controller-manager`. The valid range is 1-1000. Larger slices reduce the number of API objects but increase the size of individual updates. Smaller slices reduce update amplification but create more API objects to watch and list. 100 is the default balanced choice for most clusters.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why Endpoints doesn't scale: single large object, full replacement on every Pod change
+- [ ] Understand EndpointSlices shard endpoints into groups (default 100 per slice)
+- [ ] Know the EndpointSlice data model: addresses, conditions (ready/serving/terminating), zone, hints
+- [ ] Understand `serving: true, terminating: true` enables connection draining during rolling updates
+- [ ] Know topology-aware routing (`topology-mode: Auto`) routes to same-zone endpoints preferentially
+- [ ] Know kube-proxy watches slices via `kubernetes.io/service-name` label
+- [ ] Can inspect slices with `kubectl get endpointslices` and verify endpoint count, conditions, and zones

@@ -1,0 +1,408 @@
+---
+title: "Chapter 3 — Cross-Namespace Rules"
+sidebar_position: 3
+module: "Module 2.8 — Network Security"
+description: "Deep dive into cross-namespace NetworkPolicy rules — how to allow specific inter-namespace traffic, the namespace label strategy, Cilium NetworkPolicy extensions for cluster-wide policies, and the AdminNetworkPolicy API for cluster administrators."
+---
+
+# Chapter 3 — Cross-Namespace Rules
+
+> **Goal:** Master cross-namespace NetworkPolicy — the patterns for allowing specific inter-namespace traffic while maintaining namespace isolation, the namespace labeling strategy required for cross-namespace rules, and the AdminNetworkPolicy API for cluster-wide governance.
+>
+> By the end of this chapter, you will understand:
+> 1. How `namespaceSelector` enables cross-namespace traffic control
+> 2. The namespace label strategy for scalable cross-namespace policies
+> 3. Common cross-namespace traffic patterns (monitoring, ingress, CI/CD)
+> 4. Cilium's `CiliumNetworkPolicy` and `CiliumClusterwideNetworkPolicy`
+> 5. The AdminNetworkPolicy API (Kubernetes 1.30+) for cluster-wide governance
+> 6. How to structure policies for multi-tenant clusters
+
+---
+
+## Real-Life Analogy
+
+Cross-namespace NetworkPolicy is like **building access policy in a corporate campus** with multiple buildings (namespaces):
+
+Building A (production) has a badge reader on every door. The security policy says: "The Security Operations Center building (SOC = monitoring namespace) can access ANY building's server room (port 9090 for metrics). The HR building (CI/CD namespace) can only access the staging building (staging namespace) for deployments. Buildings within the same division (same team label) can freely access each other."
+
+The badge system (NetworkPolicy) uses building labels ("team=engineering", "purpose=monitoring") not building names — so the policy works even when new buildings are added to a labeled group.
+
+---
+
+## Architecture Diagram
+
+```text
+              Cross-Namespace Traffic Control
+
+  Namespace: monitoring (labeled: purpose=monitoring)
+  ┌──────────────────┐
+  │ Prometheus Pod   │────────────────────────────────────┐
+  └──────────────────┘                                    │
+                                                          │ port 9090
+  Namespace: production                                   │
+  ┌──────────────────────────────────────────────────┐   │
+  │ NetworkPolicy: allow-prometheus                  │◀──┘
+  │   podSelector: {} (all pods)                     │
+  │   ingress from:                                  │
+  │     namespaceSelector: {purpose: monitoring}     │
+  │     ports: [9090]                                │
+  │                                                  │
+  │ api-pod   ←(port 8080)── ingress-nginx           │◀─ ingress-nginx ns
+  │ worker-pod  ✗ blocked from external namespaces   │
+  └──────────────────────────────────────────────────┘
+```
+
+---
+
+## Namespace Labels Are Required
+
+Cross-namespace NetworkPolicy uses `namespaceSelector` with label matching. **Namespaces must have the right labels** for this to work:
+
+```bash
+# Label namespaces for use in NetworkPolicy selectors
+kubectl label namespace monitoring purpose=monitoring
+kubectl label namespace ingress-nginx kubernetes.io/metadata.name=ingress-nginx
+kubectl label namespace production environment=production team=backend
+kubectl label namespace staging environment=staging team=backend
+
+# Kubernetes automatically adds a label for the namespace name (1.21+):
+# kubernetes.io/metadata.name: <namespace-name>
+# This is always present and safe to use in selectors
+```
+
+```bash
+# Verify labels
+kubectl get namespaces --show-labels | grep -E "monitoring|production"
+```
+
+---
+
+## Common Cross-Namespace Patterns
+
+### Pattern 1: Allow Monitoring Namespace to Scrape Metrics
+
+```yaml
+# Applied in EVERY namespace that needs Prometheus scraping
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: production
+spec:
+  podSelector: {}          # All Pods in production
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          purpose: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090    # Prometheus metrics
+    - protocol: TCP
+      port: 8080    # Common metrics port
+    - protocol: TCP
+      port: 9091    # Some exporters
+```
+
+### Pattern 2: Allow Ingress Controller Namespace
+
+```yaml
+# In application namespace: allow NGINX Ingress Controller to reach Pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-nginx
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api          # Only api Pods (not all Pods)
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+### Pattern 3: Allow CI/CD Pipeline Access
+
+```yaml
+# Allow CI/CD namespace (ArgoCD, Flux) to reach staging only
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cicd-deployment
+  namespace: staging
+spec:
+  podSelector:
+    matchLabels:
+      app: staging-api
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: argocd
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+### Pattern 4: Database Access from Multiple App Namespaces
+
+```yaml
+# In database namespace: allow specific app namespaces
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-app-namespaces-to-postgres
+  namespace: database
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          environment: production    # All production namespaces
+      podSelector:
+        matchLabels:
+          db-access: "allowed"      # AND only Pods with this label
+    ports:
+    - protocol: TCP
+      port: 5432
+```
+
+---
+
+## Multi-Tenant Namespace Isolation Pattern
+
+```yaml
+# Tenant A namespace (team=tenant-a)
+# Tenant B namespace (team=tenant-b)
+# Shared services namespace (purpose=shared)
+
+# Policy: tenants can access shared services, not each other
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tenant-isolation
+  namespace: tenant-a
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow from own namespace
+  - from:
+    - podSelector: {}
+  # Allow from shared services namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          purpose: shared
+  # Block everything else (including tenant-b)
+  # No rule for tenant-b = implicitly denied
+```
+
+---
+
+## Cilium NetworkPolicy Extensions
+
+Cilium's `CiliumNetworkPolicy` CRD adds L7 policy capabilities beyond standard NetworkPolicy:
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-api-get-only
+  namespace: production
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: GET           # L7 rule: only allow GET requests
+          path: "/api/.*"      # Only to /api/* paths
+        - method: POST
+          path: "/api/v1/orders"  # Only POST to this specific path
+```
+
+Cilium L7 policies work with the Envoy proxy that Cilium embeds — enabling per-method, per-path HTTP filtering without a service mesh.
+
+---
+
+## CiliumClusterwideNetworkPolicy
+
+For cluster-wide policies that apply across all namespaces:
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: block-metadata-access
+spec:
+  # Block all Pods from reaching AWS/GCP metadata endpoint
+  endpointSelector: {}    # All Pods in all namespaces
+  egressDeny:
+  - toEntities:
+    - world              # External traffic
+    toCIDR:
+    - 169.254.169.254/32  # AWS/GCP/Azure metadata endpoint
+```
+
+---
+
+## AdminNetworkPolicy (Kubernetes 1.30+)
+
+The AdminNetworkPolicy API was introduced in Kubernetes 1.30 to address the governance gap — cluster admins couldn't enforce cluster-wide policies that namespace-level NetworkPolicies couldn't override:
+
+```yaml
+# AdminNetworkPolicy: cluster-scoped, higher priority than NetworkPolicy
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: cluster-admin-baseline
+spec:
+  priority: 10    # Lower number = higher priority than NetworkPolicy
+
+  subject:
+    namespaces:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values: [kube-system, kube-public]  # All except system namespaces
+
+  ingress:
+  # ALLOW: kube-system can always reach any Pod (for health checks, monitoring)
+  - name: allow-kube-system
+    action: Allow
+    from:
+    - namespaces:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+
+  # DENY: no Pod can be reached from the internet on admin ports
+  - name: deny-internet-admin-ports
+    action: Deny
+    from:
+    - networks:
+      - cidr: 0.0.0.0/0  # External
+    ports:
+    - portNumber:
+        port: 22
+        protocol: TCP
+    - portNumber:
+        port: 6443
+        protocol: TCP
+
+  egress:
+  # DENY: no Pod can reach the cloud metadata endpoint
+  - name: deny-metadata-server
+    action: Deny
+    to:
+    - networks:
+      - cidr: 169.254.169.254/32
+```
+
+AdminNetworkPolicy `action` options: `Allow`, `Deny`, `Pass` (defer to namespace NetworkPolicy).
+
+---
+
+## Hands-On: Cross-Namespace Policy Debugging
+
+```bash
+# 1. Check namespace labels (critical for namespaceSelector policies)
+kubectl get ns --show-labels
+
+# 2. Add required labels to namespaces
+kubectl label namespace monitoring purpose=monitoring --overwrite
+kubectl label namespace ingress-nginx \
+  kubernetes.io/metadata.name=ingress-nginx --overwrite
+
+# 3. Test cross-namespace connectivity (before policy)
+kubectl run test-client -n monitoring --image=curlimages/curl \
+  --labels="app=prometheus" --command -- sleep 3600
+
+kubectl exec test-client -n monitoring -- \
+  curl -s --max-time 3 http://api-service.production:8080/metrics
+
+# 4. Apply allow-monitoring policy to production
+kubectl apply -f allow-prometheus-scraping.yaml -n production
+
+# 5. Test again (should now succeed)
+kubectl exec test-client -n monitoring -- \
+  curl -s --max-time 3 http://api-service.production:8080/metrics
+
+# 6. Verify which policies apply to a Pod
+kubectl get networkpolicies -n production -o json | jq '
+  .items[] |
+  select(.spec.podSelector.matchLabels == null or
+         (.spec.podSelector.matchLabels | to_entries | length == 0) or
+         (.spec.podSelector.matchLabels.app == "api")) |
+  {name: .metadata.name, ingress_sources: [.spec.ingress[]?.from[]?]}'
+
+# 7. Use Cilium policy trace for cross-namespace
+kubectl exec -n kube-system cilium-<id> -- \
+  cilium policy trace \
+    --src-k8s-pod monitoring:test-client \
+    --dst-k8s-pod production:api-pod \
+    --dport 9090 \
+    -v
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does `namespaceSelector` in a NetworkPolicy work and what is required for it to function?**
+
+`namespaceSelector` matches namespaces by their labels. When used in a `from` or `to` clause, it allows traffic from/to any Pod in any namespace that has matching labels. **Critical requirement**: the namespaces must actually be labeled with the correct labels. Kubernetes 1.21+ automatically adds `kubernetes.io/metadata.name: <ns-name>` to all namespaces, making it safe to use for namespace name matching. For custom labels (`purpose=monitoring`), you must apply them with `kubectl label namespace`.
+
+**Q2: How do you allow Prometheus (in the monitoring namespace) to scrape metrics from all Pods in all application namespaces?**
+
+You cannot create a single "global" NetworkPolicy — standard NetworkPolicy is namespace-scoped. The pattern is to create the same NetworkPolicy in every application namespace. This is typically automated via GitOps (the policy is in a template applied to all application namespaces) or via a cluster-level tool like Kyverno/OPA Gatekeeper that generates the policy in each namespace. Cilium's `CiliumClusterwideNetworkPolicy` allows a single cluster-wide policy for this pattern.
+
+**Q3: What is the difference between Kubernetes NetworkPolicy and AdminNetworkPolicy?**
+
+NetworkPolicy is namespace-scoped — it can only control traffic within or to/from a specific namespace. It cannot override policies in other namespaces and has no concept of priority. AdminNetworkPolicy (v1.30+) is cluster-scoped, has a priority field, and can: (1) apply to multiple namespaces via label selectors, (2) enforce rules that namespace teams cannot override (the `Deny` action preempts all NetworkPolicy), (3) use the `Pass` action to explicitly defer to namespace-level NetworkPolicy for specific traffic. AdminNetworkPolicy is designed for cluster administrators to set baseline security rules.
+
+**Q4: What is the AND vs OR distinction when combining `namespaceSelector` and `podSelector` in a cross-namespace rule?**
+
+If both appear in the **same list item** (no additional `-`), they are AND'd: the source must match BOTH the namespace label AND the pod label. Example: `from: [{namespaceSelector: {team: backend}, podSelector: {app: api}}]` means "from Pods labeled `app=api` that are IN namespaces labeled `team=backend`". If they're in **separate list items**, they're OR'd: "from Pods labeled `app=api` OR from any Pod in namespaces labeled `team=backend`". The YAML indentation structure determines the logic.
+
+**Q5: What is Cilium's `CiliumClusterwideNetworkPolicy` and what does it add over standard NetworkPolicy?**
+
+`CiliumClusterwideNetworkPolicy` is a Cilium CRD for cluster-scoped network policies that apply across all namespaces without requiring per-namespace creation. It uses `endpointSelector` (like standard NetworkPolicy's podSelector) but matches across the entire cluster. It can block access to cloud metadata endpoints (169.254.169.254) for all Pods cluster-wide, which would require per-namespace policies with standard NetworkPolicy. It also supports Cilium's L7 policy extensions (HTTP method/path rules) at cluster scope.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know `namespaceSelector` requires namespaces to have the correct labels
+- [ ] Know `kubernetes.io/metadata.name` is automatically set on all namespaces (1.21+) — safe for name-based selection
+- [ ] Know AND vs OR for combined namespaceSelector+podSelector (same item vs separate items)
+- [ ] Know common patterns: monitoring scraping, ingress controller, CI/CD, database access
+- [ ] Know Cilium's `CiliumNetworkPolicy` adds L7 (HTTP method/path) policy
+- [ ] Know `CiliumClusterwideNetworkPolicy` is cluster-scoped (one policy for all namespaces)
+- [ ] Know AdminNetworkPolicy (1.30+) has priority, cluster scope, and `Deny` action that overrides NetworkPolicy

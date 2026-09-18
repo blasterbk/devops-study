@@ -1,0 +1,284 @@
+---
+title: "Chapter 3 — Topology Spread Constraints"
+sidebar_position: 3
+module: "Module 3.6 — Advanced Scheduling"
+description: "Master Kubernetes Topology Spread Constraints — maxSkew calculation, whenUnsatisfiable (DoNotSchedule vs ScheduleAnyway), matchLabelKeys during rolling updates, minDomains, and multi-zone balanced distribution."
+---
+
+# Chapter 3 — Topology Spread Constraints
+
+> **Goal:** Master Topology Spread Constraints in Kubernetes — understanding how `maxSkew` mathematically enforces even Pod distribution across availability zones, nodes, and racks, configuring `DoNotSchedule` vs `ScheduleAnyway`, leveraging `matchLabelKeys` for seamless rolling updates, and avoiding the rigid placement deadlocks of classic Pod Anti-Affinity.
+>
+> By the end of this chapter, you will understand:
+> 1. The mathematical definition of Skew: $\text{Actual} - \text{Global Minimum}$
+> 2. How `topologySpreadConstraints` solves the scaling limits of Pod Anti-Affinity
+> 3. The difference between `whenUnsatisfiable: DoNotSchedule` (hard) and `ScheduleAnyway` (soft)
+> 4. How `matchLabelKeys` (Kubernetes 1.27+ GA) prevents rolling updates from skewing zone counts
+> 5. How `minDomains` (Kubernetes 1.30+ GA) handles dynamic cluster autoscaling and scale-to-zero zones
+> 6. How to combine multiple overlapping spread constraints across zones and hosts
+
+---
+
+## Real-Life Analogy
+
+Think of Topology Spread Constraints as a **fair card dealer distributing cards to 3 players around a table**:
+
+- **Pod Anti-Affinity (Overly Rigid Rule):** *"Each player can hold at most ONE card."* If you deal 3 cards, everyone gets 1 card. But if you try to deal a 4th card (`replicas: 4`), the dealer panics, refuses to deal, and cancels the game (`Pending` deadlock).
+- **Topology Spread Constraints (`maxSkew: 1`):** *"No player can have more than 1 card more than any other player."*
+  - Dealing 3 cards: Player A has 1, Player B has 1, Player C has 1 ($\text{Skew} = 1 - 1 = 0$).
+  - Dealing 4 cards: Player A gets the 4th card ($[2, 1, 1]$). The difference between Player A (2) and the lowest player (1) is $2 - 1 = 1$. This satisfies `maxSkew: 1`!
+  - Dealing 5 cards: Player B gets the 5th card ($[2, 2, 1]$). Skew is $2 - 1 = 1$ (Allowed).
+  - Dealing 6 cards: Player C gets the 6th card ($[2, 2, 2]$). Skew is 0 (Perfect balance).
+  - You can scale from 3 to 300 replicas smoothly, and cards are **always evenly balanced** across all players!
+
+---
+
+## Architecture Diagram
+
+```text
+               Topology Spread Calculation Across 3 Zones
+
+ TopologyKey: topology.kubernetes.io/zone, maxSkew: 1, whenUnsatisfiable: DoNotSchedule
+ Current State: 4 Pods already running across 3 zones
+
+ ┌─────────────────────┐    ┌─────────────────────┐    ┌─────────────────────┐
+ │ Zone: us-east-1a    │    │ Zone: us-east-1b    │    │ Zone: us-east-1c    │
+ │ [Pod 1]  [Pod 2]    │    │ [Pod 3]             │    │ [Pod 4]             │
+ │ Count = 2           │    │ Count = 1           │    │ Count = 1           │
+ └─────────────────────┘    └─────────────────────┘    └─────────────────────┘
+ 
+ Global Minimum Count across all zones = 1 (Zones 1b and 1c have 1 pod)
+
+ Incoming Pod 5 arrives at Scheduler:
+ 
+ Option A: Place in us-east-1a ──► New Count = 3 ──► Skew = 3 - 1 = 2 (VIOLATES maxSkew: 1 ──► REJECTED!)
+ Option B: Place in us-east-1b ──► New Count = 2 ──► Skew = 2 - 1 = 1 (ALLOWED!)
+ Option C: Place in us-east-1c ──► New Count = 2 ──► Skew = 2 - 1 = 1 (ALLOWED!)
+
+ Scheduler binds Pod 5 to either Zone 1b or Zone 1c!
+```
+
+---
+
+## The Skew Formula
+
+The scheduler evaluates placement by computing the **Skew**:
+
+$$\text{Skew} = (\text{Matching Pods in Candidate Domain}) - (\text{Global Minimum Pods in Any Domain})$$
+
+```text
+ Rule:
+ A node is a VALID candidate if and only if placing the new Pod on that node 
+ results in a Skew <= maxSkew.
+```
+
+---
+
+## `whenUnsatisfiable`: Hard Filter vs Soft Scoring
+
+```text
+ ┌───────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ Parameter Value           │ Scheduler Behavior                                                     │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`DoNotSchedule`**       │ **Hard Constraint (Filter Phase).**                                    │
+ │                           │ If placing the Pod on a node causes Skew > `maxSkew`, that node is     │
+ │                           │ completely filtered out. Pod stays `Pending` if no valid nodes exist.  │
+ │───────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`ScheduleAnyway`**      │ **Soft Scoring (Score Phase).**                                        │
+ │                           │ The scheduler prioritizes nodes that minimize the skew, but will still │
+ │                           │ place the Pod on a skewed node if cluster capacity requires it.        │
+ └───────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Rolling Updates & `matchLabelKeys` (Kubernetes 1.27+ GA)
+
+During a `RollingUpdate`, old Pods (with `pod-template-hash: v1`) and new Pods (with `pod-template-hash: v2`) exist simultaneously.
+
+Historically, if `labelSelector` matched only `app: web`, the scheduler counted both versions together. But if old Pods were terminating, the skew calculation could become temporarily unbalanced.
+
+`matchLabelKeys` solves this by dynamically calculating skew across rollout revisions:
+
+```yaml
+topologySpreadConstraints:
+- maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
+  labelSelector:
+    matchLabels:
+      app: web
+  # Automatically scopes skew calculation per rollout revision!
+  matchLabelKeys:
+  - pod-template-hash
+```
+
+---
+
+## Handling Dynamic Clouds: `minDomains` (Kubernetes 1.30+ GA)
+
+In autoscaling clusters, an entire Availability Zone might temporarily have **0 worker nodes** because the Cluster Autoscaler scaled it down.
+
+Without `minDomains`, the scheduler calculates the minimum across *existing* domains only. If Zone C has 0 nodes, the minimum is computed from Zones A and B ($[5, 5]$ -> Min = 5), masking the fact that an entire 3rd zone exists!
+
+`minDomains` enforces domain discovery:
+
+```yaml
+spec:
+  topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    minDomains: 3          # Require at least 3 zones in the skew calculation!
+    labelSelector:
+      matchLabels:
+        app: web
+```
+
+---
+
+## Complete Multi-Level Production Spread Manifest
+
+This manifest enforces a dual spread hierarchy:
+1. **Zone-Level:** Replicas must spread evenly across Availability Zones (`maxSkew: 1`).
+2. **Node-Level:** Replicas within the same zone should prefer spreading across separate physical nodes (`maxSkew: 1`, soft).
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resilient-payment-gateway
+  namespace: finance
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: payment-gw
+  template:
+    metadata:
+      labels:
+        app: payment-gw
+    spec:
+      topologySpreadConstraints:
+      # Level 1: HARD spread across Availability Zones
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: payment-gw
+        matchLabelKeys:
+        - pod-template-hash
+
+      # Level 2: SOFT spread across individual Worker Nodes
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: payment-gw
+
+      containers:
+      - name: gateway
+        image: payment-gw:v3.2.0
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+```
+
+---
+
+## Hands-On Lab: Observing Zone Skew Calculation
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace spread-lab
+
+# Step 2: Identify available nodes and simulate zones if on local cluster
+NODES=($(kubectl get nodes --no-headers | awk '{print $1}'))
+echo "Nodes detected: ${NODES[@]}"
+
+# Label nodes with mock availability zones
+kubectl label node ${NODES[0]} mock-zone=zone-a --overwrite
+if [ ${#NODES[@]} -gt 1 ]; then kubectl label node ${NODES[1]} mock-zone=zone-b --overwrite; fi
+if [ ${#NODES[@]} -gt 2 ]; then kubectl label node ${NODES[2]} mock-zone=zone-c --overwrite; fi
+
+# Step 3: Deploy an application with maxSkew: 1 across mock-zone
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spread-demo
+  namespace: spread-lab
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: spread-demo
+  template:
+    metadata:
+      labels:
+        app: spread-demo
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: mock-zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: spread-demo
+      containers:
+      - name: web
+        image: nginx:1.25-alpine
+EOF
+
+# Step 4: Wait for Pods to be created and inspect distribution across mock-zone
+kubectl wait --for=condition=Ready deployment/spread-demo -n spread-lab --timeout=30s
+
+# Step 5: Verify even spread across nodes
+kubectl get pods -n spread-lab -o wide
+
+# Step 6: Clean up labels and lab
+kubectl label node ${NODES[@]} mock-zone-
+kubectl delete namespace spread-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a Topology Spread Constraint, and why was it introduced?**
+
+Topology Spread Constraints (`topologySpreadConstraints`) control how Pods are distributed across failure domains (e.g. zones, hosts, regions). They were introduced to overcome the limitations of Pod Anti-Affinity. Hard Pod Anti-Affinity permits at most one Pod per domain, making it impossible to scale replicas beyond the domain count. Topology Spread Constraints allow multiple Pods per domain while mathematically ensuring that the difference in Pod counts between any two domains never exceeds `maxSkew`.
+
+**Q2: What is `maxSkew`, and how does the scheduler calculate it?**
+
+`maxSkew` is an integer defining the maximum allowed difference in matching Pod counts between any candidate domain and the domain with the fewest Pods (the global minimum). When evaluating a node, the scheduler calculates: $\text{Skew} = \text{Count in Candidate Domain after placement} - \text{Minimum Count across all domains}$. If $\text{Skew} \le \text{maxSkew}$, the placement is permitted; if $\text{Skew} > \text{maxSkew}$ with `DoNotSchedule`, the node is rejected.
+
+**Q3: What is the difference between `whenUnsatisfiable: DoNotSchedule` and `ScheduleAnyway`?**
+
+`whenUnsatisfiable: DoNotSchedule` enforces a hard constraint during the scheduler's Filter stage: any node whose selection would violate `maxSkew` is eliminated, and the Pod remains `Pending` if no compliant nodes exist. `ScheduleAnyway` enforces a soft constraint during the Scoring stage: the scheduler scores compliant nodes higher, but if cluster resources are constrained, it will schedule the Pod on a non-compliant node to avoid leaving the workload unplaced.
+
+**Q4: How does `matchLabelKeys` assist during Deployment rolling updates?**
+
+During a rolling update, Pods from the old and new revisions share base labels (e.g. `app: web`). By configuring `matchLabelKeys: [pod-template-hash]`, the scheduler dynamically scopes the skew calculation to Pods sharing the same template hash key as the incoming Pod. This ensures that new revision replicas are distributed evenly across zones on their own terms without being blocked by terminating older revision Pods.
+
+**Q5: What is `minDomains`, and why is it important for autoscaled clusters?**
+
+`minDomains` (GA in Kubernetes 1.30) defines the minimum expected number of topology domains (e.g. 3 zones). In clusters where the Cluster Autoscaler has temporarily scaled down all worker nodes in an empty zone, Kubernetes would otherwise compute the global minimum Pod count only across the remaining active zones. `minDomains` forces the scheduler to assume the missing zone exists with 0 Pods, preventing Pods from clustering heavily into existing zones.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Skew equals: $\text{Candidate Domain Count} - \text{Global Minimum Count}$
+- [ ] Know that `maxSkew` defines the maximum allowed imbalance
+- [ ] Know that `DoNotSchedule` is a hard filter; `ScheduleAnyway` is soft scoring
+- [ ] Know that Topology Spread Constraints scale smoothly unlike rigid Pod Anti-Affinity
+- [ ] Know how `matchLabelKeys: [pod-template-hash]` prevents rolling update imbalances
+- [ ] Know how `minDomains` handles empty autoscaled zones
+- [ ] Can inspect pod distribution with `kubectl get pods -o wide`

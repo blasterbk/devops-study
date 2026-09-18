@@ -1,0 +1,384 @@
+---
+title: "Chapter 4 — API Aggregation Layer"
+sidebar_position: 4
+module: "Module 1.1 — Kubernetes Control Plane"
+description: "> **Goal:** Understand how Kubernetes extends its API without modifying the core API Server."
+---
+
+# Chapter 4 — API Aggregation Layer
+
+> **Goal:** Understand how Kubernetes extends its API without modifying the core API Server.
+>
+> By the end of this chapter, you will understand how services like **Metrics Server**, **Prometheus Adapter**, and other extension API servers integrate seamlessly into Kubernetes.
+
+---
+
+# Why Should You Learn This?
+
+A common interview question is:
+
+> **How does `kubectl top pod` work?**
+
+Many engineers answer: *"It gets metrics from kubelet."* That is only partially true.
+
+The complete flow is:
+
+```text
+Container Runtime
+  |
+  v
+    kubelet(s)
+  |
+  v
+ Metrics Server
+  |
+  v
+ metrics.k8s.io
+  |
+  v
+ kube-apiserver
+  |
+  v
+  kubectl top
+```
+
+The API Aggregation Layer is what allows Kubernetes to expose **new APIs** without changing the core Kubernetes codebase.
+
+Without it:
+- Metrics Server would not work seamlessly via `kubectl`.
+- `kubectl top` would not exist.
+- Custom Metrics APIs (`custom.metrics.k8s.io`) would not exist.
+- External Metrics APIs (`external.metrics.k8s.io`) would not exist.
+
+---
+
+# The Problem Before API Aggregation
+
+Imagine Kubernetes only supported built-in APIs:
+
+```text
+/api/v1
+/apis/apps/v1
+/apis/batch/v1
+/apis/networking.k8s.io/v1
+```
+
+Suppose you wanted to add a new API group:
+
+```text
+metrics.k8s.io
+```
+
+Without API Aggregation, you would need to:
+- Modify `kube-apiserver` source code.
+- Recompile Kubernetes.
+- Upgrade every control plane component across all clusters.
+
+This would make extending Kubernetes extremely rigid and unsustainable.
+
+---
+
+# The Kubernetes Solution
+
+Instead of modifying `kube-apiserver`, Kubernetes introduced the **API Aggregation Layer** (`kube-aggregator`).
+
+Think of it as an API Gateway running in-process within `kube-apiserver`:
+
+```text
+Client (kubectl)
+  |
+  v
+ kube-apiserver
+       |
+       +── API Aggregation Layer (kube-aggregator)
+  |
+  v
+        Extension API Server (e.g., Metrics Server)
+```
+
+The main API Server becomes capable of transparently proxying requests to registered extension API servers.
+
+---
+
+# Real-Life Analogy
+
+Imagine a hospital:
+
+```text
+Hospital Receptionist
+       |
+       +── General Practitioner
+       |
+       +── Cardiology Specialist
+       |
+       +── Neurology Specialist
+```
+
+The receptionist does not treat every patient. Instead, the receptionist evaluates incoming patient requests and routes them to the appropriate specialist department.
+
+The API Aggregation Layer works exactly the same way within `kube-apiserver`.
+
+---
+
+# What is the API Aggregation Layer?
+
+The API Aggregation Layer runs in-process inside **`kube-apiserver`** (implemented by `kube-aggregator`). It enables Kubernetes to expose APIs served by external extension API servers.
+
+It acts as a:
+- Request Router
+- Reverse Proxy
+- API Gateway
+- Unified API Registry
+
+Aggregated APIs are exposed to Kubernetes clients through the main Kubernetes API endpoint, with `kube-apiserver` proxying requests to the registered extension API server.
+
+---
+
+# Mental Model Architecture
+
+```text
+                     kube-apiserver
+                           |
+              +────────────+────────────+
+              |                         |
+              v                         v
+        Built-in APIs             Aggregation Layer (kube-aggregator)
+              |                         |
+              v                         v
+             etcd                Extension API Server
+  |
+  v
+                                  Metrics Server
+```
+
+The Aggregation Layer is part of `kube-apiserver` itself, not a separate standalone process you deploy.
+
+---
+
+# Why Route Through kube-apiserver?
+
+Suppose Metrics Server runs as `metrics-server.kube-system.svc`.
+
+If clients communicated directly with the extension API server:
+- Different authentication mechanisms.
+- Different authorization policies.
+- Different TLS certificate management.
+- Disjointed API endpoints.
+- Inconsistent client tooling.
+
+By proxying through `kube-apiserver`:
+- Single unified API endpoint (`https://kubernetes.default.svc`).
+- Centralized Authentication & Authorization (RBAC).
+- Audit Logging across all endpoints.
+- Unified API Discovery (`kubectl api-resources`).
+
+---
+
+# Components of API Aggregation
+
+1. **`kube-apiserver`:** Main entry point handling incoming REST requests.
+2. **`kube-aggregator`:** In-process module within `kube-apiserver` responsible for:
+   - Registering `APIService` resources.
+   - Routing matching requests to extension API servers.
+   - Proxying traffic and handling mTLS.
+   - Merging API discovery endpoints.
+3. **`APIService` Resource:** Declarative registration object in `apiregistration.k8s.io/v1`.
+4. **Extension API Server:** Independent service (e.g., Metrics Server, Prometheus Adapter) serving the registered API group.
+
+---
+
+# APIService Resource Registration
+
+Kubernetes discovers extension APIs via the `APIService` resource:
+
+```yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.k8s.io
+spec:
+  group: metrics.k8s.io
+  version: v1beta1
+  groupPriorityMinimum: 100
+  versionPriority: 100
+  service:
+    name: metrics-server
+    namespace: kube-system
+    port: 443
+  caBundle: <base64-encoded-ca-cert>
+```
+
+Key fields:
+- **`groupPriorityMinimum` & `versionPriority`:** Required priority fields used by `kube-apiserver` to resolve API ordering and preferred versions.
+- **`service`:** References the Kubernetes `Service` backing the extension API server.
+- **`caBundle`:** CA certificate bundle used by `kube-apiserver` to verify the extension API server's TLS certificate.
+
+---
+
+# CRDs vs. Aggregated APIs
+
+Many engineers confuse Custom Resource Definitions (CRDs) with Aggregated APIs.
+
+```text
+CRD
+ |
+ +── Adds new Kubernetes resource types
+ +── Served directly by kube-apiserver
+ +── Normally stored in etcd
+ +── Does not require a separate API server
+
+API Aggregation
+ |
+ +── Adds an externally implemented API group
+ +── Has its own extension API server
+ +── kube-apiserver proxies requests to it
+ +── Can use custom backend / non-etcd storage
+```
+
+### Detailed Comparison
+
+| Feature | CRDs | API Aggregation |
+| :--- | :--- | :--- |
+| **Serving Component** | `kube-apiserver` | Extension API Server |
+| **Primary Storage** | `etcd` | Custom Storage / In-Memory / External DB |
+| **Custom Business Logic** | Schema validation, CEL, Webhooks, Controllers | Full control over API request handling |
+| **API Discovery** | Integrated into `kube-apiserver` | Merged by `kube-aggregator` |
+| **Proxy Required** | No | Yes (`kube-aggregator` reverse proxy) |
+
+> **Custom Business Logic Clarification:** CRDs support validation and behavior through OpenAPI schemas, CEL rules, conversion webhooks, admission webhooks, and operators. However, CRDs do not give you an independently implemented API server with arbitrary request-handling logic.
+
+---
+
+# Does the Aggregation Layer Store Data in etcd?
+
+**No.** The Aggregation Layer itself is an in-process routing/proxy layer within `kube-apiserver`.
+
+The extension API server decides how its data is handled and stored:
+- **Metrics Server:** Stores resource metrics in-memory (ephemeral).
+- **Custom Adapters:** Query external databases like Prometheus, TimescaleDB, or Redis.
+- **Custom Extension Servers:** Can use PostgreSQL, MySQL, or their own etcd instances.
+
+---
+
+# Autoscaling Integration (HPA)
+
+### Resource Metrics API (`metrics.k8s.io`)
+Provided by **Metrics Server** for basic container CPU and memory metrics:
+
+```text
+Resource Metrics (metrics.k8s.io)
+  |
+  v
+ Metrics Server
+  |
+  v
+  CPU / Memory
+  |
+  v
+      HPA
+```
+
+### Custom & External Metrics APIs
+Provided by adapters like **Prometheus Adapter** or **KEDA** for application-level or cloud-provider metrics:
+
+```text
+Custom Metrics (custom.metrics.k8s.io)
+  |
+  v
+ Prometheus Adapter
+  |
+  v
+    Prometheus
+  |
+  v
+      HPA
+```
+
+---
+
+# End-to-End Execution Flow: `kubectl top pod`
+
+```text
+kubectl top pod
+  |
+  v
+kube-apiserver
+  |
+  v
+API Aggregation Layer (kube-aggregator)
+  |
+  v
+  APIService (v1beta1.metrics.k8s.io)
+  |
+  v
+Metrics Server
+      |
+      +──> kubelet (node 1)
+      +──> kubelet (node 2)
+      +──> kubelet (node 3)
+  |
+  v
+Metrics Server (In-Memory Aggregation)
+  |
+  v
+metrics.k8s.io API Response
+  |
+  v
+kube-apiserver
+  |
+  v
+kubectl (Formatted Output)
+```
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause | Resolution |
+| :--- | :--- | :--- |
+| `kubectl top` fails | Metrics Server down or APIService unhealthy | Check `kubectl get apiservice v1beta1.metrics.k8s.io` |
+| APIService status `False` | Extension API server unreachable or failing healthz | Inspect extension server Pod logs & service endpoints |
+| TLS handshake errors | Invalid `caBundle` in APIService spec | Verify CA cert or set `insecureSkipTLSVerify: true` (dev only) |
+| 503 Service Unavailable | Extension backend API server crashing | Check deployment status of extension API server |
+| Missing from `kubectl api-resources` | APIService registration failed or pending | Re-verify APIService manifest spec fields |
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the API Aggregation Layer?
+It is an in-process component inside `kube-apiserver` (implemented by `kube-aggregator`) that proxies API requests for registered external API groups to extension API servers.
+
+### Q2. Does `kube-aggregator` run as a separate Pod?
+No. `kube-aggregator` runs in-process inside the `kube-apiserver` binary.
+
+### Q3. How does `kubectl top pod` work end-to-end?
+`kubectl` requests `metrics.k8s.io` from `kube-apiserver`. `kube-aggregator` proxies the request to Metrics Server. Metrics Server queries node `kubelets` for CPU/memory data, aggregates the results in-memory, and returns the response through `kube-apiserver` to `kubectl`.
+
+### Q4. What are the key fields required in an `APIService` spec?
+`group`, `version`, `groupPriorityMinimum`, `versionPriority`, `service` (name, namespace, port), and `caBundle`.
+
+### Q5. What is the difference between CRDs and Aggregated APIs?
+CRDs add new resource types stored in `etcd` and served directly by `kube-apiserver`. Aggregated APIs connect an external API server with custom logic and storage, proxied by `kube-apiserver`.
+
+### Q6. Does the Aggregation Layer store data in etcd?
+No. The Aggregation Layer is strictly a routing proxy. Storage is handled independently by the extension API server.
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain why `kube-aggregator` runs in-process inside `kube-apiserver`.
+2. Trace the full path of a `kubectl top pod` request from client to kubelets.
+3. List the required fields in an `APIService` object.
+4. Contrast CRDs and Aggregated APIs across storage, serving, and logic capabilities.
+5. Explain how HPA consumes `metrics.k8s.io` vs `custom.metrics.k8s.io`.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — Aggregated APIs**
+
+In the next chapter, we will dive deep into specific Aggregated API implementations including Metrics Server, Prometheus Adapter, HPA, and KEDA autoscaling workflows.

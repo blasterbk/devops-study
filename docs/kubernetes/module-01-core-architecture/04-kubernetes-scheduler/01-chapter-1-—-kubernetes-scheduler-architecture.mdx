@@ -1,0 +1,1565 @@
+---
+title: "Chapter 1 — Kubernetes Scheduler Architecture"
+sidebar_position: 1
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand why Kubernetes needs a Scheduler, how it fits into the Kubernetes Control Plane, its internal architecture, major components, event loop,..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+> **Deep Learning Guide (University-Level + Interview-Oriented)**
+
+---
+
+## Why We Study This Module
+
+Module 1.3 taught you how etcd stores cluster state. Module 1.4 teaches you what happens when a new Pod appears in etcd with no `spec.nodeName` — how the Kubernetes Scheduler decides **which node that Pod should run on**.
+
+---
+
+## Learning Roadmap
+
+```text
+Module 1.4 — Kubernetes Scheduler Internals
+
+Chapter 1   Scheduler Architecture
+Chapter 2   Scheduling Framework
+Chapter 3   Scheduling Cycle
+Chapter 4   Binding Cycle
+Chapter 5   Scheduler Cache
+Chapter 6   Scheduling Queue
+Chapter 7   Filter Plugins
+Chapter 8   Score Plugins
+Chapter 9   Reserve Phase
+Chapter 10  Permit Phase
+Chapter 11  Bind Phase
+Chapter 12  Preemption
+Chapter 13  Scheduler Profiles
+Chapter 14  Custom Scheduler
+```
+
+---
+
+# Chapter 1 — Kubernetes Scheduler Architecture
+
+> **Goal:** Understand why Kubernetes needs a Scheduler, how it fits into the Kubernetes Control Plane, its internal architecture, major components, event loop, scheduling workflow, scheduler cache, scheduling queue, scheduling framework, and how production Kubernetes clusters use multiple scheduler instances for high availability.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why Kubernetes needs a Scheduler (nodeName problem)
+> 2. Scheduler position in the Control Plane
+> 3. Internal components: Cache, Queue, Framework
+> 4. The Scheduler event loop
+> 5. Scheduling workflow: Queue -> Filter -> Score -> Bind
+> 6. How the Scheduler uses Informers and Watches
+> 7. HA Scheduler deployment with leader election
+> 8. Complete scheduling lifecycle overview
+> ```
+
+---
+
+---
+
+# Real-Life Analogy
+
+Think of the Kubernetes Scheduler like an airport control tower.
+
+```text
+Airport Control Tower Analogy:
+
+Aircraft (Pods) request landing clearance (node assignment)
+Control tower (Scheduler) sees all runways (Nodes) in real-time
+Tower checks runway capacity, length, weather (Filter + Score)
+Tower assigns aircraft to the best runway (selects Node)
+Tower updates the flight manifest (writes spec.nodeName)
+Aircraft autonomously lands on assigned runway (kubelet starts Pod)
+```
+
+| Airport | Kubernetes Scheduler |
+| :--- | :--- |
+| Aircraft waiting to land | Unscheduled Pod in the Scheduling Queue |
+| Control tower | kube-scheduler |
+| Runway capacity and status | Node resources and conditions |
+| Checking runway suitability | Filter plugins |
+| Ranking the best runway | Score plugins |
+| Assigning runway to aircraft | Binding (writing `spec.nodeName`) |
+| Aircraft lands autonomously | kubelet starts the Pod |
+
+> **Important:** The Scheduler reads **all Node and Pod state from its local in-memory cache** (not from the API Server or etcd directly) during scheduling. This cache is kept up-to-date via Informers and Watch streams. This design makes scheduling extremely fast even in large clusters.
+
+---
+
+# Prerequisites
+
+Before studying this chapter, you should already understand:
+
+- Kubernetes API Server
+- etcd
+- Watches
+- Shared Informers
+- WorkQueues
+- Controllers
+- API Machinery
+
+This chapter builds directly on everything learned in the previous modules.
+
+---
+
+# Why Does Kubernetes Need a Scheduler?
+
+Imagine a Kubernetes cluster with:
+
+```text
+20 Worker Nodes
+
+v
+
+1000 CPU Cores
+
+v
+
+4 TB RAM
+
+v
+
+500 Pods Waiting
+```
+
+Question:
+
+> **Which Pod should run on which Node?**
+
+Someone must decide.
+
+That component is:
+
+```text
+kube-scheduler
+```
+
+---
+
+# Without a Scheduler
+
+Imagine Kubernetes without scheduling.
+
+User creates:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+```
+
+Where should it run?
+
+```text
+Node A?
+
+Node B?
+
+Node C?
+
+Node D?
+```
+
+Nobody knows.
+
+The Pod remains:
+
+```text
+Pending
+```
+
+Forever.
+
+---
+
+# Scheduler's Primary Responsibility
+
+The Scheduler answers one question:
+
+> **Which Node is the best Node for this Pod?**
+
+Not:
+
+```text
+Can this Pod run?
+```
+
+Not:
+
+```text
+How to start containers?
+```
+
+Not:
+
+```text
+How to pull images?
+```
+
+Only:
+
+```text
+Choose
+
+The Best
+
+Node
+```
+
+---
+
+# Responsibilities of kube-scheduler
+
+The Scheduler is responsible for:
+
+- Watching for unscheduled Pods
+- Finding candidate Nodes
+- Filtering unsuitable Nodes
+- Scoring suitable Nodes
+- Selecting the best Node
+- Binding the Pod
+
+It is **not** responsible for:
+
+- Creating containers
+- Pulling images
+- Starting Pods
+- Monitoring containers
+- Restarting applications
+
+Those responsibilities belong to the kubelet.
+
+---
+
+# High-Level Scheduling Flow
+
+```text
+User
+
+v
+
+kubectl apply pod.yaml
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Scheduler
+
+v
+
+Select Node
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+kubelet
+
+v
+
+Container Runtime
+
+v
+
+Running Pod
+```
+
+Notice:
+
+The Scheduler only participates in one small—but extremely important—part of the lifecycle.
+
+---
+
+# Scheduler Position in the Control Plane
+
+```text
+                  User
+
+                   |
+
+            kubectl apply
+
+                   |
+
+                   ▼
+
+              API Server
+
+                   |
+
+                   ▼
+
+                 etcd
+
+                   ▲
+
+                   |
+
+            kube-scheduler
+
+                   |
+
+         Watches Unscheduled Pods
+
+                   |
+
+          Selects Best Node
+
+                   |
+
+                   ▼
+
+             API Server (Bind)
+
+                   |
+
+                   ▼
+
+                Worker Node
+```
+
+---
+
+# What Triggers Scheduling?
+
+The Scheduler continuously watches the API Server.
+
+Specifically:
+
+```text
+Pods
+
+WITHOUT
+
+.spec.nodeName
+```
+
+These Pods are considered:
+
+```text
+Pending
+
+v
+
+Needs Scheduling
+```
+
+Example:
+
+```yaml
+spec:
+  nodeName: ""
+```
+
+or simply:
+
+```yaml
+spec:
+  containers:
+```
+
+No assigned node means the Pod enters the scheduling process.
+
+---
+
+# Scheduling is Event Driven
+
+The Scheduler does **not** poll every second.
+
+Instead:
+
+```text
+API Server
+
+v
+
+Watch
+
+v
+
+New Pod Event
+
+v
+
+Scheduler
+```
+
+This makes Kubernetes highly scalable.
+
+---
+
+# Example Event
+
+User creates:
+
+```bash
+kubectl apply -f nginx.yaml
+```
+
+API Server stores:
+
+```text
+Pod
+
+v
+
+etcd
+```
+
+Immediately:
+
+```text
+Watch Event
+
+v
+
+Scheduler
+```
+
+The Scheduler reacts almost instantly.
+
+---
+
+# Scheduler Architecture
+
+```text
+                   API Server
+
+                        |
+
+                  Watch Stream
+
+                        |
+
+                        ▼
+
+                 Shared Informer
+
+                        |
+
+                        ▼
+
+               Scheduling Queue
+
+                        |
+
+                        ▼
+
+              Scheduling Cycle
+
+                        |
+
+                        ▼
+
+             Scheduling Framework
+
+                        |
+
+        ┌───────────────┼────────────────┐
+
+        ▼               ▼                ▼
+
+     Filter         Score            Reserve
+
+        |               |                |
+
+        +--─────────────┼────────────────┘
+
+                        ▼
+
+                   Permit
+
+                        ▼
+
+                     Bind
+
+                        ▼
+
+                  API Server
+
+                        ▼
+
+                     etcd
+```
+
+---
+
+# Scheduler Components
+
+The Scheduler consists of multiple internal components.
+
+```text
+Scheduler
+
++-- Informers
++-- Scheduler Cache
++-- Scheduling Queue
++-- Scheduling Framework
++-- Plugins
++-- Extenders (legacy)
++-- Binder
++-- Event Handlers
+```
+
+Each component has a specialized responsibility.
+
+---
+
+# Component 1 — Informers
+
+Like Controllers,
+
+the Scheduler also uses:
+
+```text
+Shared Informers
+```
+
+It watches:
+
+- Pods
+- Nodes
+- PersistentVolumes
+- PersistentVolumeClaims
+- CSI Nodes
+- StorageClasses
+- Services (when required)
+- Custom scheduling resources
+
+These resources populate the Scheduler's local cache.
+
+---
+
+# Component 2 — Scheduler Cache
+
+The Scheduler maintains its own in-memory cache.
+
+It does **not** query the API Server for every scheduling decision.
+
+Instead:
+
+```text
+API Server
+
+v
+
+Watch
+
+v
+
+Scheduler Cache
+
+v
+
+Scheduling Decisions
+```
+
+The cache contains:
+
+- Node resources
+- Running Pods
+- Images
+- Allocatable resources
+- Requested resources
+- Topology information
+
+---
+
+# Why Cache Exists
+
+Imagine:
+
+```text
+100 Nodes
+
+v
+
+1000 Scheduling Decisions
+
+v
+
+API Request
+
+Per Node
+```
+
+Impossible.
+
+Instead:
+
+```text
+One Watch
+
+v
+
+Local Memory
+
+v
+
+Fast Scheduling
+```
+
+---
+
+# Component 3 — Scheduling Queue
+
+Every unscheduled Pod enters:
+
+```text
+Scheduling Queue
+```
+
+Example:
+
+```text
+Pod A
+
+Pod B
+
+Pod C
+
+Pod D
+```
+
+The Scheduler processes Pods one by one (while supporting parallel evaluation internally).
+
+---
+
+# Queue Example
+
+```text
+Head
+
+v
+
+Pod A
+
+v
+
+Pod B
+
+v
+
+Pod C
+
+v
+
+Pod D
+```
+
+The Scheduler pops:
+
+```text
+Pod A
+```
+
+Schedules it,
+
+then processes the next Pod.
+
+---
+
+# Component 4 — Scheduling Framework
+
+This is the heart of modern Kubernetes scheduling.
+
+Instead of hardcoding logic,
+
+Kubernetes uses a plugin framework.
+
+```text
+Scheduling Framework
+
+v
+
+Plugins
+
+v
+
+Decision
+```
+
+We'll study this in depth later.
+
+---
+
+# Component 5 — Binder
+
+After selecting the best Node,
+
+the Scheduler performs:
+
+```text
+Bind
+```
+
+Meaning:
+
+```text
+Pod
+
+v
+
+Node Assignment
+
+v
+
+API Server
+```
+
+The API Server stores:
+
+```yaml
+spec:
+  nodeName: worker-3
+```
+
+The kubelet on that node then starts the Pod.
+
+---
+
+# Scheduler Event Loop
+
+The Scheduler continuously executes an event loop.
+
+```text
+Loop
+
+v
+
+Wait for Pod
+
+v
+
+Get Next Pod
+
+v
+
+Find Node
+
+v
+
+Bind
+
+v
+
+Repeat
+```
+
+Forever.
+
+---
+
+# Internal Event Loop
+
+```text
+while true
+
+v
+
+Receive Pod
+
+v
+
+Scheduling Queue
+
+v
+
+Scheduling Cycle
+
+v
+
+Binding Cycle
+
+v
+
+Next Pod
+```
+
+The Scheduler never stops unless terminated.
+
+---
+
+# Complete Scheduling Workflow
+
+```text
+Pod Created
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+Shared Informer
+
+v
+
+Scheduling Queue
+
+v
+
+Scheduling Cycle
+
+v
+
+Candidate Nodes
+
+v
+
+Filter Plugins
+
+v
+
+Score Plugins
+
+v
+
+Best Node
+
+v
+
+Binding Cycle
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+kubelet
+
+v
+
+Container Runtime
+
+v
+
+Running Pod
+```
+
+This is the complete scheduling pipeline.
+
+---
+
+# Scheduling Cycle vs Binding Cycle
+
+Modern Scheduler divides work into two phases.
+
+```text
+Scheduling Cycle
+
+v
+
+Find Best Node
+```
+
+Then:
+
+```text
+Binding Cycle
+
+v
+
+Assign Pod
+```
+
+Separating these phases improves concurrency and extensibility.
+
+---
+
+# Scheduler Cache Overview
+
+The Scheduler Cache stores information about:
+
+```text
+Nodes
+
+v
+
+CPU
+
+Memory
+
+Pods
+
+Images
+
+Volumes
+
+Topology
+
+Reservations
+```
+
+Instead of querying the API Server,
+
+everything is read locally.
+
+---
+
+# Cache Update Flow
+
+```text
+API Server
+
+v
+
+Watch Event
+
+v
+
+Informer
+
+v
+
+Scheduler Cache
+
+v
+
+Scheduler Decision
+```
+
+The cache is continuously updated.
+
+---
+
+# Queue Overview
+
+There are actually multiple queues.
+
+Conceptually:
+
+```text
+Scheduling Queue
+
++-- Active Queue
++-- Backoff Queue
++-- Unschedulable Queue
+```
+
+We'll study each one in detail later.
+
+---
+
+# Active Queue
+
+Contains Pods ready for scheduling.
+
+```text
+Pod A
+
+v
+
+Pod B
+
+v
+
+Pod C
+```
+
+---
+
+# Backoff Queue
+
+Pods that recently failed scheduling.
+
+Instead of retrying immediately,
+
+they wait.
+
+---
+
+# Unschedulable Queue
+
+Pods with:
+
+```text
+No Suitable Node
+```
+
+remain here until the cluster changes.
+
+Example:
+
+```text
+New Node Added
+
+v
+
+Retry Scheduling
+```
+
+---
+
+# Scheduling Framework Overview
+
+Modern Kubernetes scheduling is plugin-based.
+
+Instead of:
+
+```text
+One Giant Algorithm
+```
+
+Scheduling consists of multiple extension points.
+
+```text
+Scheduling Framework
+
+v
+
+Plugins
+
+v
+
+Node Decision
+```
+
+---
+
+# Framework Pipeline
+
+```text
+Queue
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PostFilter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+PreBind
+
+v
+
+Bind
+
+v
+
+PostBind
+```
+
+Each stage has a specific purpose.
+
+Entire upcoming chapters will explain every stage.
+
+---
+
+# Why Plugin Architecture?
+
+Imagine adding:
+
+```text
+GPU Scheduling
+```
+
+Without plugins,
+
+Kubernetes source code would require major modification.
+
+With plugins:
+
+```text
+Custom Plugin
+
+v
+
+Framework
+
+v
+
+Done
+```
+
+Much easier.
+
+---
+
+# Example Scheduling Decision
+
+Suppose:
+
+Cluster:
+
+```text
+Node1
+
+2 CPU
+
+Node2
+
+8 CPU
+
+Node3
+
+16 CPU
+```
+
+Pod requests:
+
+```yaml
+resources:
+  requests:
+    cpu: "4"
+```
+
+Scheduler:
+
+```text
+Filter
+
+v
+
+Node1 Removed
+
+v
+
+Score
+
+v
+
+Node2 = 80
+
+v
+
+Node3 = 70
+
+v
+
+Choose Node2
+```
+
+---
+
+# Why Scheduling Isn't Random
+
+Many people think:
+
+```text
+Scheduler
+
+v
+
+Random Node
+```
+
+Wrong.
+
+Scheduling considers:
+
+- Resources
+- Affinity
+- Anti-affinity
+- Taints
+- Topology
+- Storage
+- Images
+- Policies
+- Priority
+- Custom plugins
+
+Thousands of decisions may contribute to a single placement.
+
+---
+
+# Production Architecture
+
+Highly available clusters usually deploy multiple Scheduler instances.
+
+```text
+                   API Server
+
+            ┌────────┼────────┐
+
+            ▼        ▼        ▼
+
+      Scheduler1 Scheduler2 Scheduler3
+
+            |        |        |
+
+            +--──────Leader Election──────┘
+
+                     |
+
+               Active Scheduler
+
+                     |
+
+               Scheduling Pods
+
+                     |
+
+                 Bind Requests
+```
+
+Only one Scheduler instance actively schedules Pods for a given leader-elected scheduler configuration.
+
+---
+
+# Multiple Scheduler Profiles
+
+A single Scheduler process can also expose multiple profiles.
+
+```text
+Scheduler
+
++-- default-scheduler
++-- gpu-scheduler
++-- ai-scheduler
++-- batch-scheduler
+```
+
+Pods select one using:
+
+```yaml
+spec:
+  schedulerName: gpu-scheduler
+```
+
+We'll explore this in later chapters.
+
+---
+
+# Relationship with Previous Modules
+
+```text
+User
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Watch
+
+v
+
+Scheduler Informer
+
+v
+
+Scheduler Cache
+
+v
+
+Scheduling Queue
+
+v
+
+Scheduling Framework
+
+v
+
+Bind
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+kubelet
+
+v
+
+Container Runtime
+```
+
+The Scheduler is another event-driven Kubernetes controller, but instead of reconciling resources, it makes placement decisions.
+
+---
+
+# Real Production Example
+
+Suppose an e-commerce platform experiences a flash sale.
+
+Within one minute:
+
+```text
+5,000 Pods
+
+Created
+```
+
+The Scheduler must:
+
+- Read cached cluster state
+- Process thousands of Pods
+- Filter hundreds of Nodes
+- Score candidates
+- Bind Pods quickly
+- Keep API Server load low
+
+This is why the Scheduler relies heavily on caches, queues, watches, and plugins.
+
+---
+
+# Production Best Practices
+
+✔ Run multiple Scheduler replicas for high availability.
+
+✔ Keep Scheduler close to the API Server to minimize latency.
+
+✔ Monitor scheduling latency.
+
+✔ Monitor queue depth.
+
+✔ Avoid excessive custom scheduling logic.
+
+✔ Keep Scheduler Cache synchronized through Informers.
+
+✔ Use Scheduler Profiles instead of maintaining separate scheduler binaries when possible.
+
+✔ Monitor failed scheduling events.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The Scheduler starts containers.
+
+Wrong.
+
+The kubelet starts containers after the Pod is bound.
+
+---
+
+### ❌ Misconception 2
+
+The Scheduler talks directly to etcd.
+
+Wrong.
+
+Like other control-plane components, it communicates through the API Server.
+
+---
+
+### ❌ Misconception 3
+
+The Scheduler continuously polls the API Server.
+
+Wrong.
+
+It uses Informers and Watches.
+
+---
+
+### ❌ Misconception 4
+
+Scheduling is random.
+
+Wrong.
+
+Scheduling is a multi-stage optimization process.
+
+---
+
+### ❌ Misconception 5
+
+Every Pod is immediately scheduled.
+
+Wrong.
+
+Pods may wait in queues, backoff, or remain unschedulable.
+
+---
+
+### ❌ Misconception 6
+
+Only one scheduling algorithm exists.
+
+Wrong.
+
+Modern Kubernetes uses a plugin-based Scheduling Framework with multiple extension points.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does Kubernetes need a Scheduler?
+
+Because Kubernetes must decide which Node should run each unscheduled Pod while satisfying resource constraints and scheduling policies.
+
+---
+
+### Q2. What triggers the Scheduler?
+
+A watch event for a Pod that does not yet have a `spec.nodeName`.
+
+---
+
+### Q3. Does the Scheduler communicate directly with etcd?
+
+No. It watches and updates resources through the API Server.
+
+---
+
+### Q4. Why does the Scheduler maintain a local cache?
+
+To avoid querying the API Server for every scheduling decision and to make scheduling fast and scalable.
+
+---
+
+### Q5. What is the Scheduling Queue?
+
+An internal queue that stores Pods waiting to be scheduled, along with retry mechanisms for failed scheduling attempts.
+
+---
+
+### Q6. What is the difference between the Scheduling Cycle and the Binding Cycle?
+
+The Scheduling Cycle selects the best Node. The Binding Cycle commits that decision by binding the Pod through the API Server.
+
+---
+
+### Q7. Why is the Scheduling Framework plugin-based?
+
+To allow Kubernetes and platform teams to extend scheduling behavior without rewriting the core scheduler.
+
+---
+
+### Q8. What happens after a Pod is bound?
+
+The API Server persists the binding, the kubelet on the selected node observes the assigned Pod, and the container runtime starts the containers.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pods remain `Pending` | No suitable Node, resource shortage, taints, affinity rules, or scheduling constraints |
+| Slow scheduling | Large scheduling queue, expensive plugins, stale cache, or overloaded Scheduler |
+| Scheduler not reacting to new Pods | Informer/watch issues, API Server connectivity, or Scheduler failure |
+| Frequent scheduling retries | Resource pressure, conflicting policies, or transient cluster state |
+| High scheduling latency | Large cluster, plugin overhead, or API Server performance issues |
+| Multiple Scheduler instances scheduling the same Pod | Leader election misconfiguration (rare in correctly configured clusters) |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does Kubernetes need a Scheduler?
+2. What is the Scheduler's primary responsibility?
+3. Where does the Scheduler fit in the Kubernetes control plane?
+4. What event triggers scheduling?
+5. Why does the Scheduler use Informers?
+6. Why does it maintain a Scheduler Cache?
+7. What is the purpose of the Scheduling Queue?
+8. What is the difference between the Scheduling Cycle and the Binding Cycle?
+9. Why is the Scheduling Framework plugin-based?
+10. Why does the Scheduler communicate through the API Server instead of directly with etcd?
+11. How does the Scheduler scale in production?
+12. What happens after a Pod is successfully bound?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned:
+
+- Why Kubernetes requires a dedicated Scheduler
+- How the Scheduler fits into the Kubernetes control plane
+- The major internal components of the Scheduler
+- How the event-driven Scheduler watches for unscheduled Pods
+- The complete scheduling workflow from Pod creation to binding
+- The purpose of the Scheduler Cache and Scheduling Queue
+- How the Scheduling Framework provides a modular plugin architecture
+- How highly available production clusters deploy multiple Scheduler instances with leader election
+
+This chapter provides the architectural foundation for everything that follows. In the next chapter, we'll open the Scheduler itself and study the **Scheduling Framework**—the plugin-based engine that powers every scheduling decision in modern Kubernetes.
+
+---
+
+# Next Chapter
+
+**Chapter 2 — Scheduling Framework**
+
+We'll dive deep into:
+
+- Why the Scheduling Framework was introduced
+- Framework Architecture
+- Extension Points
+- Plugin Types
+- Framework Handle
+- Scheduler Execution Pipeline
+- Plugin Registration
+- Execution Order
+- Built-in Plugins
+- Writing Custom Plugins
+- Production Design Considerations
+
+This chapter will explain how Kubernetes transformed its scheduler from a monolithic algorithm into one of the most extensible scheduling systems used in modern distributed platforms.
+```

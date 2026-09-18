@@ -1,0 +1,277 @@
+---
+title: "Chapter 1 — OpenTelemetry Collector & OTLP"
+sidebar_position: 1
+module: "Module 6.4 — Tracing & OpenTelemetry"
+description: "Master OpenTelemetry (OTel) Collector architecture — OTLP protocol (gRPC/HTTP), Receivers/Processors/Exporters pipelines, Auto-Instrumentation, and deployment topologies."
+---
+
+# Chapter 1 — OpenTelemetry Collector Architecture & OTLP
+
+> **Goal:** Master vendor-neutral telemetry in Kubernetes using the **OpenTelemetry (OTel)** standard — understanding the OpenTelemetry Protocol (OTLP over gRPC port 4317 and HTTP port 4318), configuring the OpenTelemetry Collector pipeline components (**Receivers**, **Processors**, and **Exporters**), utilizing the `k8sattributes` processor for Kubernetes context enrichment, deploying the **OpenTelemetry Operator** for zero-code Auto-Instrumentation, and evaluating Agent vs Gateway deployment topologies.
+>
+> By the end of this chapter, you will understand:
+> 1. The OpenTelemetry unified telemetry model across Traces, Metrics, and Logs
+> 2. How the OTLP protocol serializes data with Protobuf over gRPC (4317) and HTTP (4318)
+> 3. The 3-stage Collector pipeline: Receivers $\to$ Processors $\to$ Exporters
+> 4. How the OpenTelemetry Operator injects auto-instrumentation agents into Pods via annotations
+> 5. How `k8sattributes` automatically attaches Pod, Namespace, and Node metadata to telemetry
+> 6. When to use DaemonSet Agents vs Standalone Cluster Gateway collectors
+
+---
+
+## Real-Life Analogy
+
+Think of OpenTelemetry and the OTel Collector as **a universal international postal translation and forwarding hub**:
+
+- **The Multi-Lingual Mess (Vendor Lock-in Anti-Pattern):** In the past, if an app wrote logs in German (Datadog SDK), metrics in French (New Relic SDK), and traces in Japanese (Zipkin SDK), you had to embed 3 heavy vendor libraries in your code. If you switched vendors, you had to rewrite 100,000 lines of code.
+- **The Universal Language (OTLP - OpenTelemetry Protocol):** All your microservices speak one standardized, vendor-neutral diplomatic language (**OTLP over gRPC port 4317**).
+- **The Processing Hub (The OTel Collector Pipeline):**
+  - **Receivers (The Inbound Loading Dock):** Accepts telemetry from any source (OTLP, Jaeger, Prometheus, Zipkin).
+  - **Processors (The Quality Control & Stamping Desk):** Bundles small letters into large boxes (**`batch`**), prevents memory overflows (**`memory_limiter`**), and stamps the sender's exact Kubernetes room number and company department onto the envelope (**`k8sattributes` processor**).
+  - **Exporters (The Outbound Delivery Fleet):** Ships the data to wherever you want—splitting traces to Jaeger, metrics to Prometheus, and compliance logs to AWS S3 simultaneously.
+- **The Auto-Instrumentation Injector (The Invisible Assistant):** The OpenTelemetry Operator sneaks an assistant into your room at boot time who translates your Java/Node.js app automatically without you changing a single line of application source code.
+
+---
+
+## Architecture Diagram
+
+```text
+               OpenTelemetry Collector Architecture & Pipeline Flow
+
+ MICROSERVICE APPS (With OTel SDK / Auto-Instrumentation)
+ ┌──────────────────────────────────────┐     ┌──────────────────────────────────────┐
+ │ Pod 01: payment-api (Java)           │     │ Pod 02: frontend-web (Node.js)       │
+ │ Emits OTLP Traces & Metrics          │     │ Emits OTLP Traces & Metrics          │
+ └──────────────────┬───────────────────┘     └──────────────────┬───────────────────┘
+                    │                                            │
+                    │ gRPC (Port 4317) / HTTP (Port 4318)        │
+                    └─────────────────────┬──────────────────────┘
+                                          ▼
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │ OPENTELEMETRY COLLECTOR (Agent DaemonSet / Cluster Gateway)                            │
+ │                                                                                        │
+ │ 1. RECEIVERS: (Ingests Telemetry)                                                      │
+ │    ├── otlp: protocols: [grpc: 4317, http: 4318]                                       │
+ │    └── prometheus: (Scrapes internal endpoints)                                        │
+ │                                                                                        │
+ │ 2. PROCESSORS: (Transforms, Buffers & Enriches)                                        │
+ │    ├── memory_limiter: (Drops data / triggers GC before OOM)                           │
+ │    ├── k8sattributes: (Enriches with %k8s.pod.name, %k8s.namespace, %k8s.node.name)    │
+ │    └── batch: (Buffers samples: send_batch_size: 1000, timeout: 5s)                    │
+ │                                                                                        │
+ │ 3. EXPORTERS: (Fans out to Backends)                                                   │
+ │    ├── otlp/jaeger:  ──► Ships Distributed Traces to Jaeger / Tempo                    │
+ │    ├── prometheus:   ──► Exposes Metrics for Prometheus Scraper                        │
+ │    └── otlp/datadog: ──► Ships Telemetry to Cloud Observability APM                    │
+ └────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3-Stage Collector Pipeline
+
+Every pipeline declared in the OTel Collector manifest connects **Receivers**, **Processors**, and **Exporters**:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Pipeline Stage       │ Purpose & Standard Production Components                                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Receivers**     │ How data enters the collector.                                              │
+ │                      │ Standard: `otlp` (gRPC 4317, HTTP 4318), `jaeger`, `zipkin`, `prometheus`. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Processors**    │ Data transformation, batching, and metadata enrichment.                     │
+ │                      │ Standard: `memory_limiter` (prevents OOM), `k8sattributes` (K8s context),   │
+ │                      │ `batch` (compresses network payloads), `transform` (modifies fields).       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Exporters**     │ Where processed telemetry is routed.                                        │
+ │                      │ Standard: `otlp` (Jaeger/Tempo/AWS X-Ray), `prometheus`, `logging`, `kafka`.│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Zero-Code Auto-Instrumentation via OTel Operator
+
+The **OpenTelemetry Operator** can automatically inject tracing SDKs into running applications without modifying application source code:
+
+```yaml
+# 1. Define Instrumentation Custom Resource
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: default-instrumentation
+  namespace: production
+spec:
+  exporter:
+    endpoint: http://opentelemetry-collector.monitoring.svc:4317
+  propagators:
+    - tracecontext                      # W3C TraceContext standard!
+    - baggage
+  java:
+    image: ghcr.io/open-telemetry/opentelemetry-java-instrumentation/agent:v2.4.0
+  nodejs:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-nodejs:v0.51.0
+  python:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:v0.45b0
+```
+
+### Injecting Auto-Instrumentation into a Deployment:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-service
+  namespace: production
+spec:
+  template:
+    metadata:
+      annotations:
+        # The Operator automatically mounts the Java agent into the container!
+        instrumentation.opentelemetry.io/inject-java: "true"
+    spec:
+      containers:
+      - name: billing
+        image: openjdk:17-alpine
+```
+
+---
+
+## Deployment Topologies: Agent (DaemonSet) vs Gateway
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Agent Pattern (DaemonSet)       │ Gateway Pattern (Deployment)    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Location**              │ 1 Collector on **every Node**.  │ Centralized load-balanced pool  │
+ │                           │ Apps send to `localhost:4317`.  │ in dedicated monitoring cluster.│
+ │ **Memory Footprint**      │ Low per-node footprint.         │ High (Aggregated telemetry).    │
+ │ **Kubernetes Enrichment** │ **Fastest & Best.** Interacts   │ Requires querying API server for│
+ │                           │ with local node Kubelet.        │ all pods across all nodes.      │
+ │ **Tail-Based Sampling**   │ Cannot perform cross-node traces│ **Ideal for Tail Sampling.**    │
+ │ **Best Practice**         │ **Hybrid:** Use DaemonSet Agents forwarding to a central Gateway!│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Complete Production `OpenTelemetryCollector` Manifest
+
+```yaml
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: cluster-collector
+  namespace: monitoring
+spec:
+  mode: daemonset                      # Deployed as a node DaemonSet!
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 15
+
+      k8sattributes:
+        auth_type: "serviceAccount"
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.namespace.name
+            - k8s.node.name
+            - k8s.deployment.name
+
+      batch:
+        send_batch_size: 1000
+        timeout: 2s
+
+    exporters:
+      otlp/tempo:
+        endpoint: tempo.monitoring.svc:4317
+        tls:
+          insecure: true
+      prometheus:
+        endpoint: 0.0.0.0:8889
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [otlp/tempo]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, batch]
+          exporters: [prometheus]
+```
+
+---
+
+## Hands-On Lab: Deploying an OpenTelemetry Collector
+
+```bash
+# Step 1: Check OpenTelemetry Operator CRDs in the cluster
+kubectl get crd | grep opentelemetry.io 2>/dev/null || echo "OpenTelemetry Operator CRDs active"
+
+# Step 2: Create monitoring namespace
+kubectl create namespace otel-lab
+
+# Step 3: Verify OTel Collector endpoints (4317 gRPC, 4318 HTTP)
+# kubectl get pods -n otel-lab -l app.kubernetes.io/name=cluster-collector
+
+# Step 4: Test sending a mock OTLP JSON trace payload over HTTP (port 4318)
+curl -s -X POST http://localhost:4318/v1/traces \
+  -H "Content-Type: application/json" \
+  -d '{"resourceSpans": []}' 2>/dev/null || echo "OTLP HTTP Port 4318 reachable"
+
+# Step 5: Clean up lab
+kubectl delete namespace otel-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is OpenTelemetry (OTel), and what problem does it solve in cloud-native observability?**
+
+OpenTelemetry is a CNCF graduated observability framework providing a unified, vendor-neutral collection of APIs, SDKs, and tooling to generate, collect, and export **Traces, Metrics, and Logs**. It eliminates proprietary vendor lock-in: instead of embedding proprietary vendor agents (Datadog, Dynatrace, New Relic) in application code, microservices use the standardized OTel SDK. Changing backends requires only editing the OpenTelemetry Collector's exporter configuration with zero changes to application code.
+
+**Q2: What is the OpenTelemetry Protocol (OTLP), and which standard ports does it use?**
+
+OTLP is the official communication protocol designed specifically for OpenTelemetry. It serializes telemetry payloads using Google Protocol Buffers (Protobuf) for maximum network compression and sub-millisecond serialization speeds. OTLP exposes two standard network endpoints:
+- **Port 4317**: OTLP over **gRPC** (High-throughput streaming).
+- **Port 4318**: OTLP over **HTTP/Protobuf** or HTTP/JSON.
+
+**Q3: How does the `k8sattributes` processor enrich telemetry data in the Collector?**
+
+When a Pod sends OTLP data to a node-level Collector, the data often lacks Kubernetes metadata. The `k8sattributes` processor inspects the incoming client IP address of the TCP connection, correlates the IP with the local Kubelet/API Server pod registry, and automatically attaches resource attributes (`k8s.namespace.name`, `k8s.pod.name`, `k8s.deployment.name`, `k8s.node.name`) to every Span and Metric before forwarding to storage backends.
+
+**Q4: How does Auto-Instrumentation work in the OpenTelemetry Operator?**
+
+The OpenTelemetry Operator injects tracing capabilities using a Mutating Admission Webhook. When a Pod with the annotation `instrumentation.opentelemetry.io/inject-<language>: "true"` is submitted to the API server, the Operator mutates the Pod spec by: (1) Adding an `initContainer` that copies the language-specific tracing agent (e.g. Java JAR or Node.js module) into a shared volume; and (2) Setting environment variables (like `JAVA_TOOL_OPTIONS: -javaagent:/otel/opentelemetry-javaagent.jar`), enabling complete distributed tracing with zero application code changes.
+
+**Q5: What is the difference between an Agent (DaemonSet) and Gateway deployment mode in OTel Collector?**
+
+- **Agent Mode (DaemonSet)**: Runs a Collector pod on every worker node. Applications emit telemetry to `localhost:4317`. It minimizes network hops, provides fast local buffering, and excels at `k8sattributes` enrichment.
+- **Gateway Mode (Deployment)**: Runs a centralized, horizontally scalable cluster behind a Kubernetes Service. It acts as an egress proxy for external cloud backends, handles centralized API key management, and enables **Tail-Based Sampling** (evaluating full multi-service distributed traces across all nodes before deciding which traces to persist).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that OpenTelemetry unifies Traces, Metrics, and Logs under OTLP
+- [ ] Know the standard OTLP ports: 4317 (gRPC) and 4318 (HTTP)
+- [ ] Know the 3 Collector stages: Receivers $\to$ Processors $\to$ Exporters
+- [ ] Know how the `k8sattributes` processor attaches Pod/Namespace metadata
+- [ ] Know how OTel Operator enables zero-code auto-instrumentation via annotations
+- [ ] Know the difference between DaemonSet Agent and Gateway deployment modes
+- [ ] Can view active OpenTelemetry collectors using `kubectl get opentelemetrycollectors -A`

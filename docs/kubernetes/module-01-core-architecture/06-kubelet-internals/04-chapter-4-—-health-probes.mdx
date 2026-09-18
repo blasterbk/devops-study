@@ -1,0 +1,1554 @@
+---
+title: "Chapter 4 — Health Probes"
+sidebar_position: 4
+module: "Module 1.6 — kubelet Internals"
+description: "> **Goal:** Understand how the kubelet continuously monitors application health using **Readiness**, **Liveness**, and **Startup Probes**. Learn how probe execu..."
+---
+
+# Module 1.6 — kubelet Internals
+
+# Chapter 4 — Health Probes
+
+> **Goal:** Understand how the kubelet continuously monitors application health using **Readiness**, **Liveness**, and **Startup Probes**. Learn how probe execution works internally, how different probe types are implemented, how probe results influence Kubernetes behavior, and how to design production-grade health checks.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. The three probe types: Liveness, Readiness, Startup
+> 2. Probe mechanisms: HTTP GET, TCP Socket, Exec, gRPC
+> 3. Probe parameters: initialDelaySeconds, periodSeconds, failureThreshold
+> 4. How kubelet executes probes: ProbeManager goroutines per container
+> 5. Readiness probe failure: Pod removed from Service Endpoints (not restarted)
+> 6. Liveness probe failure: container restarted (Pod stays on same Node)
+> 7. Startup probe: blocks Liveness/Readiness until app finishes initializing
+> 8. Common misconfiguration patterns and production best practices
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Health Probes like an aircraft pre-flight and in-flight monitoring system.
+
+```text
+Aircraft Monitoring Analogy:
+
+Ground crew checks aircraft before takeoff (Startup Probe: is app ready to start?)
+Control tower checks if aircraft is ready to receive passengers (Readiness Probe)
+Flight monitoring checks if aircraft is still flying normally (Liveness Probe)
+If readiness check fails: no new passengers board (removed from Service endpoints)
+If liveness check fails: pilot ejects and new aircraft is deployed (container restart)
+Startup check must pass before control tower or monitoring take over
+```
+
+| Aircraft Monitoring | Health Probes |
+| :--- | :--- |
+| Ground crew pre-flight check | Startup Probe |
+| Ready to board passengers check | Readiness Probe |
+| In-flight monitoring | Liveness Probe |
+| Passengers not boarding (no new traffic) | Readiness failure: removed from Endpoints |
+| Pilot ejects, new aircraft deployed | Liveness failure: container restarted |
+| Startup must pass before others begin | Startup probe blocks Liveness + Readiness |
+
+> **Important:** A **Liveness probe failure restarts the container, not the Pod**. The Pod object stays on the same Node with the same IP. Only the container process is killed and restarted by the container runtime. This is why `kubectl get pods` may show a Pod as `Running` with `RESTARTS: 3` — the Pod is alive but its container has restarted three times.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- kubelet Architecture
+- Pod Lifecycle
+- Pod Sync Loop
+- Services
+- EndpointSlices
+- Container Lifecycle
+
+---
+
+# Why Health Probes Exist
+
+Running does **not** mean healthy.
+
+Consider this application:
+
+```text
+Container Started
+  |
+  v
+Application Deadlocked
+  |
+  v
+Process Still Running
+```
+
+From Linux's perspective:
+
+```text
+Process Exists
+
+✓ Running
+```
+
+From the user's perspective:
+
+```text
+Website
+  |
+  v
+Timeout
+  |
+  v
+Unavailable
+```
+
+The kubelet needs a way to determine whether an application is actually usable.
+
+Health Probes solve this problem.
+
+---
+
+# The Problem Without Health Probes
+
+```text
+Container Running
+  |
+  v
+Application Hung
+  |
+  v
+Service Sends Traffic
+  |
+  v
+Every Request Fails
+```
+
+Without probes, Kubernetes assumes:
+
+```text
+Running Process
+
+=
+
+Healthy Application
+```
+
+This assumption is incorrect.
+
+---
+
+# What Are Health Probes?
+
+A **Health Probe** is a check executed by the kubelet against a container.
+
+Its purpose is to answer one of three questions:
+
+```text
+Can I Send Traffic?
+  |
+  v
+Readiness
+
+────────────
+
+Should I Restart It?
+  |
+  v
+Liveness
+
+────────────
+
+Has Startup Finished?
+  |
+  v
+Startup
+```
+
+Each probe has a different responsibility.
+
+---
+
+# Probe Architecture
+
+```text
+                kubelet
+
+                   |
+
+          Probe Manager
+
+                   |
+
+        Probe Worker Thread
+
+                   |
+
+         Execute Probe
+
+                   |
+
+           Container
+
+                   |
+
+        Success / Failure
+
+                   |
+
+            Update State
+```
+
+The kubelet performs every probe locally.
+
+No control plane component executes health probes.
+
+---
+
+# Three Probe Types
+
+```text
+Readiness
+  |
+  v
+Traffic Control
+
+──────────────────
+
+Liveness
+  |
+  v
+Container Restart
+
+──────────────────
+
+Startup
+  |
+  v
+Startup Protection
+```
+
+Never confuse their responsibilities.
+
+---
+
+# Readiness Probe
+
+The Readiness Probe answers:
+
+```text
+Can This Pod
+
+Receive Traffic?
+```
+
+---
+
+# Why Readiness Exists
+
+Suppose a web server starts:
+
+```text
+Container Running
+  |
+  v
+Loading Cache
+  |
+  v
+Connecting Database
+  |
+  v
+Ready In 30 Seconds
+```
+
+Without Readiness:
+
+```text
+Service
+  |
+  v
+Traffic Sent Immediately
+  |
+  v
+Errors
+```
+
+---
+
+# Readiness Workflow
+
+```text
+Container Running
+  |
+  v
+Readiness Probe
+  |
+  v
+Success?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Ready=True
+  |
+  v
+Service Adds Endpoint
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Ready=False
+  |
+  v
+No Traffic
+```
+
+---
+
+# Important Behavior
+
+If Readiness fails:
+
+```text
+Container
+
+Keeps Running
+```
+
+Only:
+
+```text
+Service
+  |
+  v
+Stops Sending Traffic
+```
+
+The kubelet **does not restart** the container.
+
+---
+
+# Real Example
+
+```text
+Database Restarting
+  |
+  v
+Application Cannot Connect
+  |
+  v
+Readiness Fails
+  |
+  v
+Traffic Removed
+  |
+  v
+Database Ready
+  |
+  v
+Readiness Passes
+  |
+  v
+Traffic Restored
+```
+
+No restart occurred.
+
+---
+
+# Liveness Probe
+
+The Liveness Probe answers:
+
+```text
+Should This
+
+Container
+
+Be Restarted?
+```
+
+---
+
+# Why Liveness Exists
+
+Suppose:
+
+```text
+Infinite Loop
+  |
+  v
+Deadlock
+  |
+  v
+Memory Corruption
+  |
+  v
+Application Stops Responding
+```
+
+The process still exists.
+
+Without Liveness:
+
+```text
+Application
+  |
+  v
+Broken Forever
+```
+
+---
+
+# Liveness Workflow
+
+```text
+Container Running
+  |
+  v
+Liveness Probe
+  |
+  v
+Healthy?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Continue
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Restart Container
+```
+
+The kubelet performs the restart according to the Pod's restart policy.
+
+---
+
+# Important Behavior
+
+Liveness failure causes:
+
+```text
+Container Restart
+```
+
+It does **not** directly affect Service endpoints.
+
+The temporary removal from Service endpoints usually occurs because the restarted container is not Ready until the Readiness Probe succeeds again.
+
+---
+
+# Startup Probe
+
+The Startup Probe answers:
+
+```text
+Has Startup
+
+Completed?
+```
+
+---
+
+# Why Startup Exists
+
+Some applications require:
+
+```text
+Java
+
+Spring Boot
+  |
+  v
+90 Seconds Startup
+```
+
+Without Startup Probe:
+
+```text
+Liveness Starts
+  |
+  v
+Startup Not Finished
+  |
+  v
+Probe Failure
+  |
+  v
+Restart
+  |
+  v
+Infinite Loop
+```
+
+---
+
+# Startup Workflow
+
+```text
+Container Starts
+  |
+  v
+Startup Probe
+  |
+  v
+Succeeded?
+
+|
+
++-- No
+
+|
+
+▼
+
+Continue Waiting
+
+|
+
++-- Yes
+
+     |
+
+     ▼
+
+Enable
+
+Readiness
+
++
+
+Liveness
+```
+
+---
+
+# Critical Concept
+
+While the Startup Probe is active:
+
+```text
+Readiness
+
+Ignored
+
+────────────
+
+Liveness
+
+Ignored
+```
+
+Only after Startup succeeds do the other probes begin running.
+
+---
+
+# Probe Comparison
+
+| Probe | Main Purpose | Failure Result |
+|---------|--------------|----------------|
+| Readiness | Control traffic | Remove Pod from Service endpoints |
+| Liveness | Detect broken containers | Restart the container |
+| Startup | Protect slow startup | Delay Readiness and Liveness until startup completes |
+
+---
+
+# Probe Types
+
+Kubernetes supports four probe mechanisms.
+
+---
+
+# HTTP Probe
+
+The kubelet performs:
+
+```text
+HTTP GET
+  |
+  v
+Container
+  |
+  v
+HTTP Response
+```
+
+Example:
+
+```text
+GET /health
+  |
+  v
+HTTP 200
+  |
+  v
+Success
+```
+
+---
+
+# HTTP Workflow
+
+```text
+kubelet
+  |
+  v
+HTTP GET
+  |
+  v
+Application
+  |
+  v
+200?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Healthy
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Failure
+```
+
+---
+
+# TCP Probe
+
+The kubelet attempts:
+
+```text
+TCP Connect
+  |
+  v
+Port Open?
+```
+
+It verifies only:
+
+```text
+Connection
+
+Succeeded?
+```
+
+It does **not** verify application correctness.
+
+---
+
+# TCP Workflow
+
+```text
+TCP Connect
+  |
+  v
+Success?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Healthy
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Failure
+```
+
+---
+
+# Exec Probe
+
+The kubelet executes a command inside the container.
+
+Example:
+
+```text
+cat
+
+/tmp/healthy
+```
+
+Exit status:
+
+```text
+0
+  |
+  v
+Success
+
+────────────
+
+Non-Zero
+  |
+  v
+Failure
+```
+
+---
+
+# Exec Workflow
+
+```text
+Run Command
+  |
+  v
+Exit Code?
+
+|
+
++-- 0
+
+|
+
+▼
+
+Healthy
+
+|
+
++-- Non-Zero
+
+     |
+
+     ▼
+
+Failure
+```
+
+---
+
+# gRPC Probe
+
+Modern Kubernetes also supports:
+
+```text
+gRPC Health Protocol
+```
+
+Workflow:
+
+```text
+kubelet
+  |
+  v
+gRPC Health Check
+  |
+  v
+Application
+  |
+  v
+SERVING?
+  |
+  v
+Healthy
+```
+
+This is commonly used by gRPC-native applications.
+
+---
+
+# Probe Execution Flow
+
+Internally,
+
+the kubelet continuously executes probes.
+
+```text
+Probe Worker
+  |
+  v
+Execute Probe
+  |
+  v
+Success?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Reset Failure Counter
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Increment Failure Counter
+  |
+  v
+Threshold Reached?
+
+|
+
++-- No
+
+|
+
+▼
+
+Retry Later
+
+|
+
++-- Yes
+
+     |
+
+     ▼
+
+Take Action
+```
+
+---
+
+# Probe Timing Parameters
+
+Each probe can be configured with timing controls.
+
+Common parameters include:
+
+```text
+initialDelaySeconds
+
+periodSeconds
+
+timeoutSeconds
+
+successThreshold
+
+failureThreshold
+```
+
+These determine:
+
+- When probing begins
+- How often probes run
+- How long kubelet waits for a response
+- How many consecutive successes or failures are required before changing state
+
+---
+
+# Probe State Machine
+
+```text
+Start
+  |
+  v
+Run Probe
+  |
+  v
+Success?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Healthy
+  |
+  v
+Wait
+  |
+  v
+Run Again
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Failure Counter
+  |
+  v
+Threshold?
+
+|
+
++-- No
+
+|
+
+▼
+
+Retry
+
+|
+
++-- Yes
+
+     |
+
+     ▼
+
+Restart
+
+or
+
+Not Ready
+```
+
+The final action depends on the probe type.
+
+---
+
+# Readiness Timeline
+
+```text
+Container Starts
+  |
+  v
+Readiness Fails
+  |
+  v
+No Traffic
+  |
+  v
+Application Ready
+  |
+  v
+Readiness Passes
+  |
+  v
+Traffic Begins
+```
+
+---
+
+# Liveness Timeline
+
+```text
+Application Hangs
+  |
+  v
+Probe Fails
+  |
+  v
+Failure Threshold
+  |
+  v
+Restart
+  |
+  v
+Application Healthy
+```
+
+---
+
+# Startup Timeline
+
+```text
+Application Starts
+  |
+  v
+Startup Probe Running
+  |
+  v
+Startup In Progress
+  |
+  v
+Startup Success
+  |
+  v
+Readiness Enabled
+  |
+  v
+Liveness Enabled
+```
+
+---
+
+# Interaction with Services
+
+Readiness directly influences Service routing.
+
+```text
+Readiness=True
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+Service Routes Traffic
+```
+
+If Readiness becomes False:
+
+```text
+Endpoint Removed
+  |
+  v
+Traffic Stops
+```
+
+The container continues running.
+
+---
+
+# Relationship with EndpointSlices
+
+```text
+Readiness Changes
+  |
+  v
+kubelet Updates Pod Status
+  |
+  v
+EndpointSlice Controller
+  |
+  v
+Update EndpointSlice
+  |
+  v
+Traffic Routing Changes
+```
+
+The kubelet does **not** update EndpointSlices directly.
+
+It updates Pod status, and the control plane reconciles EndpointSlices.
+
+---
+
+# Relationship with Restart Policy
+
+Suppose:
+
+```text
+Liveness Failure
+```
+
+The kubelet decides:
+
+```text
+Restart Container
+```
+
+The actual restart behavior follows the Pod's `restartPolicy`.
+
+For normal application Pods (such as those created by Deployments), this is typically `Always`.
+
+---
+
+# Complete Internal Workflow
+
+```text
+Container Running
+  |
+  v
+Probe Manager
+  |
+  v
+Probe Worker
+  |
+  v
+HTTP / TCP / Exec / gRPC
+  |
+  v
+Success?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Update Ready
+  |
+  v
+Continue
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Failure Threshold
+  |
+  v
+Readiness?
+  |
+  v
+Remove Endpoint
+
+────────────
+
+Liveness?
+  |
+  v
+Restart Container
+
+────────────
+
+Startup?
+  |
+  v
+Continue Waiting
+```
+
+---
+
+# Common Misconfigurations
+
+---
+
+## Misconfiguration 1
+
+Using the same endpoint for:
+
+```text
+Readiness
+
++
+
+Liveness
+```
+
+Problem:
+
+A temporary dependency failure may unnecessarily restart the application.
+
+Better approach:
+
+```text
+Readiness
+  |
+  v
+Dependency Checks
+
+────────────
+
+Liveness
+  |
+  v
+Internal Process Health
+```
+
+---
+
+## Misconfiguration 2
+
+Aggressive Timeouts
+
+Example:
+
+```text
+timeoutSeconds=1
+```
+
+Slow networks or temporary CPU spikes may cause false failures.
+
+---
+
+## Misconfiguration 3
+
+No Startup Probe
+
+Large applications:
+
+```text
+Java
+
+.NET
+
+ML Models
+```
+
+often require Startup Probes to avoid premature Liveness failures.
+
+---
+
+## Misconfiguration 4
+
+Expensive Exec Probes
+
+Example:
+
+```text
+Run Database Query
+
+Every Second
+```
+
+This increases CPU usage and may become a bottleneck.
+
+Prefer lightweight checks.
+
+---
+
+## Misconfiguration 5
+
+Checking External Dependencies in Liveness
+
+Example:
+
+```text
+Database Down
+  |
+  v
+Liveness Fails
+  |
+  v
+Restart
+  |
+  v
+Database Still Down
+  |
+  v
+Restart Again
+```
+
+The restart does not solve the problem.
+
+Dependency availability is usually more appropriate for Readiness.
+
+---
+
+# Production Best Practices
+
+✔ Keep probe endpoints lightweight.
+
+✔ Use Readiness to protect users from partially initialized applications.
+
+✔ Use Liveness only for unrecoverable application failures.
+
+✔ Use Startup Probes for slow-starting workloads.
+
+✔ Avoid expensive Exec Probes whenever possible.
+
+✔ Choose reasonable timeout and failure thresholds based on application behavior.
+
+✔ Monitor probe failures as part of application observability.
+
+✔ Test probe behavior during deployments and failure scenarios.
+
+---
+
+# Production Example 1
+
+Web API Startup
+
+```text
+Container Starts
+  |
+  v
+Startup Probe
+  |
+  v
+Load Configuration
+  |
+  v
+Connect Database
+  |
+  v
+Startup Success
+  |
+  v
+Readiness
+  |
+  v
+Traffic Begins
+```
+
+---
+
+# Production Example 2
+
+Database Maintenance
+
+```text
+Database Restart
+  |
+  v
+Readiness Fails
+  |
+  v
+Traffic Stops
+  |
+  v
+Database Available
+  |
+  v
+Readiness Passes
+  |
+  v
+Traffic Returns
+```
+
+---
+
+# Production Example 3
+
+Application Deadlock
+
+```text
+Application Hung
+  |
+  v
+Liveness Failure
+  |
+  v
+Restart
+  |
+  v
+Healthy Again
+```
+
+---
+
+# Production Example 4
+
+gRPC Service
+
+```text
+kubelet
+  |
+  v
+gRPC Health Check
+  |
+  v
+SERVING
+  |
+  v
+Healthy
+```
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Readiness failures restart containers.
+
+**Correct:** Readiness only controls whether traffic is sent to the Pod.
+
+---
+
+### ❌ Misconception 2
+
+Liveness determines traffic routing.
+
+**Correct:** Liveness determines whether the kubelet should restart the container.
+
+---
+
+### ❌ Misconception 3
+
+Startup Probes replace Liveness Probes.
+
+**Correct:** Startup Probes delay the start of Liveness and Readiness checks until initialization is complete.
+
+---
+
+### ❌ Misconception 4
+
+TCP probes verify application correctness.
+
+**Correct:** TCP probes only verify that a TCP connection can be established.
+
+---
+
+### ❌ Misconception 5
+
+The API Server executes health probes.
+
+**Correct:** The kubelet executes all health probes locally on the Node.
+
+---
+
+### ❌ Misconception 6
+
+Readiness directly updates Service objects.
+
+**Correct:** kubelet updates Pod Status, and Kubernetes controllers update EndpointSlices, which Services use for traffic routing.
+
+---
+
+### ❌ Misconception 7
+
+Every failed probe immediately triggers an action.
+
+**Correct:** Actions occur only after the configured failure threshold is reached.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the difference between Readiness and Liveness Probes?
+
+Readiness determines whether a Pod should receive traffic, while Liveness determines whether a container should be restarted.
+
+---
+
+### Q2. Why are Startup Probes needed?
+
+They prevent slow-starting applications from being restarted by Liveness Probes before initialization is complete.
+
+---
+
+### Q3. Who executes health probes?
+
+The kubelet.
+
+---
+
+### Q4. Which probe types are supported?
+
+HTTP, TCP, Exec, and gRPC.
+
+---
+
+### Q5. What happens when a Readiness Probe fails?
+
+The Pod is removed from Service endpoints but continues running.
+
+---
+
+### Q6. What happens when a Liveness Probe fails?
+
+The kubelet restarts the container according to the Pod's restart policy.
+
+---
+
+### Q7. Does a TCP probe verify application logic?
+
+No. It only checks whether a TCP connection can be established.
+
+---
+
+### Q8. Why shouldn't external dependency checks usually be used in Liveness Probes?
+
+Because restarting the application does not fix an unavailable external dependency and may create unnecessary restart loops.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod never receives traffic | Readiness Probe failing |
+| Container restarts repeatedly | Liveness Probe failing or application crashing |
+| Application stuck during startup | Missing or incorrectly configured Startup Probe |
+| Frequent false probe failures | Timeout too short or failure threshold too low |
+| High CPU usage from probes | Expensive Exec Probes or probe frequency too high |
+| Service still routes to unhealthy Pods | Readiness Probe missing or incorrectly implemented |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why are Health Probes necessary?
+2. What is the purpose of a Readiness Probe?
+3. What is the purpose of a Liveness Probe?
+4. What is the purpose of a Startup Probe?
+5. Which probe types does Kubernetes support?
+6. How does kubelet execute probes?
+7. What happens when a Readiness Probe fails?
+8. What happens when a Liveness Probe fails?
+9. Why are Startup Probes important for slow-starting applications?
+10. What are common probe configuration mistakes?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the kubelet continuously evaluates application health using Kubernetes Health Probes.
+
+You learned:
+
+- Why a running process is not necessarily a healthy application
+- The distinct responsibilities of Readiness, Liveness, and Startup Probes
+- How HTTP, TCP, Exec, and gRPC probe types work
+- How the kubelet's Probe Manager executes probes and evaluates success and failure thresholds
+- How Readiness influences traffic routing through Pod Status and EndpointSlices
+- How Liveness enables automatic recovery by restarting unhealthy containers
+- How Startup Probes protect slow-starting applications from premature restarts
+- Common probe misconfigurations and production best practices
+
+Health Probes are one of Kubernetes' most important self-healing mechanisms. By continuously checking application state rather than simply process existence, the kubelet can prevent traffic from reaching unhealthy Pods, recover from application failures automatically, and ensure reliable operation across a wide variety of workloads.
+
+---
+
+# Next Chapter
+
+**Chapter 5 — Node Pressure & Eviction**
+
+In the next chapter, we'll explore how the kubelet protects Node stability when system resources become scarce.
+
+Topics include:
+
+- Node Pressure
+- Eviction Signals
+- Node Pressure Eviction
+- Eviction Manager
+- Pod Selection for Eviction
+- QoS Classes & Eviction
+- Graceful Termination
+- Graceful Node Shutdown
+- Production Examples
+
+You'll learn how kubelet makes eviction decisions, protects critical workloads, and keeps Kubernetes Nodes stable under resource pressure.
+```

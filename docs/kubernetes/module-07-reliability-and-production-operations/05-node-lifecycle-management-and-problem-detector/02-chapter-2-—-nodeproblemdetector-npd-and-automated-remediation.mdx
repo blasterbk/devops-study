@@ -1,0 +1,285 @@
+---
+title: "Chapter 2 — Node Problem Detector & Remediation"
+sidebar_position: 2
+module: "Module 7.5 — Node Lifecycle & NPD"
+description: "Master Kubernetes Node Problem Detector (NPD) and automated remediation — kernel deadlock detection, custom health check plugins, Draino auto-draining, and Kured reboot orchestration."
+---
+
+# Chapter 2 — Node Problem Detector (NPD) & Automated Remediation
+
+> **Goal:** Master advanced host operating system diagnostics and automated self-healing in Kubernetes using the **Node Problem Detector (NPD)** — understanding why native Kubelet health checks fail to detect silent kernel lockups and read-only filesystems, configuring NPD **System Log Monitors** and **Custom Plugin Monitors**, translating host OS faults into Kubernetes `NodeConditions` and Events, and building closed-loop remediation pipelines using **Draino** and **Kured**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why standard Kubelet checks miss critical kernel panics and container runtime deadlocks
+> 2. The 3 internal NPD sub-monitors: System Log Monitor, System Stats, and Custom Plugins
+> 3. How NPD updates `NodeConditions` (`KernelDeadlock=True`, `ReadonlyFilesystem=True`)
+> 4. How **Draino** automatically cordons and drains nodes when NPD conditions trigger
+> 5. How **Kured (Kubernetes Reboot Daemon)** coordinates rolling host kernel reboots
+> 6. How to author custom bash/Python diagnostic plugins for hardware and CNI validation
+
+---
+
+## Real-Life Analogy
+
+Think of Kubelet, Node Problem Detector, and Draino as **the difference between a building security guard checking if the lights are on versus a specialized building diagnostic inspector and an automated evacuation team**:
+
+- **The Standard Security Guard (Kubelet):** The guard walks past the front door every 10 seconds. If the front glass door is intact and the light switch clicks (**Process running & Lease renewed**), the guard marks the building as *"100% Healthy"* (**`Ready: True`**).
+- **The Silent Disaster (Kernel Deadlocks & Broken Plumbing):** Inside the building, a major water pipe burst behind the drywall (**Read-only filesystem**), the elevator cables are jammed (**Containerd socket deadlocked**), and the air conditioning compressor is smoking (**Hardware kernel bug**). The guard at the front door has no idea.
+- **The Specialized Diagnostic Inspector (Node Problem Detector - NPD):** NPD walks through every utility closet in the basement. It listens to the electrical meters (**System Stats Monitor**), reads the maintenance incident logbook (**Log Monitor parsing `dmesg`**), and tests the water pressure with a pressure gauge (**Custom Plugin Monitor**). The moment it detects a leak, it sticks a bright red sign on the lobby wall (**`NodeCondition: ReadonlyFilesystem=True`**).
+- **The Automated Evacuation Dispatcher (Draino & Auto-Repair):** Draino watches the lobby sign. The second the red sign appears, Draino locks the entrance door (**Cordon**), guides all tenants safely into the neighboring building (**Drain Pods**), and calls the demolition crew to replace the building (**Cloud Autoscaler replaces VM**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Node Problem Detector (NPD) & Self-Healing Remediation
+
+ LINUX WORKER NODE HOST
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HOST OPERATING SYSTEM & KERNEL:                                        │
+ │ - Kernel emits: `dmesg: BUG: unable to handle kernel NULL pointer`     │
+ │ - Root disk mounts as: `Read-only file system`                         │
+ │ - NTP clock drifts: `Clock offset > 500ms`                             │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Monitored via Log Pipes & Custom Scripts
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ NODE PROBLEM DETECTOR (NPD DaemonSet Pod)                              │
+ │                                                                        │
+ │ 1. System Log Monitor: (Tails `/var/log/journal/`, `/var/log/dmesg`)   │
+ │ 2. Custom Plugin Monitor: (Runs `/bin/check_cni.sh`, `/bin/check_ntp`) │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Updates Node API Resource over mTLS
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES API SERVER: Updated Node Object                             │
+ │ status.conditions:                                                     │
+ │   - Type: `KernelDeadlock`, Status: `True`                             │
+ │   - Type: `ReadonlyFilesystem`, Status: `True`                         │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Continuous Controller Watch
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ DRAINO / SELF-HEALING OPERATOR                                         │
+ │ 1. Matches Condition: `KernelDeadlock=True`                            │
+ │ 2. `kubectl cordon <node>` (Prevents new pods from landing)            │
+ │ 3. `kubectl drain <node>` (Evicts active pods respecting PDBs)         │
+ │ 4. Cloud Auto-Repair / Karpenter terminates and replaces bad node!     │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## What Standard Kubelet Misses vs NPD
+
+```text
+ ┌───────────────────────────┬───────────────────┬───────────────────────────────────────────────────┐
+ │ Failure Scenario          │ Kubelet Response  │ Node Problem Detector (NPD) Detection             │
+ │───────────────────────────┼───────────────────┼───────────────────────────────────────────────────┤
+ │ **Kernel Deadlock**       │ Node stays `Ready`│ NPD regex catches kernel oops in `/var/log/dmesg`;│
+ │                           │ (Pods hang/fail). │ sets `NodeCondition: KernelDeadlock=True`.        │
+ │───────────────────────────┼───────────────────┼───────────────────────────────────────────────────┤
+ │ **Read-Only Root FS**     │ Node stays `Ready`│ NPD detects filesystem remount error in kernel log│
+ │ (Hardware disk error)     │ (Pod creates fail)│ sets `NodeCondition: ReadonlyFilesystem=True`.    │
+ │───────────────────────────┼───────────────────┼───────────────────────────────────────────────────┤
+ │ **Corrupted Containerd**  │ Heartbeat succeeds│ NPD custom plugin attempts to launch test container│
+ │ **Runtime Socket**        │ (Execs fail).     │ via CRI; flags `ContainerRuntimeDeadlock=True`.    │
+ │───────────────────────────┼───────────────────┼───────────────────────────────────────────────────┤
+ │ **NTP Clock Drift**       │ Ignored completely│ Custom script detects clock skew $> 500\text{ms}$; │
+ │ (Breaches TLS certs)      │ (Auth breaks).    │ emits Warning Event `ClockDriftExceeded`.         │
+ └───────────────────────────┴───────────────────┴───────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 NPD Sub-Monitors
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Monitor Type         │ Mechanism & Configuration Target                                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. System Log**    │ Tails system logs (`/var/log/messages`, `/var/log/dmesg`, `systemd-journal`)│
+ │ **Monitor**          │ using customizable regular expressions.                                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. System Stats**  │ Periodically collects host OS hardware statistics (e.g. disk queue length,  │
+ │ **Monitor**          │ file descriptor exhaustion, CPU thermal throttling).                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Custom Plugin** │ Executes custom user-provided shell scripts or binaries on a periodic timer │
+ │ **Monitor**          │ (Checks exit code $0 = \text{Healthy}$, $1 = \text{Warning}$, $2 = \text{Failure}$).│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production NPD ConfigMap & DaemonSet Manifest
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-problem-detector-config
+  namespace: kube-system
+data:
+  kernel-monitor.json: |
+    {
+      "plugin": "kmsg",
+      "logPath": "/dev/kmsg",
+      "bufferSize": 10,
+      "source": "kernel-monitor",
+      "conditions": [
+        {
+          "type": "KernelDeadlock",
+          "reason": "KernelHasNoDeadlock",
+          "message": "kernel has no deadlock"
+        }
+      ],
+      "rules": [
+        {
+          "type": "temporary",
+          "reason": "OOMKilling",
+          "pattern": ".*Kill process \\d+ \\(.*\\) score \\d+ or sacrifice child"
+        },
+        {
+          "type": "permanent",
+          "condition": "KernelDeadlock",
+          "reason": "DockerHung",
+          "pattern": ".*task [\\w-:]+:\\d+ blocked for more than \\d+ seconds\\."
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-problem-detector
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: node-problem-detector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-problem-detector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: node-problem-detector
+    spec:
+      hostNetwork: true
+      hostPID: true
+      securityContext:
+        privileged: true
+      containers:
+      - name: node-problem-detector
+        image: registry.k8s.io/node-problem-detector/node-problem-detector:v0.8.19
+        command:
+        - /node-problem-detector
+        - --logtostderr
+        - --config.system-log-monitor=/config/kernel-monitor.json
+        volumeMounts:
+        - name: log
+          mountPath: /var/log
+          readOnly: true
+        - name: kmsg
+          mountPath: /dev/kmsg
+          readOnly: true
+        - name: config
+          mountPath: /config
+          readOnly: true
+      volumes:
+      - name: log
+        hostPath:
+          path: /var/log
+      - name: kmsg
+        hostPath:
+          path: /dev/kmsg
+      - name: config
+        configMap:
+          name: node-problem-detector-config
+```
+
+---
+
+## Automated Remediation with Draino
+
+**Draino** automatically cordons and drains nodes matching specific NPD conditions:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: draino
+  namespace: kube-system
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: draino
+        image: planetlabs/draino:v0.4.8
+        command:
+          - /draino
+          - --dry-run=false
+          - --eviction-headroom=30s
+          - --drain-buffer=10m
+          # Automatically drains nodes if ANY of these conditions are True!
+          - KernelDeadlock
+          - ReadonlyFilesystem
+          - CorruptDockerOverlay2
+```
+
+---
+
+## Hands-On Lab: Observing NPD Node Conditions
+
+```bash
+# Step 1: Check if Node Problem Detector is deployed in kube-system
+kubectl get daemonset -n kube-system -l app.kubernetes.io/name=node-problem-detector 2>/dev/null || echo "NPD DaemonSet active / simulated"
+
+# Step 2: Query custom Node Conditions reported by NPD
+kubectl get nodes -o json | jq '.items[].status.conditions[] | select(.type | contains("Kernel") or contains("Deadlock") or contains("Filesystem"))' 2>/dev/null || echo "Zero kernel deadlock conditions detected"
+
+# Step 3: Check Warning Events emitted by NPD
+kubectl get events -A --field-selector reason=OOMKilling 2>/dev/null || echo "NPD Event stream active"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Node Problem Detector (NPD), and why is it needed alongside Kubelet?**
+
+Kubelet performs only high-level health checking (such as verifying local process execution and API server connectivity). It is blind to deep operating system and kernel-level degradation—such as silent kernel deadlocks, corrupted file system overlays, unmountable network storage, or container runtime socket hangs. The Node Problem Detector (NPD) runs as a privileged DaemonSet that continuously monitors host logs, system statistics, and custom health check scripts, translating low-level OS failures into Kubernetes `NodeConditions` and `Warning` Events.
+
+**Q2: What is the difference between an NPD "Permanent Condition" and a "Temporary Event"?**
+
+- **Permanent Condition**: Represents a persistent, non-recoverable hardware or OS failure (such as `KernelDeadlock=True` or `ReadonlyFilesystem=True`). NPD adds this to the Node's `.status.conditions` array. It stays active until the node is rebooted or repaired, allowing controllers like Draino to cordon and drain the node.
+- **Temporary Event**: Represents a point-in-time anomaly that does not necessarily make the entire node unserviceable (such as a single process OOMKill or a temporary network drop). NPD emits a standard Kubernetes `Event` (`reason: OOMKilling`), visible via `kubectl get events`.
+
+**Q3: How does the combination of NPD, Draino, and Cloud Autoscaling achieve zero-human automated self-healing?**
+
+1. **Detection**: NPD detects an unrecoverable kernel oops in `/dev/kmsg` and sets `NodeCondition: KernelDeadlock=True`.
+2. **Quarantine & Eviction**: **Draino** observes the `KernelDeadlock` condition, cordons the node to stop new workloads, and gracefully drains existing pods to healthy nodes respecting PDBs.
+3. **Replacement**: Once the bad node is empty, the Cloud Cluster Autoscaler (or Karpenter) marks the instance as unneeded and terminates the VM. The cloud provider provisions a brand new, healthy VM in its place.
+
+**Q4: How does Kured (Kubernetes Reboot Daemon) handle rolling OS security reboots safely?**
+
+Kured watches for the sentinel file `/var/run/reboot-required` created by OS package managers after kernel updates. To prevent rebooting all nodes simultaneously: (1) Kured acquires a cluster-wide leader election lock (`coordination.k8s.io/Lease`); (2) It cordons and drains the node; (3) It issues a system reboot command; (4) Once the node reboots and becomes `Ready`, Kured uncordons the node, releases the lease, and allows the next node to reboot.
+
+**Q5: What return codes must a Custom Plugin Monitor script output for NPD?**
+
+NPD custom plugin scripts follow standard Unix convention:
+- **Exit Code 0 (`OK`)**: The check passed; the corresponding `NodeCondition` is set to `False`.
+- **Exit Code 1 (`Warning`)**: Non-critical issue; NPD emits a Warning Event without changing the permanent Node Condition.
+- **Exit Code 2 (`Non-Recoverable Failure`)**: Critical failure; NPD sets the corresponding `NodeCondition` to `True`, triggering automated remediation.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why standard Kubelet checks miss kernel deadlocks and read-only filesystems
+- [ ] Know the 3 NPD monitors: System Log Monitor, System Stats, and Custom Plugins
+- [ ] Know that NPD translates OS faults into `NodeConditions` and Warning `Events`
+- [ ] Know how Draino automatically cordons and drains nodes matching NPD conditions
+- [ ] Know how Kured coordinates sequential rolling reboots using cluster Leases
+- [ ] Can inspect custom NPD node conditions using `kubectl get nodes -o json`

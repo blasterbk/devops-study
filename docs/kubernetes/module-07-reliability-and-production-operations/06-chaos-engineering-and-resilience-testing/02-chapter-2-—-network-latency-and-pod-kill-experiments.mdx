@@ -1,0 +1,234 @@
+---
+title: "Chapter 2 — Network Latency & Pod Kill Labs"
+sidebar_position: 2
+module: "Module 7.6 — Chaos Engineering"
+description: "Master real-world Chaos experiments in Kubernetes — NetworkChaos latency and packet loss injection via Linux tc, PodChaos kill drills, and validating circuit breaker resilience."
+---
+
+# Chapter 2 — Network Latency & Pod Kill Experiments
+
+> **Goal:** Master the practical execution and evaluation of high-impact chaos experiments in Kubernetes — implementing **`NetworkChaos`** (latency, packet loss, and network partitions via Linux Traffic Control `tc`), executing **`PodChaos`** sudden-death drills, simulating degraded storage with **`IOChaos`**, and scientifically validating that application-layer resilience mechanisms (circuit breakers, exponential backoff retries, and fallback caches) protect user experience.
+>
+> By the end of this chapter, you will understand:
+> 1. How `NetworkChaos` uses Linux `tc` / NetEm to inject millisecond delays and jitter
+> 2. How to simulate total bi-directional network partition split-brains between namespaces
+> 3. How `IOChaos` simulates disk storage slowdowns using FUSE file system intercepts
+> 4. How to verify that Circuit Breakers (Envoy, Resilience4j) trip properly under latency
+> 5. Why retry storms occur and how Retry Budgets with Jitter prevent downstream collapse
+> 6. How to author and execute complete declarative chaos scenarios with automated teardown
+
+---
+
+## Real-Life Analogy
+
+Think of NetworkChaos and Pod Kill experiments as **a live stress-testing simulation conducted inside a high-speed parcel sorting facility**:
+
+- **The Normal Traffic Flow (The Smooth Highway):** Every 10 milliseconds, a courier truck leaves the sorting center (**Frontend**) and delivers a box to the airport hub (**Payment API**). Everything runs at 60 mph.
+- **The Network Latency Injection (`NetworkChaos: delay 200ms`):** A sudden heavy blizzard hits the highway (**Linux `tc` NetEm attaches delay**). Instead of arriving in 5ms, trucks now take 200ms.
+- **The Fragile System Collapse (The Thundering Herd Retry Storm):** The sorting manager panics because packages are taking 200ms. Instead of waiting, the manager sends **10 duplicate trucks for every package every second (**Naive Retry Loops**). Now 5,000 trucks gridlock the highway, the airport collapses (**Database Connection Exhaustion**), and the entire company goes out of business (**Total Outage**).
+- **The Resilient System with Circuit Breakers (The Smart Dispatcher):** The smart manager notices that 3 consecutive trucks took 200ms. The manager immediately **trips the circuit breaker**: *"Stop sending trucks to the airport! Store packages in the local warehouse temporarily and hand customers a receipt (**Graceful Degradation / Fallback Cache**)."*
+- **The Random Power Blackout (`PodChaos: pod-kill`):** An electrician cuts power to Station 4 (**Container killed**). Station 5 and Station 6 instantly absorb the workload without dropping a single package (**ReplicaSet and Load Balancer resilience**).
+
+---
+
+## Architecture Diagram
+
+```text
+               NetworkChaos Fault Injection & Circuit Breaker Tripping
+
+ CLIENT / FRONTEND POD (`frontend-api`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ In-Process Circuit Breaker (Resilience4j / Envoy Mesh)                │
+ │ State: [ CLOSED / NORMAL ] ──► Sends HTTP Request: `POST /orders`      │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Network Packet passes through Linux Virtual Ethernet (`veth`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX TRAFFIC CONTROL (Chaos Mesh `tc` NetEm Filter Active!)           │
+ │ - Injects: `250ms Delay (+/- 50ms Jitter)` + `10% Random Packet Loss`  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ High-Latency / Degraded Network Stream
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TARGET MICROSERVICE POD (`payment-backend`)                            │
+ │ Processing delayed by 250ms...                                         │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ In-Flight Request Times Out (> 100ms Timeout)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT APPLICATION CIRCUIT BREAKER TRIPS!                              │
+ │ - Transitions State: [ CLOSED ] ──► [ OPEN / TRIPPED ]                │
+ │ - Diverts traffic immediately to Local Redis Cache (Zero 500 Errors!) │
+ │ - Protects payment backend from crashing under retry overload!         │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Chaos Experiment Types Compared
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Chaos Type           │ Underlying Mechanism    │ Simulated Real-World Incident                     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`NetworkChaos`**   │ Linux `tc` (Traffic     │ Cross-AZ network congestion, transatlantic WAN    │
+ │ (delay, loss, part)  │ Control) / NetEm        │ latency, flaky fiber optic cables, split-brains.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`PodChaos`**       │ Linux `ptrace` / POSIX  │ Sudden node reboot, Kernel OOMKill, pod eviction, │
+ │ (kill, failure)      │ `SIGKILL` / cgroups     │ unhandled application runtime panic.              │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`IOChaos`**        │ FUSE (Filesystem in     │ Cloud EBS volume throttling (IOPS exhaustion),    │
+ │ (delay, fault)       │ Userspace) interceptor  │ corrupt read blocks, slow NFS mounts.             │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`StressChaos`**    │ Linux cgroup CPU/Memory │ Cryptominer malware, CPU burn loops, memory leaks,│
+ │ (cpu, memory)        │ stress generators       │ JVM garbage collection compaction thrashing.      │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `NetworkChaos` Latency & Packet Loss Manifest
+
+This experiment injects **200ms latency (with 30ms jitter)** and **10% packet loss** into all traffic between `frontend` and `payment-api`:
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: payment-api-network-degradation
+  namespace: chaos-testing
+spec:
+  action: delay                        # Injects network latency
+  mode: all                            # Affects all matching pods
+  selector:
+    namespaces:
+      - production
+    labelSelectors:
+      app: frontend-gateway
+  # Target destination to throttle
+  target:
+    selector:
+      namespaces:
+        - production
+      labelSelectors:
+        app: payment-api
+    mode: all
+  delay:
+    latency: "200ms"                   # Average delay added to every packet
+    jitter: "30ms"                     # Random deviation (+/- 30ms)
+    correlation: "25"                  # Correlation with previous packet delay
+  loss:
+    loss: "10"                         # 10% random packet drop rate
+  direction: to                        # Outbound traffic from frontend to payment
+  duration: "5m"                       # Auto-aborts after 5 minutes!
+```
+
+---
+
+## Bi-Directional Network Partition (Split-Brain Simulation)
+
+Simulate total network isolation between two microservice tiers:
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: isolate-database-tier
+  namespace: chaos-testing
+spec:
+  action: partition                    # Drops 100% of network packets
+  mode: all
+  selector:
+    namespaces:
+      - production
+    labelSelectors:
+      app: payment-api
+  target:
+    selector:
+      namespaces:
+        - production
+      labelSelectors:
+        app: postgres-cluster
+    mode: all
+  direction: both                      # Bi-directional isolation!
+  duration: "3m"
+```
+
+---
+
+## Evaluating Resilience: The 3 Golden Defense Patterns
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Defense Pattern      │ Expected Behavior During Chaos Testing                                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Circuit**       │ When downstream latency breaches 100ms for 5 consecutive calls, the client  │
+ │ **Breakers**         │ opens the circuit, immediately returning cached data without calling backend│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Exponential**   │ If a request fails, the client waits $200\text{ms} \to 400\text{ms} \to     │
+ │ **Backoff + Jitter** │ $800\text{ms}$ with random jitter ($\pm 50\text{ms}$), preventing thundering│
+ │                      │ herds from overloading recovering microservices.                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Retry Budgets** │ Limits total retries to at most **10% of total request volume**, ensuring   │
+ │                      │ that failing dependencies are not overwhelmed by retry storms.              │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Simulating Latency & Observing Circuit Breaker Tripping
+
+```bash
+# Step 1: Create a test namespace
+kubectl create namespace chaos-demo
+
+# Step 2: Deploy an echo server and a client tester
+kubectl run echo-server --image=hashicorp/http-echo --port=5678 -- -text="hello" -n chaos-demo
+kubectl expose pod echo-server --port=5678 -n chaos-demo
+
+# Step 3: Verify baseline latency is < 2ms
+kubectl run tester --image=curlimages/curl --rm -it --restart=Never -n chaos-demo -- \
+  curl -o /dev/null -s -w "Total Time: %{time_total}s\n" http://echo-server.chaos-demo:5678
+
+# Step 4: Apply a 200ms NetworkChaos delay (if Chaos Mesh CRDs installed)
+# kubectl apply -f payment-network-degradation.yaml
+
+# Step 5: Clean up lab
+kubectl delete namespace chaos-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does `NetworkChaos` inject network latency into Kubernetes pods without deploying sidecar proxies?**
+
+`NetworkChaos` uses the Linux kernel's built-in **Traffic Control (`tc`) NetEm (Network Emulation)** queuing disciplines. The node-level `chaos-daemon` enters the network namespace of the target pod's container using the `setns()` Linux syscall. It attaches a `qdisc` (queuing discipline) directly to the container's virtual ethernet interface (`eth0` / `veth`), buffering outbound or inbound IP packets in kernel space for the configured millisecond duration before releasing them, with zero modification to application code.
+
+**Q2: What is the "Thundering Herd Problem" during network outages, and how does Jitter solve it?**
+
+When a downstream database or microservice experiences a temporary 1-second lag, thousands of upstream client pods timeout simultaneously. If all client pods retry immediately at fixed intervals (e.g. exactly every 1 second), all 5,000 retry requests slam into the struggling database at the exact same millisecond, crashing it permanently. Adding **Exponential Backoff with Random Jitter** (randomizing retry intervals between $800\text{ms}$ and $1200\text{ms}$) spreads the retry load evenly over time, allowing the database to recover smoothly.
+
+**Q3: How do you verify that an application's Circuit Breaker is working during a `NetworkChaos` experiment?**
+
+During the experiment: (1) Observe client-side Prometheus metrics (e.g. `circuit_breaker_state{state="open"}`); (2) Verify that upstream client p99 latency drops back to near-zero within seconds of the chaos injection (because tripped circuit breakers fail fast or return cached fallbacks immediately instead of hanging on timeouts); and (3) Verify that downstream server request volume drops to zero, confirming that traffic was successfully diverted.
+
+**Q4: What is the difference between a `NetworkChaos` delay versus a `NetworkChaos` partition?**
+
+- **`delay`**: Packets still successfully reach their destination, but their transit time is artificially delayed in kernel buffers (testing timeouts, latency tolerance, and async queuing).
+- **`partition`**: Packets are **100% dropped at the kernel level**, simulating a complete loss of network routing between two specific pods, namespaces, or CIDR blocks (testing split-brain handling, raft consensus, and service discovery failover).
+
+**Q5: How does `IOChaos` simulate disk latency on persistent volumes?**
+
+`IOChaos` leverages **FUSE (Filesystem in Userspace)** and eBPF. When an `IOChaos` experiment is applied to a Pod with a PersistentVolume (EBS or local storage), Chaos Daemon dynamically injects a FUSE proxy layer between the container's storage mount and the physical Linux block device. When the container executes `read()` or `write()` syscalls, the FUSE proxy intercepts the file descriptor operations, introduces artificial delay loops, or returns `EIO` (I/O error) codes.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `NetworkChaos` uses Linux `tc` NetEm to inject delays directly into veth interfaces
+- [ ] Know how to configure latency, jitter, and packet loss in `NetworkChaos` specs
+- [ ] Know why retry storms occur and how Retry Budgets with Jitter prevent crashes
+- [ ] Know how Circuit Breakers protect microservices during downstream latency surges
+- [ ] Know the difference between `delay` (slow packets) and `partition` (dropped packets)
+- [ ] Can view active network chaos experiments using `kubectl get networkchaos -A`

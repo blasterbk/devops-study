@@ -1,0 +1,1298 @@
+---
+title: "Chapter 5 — RuntimeClass"
+sidebar_position: 5
+module: "Module 1.7 — Container Runtime Internals"
+description: "> **Goal:** Understand how Kubernetes allows different Pods to use different container runtimes through **RuntimeClass**. Learn how **Runtime Handlers**, **cont..."
+---
+
+# Module 1.7 — Container Runtime Internals
+
+# Chapter 5 — RuntimeClass
+
+> **Goal:** Understand how Kubernetes allows different Pods to use different container runtimes through **RuntimeClass**. Learn how **Runtime Handlers**, **containerd**, **Kata Containers**, and **gVisor** work together to provide different levels of performance, compatibility, and isolation.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What RuntimeClass is: per-Pod runtime selection
+> 2. Runtime Handlers: the named configurations in containerd that map to OCI runtimes
+> 3. RuntimeClass resource: apiVersion, kind, handler field
+> 4. Pod spec: spec.runtimeClassName field
+> 5. runc: the default OCI runtime (process isolation via Linux namespaces)
+> 6. gVisor (runsc): userspace kernel intercepting syscalls (strong isolation)
+> 7. Kata Containers: hardware VM isolation using lightweight VMs
+> 8. When to use each: performance vs security vs compatibility tradeoffs
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of RuntimeClass like passport control choosing which customs lane to use.
+
+```text
+Passport Control Analogy:
+
+Airport has multiple customs lanes (runtimes: runc, gVisor, Kata)
+Default lane (runc): standard processing, fast, trusted travelers
+Enhanced screening lane (gVisor): extra checks, slower but more secure
+Diplomatic lane (Kata Containers): completely separate VIP processing
+Passenger presents passport with visa type (Pod sets runtimeClassName)
+Airport authority configured which lanes exist (Node + containerd handler config)
+Not all lanes available at all gates (not all Nodes may have all runtimes)
+```
+
+| Passport Control | RuntimeClass |
+| :--- | :--- |
+| Airport authority | Cluster administrator |
+| Customs lane | Runtime handler (runc / runsc / kata) |
+| Default lane | runc (used when no runtimeClassName set) |
+| Enhanced screening lane | gVisor (`runsc`): syscall interception |
+| Diplomatic lane | Kata Containers: hardware VM isolation |
+| Passenger's visa type | `spec.runtimeClassName` in Pod spec |
+| Lane configuration | `RuntimeClass` Kubernetes resource |
+
+> **Important:** The **default runtime** (`runc`) is used when a Pod does **not** set `spec.runtimeClassName`. gVisor and Kata Containers only activate when a Pod explicitly requests them. Additionally, not every Node in a cluster may have every runtime installed — you must use `nodeSelector` or `scheduling` in the RuntimeClass to ensure Pods only land on Nodes that have the requested runtime available.
+
+---
+
+# Prerequisites
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- CRI (Container Runtime Interface)
+- OCI Runtime Specification
+- containerd Architecture
+- runc
+- Pod Sandbox
+- Linux Namespaces (basic understanding)
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapters, we learned:
+
+```text
+kubelet
+  |
+  v
+CRI
+  |
+  v
+containerd
+  |
+  v
+runc
+  |
+  v
+Linux Container
+```
+
+But this raises an important question:
+
+> **Must every Pod use runc?**
+
+The answer is:
+
+**No.**
+
+Kubernetes allows different Pods to use different runtimes.
+
+---
+
+# Why RuntimeClass Exists
+
+Different workloads have different requirements.
+
+Example:
+
+```text
+Payment Service
+  |
+  v
+Maximum Security
+
+────────────
+
+Machine Learning
+  |
+  v
+Maximum Performance
+
+────────────
+
+CI Jobs
+  |
+  v
+Strong Isolation
+```
+
+Using a single runtime for every workload is not always ideal.
+
+---
+
+# One Runtime Doesn't Fit All
+
+Traditional Kubernetes clusters used:
+
+```text
+All Pods
+  |
+  v
+runc
+```
+
+While simple,
+
+this approach cannot satisfy every workload.
+
+---
+
+# Modern Runtime Architecture
+
+Today a cluster may contain:
+
+```text
+Pod A
+  |
+  v
+runc
+
+────────────
+
+Pod B
+  |
+  v
+gVisor
+
+────────────
+
+Pod C
+  |
+  v
+Kata Containers
+```
+
+Each Pod uses the runtime best suited to its requirements.
+
+---
+
+# What is RuntimeClass?
+
+A **RuntimeClass** is a Kubernetes API resource that tells kubelet **which container runtime handler should be used** for a Pod.
+
+Think of RuntimeClass as:
+
+```text
+Pod
+  |
+  v
+Choose Runtime
+  |
+  v
+Start Container
+```
+
+---
+
+# RuntimeClass Concept
+
+Without RuntimeClass:
+
+```text
+All Pods
+  |
+  v
+Same Runtime
+```
+
+With RuntimeClass:
+
+```text
+Pod
+  |
+  v
+RuntimeClass
+  |
+  v
+Specific Runtime
+```
+
+---
+
+# High-Level Architecture
+
+```text
+              Pod
+
+               |
+
+      runtimeClassName
+
+               |
+
+               ▼
+
+          RuntimeClass
+
+               |
+
+         Runtime Handler
+
+               |
+
+               ▼
+
+          containerd
+
+               |
+
+               ▼
+
+      Selected OCI Runtime
+```
+
+---
+
+# RuntimeClass Resource
+
+RuntimeClass is a cluster-scoped Kubernetes resource.
+
+Conceptually:
+
+```text
+RuntimeClass
+  |
+  v
+Handler
+  |
+  v
+Runtime
+```
+
+The most important field is:
+
+```text
+handler
+```
+
+---
+
+# Runtime Handler
+
+A **Runtime Handler** is a name understood by the container runtime.
+
+Example:
+
+```text
+runc
+
+kata
+
+gvisor
+```
+
+The handler tells containerd which runtime implementation should be used.
+
+---
+
+# Important Distinction
+
+Do not confuse:
+
+```text
+RuntimeClass
+  |
+  v
+Kubernetes Resource
+
+────────────
+
+Runtime Handler
+  |
+  v
+containerd Configuration
+```
+
+RuntimeClass exists in Kubernetes.
+
+Runtime Handlers exist in the container runtime configuration.
+
+---
+
+# Relationship
+
+```text
+RuntimeClass
+  |
+  v
+Handler
+  |
+  v
+containerd
+  |
+  v
+OCI Runtime
+```
+
+---
+
+# Example Architecture
+
+```text
+RuntimeClass
+  |
+  v
+handler: kata
+  |
+  v
+containerd
+  |
+  v
+Kata Runtime
+  |
+  v
+Virtual Machine
+  |
+  v
+Application
+```
+
+---
+
+# RuntimeClass Workflow
+
+Suppose:
+
+```yaml
+runtimeClassName:
+
+kata
+```
+
+Workflow:
+
+```text
+Pod Created
+  |
+  v
+Scheduler
+  |
+  v
+kubelet
+  |
+  v
+Read RuntimeClass
+  |
+  v
+Read Handler
+  |
+  v
+CRI Request
+  |
+  v
+containerd
+  |
+  v
+Select Kata Runtime
+  |
+  v
+Run Container
+```
+
+---
+
+# Runtime Request Flow
+
+```text
+Pod
+  |
+  v
+runtimeClassName
+  |
+  v
+RuntimeClass
+  |
+  v
+Handler
+  |
+  v
+containerd
+  |
+  v
+OCI Runtime
+  |
+  v
+Linux Process
+```
+
+---
+
+# RuntimeClass Architecture
+
+Complete architecture:
+
+```text
+             API Server
+
+                  |
+
+            RuntimeClass
+
+                  |
+
+                  ▼
+
+               kubelet
+
+                  |
+
+                  ▼
+
+                 CRI
+
+                  |
+
+                  ▼
+
+             containerd
+
+                  |
+
+        Runtime Handler
+
+        ┌─────┼──────┐
+
+        ▼     ▼      ▼
+
+      runc  Kata   gVisor
+```
+
+---
+
+# Multiple Runtimes
+
+One cluster can support multiple runtimes simultaneously.
+
+Example:
+
+```text
+Namespace A
+  |
+  v
+runc
+
+────────────
+
+Namespace B
+  |
+  v
+gVisor
+
+────────────
+
+Namespace C
+  |
+  v
+Kata
+```
+
+Pods select the runtime independently.
+
+---
+
+# Why Multiple Runtimes?
+
+Different applications require different trade-offs.
+
+Some require:
+
+```text
+Maximum Performance
+```
+
+Others require:
+
+```text
+Maximum Isolation
+```
+
+RuntimeClass enables this flexibility.
+
+---
+
+# Runtime Comparison
+
+Conceptually:
+
+```text
+Performance
+
+runc
+
+>
+
+gVisor
+
+>
+
+Kata (varies by workload)
+
+────────────
+
+Isolation
+
+Kata
+
+>
+
+gVisor
+
+>
+
+runc
+```
+
+No runtime is universally best.
+
+---
+
+# runc
+
+runc is the default OCI runtime used by most Kubernetes clusters.
+
+Architecture:
+
+```text
+Container
+  |
+  v
+Linux Namespaces
+  |
+  v
+Linux Kernel
+```
+
+Advantages:
+
+- Fast startup
+- High performance
+- Mature ecosystem
+
+Limitations:
+
+- Shares the host kernel with containers
+
+---
+
+# Kata Containers
+
+Kata Containers provide stronger isolation.
+
+Architecture:
+
+```text
+Pod
+  |
+  v
+Kata Runtime
+  |
+  v
+Lightweight VM
+  |
+  v
+Guest Kernel
+  |
+  v
+Application
+```
+
+Each Pod runs inside its own lightweight virtual machine.
+
+---
+
+# Why Kata?
+
+Traditional containers share:
+
+```text
+Host Kernel
+```
+
+Kata introduces:
+
+```text
+Dedicated Guest Kernel
+```
+
+This significantly improves isolation.
+
+---
+
+# Kata Workflow
+
+```text
+Pod
+  |
+  v
+containerd
+  |
+  v
+Kata Runtime
+  |
+  v
+Create VM
+  |
+  v
+Boot Guest Kernel
+  |
+  v
+Start Container
+```
+
+---
+
+# Kata Advantages
+
+- Strong isolation
+- Hardware virtualization
+- Better multi-tenant security
+- Reduced kernel attack surface
+
+Trade-offs:
+
+- Higher memory usage
+- Slower startup than runc
+- Additional virtualization overhead
+
+---
+
+# gVisor
+
+gVisor takes a different approach.
+
+Instead of using a VM,
+
+it introduces a userspace kernel.
+
+Architecture:
+
+```text
+Application
+  |
+  v
+gVisor
+  |
+  v
+Host Kernel
+```
+
+---
+
+# gVisor Workflow
+
+```text
+Application
+  |
+  v
+System Call
+  |
+  v
+gVisor
+  |
+  v
+Host Kernel
+```
+
+Many system calls are intercepted by gVisor before reaching the host kernel.
+
+---
+
+# Why gVisor?
+
+Goal:
+
+```text
+Reduce
+
+Kernel Attack Surface
+```
+
+Applications have less direct interaction with the host kernel.
+
+---
+
+# gVisor Advantages
+
+- Stronger isolation than runc
+- Lower overhead than full virtualization
+- Good balance between security and performance
+
+Trade-offs:
+
+- Some workloads experience performance overhead
+- Not every Linux feature is supported
+
+---
+
+# Runtime Comparison Table
+
+| Runtime | Isolation | Performance | Startup Time | Typical Use Case |
+|----------|-----------|-------------|--------------|------------------|
+| runc | Standard container isolation | Highest | Fastest | General workloads |
+| gVisor | Stronger userspace isolation | Medium | Moderate | Untrusted applications |
+| Kata Containers | Hardware-assisted isolation | Lower than runc for many workloads | Slowest | Multi-tenant and highly sensitive workloads |
+
+---
+
+# Runtime Selection
+
+How does Kubernetes choose a runtime?
+
+Workflow:
+
+```text
+Pod
+  |
+  v
+runtimeClassName
+  |
+  v
+RuntimeClass
+  |
+  v
+Handler
+  |
+  v
+containerd
+  |
+  v
+Selected Runtime
+```
+
+If no RuntimeClass is specified:
+
+```text
+Default Runtime
+```
+
+is used.
+
+---
+
+# Default Runtime
+
+Most clusters configure:
+
+```text
+Default
+  |
+  v
+runc
+```
+
+Therefore:
+
+```text
+Pod
+  |
+  v
+No RuntimeClass
+  |
+  v
+runc
+```
+
+---
+
+# Runtime Selection Example
+
+Pod A:
+
+```text
+No RuntimeClass
+  |
+  v
+runc
+```
+
+Pod B:
+
+```text
+runtimeClassName:
+
+kata
+  |
+  v
+Kata
+```
+
+Pod C:
+
+```text
+runtimeClassName:
+
+gvisor
+  |
+  v
+gVisor
+```
+
+Each Pod runs independently.
+
+---
+
+# RuntimeClass and Scheduling
+
+RuntimeClass selects **how** a Pod runs.
+
+It does **not** decide **where** the Pod runs.
+
+Scheduling is still performed by the Kubernetes Scheduler.
+
+However, runtime-specific nodes are commonly labeled and selected using node selectors, affinities, or taints so that Pods are scheduled only onto Nodes that support the requested runtime.
+
+---
+
+# Complete Internal Workflow
+
+```text
+Pod Created
+  |
+  v
+Scheduler Chooses Node
+  |
+  v
+kubelet
+  |
+  v
+Read RuntimeClass
+  |
+  v
+Read Handler
+  |
+  v
+CRI Request
+  |
+  v
+containerd
+  |
+  v
+Select Runtime
+  |
+  v
+RunPodSandbox()
+  |
+  v
+Create Container
+  |
+  v
+Application Running
+```
+
+---
+
+# Runtime Failure
+
+Suppose:
+
+```text
+runtimeClassName:
+
+kata
+```
+
+But:
+
+```text
+Kata Runtime
+  |
+  v
+Not Installed
+```
+
+Result:
+
+```text
+Sandbox Creation
+  |
+  v
+Failure
+  |
+  v
+Pod Cannot Start
+```
+
+The RuntimeClass alone is not sufficient; the corresponding runtime handler must exist on the target Node.
+
+---
+
+# Runtime Handler Configuration
+
+containerd maintains a mapping.
+
+Conceptually:
+
+```text
+Handler
+  |
+  v
+OCI Runtime
+  |
+  v
+Binary
+```
+
+Example:
+
+```text
+runc
+  |
+  v
+runc Binary
+
+────────────
+
+kata
+  |
+  v
+Kata Runtime
+
+────────────
+
+gvisor
+  |
+  v
+runsc
+```
+
+---
+
+# Security Perspective
+
+Security increases roughly as:
+
+```text
+runc
+  |
+  v
+gVisor
+  |
+  v
+Kata
+```
+
+Performance generally trends in the opposite direction.
+
+Choosing the appropriate runtime is a trade-off.
+
+---
+
+# Production Example 1
+
+Banking Platform
+
+```text
+Payment Pods
+  |
+  v
+Kata Containers
+  |
+  v
+Maximum Isolation
+```
+
+Sensitive workloads receive stronger protection.
+
+---
+
+# Production Example 2
+
+Machine Learning
+
+```text
+GPU Workloads
+  |
+  v
+runc
+  |
+  v
+Maximum Performance
+```
+
+Performance is prioritized.
+
+---
+
+# Production Example 3
+
+Multi-Tenant SaaS
+
+```text
+Customer Workloads
+  |
+  v
+gVisor
+  |
+  v
+Kernel Isolation
+```
+
+Improves protection between tenants.
+
+---
+
+# Production Example 4
+
+Mixed Cluster
+
+```text
+Frontend
+  |
+  v
+runc
+
+────────────
+
+Payment
+  |
+  v
+Kata
+
+────────────
+
+Sandboxed Jobs
+  |
+  v
+gVisor
+```
+
+One cluster,
+
+multiple runtimes.
+
+---
+
+# Production Best Practices
+
+✔ Use runc for general-purpose workloads.
+
+✔ Use Kata Containers for highly sensitive or strongly isolated workloads.
+
+✔ Use gVisor when balancing security and resource efficiency.
+
+✔ Verify that every runtime handler is installed on Nodes that advertise it.
+
+✔ Combine RuntimeClass with node labels, taints, tolerations, and affinities when runtimes are available only on selected Nodes.
+
+✔ Benchmark applications before changing runtimes.
+
+✔ Monitor startup latency and memory usage for sandboxed runtimes.
+
+✔ Keep runtime implementations updated with security patches.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+RuntimeClass is a container runtime.
+
+**Correct:** RuntimeClass is a Kubernetes resource that selects a runtime handler.
+
+---
+
+### ❌ Misconception 2
+
+RuntimeClass replaces CRI.
+
+**Correct:** RuntimeClass works with CRI. kubelet still communicates with the runtime through the CRI interface.
+
+---
+
+### ❌ Misconception 3
+
+Every Node automatically supports every runtime.
+
+**Correct:** Each runtime must be installed and configured on the Node's container runtime.
+
+---
+
+### ❌ Misconception 4
+
+Kata Containers are ordinary Linux namespaces.
+
+**Correct:** Kata launches each Pod inside a lightweight virtual machine with its own guest kernel.
+
+---
+
+### ❌ Misconception 5
+
+gVisor uses a virtual machine.
+
+**Correct:** gVisor primarily provides a userspace kernel (`runsc`), not a hardware virtual machine.
+
+---
+
+### ❌ Misconception 6
+
+RuntimeClass influences scheduling decisions.
+
+**Correct:** RuntimeClass selects the runtime implementation. Scheduling is still handled by the Kubernetes Scheduler, though scheduling constraints are commonly added to ensure Pods land on compatible Nodes.
+
+---
+
+### ❌ Misconception 7
+
+runc is always the best runtime.
+
+**Correct:** runc offers excellent performance, but workloads requiring stronger isolation may benefit from gVisor or Kata Containers.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is RuntimeClass?
+
+A Kubernetes resource that selects which runtime handler should be used to run a Pod.
+
+---
+
+### Q2. What is a Runtime Handler?
+
+A runtime-specific identifier configured in the container runtime (such as containerd) that maps to a particular OCI runtime implementation.
+
+---
+
+### Q3. What happens if a Pod does not specify a RuntimeClass?
+
+The Node's default runtime handler is used, which is commonly configured to use runc.
+
+---
+
+### Q4. What is the difference between RuntimeClass and Runtime Handler?
+
+RuntimeClass is a Kubernetes API object; the Runtime Handler is a configuration inside the container runtime.
+
+---
+
+### Q5. Why would someone use Kata Containers?
+
+To obtain stronger workload isolation by running Pods inside lightweight virtual machines.
+
+---
+
+### Q6. How does gVisor improve security?
+
+It intercepts many system calls through a userspace kernel, reducing direct interaction with the host kernel.
+
+---
+
+### Q7. Can one Kubernetes cluster use multiple runtimes?
+
+Yes. Different Pods can use different RuntimeClasses that map to different runtime handlers.
+
+---
+
+### Q8. Does RuntimeClass replace the scheduler?
+
+No. The scheduler still selects the Node. RuntimeClass only influences how the Pod is executed on that Node.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod fails during sandbox creation | Requested runtime handler not configured on the Node |
+| RuntimeClass not found | Incorrect `runtimeClassName` or missing RuntimeClass resource |
+| Pod scheduled but never starts | Runtime installed incorrectly or CRI runtime handler unavailable |
+| Unexpected runtime used | No `runtimeClassName` specified or default runtime selected |
+| Higher startup latency | Using Kata Containers or another sandboxed runtime |
+| Application incompatible with selected runtime | Runtime-specific limitations or unsupported kernel features |
+
+---
+
+# Knowledge Check
+
+Before completing this module, you should be able to answer:
+
+1. What problem does RuntimeClass solve?
+2. What is the difference between RuntimeClass and a Runtime Handler?
+3. How does kubelet use RuntimeClass during Pod creation?
+4. Why might a cluster use multiple runtimes?
+5. What are the advantages of runc?
+6. How do Kata Containers differ from ordinary containers?
+7. How does gVisor improve workload isolation?
+8. What happens when a requested runtime handler is unavailable?
+9. Does RuntimeClass determine Pod scheduling?
+10. Which runtime would you choose for maximum performance versus maximum isolation?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes supports multiple container runtime implementations through RuntimeClass.
+
+You learned:
+
+- What RuntimeClass is and why it was introduced
+- How Runtime Handlers map Kubernetes requests to specific OCI runtime implementations
+- The internal architecture connecting RuntimeClass, kubelet, CRI, containerd, and OCI runtimes
+- How Kubernetes supports multiple runtimes within the same cluster
+- The architectural differences between runc, gVisor, and Kata Containers
+- How runtime selection affects performance, security, and isolation
+- Common deployment patterns and operational considerations for production environments
+
+RuntimeClass gives Kubernetes the flexibility to run different workloads with different execution models without changing the core Pod abstraction. Whether optimizing for maximum performance with runc, stronger userspace isolation with gVisor, or hardware-assisted isolation with Kata Containers, RuntimeClass provides a consistent mechanism for selecting the most appropriate runtime for each workload.
+
+---
+
+# Module 1.7 Complete
+
+You have completed **Module 1.7 — Container Runtime Internals**.
+
+You now have a production-level understanding of:
+
+```text
+Chapter 1   Container Runtime Architecture
+            -- CRI: gRPC over Unix socket (local to Node, not via API Server)
+            -- OCI: image spec (layers) + runtime spec (bundle)
+            -- kubelet -> CRI -> containerd -> OCI runtime
+
+Chapter 2   containerd & runc Internals
+            -- containerd-shim stays alive after runc exits
+            -- containers survive containerd restarts
+            -- runc creates namespaces + cgroups then exits
+
+Chapter 3   Image Management
+            -- imagePullPolicy Always checks digest, does not always re-pull data
+            -- Image layers are deduped across all images on the Node
+            -- Image GC reclaims disk when thresholds are exceeded
+
+Chapter 4   Pod Sandbox
+            -- pause container holds network namespace (no app code)
+            -- sandbox created first, destroyed last
+            -- pause dying destroys the Pod's network identity
+
+Chapter 5   RuntimeClass
+            -- runc is default (used when runtimeClassName is not set)
+            -- gVisor: syscall interception; Kata: hardware VM isolation
+            -- Nodes must have runtime installed; use scheduling in RuntimeClass
+```
+
+You now understand the complete container execution stack: from kubelet issuing a CRI call, through containerd and containerd-shim, to runc setting up Linux namespaces and cgroups, to the application process running inside the sandbox.
+
+---
+
+# Next Module
+
+## Module 1.8 — kube-proxy Internals
+
+The next module explores **how Kubernetes Services route traffic to Pods** using the Linux networking stack.
+
+Topics include kube-proxy architecture, iptables mode, IPVS mode, eBPF-based replacements, conntrack, Service load balancing, session affinity, and why modern platforms increasingly replace kube-proxy with Cilium or other eBPF dataplanes.

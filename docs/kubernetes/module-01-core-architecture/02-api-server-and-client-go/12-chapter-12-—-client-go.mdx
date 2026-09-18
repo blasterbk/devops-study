@@ -1,0 +1,376 @@
+---
+title: "Chapter 12 — client-go"
+sidebar_position: 12
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand the architecture of client-go, the official Kubernetes Go SDK, covering RESTClient, Clientset, Dynamic Client, Discovery Client, and how they integrate with Informers and Work Queues."
+---
+
+# Chapter 12 — client-go
+
+> **Goal:** Understand the architecture of **client-go**, the official Kubernetes Go SDK. Learn how RESTClient, Clientset, Dynamic Client, Discovery Client, SharedInformerFactory, and Work Queues work together to build production Kubernetes controllers.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. What client-go is and why it exists
+> 2. RESTClient — low-level HTTP transport
+> 3. Clientset — typed, generated API clients
+> 4. Dynamic Client — schema-less, any-resource access
+> 5. Discovery Client — API discovery
+> 6. SharedInformerFactory integration
+> 7. Complete controller architecture using client-go
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Every Kubernetes component written in Go uses **client-go**:
+
+- `kube-controller-manager`
+- `kube-scheduler`
+- `kube-proxy`
+- Cluster Autoscaler
+- cert-manager
+- ArgoCD
+- Prometheus Operator
+- Crossplane
+- Kubebuilder Operators
+
+If you are writing controllers, operators, admission webhooks, or Kubernetes automation, you will use `client-go`.
+
+---
+
+# Real-Life Analogy
+
+Think of `client-go` like a driver's license + car for navigating Kubernetes.
+
+```text
+Without client-go:
+  You write raw HTTP requests to every endpoint manually
+  Handle authentication headers yourself
+  Parse JSON/YAML manually
+  Implement retries, timeouts, and reconnects yourself
+
+With client-go:
+  You call typed Go methods
+  Authentication handled automatically (kubeconfig/ServiceAccount)
+  Typed Go structs for all resources
+  Informers, Listers, WorkQueues built-in
+```
+
+| Driving Analogy | Kubernetes |
+| :--- | :--- |
+| Raw walking everywhere | Hand-crafted HTTP requests to API Server |
+| Driver's license | kubeconfig / ServiceAccount credentials |
+| The car | `client-go` library |
+| GPS navigation | Discovery Client (finding API endpoints) |
+| Cruise control | Informer + Work Queue (autonomous watching) |
+
+---
+
+# client-go Architecture
+
+```text
+Your Application
+  |
+  v
+client-go Library
+        |
+        +-- RESTClient         (raw HTTP transport layer)
+        |
+        +-- Clientset          (typed clients per GVR)
+        |
+        +-- Dynamic Client     (untyped, any resource)
+        |
+        +-- Discovery Client   (API group/version/resource discovery)
+        |
+        +-- SharedInformerFactory  (Watch-based cache management)
+  |
+  v
+kube-apiserver
+```
+
+---
+
+# 1. RESTClient
+
+`RESTClient` is the lowest-level component — a raw HTTP client configured for Kubernetes APIs:
+
+```go
+config, _ := clientcmd.BuildConfigFromFlags("", kubeconfig)
+restClient, _ := rest.RESTClientFor(config)
+
+result := restClient.
+    Get().
+    Namespace("default").
+    Resource("pods").
+    Name("nginx").
+    Do(context.TODO())
+```
+
+`RESTClient` handles:
+- TLS configuration (CA cert, client cert)
+- Authentication headers (Bearer token)
+- Content-Type negotiation (JSON/Protobuf)
+- HTTP retries on transient errors
+
+> **Important:** Most controllers use Clientset or Dynamic Client rather than RESTClient directly. RESTClient is the foundation layer used by the higher-level clients internally.
+
+---
+
+# 2. Clientset — Typed Client
+
+`Clientset` is a collection of typed clients for every built-in Kubernetes resource:
+
+```go
+clientset, _ := kubernetes.NewForConfig(config)
+
+// Core v1 resources
+pod, err := clientset.CoreV1().
+    Pods("default").
+    Get(ctx, "nginx", metav1.GetOptions{})
+
+// apps/v1 resources
+deployment, err := clientset.AppsV1().
+    Deployments("default").
+    Get(ctx, "nginx", metav1.GetOptions{})
+
+// Creating a resource
+_, err = clientset.CoreV1().
+    Pods("default").
+    Create(ctx, newPod, metav1.CreateOptions{})
+
+// Updating a resource
+_, err = clientset.AppsV1().
+    Deployments("default").
+    Update(ctx, deployment, metav1.UpdateOptions{})
+
+// Deleting a resource
+err = clientset.CoreV1().
+    Pods("default").
+    Delete(ctx, "nginx", metav1.DeleteOptions{})
+```
+
+Clientset provides:
+- Compile-time type safety (returns `*v1.Pod`, not `interface{}`)
+- All standard verbs: `Get`, `List`, `Create`, `Update`, `Patch`, `Delete`, `Watch`
+- Sub-resource access: `Pods().GetLogs()`, `Deployments().GetScale()`
+
+---
+
+# 3. Dynamic Client
+
+The Dynamic Client operates on `*unstructured.Unstructured` objects — it works with **any resource** (including CRDs) without compile-time type knowledge:
+
+```go
+dynamicClient, _ := dynamic.NewForConfig(config)
+
+gvr := schema.GroupVersionResource{
+    Group:    "apps",
+    Version:  "v1",
+    Resource: "deployments",
+}
+
+// List any resource dynamically
+list, err := dynamicClient.
+    Resource(gvr).
+    Namespace("default").
+    List(ctx, metav1.ListOptions{})
+
+for _, item := range list.Items {
+    name, _, _ := unstructured.NestedString(item.Object, "metadata", "name")
+    fmt.Println(name)
+}
+```
+
+Use the Dynamic Client when:
+- Working with CRDs whose types are not compiled into the program
+- Building generic tools that operate on any Kubernetes resource
+- Implementing controllers that handle multiple resource types
+
+---
+
+# 4. Discovery Client
+
+The Discovery Client queries the API Server to discover available API groups, versions, and resources:
+
+```go
+discoveryClient, _ := discovery.NewDiscoveryClientForConfig(config)
+
+// List all API groups
+groups, _ := discoveryClient.ServerGroups()
+
+// List all resources in a group
+resources, _ := discoveryClient.ServerResourcesForGroupVersion("apps/v1")
+
+// List everything
+apiGroups, apiResources, _ := discoveryClient.ServerGroupsAndResources()
+```
+
+`kubectl api-resources` and `kubectl api-versions` use the Discovery Client internally.
+
+The Discovery Client result is cached locally (in `~/.kube/cache/discovery/`) to avoid querying the API Server on every operation.
+
+---
+
+# 5. SharedInformerFactory Integration
+
+`client-go` provides `SharedInformerFactory` for all built-in resources:
+
+```go
+factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
+
+podInformer    := factory.Core().V1().Pods()
+deployInformer := factory.Apps().V1().Deployments()
+
+podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+    AddFunc:    handleAdd,
+    UpdateFunc: handleUpdate,
+    DeleteFunc: handleDelete,
+})
+
+factory.Start(stopCh)
+factory.WaitForCacheSync(stopCh)
+```
+
+---
+
+# Complete client-go Controller Architecture
+
+```text
+kubeconfig / ServiceAccount
+  |
+  v
+rest.Config (TLS, auth, server URL)
+        |
+        +------> Clientset (writes: Create, Update, Patch, Delete)
+        |
+        +------> SharedInformerFactory
+        |               |
+        |               +-- Informers (Watch + cache)
+        |               |
+        |               +-- Listers (cache reads)
+        |
+        +------> Dynamic Client (CRDs, generic tools)
+        |
+        +------> Discovery Client (API discovery)
+  |
+  v
+Work Queue (deduplication + rate limiting)
+  |
+  v
+Worker Goroutines (reconcile function)
+        |
+        +-- Read from Lister (cache, no API call)
+        |
+        +-- Write via Clientset (API call to kube-apiserver)
+  |
+  v
+kube-apiserver -> etcd
+```
+
+---
+
+# Complete Minimal Controller Example
+
+```go
+func main() {
+    config, _ := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+    clientset, _ := kubernetes.NewForConfig(config)
+
+    factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
+    podInformer := factory.Core().V1().Pods()
+    podLister := podInformer.Lister()
+
+    queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+
+    podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc: func(obj interface{}) {
+            key, _ := cache.MetaNamespaceKeyFunc(obj)
+            queue.Add(key)
+        },
+        UpdateFunc: func(_, obj interface{}) {
+            key, _ := cache.MetaNamespaceKeyFunc(obj)
+            queue.Add(key)
+        },
+        DeleteFunc: func(obj interface{}) {
+            key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+            queue.Add(key)
+        },
+    })
+
+    stopCh := make(chan struct{})
+    factory.Start(stopCh)
+    factory.WaitForCacheSync(stopCh)
+
+    // Worker loop
+    for {
+        key, quit := queue.Get()
+        if quit { break }
+        namespace, name, _ := cache.SplitMetaNamespaceKey(key.(string))
+        pod, err := podLister.Pods(namespace).Get(name)
+        if err == nil {
+            fmt.Printf("Reconciling pod: %s/%s\n", pod.Namespace, pod.Name)
+            queue.Forget(key)
+        } else {
+            queue.AddRateLimited(key)
+        }
+        queue.Done(key)
+    }
+}
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. What is client-go?
+`client-go` is the official Kubernetes Go client library. It provides typed (Clientset), untyped (Dynamic Client), and discovery-based access to the Kubernetes API, plus higher-level components like SharedInformerFactory, Listers, and Work Queues.
+
+### Q2. What is the difference between Clientset and Dynamic Client?
+Clientset provides compile-time type-safe clients for all built-in resources (returns `*v1.Pod`, `*appsv1.Deployment`). Dynamic Client works with `*unstructured.Unstructured` and can access any resource including CRDs, but without compile-time type checking.
+
+### Q3. When would you use the Dynamic Client over Clientset?
+When working with CRDs not compiled into the program, building generic tools that operate on arbitrary resources, or implementing generic controllers (e.g., GitOps engines that manage any resource type).
+
+### Q4. What does the Discovery Client do?
+It queries `kube-apiserver` to discover available API groups, versions, and resources dynamically. It is used by `kubectl api-resources`, dynamic clients, and operators that must handle CRDs or multiple API versions.
+
+### Q5. What is SharedInformerFactory?
+A factory that creates and manages SharedIndexInformer instances for all built-in resources, ensuring only one Informer per resource type across all controllers in a process.
+
+### Q6. What are the four main client-go components a production controller uses?
+`rest.Config` (authentication), `Clientset` (writes), `SharedInformerFactory` + `Lister` (reads via cache), and `workqueue.RateLimitingQueue` (safe async reconciliation).
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| `401 Unauthorized` on controller startup | Incorrect kubeconfig or ServiceAccount permissions | Verify kubeconfig path / RBAC rules for ServiceAccount |
+| `No matches for kind` error | Wrong GVR in Dynamic Client | Use Discovery Client to verify group/version/resource |
+| CRD objects return `nil` from Clientset | CRD types not compiled into Clientset | Use Dynamic Client for CRD resources |
+| High API Server load from controller | Reading directly from Clientset on every reconcile | Use Lister (Informer cache) for reads |
+| Controller creates duplicate resources | Not checking `errors.IsNotFound()` before Create | Check existence with Lister before calling `Create` |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Describe the four main components of `client-go` and their roles.
+2. Distinguish Clientset from Dynamic Client and explain when to use each.
+3. Explain what the Discovery Client does and how it caches results.
+4. Show the complete client-go controller architecture diagram from config to etcd.
+5. Write a minimal controller that uses SharedInformerFactory, Lister, and Work Queue.
+6. Explain why controllers should use Lister for reads and Clientset for writes.
+
+---
+
+# Next Chapter
+
+**Chapter 13 — controller-runtime**
+
+In the next chapter, you'll learn about `controller-runtime` — the higher-level framework built on top of `client-go` used by Kubebuilder and Operator SDK. It abstracts away the Informer, Work Queue, and reconciliation boilerplate into a clean, declarative pattern.

@@ -1,0 +1,223 @@
+---
+title: "Chapter 1 — Container Architecture & Lifecycle"
+sidebar_position: 1
+module: "Module 1.2 — Container Architecture"
+description: "Master container architecture and state machine mechanics — Created, Running, Paused (cgroup freezer), Stopped lifecycles, PID 1 signal propagation, and runtime stacks."
+---
+
+# Chapter 1 — Container Architecture & Lifecycle
+
+> **Goal:** Master container runtime architecture, internal execution states, and Linux kernel signal dispatching — dissecting the **Container State Machine (`Created` $\to$ `Running` $\to$ `Paused` $\to$ `Stopped` $\to$ `Deleted`)**, understanding how the **cgroup Freezer subsystem** suspends process threads, analyzing why **PID 1 processes** ignore default Unix signals (`SIGTERM`), and detailing the container execution flow across **containerd**, **containerd-shim**, and **runc**.
+>
+> By the end of this chapter, you will understand:
+> 1. The 5 formal states of a container lifecycle and their transition triggers
+> 2. How the cgroup freezer subsystem suspends execution without terminating processes
+> 3. Why PID 1 inside a container handles `SIGTERM` differently than normal Linux processes
+> 4. What gets shared with the host kernel vs what is isolated in user-space root filesystems
+> 5. The architectural role of `containerd-shim` in surviving container engine daemon crashes
+> 6. How to trace state transitions and inspect cgroup freeze states using the command line
+
+---
+
+## Real-Life Analogy
+
+Think of the Container Architecture and State Machine as **an electric automobile on an automated smart highway with specialized driving modes**:
+
+- **1. The Factory Assembly Stage (`Created`):**
+  - The electric car is assembled in the factory according to a digital blueprint (**The OCI Image Manifest**).
+  - The chassis, wheels, and battery are bolted together (**Namespaces and cgroups allocated, OverlayFS rootfs mounted**).
+  - However, the ignition key has not been turned. The motor is completely off, consuming 0 watts of electricity (**Process not yet spawned**).
+- **2. The Highway Cruise Stage (`Running`):**
+  - The driver turns the key (**`docker start` / `runc start`**).
+  - The main engine controller (**PID 1**) begins spinning, processing traffic, and executing instructions at full line rate.
+- **3. The Time-Freeze Chamber (`Paused` - cgroup Freezer):**
+  - The car enters a quantum freeze chamber (**`docker pause`**).
+  - The car doesn't turn off its radio or dump its battery charge (**Zero memory loss; all variables and network sockets stay open in RAM**).
+  - Instead, the Linux kernel simply stops scheduling CPU clock cycles to the engine. The car is frozen in time in 0.0 milliseconds!
+- **4. The Graceful Parking vs Emergency Brake (`Stopped` - `SIGTERM` vs `SIGKILL`):**
+  - The highway controller signals: *"Exit the highway (**`SIGTERM`**)."* The car has **10 seconds** to signal, pull onto the shoulder, save navigation logs, and park.
+  - If the car ignores the exit sign after 10 seconds, the highway drops a 50-ton concrete wall on the car (**`SIGKILL` - Immediate uncatchable kernel termination**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               The Container State Machine & Runtime Stack Transition Flow
+
+                     ┌─────────────────────────────────────────┐
+                     │ 1. OCI CONTAINER IMAGE (Read-Only)      │
+                     └────────────────────┬────────────────────┘
+                                          │ `docker create` / `runc create`
+                                          ▼
+                     ┌─────────────────────────────────────────┐
+                     │ STATE: CREATED                          │
+                     │ - Namespaces & cgroups allocated        │
+                     │ - OverlayFS writable layer mounted      │
+                     │ - Process NOT yet executing             │
+                     └────────────────────┬────────────────────┘
+                                          │ `docker start` (Executes entrypoint)
+                                          ▼
+ ┌────────────────────────────────────────────────────────────────────────────────┐
+ │ STATE: RUNNING                                                                 │
+ │ - Main process (PID 1) executes user code                                      │
+ │ - Consumes CPU/RAM within cgroup bounds                                        │
+ └──────────────┬───────────────────▲─────────────────────────────┬───────────────┘
+                │ `docker pause`    │ `docker unpause`            │ `docker stop`
+                │ (cgroup freezer)  │ (SIGCONT)                   │ (SIGTERM: 10s)
+                ▼                   │                             ▼
+ ┌──────────────────────────────────┴─────┐         ┌─────────────────────────────┐
+ │ STATE: PAUSED                          │         │ STATE: STOPPED              │
+ │ - Zero CPU cycles allocated by kernel  │         │ - Process terminated        │
+ │ - RAM & TCP socket buffers retained!   │         │ - Exit code recorded        │
+ └────────────────────────────────────────┘         │ - Filesystem preserved      │
+                                                    └─────────────┬───────────────┘
+                                                                  │ `docker rm`
+                                                                  ▼
+                                                    ┌─────────────────────────────┐
+                                                    │ STATE: DELETED (Destroyed)  │
+                                                    │ - Writable layer deleted    │
+                                                    └─────────────────────────────┘
+```
+
+---
+
+## The 5 Container Lifecycle States
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Lifecycle State      │ Linux Kernel Mechanism  │ Hardware Resource Consumption                     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. `Created`**     │ Namespaces & cgroups    │ Consumes disk space (OverlayFS writable layer);   │
+ │                      │ initialized; no exec.   │ **0% CPU, 0 MB host RAM**.                        │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. `Running`**     │ PID 1 executing in user │ Active CPU scheduling; memory allocated in host   │
+ │                      │ space; network active.  │ RAM cgroup; network sockets open.                 │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. `Paused`**      │ cgroup `freezer` state  │ **0% CPU consumption**; process memory preserved  │
+ │                      │ set to `FROZEN`.        │ in RAM; TCP connections remain open.              │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. `Stopped`**     │ Process terminated via  │ **0% CPU, 0 MB RAM**; ephemeral rootfs preserved  │
+ │                      │ `SIGTERM` / `SIGKILL`.  │ on disk until explicitly deleted.                 │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **5. `Deleted`**     │ Kernel cgroup/namespace │ **All resources released**; OverlayFS writable    │
+ │                      │ structs unlinked.       │ directories permanently deleted.                  │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Signal Handling & The PID 1 Problem
+
+In Linux, **Process ID 1 (PID 1)** is special:
+- In the host operating system, `systemd` or `init` runs as PID 1, adopting orphaned child processes and handling signals.
+- In a container, **your application is PID 1**.
+
+```text
+ The PID 1 Gotcha:
+ - In Linux, the kernel TREATS PID 1 DIFFERENTLY from normal processes.
+ - Normal processes receive default signal handlers (e.g. SIGTERM causes termination).
+ - The Linux kernel WILL NOT apply default signal actions to PID 1 unless the process 
+   EXPLICITLY registers a custom signal handler in code!
+```
+
+### The Shell vs Exec Form Trap in Dockerfiles:
+```dockerfile
+# ❌ ANTI-PATTERN: Shell Form (Spawns /bin/sh as PID 1; your app is child PID 2!)
+# /bin/sh does NOT forward SIGTERM to python, causing 10-second stop delays!
+ENTRYPOINT python app.py
+
+# ✅ BEST PRACTICE: Exec Form (Runs python directly as PID 1)
+# Python receives SIGTERM immediately!
+ENTRYPOINT ["python", "app.py"]
+```
+
+---
+
+## The Container Runtime Daemon Stack
+
+```text
+ Client CLI (`docker run` / `nerdctl`)
+    │
+    ▼ (UNIX Socket: `/var/run/docker.sock` via REST API)
+ High-Level Runtime (`dockerd` / `containerd`)
+    │
+    ▼ (gRPC API: `containerd.services.tasks.v1`)
+ The Shim Layer (`containerd-shim-v2`)
+    │
+    ▼ (Executes low-level OCI command)
+ Low-Level OCI Runtime (`runc create` / `runc start`)
+    │
+    ▼ (Direct Linux Kernel Syscalls: `clone()`, `pivot_root()`)
+ Isolated Linux Container Process!
+```
+
+### Why `containerd-shim` is Critical:
+The `containerd-shim` process sits between `containerd` and the running container. It keeps the container's standard I/O (stdin/stdout/stderr) file descriptors open and reports exit codes. **If the main Docker daemon or containerd crashes or restarts, the container processes remain running with zero downtime!**
+
+---
+
+## Hands-On Lab: Driving the Container State Machine
+
+```bash
+# Step 1: Create a container without starting it
+docker create --name lifecycle-demo alpine sleep 3600
+
+# Step 2: Inspect status (Notice State.Status is 'created'!)
+docker inspect lifecycle-demo --format '{{.State.Status}}'
+
+# Step 3: Start the container
+docker start lifecycle-demo
+docker inspect lifecycle-demo --format '{{.State.Status}} (PID: {{.State.Pid}})'
+
+# Step 4: Pause the container (Freezes CPU clock scheduling!)
+docker pause lifecycle-demo
+docker inspect lifecycle-demo --format '{{.State.Status}}'
+
+# Step 5: Unpause and resume execution
+docker unpause lifecycle-demo
+
+# Step 6: Stop the container (Sends SIGTERM -> waits 10s -> SIGKILL)
+docker stop -t 2 lifecycle-demo
+docker inspect lifecycle-demo --format '{{.State.Status}} (ExitCode: {{.State.ExitCode}})'
+
+# Step 7: Permanently remove the container
+docker rm lifecycle-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the primary states in a container lifecycle, and what happens in the kernel during `docker pause`?**
+
+The primary container lifecycle states are **`Created`**, **`Running`**, **`Paused`**, **`Stopped`**, and **`Deleted`**. When `docker pause` is invoked, the container runtime uses the Linux **cgroup Freezer subsystem** (`cgroup.freeze: 1` in cgroups v2). The Linux kernel immediately removes all tasks in that cgroup from the CPU scheduler queue. The processes are completely frozen in-place: **they consume 0% CPU, but remain resident in RAM with all open file descriptors and TCP socket buffers preserved**, allowing instantaneous resumption via `docker unpause`.
+
+**Q2: Why do containers sometimes take 10 seconds to stop when you run `docker stop`?**
+
+When `docker stop` is executed, the runtime sends a **`SIGTERM`** signal to the container's PID 1 process and starts a 10-second countdown timer. If the application handles `SIGTERM`, it gracefully closes database connections, flushes logs, and exits immediately. However, if: (1) The Dockerfile used the **shell form** (`ENTRYPOINT python app.py`), causing `/bin/sh` to run as PID 1 and swallow `SIGTERM`; or (2) The application ignores `SIGTERM`, the process runs until the 10-second timeout expires, at which point the runtime forcefully sends **`SIGKILL` (Exit Code 137)**.
+
+**Q3: What is the architectural purpose of `containerd-shim`?**
+
+`containerd-shim` is a lightweight daemon process spawned for every running container. Its responsibilities are: (1) **Daemonless Containers**: It acts as the parent of the container process after `runc` exits, allowing `dockerd` or `containerd` to be upgraded or restarted without killing running containers; (2) **I/O Management**: It holds the container's `stdin`, `stdout`, and `stderr` pipes open; (3) **Exit Code Reporting**: It captures the container's exit status and forwards it to the CRI/Docker API.
+
+**Q4: What is the difference between what a container shares with the host OS and what it isolates?**
+
+- **Shared Components**: The single **Host Linux Kernel**, physical CPU cores, RAM memory controllers, network cards (NICs), storage controllers, and kernel device drivers.
+- **Isolated Components**: The **User-Space Environment** (root filesystem `/`, `/etc`, `/usr`, `/lib`, `glibc`/`musl`), process ID space (PID namespace), network routing tables and IP addresses (Net namespace), mount points (Mount namespace), hostnames (UTS namespace), and resource consumption limits (cgroups).
+
+**Q5: What is the difference between `docker stop` and `docker kill`?**
+
+- **`docker stop`**: Implements **graceful termination**. It sends `SIGTERM` (Signal 15) to PID 1, allows the application a default 10-second grace period (`-t 10`) to drain connections and save state, and falls back to `SIGKILL` only if the timeout expires.
+- **`docker kill`**: Implements **immediate termination**. It sends `SIGKILL` (Signal 9) directly to the process via the Linux kernel. `SIGKILL` cannot be caught, blocked, or handled by user-space code; the process is obliterated from the kernel process table instantly.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 5 container states: Created, Running, Paused, Stopped, Deleted
+- [ ] Know that `docker pause` freezes CPU scheduling using the cgroup freezer
+- [ ] Know that PID 1 ignores default signals unless an explicit handler is registered
+- [ ] Know why Exec Form `["python", "app.py"]` is mandatory for fast signal handling
+- [ ] Know that `containerd-shim` allows container survival across daemon restarts
+- [ ] Can view container exit codes using `docker inspect <name> --format '{{.State.ExitCode}}'`

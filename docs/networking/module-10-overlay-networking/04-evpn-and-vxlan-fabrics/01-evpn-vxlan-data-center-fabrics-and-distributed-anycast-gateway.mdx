@@ -1,0 +1,149 @@
+---
+title: "Chapter 4 — EVPN-VXLAN Fabrics: Spine-Leaf, BGP EVPN Route Types & Distributed Anycast Gateway"
+sidebar_position: 1
+module: "Module 10.4 — EVPN & Fabrics"
+description: "Master modern cloud datacenter fabrics — BGP Ethernet VPN (EVPN, RFC 7432 & RFC 8365), VXLAN data plane integration, 5 BGP EVPN Route Types, ARP suppression, and Distributed Anycast Gateways."
+---
+
+# Chapter 4 — EVPN-VXLAN Fabrics: Spine-Leaf, BGP EVPN Route Types & Distributed Anycast Gateway
+
+> **Goal:** Master the premier architecture for modern cloud datacenters and telco clouds: **BGP EVPN with VXLAN Data Plane (RFC 7432 & RFC 8365)**. Understand how Spine-Leaf Clos networks eliminate Spanning Tree Protocol (STP), how MP-BGP EVPN acts as a unified control plane distributing MAC and IP reachability, the 5 BGP EVPN Route Types, ARP Suppression, and Distributed Anycast Gateways.
+>
+> By the end of this chapter, you will understand:
+> 1. Datacenter evolution: Traditional 3-Tier Core/Agg/Access (STP-blocked) $\to$ Non-Blocking Spine-Leaf Clos Fabric (ECMP Layer 3)
+> 2. Why BGP EVPN replaces data-plane flood-and-learn multicast with a declarative control plane
+> 3. The 5 standard BGP EVPN Route Types (Type 1 Ethernet Auto-Discovery, Type 2 MAC/IP, Type 3 Inclusive Multicast, Type 4 Ethernet Segment, Type 5 IP Prefix)
+> 4. Distributed Anycast Gateway: identical Default Gateway MAC/IP on every Leaf switch for zero-latency VM migration
+> 5. ARP/ND Suppression: intercepting client broadcasts directly on local Leaf switch ASICs
+> 6. Symmetric vs Asymmetric Integrated Routing and Bridging (IRB)
+
+---
+
+## Real-Life Analogy
+
+Think of EVPN-VXLAN as **a high-speed automated robotic fulfillment warehouse**:
+
+- **Traditional 3-Tier Datacenter (Old Forklift Aisles with Stop Signs):**
+  - To prevent forklifts from crashing into each other, half the aisles are barricaded with permanent "Do Not Enter" signs (**Spanning Tree Protocol / STP**). If Forklift 1 wants to talk to Forklift 2 on the same floor, it must drive all the way up to the CEO's office on the 5th floor and back down (**Trombone Routing**).
+- **Spine-Leaf Fabric with EVPN (Pneumatic Dispatch Tubes + Central Computer):**
+  - Every warehouse station (**Leaf Switch**) connects directly to every overhead dispatcher (**Spine Switch**). All aisles are open simultaneously (**ECMP line rate**).
+  - Every station has the exact same master receptionist desk (**Distributed Anycast Gateway**). When a worker moves from Station A to Station B, the central computer instantly broadcasts their new desk location (**BGP EVPN Type 2 Route**) without yelling over the loudspeaker (**Zero ARP broadcast flooding**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  Spine-Leaf Fabric with BGP EVPN-VXLAN Overlay
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ SPINE LAYER (Pure Layer 3 BGP / ECMP Underlay Transport - No VTEPs)         │
+ │                                                                             │
+ │            [Spine Switch 1]                     [Spine Switch 2]            │
+ │            ASN: 65000                           ASN: 65000                  │
+ └───────────────────▲────────────────────────────────────▲────────────────────┘
+                     │                                    │ (All links active ECMP)
+     ┌───────────────┼────────────────────┬───────────────┼───────────────┐
+     ▼               ▼                    ▼               ▼               ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ LEAF LAYER (Hardware VTEPs & Distributed Anycast Gateways - e.g. Cisco/Arista)│
+ │                                                                             │
+ │   [Leaf 1 (VTEP 1)]                    [Leaf 2 (VTEP 2)]                    │
+ │   - BGP EVPN Control Plane             - BGP EVPN Control Plane             │
+ │   - Gateway: 10.1.1.1 (Anycast MAC)    - Gateway: 10.1.1.1 (Same Anycast MAC)│
+ │   - VNI: 10010 (Tenant A)              - VNI: 10010 (Tenant A)              │
+ └───────────┬────────────────────────────────────┬────────────────────────────┘
+             │ (Local Layer 2 Ports)              │
+             ▼                                    ▼
+       [Server / VM 1]                      [Server / VM 2]
+       IP: 10.1.1.10                        IP: 10.1.1.11
+       MAC: 52:54:00:11:11:11               MAC: 52:54:00:22:22:22
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The 5 BGP EVPN Route Types (RFC 7432)
+
+```text
+ ┌────────────┬────────────────────────────┬────────────────────────────────────────────────────────────┐
+ │ Route Type │ Name                       │ Operational Purpose & Functionality                        │
+ │────────────┼────────────────────────────┼────────────────────────────────────────────────────────────┤
+ │ **Type 1** │ Ethernet Auto-Discovery    │ Multi-homing, fast failover (Mass Withdraw), and split-hor.│
+ │ **Type 2** │ MAC / IP Advertisement     │ Advertises VM MAC and IP bindings to all remote VTEPs      │
+ │ **Type 3** │ Inclusive Multicast Tag    │ Sets up head-end replication tunnels for BUM traffic       │
+ │ **Type 4** │ Ethernet Segment Route     │ Discovers dual-homed Leaf switches connected to same server│
+ │ **Type 5** │ IP Prefix Route            │ Inter-subnet / inter-tenant routing and external WAN routes│
+ └────────────┴────────────────────────────┴────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Distributed Anycast Gateway & ARP Suppression
+
+1. **Distributed Anycast Gateway:**
+   - Every Leaf switch configures the **exact same virtual IP (`10.1.1.1/24`) and virtual MAC (`0000.5e00.0101`)** for a given VLAN/VNI.
+   - When a VM transmits an ARP request for its default gateway, its local Leaf switch responds immediately. When the VM live-migrates (vMotion) to a different server rack across the datacenter, its gateway IP and MAC remain identical—zero default-gateway re-routing needed!
+2. **ARP Suppression:**
+   - When VM 1 sends an ARP request for VM 2 (`10.1.1.11`), the local Leaf switch checks its EVPN Type 2 table. If VM 2's MAC is already learned via BGP, the local Leaf switch **answers the ARP request locally on behalf of VM 2**, completely eliminating ARP broadcast flooding across the physical underlay fabric.
+
+---
+
+### 3. Symmetric vs Asymmetric IRB Routing
+
+- **Asymmetric IRB:** Ingress Leaf bridges + routes; Egress Leaf only bridges. Requires every Leaf switch to configure all tenant VLANs (poor scalability).
+- **Symmetric IRB (Modern Industry Standard):** Ingress Leaf routes from Tenant VLAN to a dedicated **Layer 3 VNI (L3VNI / VRF)**; Egress Leaf routes from L3VNI to destination VLAN. Scales to thousands of VNIs with minimal Leaf switch memory consumption.
+
+---
+
+## Hands-On Lab: Inspecting BGP EVPN Routes in Linux / FRR
+
+```bash
+# Step 1: Verify Linux kernel support for bridge EVPN VLAN filtering
+ip link add dev br0 type bridge vlan_filtering 1 2>/dev/null && ip link del br0
+
+# Step 2: In FRR / vtysh (if active), inspect BGP EVPN summary
+# vtysh -c "show ip bgp l2vpn evpn summary"
+
+# Step 3: Inspect learned BGP EVPN Type 2 (MAC/IP) routes
+# vtysh -c "show ip bgp l2vpn evpn route type macip"
+
+# Step 4: Inspect local kernel Bridge Forwarding Database (FDB) showing VTEP tunnels
+bridge fdb show
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why did modern cloud datacenters replace traditional 3-Tier Spanning Tree (STP) networks with Spine-Leaf EVPN-VXLAN?**
+
+Traditional 3-Tier architectures (Core, Aggregation, Access) relied on **Spanning Tree Protocol (STP)** to prevent Layer 2 loops. STP artificially disabled 50% of redundant links (wasting massive bandwidth) and created high-latency bottlenecks for east-west microservice traffic. A **Spine-Leaf Fabric** routes at Layer 3 using **ECMP**, ensuring 100% of all physical links forward traffic simultaneously. EVPN-VXLAN runs on top as an overlay, delivering Layer 2 agility with Layer 3 scale, sub-millisecond predictable latency, and zero STP loops.
+
+**Q2: What is the purpose of an EVPN Type 2 Route vs a Type 5 Route?**
+
+- **Type 2 (MAC/IP Advertisement):** Advertises individual host MAC addresses and host `/32` (IPv4) or `/128` (IPv6) addresses. Used for intra-subnet bridging and host-level routing.
+- **Type 5 (IP Prefix Route):** Advertises entire subnets or CIDR blocks (e.g. `10.100.0.0/16`) rather than individual host MACs. Used for inter-datacenter interconnects (DCI) and routing traffic to external enterprise WANs and clouds.
+
+**Q3: How does EVPN-VXLAN Multi-Homing (EVPN-MH) replace proprietary vendor technologies like Cisco vPC or Arista MLAG?**
+
+Cisco vPC and MLAG required proprietary peer-links between dual switch pairs to provide server multi-homing (LACP bonding). **EVPN Multi-Homing (RFC 7432)** is an open IETF standard using **Type 1 (Auto-Discovery) and Type 4 (Ethernet Segment) routes**. It allows dual-homed servers to run standard LACP across switches from **different vendors** without proprietary inter-switch cabling, supporting active-active load sharing and sub-second failover.
+
+**Q4: What is the "Trombone Routing" problem in legacy virtualized datacenters and how does Distributed Anycast Gateway fix it?**
+
+In legacy networks with centralized default gateways (on core aggregation routers), when VM 1 on Subnet A talked to VM 2 on Subnet B located on the exact same physical server, the packet had to travel up the physical network to the core router and back down (**Trombone effect**). With **Distributed Anycast Gateway**, routing occurs directly inside the local Top-of-Rack Leaf switch ASIC on the first hop, cutting inter-subnet latency to sub-microseconds.
+
+**Q5: What is Silent Host Discovery in EVPN fabrics?**
+
+A "silent host" is a newly booted server (or security appliance) that listens on the network without transmitting any initial ARP or DHCP packets. Because the local Leaf switch has not seen any frames from the host, it cannot generate an EVPN Type 2 route. Leaf switches resolve this by periodically generating active **ARP / Neighbor Discovery probes** targeting the configured subnet to force the silent host to respond and trigger BGP EVPN advertisement.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Spine-Leaf Clos architecture and why STP was eliminated
+- [ ] Memorize the 5 BGP EVPN Route Types (Type 1 to Type 5)
+- [ ] Understand Distributed Anycast Gateways and local ARP Suppression
+- [ ] Differentiate Symmetric IRB (L3VNI) from Asymmetric IRB
+- [ ] Know how EVPN Multi-Homing (Type 1 & 4) replaces proprietary vPC/MLAG

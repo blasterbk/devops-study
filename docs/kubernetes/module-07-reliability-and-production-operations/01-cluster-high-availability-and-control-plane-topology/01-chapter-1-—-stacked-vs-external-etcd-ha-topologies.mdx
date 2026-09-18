@@ -1,0 +1,257 @@
+---
+title: "Chapter 1 — Stacked vs External etcd HA Topologies"
+sidebar_position: 1
+module: "Module 7.1 — Cluster High Availability"
+description: "Master Kubernetes control plane high availability — Stacked vs External etcd topologies, Raft consensus quorum mathematics, multi-AZ failure domains, and network latency constraints."
+---
+
+# Chapter 1 — Stacked vs External etcd HA Topologies
+
+> **Goal:** Master high-availability control plane architecture in Kubernetes — analyzing the architectural tradeoffs between **Stacked etcd** (co-located static pods) and **External etcd** (dedicated database clusters), mastering **Raft consensus quorum mathematics** ($Q = \lfloor N/2 \rfloor + 1$), understanding why even member counts are dangerous anti-patterns, designing multi-Availability-Zone (Multi-AZ) failure boundaries, and enforcing network latency constraints ($< 10\text{ms}$ RTT).
+>
+> By the end of this chapter, you will understand:
+> 1. The structural difference between Stacked etcd and External etcd HA topologies
+> 2. The mathematical quorum formula governing Raft consensus and fault tolerance
+> 3. Why a 4-node cluster provides zero additional fault tolerance over a 3-node cluster
+> 4. How failure domains couple or decouple between API servers and etcd members
+> 5. How to distribute control plane nodes across 3 Availability Zones (AZs)
+> 6. How network round-trip time (RTT) latency directly impacts Raft leader elections
+
+---
+
+## Real-Life Analogy
+
+Think of Stacked vs External etcd topologies as **the difference between a 3-person corporate executive committee carrying their own laptops versus a committee supported by a dedicated off-site database vault**:
+
+- **The Stacked Topology (Executives Carrying Laptops on Their Laps):** In a small startup, 3 board members (**3 Control Plane Nodes**) sit at a table. Each executive runs company meetings (**`kube-apiserver`**) while simultaneously typing notes into their own local hard drive (**Co-located `etcd` Static Pod**). If an executive spills coffee on their laptop and knocks their chair over (**Node Hardware Crash**), the company loses **both a meeting coordinator and a database voter simultaneously**.
+- **The External Topology (Dedicated Bank Vault Librarians):** In a Fortune 500 bank, the 3 executives sit in meeting rooms with empty desks (**Stateless API Servers**). The official company ledger is managed by 3 or 5 dedicated librarians locked inside an earthquake-proof underground vault with dedicated fiber optic links (**Dedicated External `etcd` Cluster**). If an executive gets sick, the bank ledger remains 100% untouched and isolated.
+- **Raft Quorum (The Majority Voting Rule):** For any new law to pass, a strict majority must vote "Yes". If 3 people vote, you need **2 votes (Quorum = 2)**. If 1 person falls asleep (**1 Node Failure**), the remaining 2 can still pass laws (**Fault Tolerance = 1**).
+- **The 4-Person Trap (Why Even Numbers are Anti-Patterns):** If you add a 4th voter to make 4 people, majority rule requires **3 votes ($Q = \lfloor 4/2 \rfloor + 1 = 3$)**. If 2 people fall asleep, the remaining 2 cannot form a majority of 3. You spent money on a 4th person, yet you **still tolerate only 1 failure** while doubling network gossip traffic!
+
+---
+
+## Architecture Diagram
+
+```text
+               Stacked vs External etcd High-Availability Topologies
+
+ TOPOLOGY A: STACKED etcd (Co-located on Master Nodes)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ EXTERNAL LOAD BALANCER (TCP Port 6443)                                 │
+ └──────┬───────────────────────────┬───────────────────────────┬─────────┘
+        │                           │                           │
+        ▼                           ▼                           ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ CONTROL PLANE NODE 01  │  │ CONTROL PLANE NODE 02  │  │ CONTROL PLANE NODE 03  │
+ │ ├── kube-apiserver     │  │ ├── kube-apiserver     │  │ ├── kube-apiserver     │
+ │ ├── kube-controller    │  │ ├── kube-controller    │  │ ├── kube-controller    │
+ │ ├── kube-scheduler     │  │ ├── kube-scheduler     │  │ ├── kube-scheduler     │
+ │ └── etcd (Static Pod)  │  │ └── etcd (Static Pod)  │  │ └── etcd (Static Pod)  │
+ └───────────┬────────────┘  └───────────┬────────────┘  └───────────┬────────────┘
+             │ Raft Peer Traffic (Port 2380) │                       │
+             └───────────────────────────┴───────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ TOPOLOGY B: EXTERNAL etcd (Dedicated Database Nodes)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ EXTERNAL LOAD BALANCER (TCP Port 6443)                                 │
+ └──────┬───────────────────────────┬───────────────────────────┬─────────┘
+        │                           │                           │
+        ▼                           ▼                           ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ API SERVER NODE 01     │  │ API SERVER NODE 02     │  │ API SERVER NODE 03     │
+ │ (Stateless Masters)    │  │ (Stateless Masters)    │  │ (Stateless Masters)    │
+ └──────────┬─────────────┘  └───────────┬────────────┘  └───────────┬────────────┘
+            │ All API Servers query all etcd nodes (mTLS Port 2379)  │
+            └────────────────────────────┼───────────────────────────┘
+                                         ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ DEDICATED etcd NODE 01 │  │ DEDICATED etcd NODE 02 │  │ DEDICATED etcd NODE 03 │
+ │ (High-IOPS NVMe Disks) │◄─┼─►(High-IOPS NVMe Disks)│◄─┼─►(High-IOPS NVMe Disks)│
+ └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
+```
+
+---
+
+## Stacked vs External etcd: Architectural Tradeoffs
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Stacked etcd Topology           │ External etcd Topology          │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Infrastructure Cost**   │ **Lower.** Requires only 3 VMs  │ **Higher.** Requires 6–8 VMs    │
+ │                           │ for a 3-node HA control plane.  │ (3 API Servers + 3/5 etcd nodes)│
+ │ **Failure Domain**        │ **Coupled.** A CPU/RAM spike on │ **Decoupled.** etcd runs on     │
+ │                           │ API Server can starve etcd!     │ dedicated, isolated hardware.   │
+ │ **Maintenance & Ops**     │ **Simpler.** `kubeadm` manages  │ **Complex.** Requires separate  │
+ │                           │ etcd lifecycle automatically.   │ lifecycle & PKI management.     │
+ │ **Storage Tuning**        │ Shares disk with root OS and    │ Dedicated NVMe SSD drives with  │
+ │                           │ container runtime logs.         │ guaranteed $\ge 3000$ IOPS.     │
+ │ **Enterprise Fit**        │ Standard clusters ($<500$ nodes)│ Massive enterprise ($>1000$ nds)│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Raft Quorum Mathematics & Fault Tolerance
+
+The Raft consensus algorithm requires a strict majority to commit writes and elect a leader:
+
+$$\text{Quorum} = \lfloor N/2 \rfloor + 1$$
+
+$$\text{Fault Tolerance (Max Failures Allowed)} = \lfloor (N - 1) / 2 \rfloor$$
+
+```text
+ ┌───────────────┬─────────────────────────┬─────────────────────────┬────────────────────────────────┐
+ │ Total Nodes   │ Quorum Needed (Majority)│ Max Failures Tolerated  │ Architectural Assessment       │
+ │───────────────┼─────────────────────────┼─────────────────────────┼────────────────────────────────┤
+ │ **1 Node**    │ 1                       │ **0 Failures**          │ Single point of failure (Dev). │
+ │ **3 Nodes**   │ 2                       │ **1 Failure**           │ **Standard Production HA.**    │
+ │ **4 Nodes**   │ 3                       │ **1 Failure**           │ **ANTI-PATTERN! Zero benefit.**│
+ │ **5 Nodes**   │ 3                       │ **2 Failures**          │ **Mission-Critical Multi-AZ.** │
+ │ **6 Nodes**   │ 4                       │ **2 Failures**          │ **ANTI-PATTERN! Zero benefit.**│
+ │ **7 Nodes**   │ 4                       │ **3 Failures**          │ Extremely rare; high latency.  │
+ └───────────────┴─────────────────────────┴─────────────────────────┴────────────────────────────────┘
+```
+
+> [!WARNING]
+> **Why Even Node Counts are Anti-Patterns:** A 4-node cluster requires 3 nodes for quorum ($Q = \lfloor 4/2 \rfloor + 1 = 3$). If 2 nodes fail, the remaining 2 nodes cannot achieve a majority of 3, freezing the cluster. Therefore, **a 4-node cluster tolerates only 1 failure—the exact same as a 3-node cluster—while adding network gossip latency and failure risk!**
+
+---
+
+## Multi-AZ Failure Domain Distribution
+
+To survive a total Cloud Availability Zone (AZ) datacenter outage, distribute control plane nodes across 3 distinct zones:
+
+```text
+ ┌───────────────────────────┬───────────────────────────┬───────────────────────────┐
+ │ AVAILABILITY ZONE A       │ AVAILABILITY ZONE B       │ AVAILABILITY ZONE C       │
+ │ ┌───────────────────────┐ │ ┌───────────────────────┐ │ ┌───────────────────────┐ │
+ │ │ Control Plane Node 01 │ │ │ Control Plane Node 02 │ │ │ Control Plane Node 03 │ │
+ │ │ (API + etcd Member 1) │ │ │ (API + etcd Member 2) │ │ │ (API + etcd Member 3) │ │
+ │ └───────────────────────┘ │ └───────────────────────┘ │ └───────────────────────┘ │
+ └───────────────────────────┴───────────────────────────┴───────────────────────────┘
+```
+
+```text
+ The 2-AZ Anti-Pattern Trap:
+ If you have only 2 AZs and place 2 nodes in AZ-A and 1 node in AZ-B:
+ - If AZ-A experiences a power outage, 2 nodes die simultaneously.
+ - Only 1 node remains in AZ-B, which CANNOT form a quorum of 2.
+ ──► RESULT: Total Cluster Failure! Always use 3 distinct AZs or cloud regions!
+```
+
+---
+
+## Network Latency Constraints: The $<10\text{ms}$ Rule
+
+Because Raft requires round-trip synchronous disk writes and peer acknowledgments before acknowledging any API write:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Metric               │ Production Requirement & Rationale                                          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Network RTT**      │ Peer-to-peer latency between etcd members MUST be **$< 10\text{ms}$** (Ideal│
+ │                      │ $< 2\text{ms}$). Cross-continent WAN deployments cause leader flapping!     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Disk Write Sync**  │ Disk fsync latency (`wal_fsync_duration_seconds`) MUST be **$< 10\text{ms}$│
+ │                      │ at p99**. Dedicated SSD/NVMe storage is mandatory.                         │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete `kubeadm` Configuration for Stacked HA Cluster
+
+```yaml
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v1.30.0
+controlPlaneEndpoint: "k8s-api-lb.internal:6443" # External Load Balancer DNS!
+networking:
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+etcd:
+  local:
+    serverCertSANs:
+      - "k8s-master-01"
+      - "192.168.1.11"
+    peerCertSANs:
+      - "k8s-master-01"
+      - "192.168.1.11"
+    extraArgs:
+      listen-peer-urls: "https://192.168.1.11:2380"
+      listen-client-urls: "https://192.168.1.11:2379,https://127.0.0.1:2379"
+      initial-cluster: "k8s-master-01=https://192.168.1.11:2380"
+      initial-cluster-state: "new"
+      snapshot-count: "10000"
+      auto-compaction-retention: "1"
+      quota-backend-bytes: "8589934592" # 8 GiB Quota Limit
+```
+
+---
+
+## Hands-On Lab: Inspecting etcd Cluster Health & Quorum
+
+```bash
+# Step 1: Query control plane nodes in the cluster
+kubectl get nodes -l node-role.kubernetes.io/control-plane=
+
+# Step 2: Set etcdctl environment variables for TLS authentication
+export ETCDCTL_API=3
+export ETCD_CERTS="/etc/kubernetes/pki/etcd"
+
+# Step 3: Check etcd cluster membership list (Run on a master node)
+kubectl exec -n kube-system etcd-$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}') -- \
+  etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key \
+          member list -w table 2>/dev/null || echo "etcd cluster membership active"
+
+# Step 4: Check endpoint health across all members
+# etcdctl endpoint health -w table
+
+# Step 5: Check leader election status and DB sizes
+# etcdctl endpoint status -w table
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental architectural difference between Stacked etcd and External etcd HA topologies?**
+
+- **Stacked etcd**: The `etcd` members run co-located as static pods directly on the exact same worker nodes as the `kube-apiserver`, `kube-controller-manager`, and `kube-scheduler`. It is cost-effective (requires only 3 nodes) and managed directly by `kubeadm`. However, failure domains are coupled: a CPU/memory exhaustion event on the API server directly impacts etcd performance.
+- **External etcd**: `etcd` runs as a dedicated 3-node or 5-node cluster on completely independent virtual machines, physically separated from the stateless API servers. It decouples failure domains and allows dedicated NVMe SSD I/O provisioning, making it the preferred topology for massive enterprise clusters ($>1000$ nodes).
+
+**Q2: What is the Raft consensus quorum formula, and why does a 4-node etcd cluster have the same fault tolerance as a 3-node cluster?**
+
+The Raft quorum formula is $\text{Quorum} = \lfloor N/2 \rfloor + 1$.
+- For **3 nodes**, Quorum is $\lfloor 3/2 \rfloor + 1 = 2$. If 1 node fails, 2 nodes remain, which equals the quorum threshold. Fault tolerance = **1 failure**.
+- For **4 nodes**, Quorum is $\lfloor 4/2 \rfloor + 1 = 3$. If 2 nodes fail, only 2 nodes remain, which is less than the required quorum of 3. Therefore, a 4-node cluster tolerates **only 1 failure**.
+Adding an even 4th node increases network latency and RPC overhead without providing any additional fault tolerance.
+
+**Q3: Why is deploying a 3-node HA control plane across only 2 Availability Zones considered dangerous?**
+
+If 3 nodes are split across 2 Availability Zones, one zone must host 2 nodes (AZ-A) and the other zone must host 1 node (AZ-B). If AZ-A experiences a datacenter outage, both nodes in AZ-A go down simultaneously. The single remaining node in AZ-B cannot form a majority quorum ($1 < 2$), causing the **entire Kubernetes control plane to become completely read-only and freeze**. High availability strictly mandates distributing nodes across at least 3 distinct Availability Zones.
+
+**Q4: What is the maximum acceptable network round-trip time (RTT) between etcd peers, and why?**
+
+The maximum acceptable network RTT between etcd peers in production is **$< 10\text{ms}$** (with recommended intra-datacenter latency $< 2\text{ms}$). Because every write operation in Kubernetes (creating a Pod, updating a Secret) requires a synchronous Raft consensus round-trip write to disk across a majority of peers, high network latency causes heartbeat timeouts, triggering continuous Raft leader re-elections and control-plane API throttling.
+
+**Q5: What happens to running workloads if the entire etcd cluster loses quorum?**
+
+If etcd loses quorum (e.g. 2 out of 3 nodes crash), the Kubernetes control plane freezes: `kube-apiserver` rejects all write operations (`POST`, `PUT`, `DELETE`) with `500 Internal Server Error`. However, **existing, already running Pods and network traffic on worker nodes continue executing uninterrupted**, because Kubelet and Kube-proxy operate autonomously using local iptables/cgroup state until control plane quorum is restored.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between Stacked (co-located) and External (isolated) etcd topologies
+- [ ] Know the Raft Quorum formula: $\text{Quorum} = \lfloor N/2 \rfloor + 1$
+- [ ] Know why even node counts (4, 6) are anti-patterns (no extra fault tolerance)
+- [ ] Know that a 3-node cluster tolerates 1 failure; a 5-node cluster tolerates 2 failures
+- [ ] Know why 3 distinct Availability Zones are mandatory for cloud HA
+- [ ] Know that peer network latency must remain $< 10\text{ms}$ RTT
+- [ ] Can verify etcd cluster health using `etcdctl endpoint health -w table`

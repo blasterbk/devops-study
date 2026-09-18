@@ -1,0 +1,1207 @@
+---
+title: "Chapter 3 — Mutating Admission Webhooks"
+sidebar_position: 3
+module: "Module 1.10 — Admission Controllers"
+description: "> **Goal:** Understand how **Mutating Admission Webhooks** allow Kubernetes to dynamically modify API requests before they are stored in etcd. By the end of thi..."
+---
+
+# Module 1.10 — Admission Controllers
+
+# Chapter 3 — Mutating Admission Webhooks
+
+> **Goal:** Understand how **Mutating Admission Webhooks** allow Kubernetes to dynamically modify API requests before they are stored in etcd. By the end of this chapter, you'll understand the complete mutation pipeline, AdmissionReview protocol, JSON Patch mechanism, webhook configuration, failure handling, and production patterns used by systems like Istio, Linkerd, Kyverno, and OpenShift.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What Mutating Webhooks are and how they dynamically alter objects in flight
+> 2. The AdmissionReview (v1) request and response protocol
+> 3. JSON Patch (RFC 6902): `add`, `replace`, `remove` operations encoded in Base64
+> 4. MutatingWebhookConfiguration: rules, clientConfig, failurePolicy, and timeouts
+> 5. Namespace and Object selectors: scoping webhooks to specific targets
+> 6. Side effects and idempotency: why mutation must be deterministic
+> 7. Reinvocation policy (`Never` vs `IfNeeded`): re-running webhooks when downstream webhooks mutate fields
+> 8. Production architectures: Istio sidecar injection, Vault agent injection, Kyverno defaulting
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Mutating Admission Webhooks like an airport baggage auto-tagging and safety wrap station.
+
+```text
+Baggage Prep Station Analogy:
+
+Passenger checks in luggage (Pod manifest submitted to API Server)
+Luggage moves down the conveyor belt through automated prep stations (Mutating Webhooks):
+  - Station 1 (Istio): Attaches an RFID tracking tag to the handle (Injects envoy sidecar container)
+  - Station 2 (Security): Wraps the suitcase in protective tamper-evident film (Adds securityContext)
+  - Station 3 (Billing): Sticks a heavy luggage barcode sticker (Adds standard billing labels)
+Luggage emerges with modifications applied
+Only after all prep stations finish is the luggage sent to X-Ray inspection (Validating phase)
+```
+
+| Baggage Prep Station | Mutating Webhook |
+| :--- | :--- |
+| Unprocessed suitcase | Original API request object (`request.object`) |
+| RFID tracking tag attached | Injected sidecar container (Istio / Vault) |
+| Tamper-evident film applied | Injected `securityContext` / resource requests |
+| Instructions for baggage modification | Base64-encoded JSON Patch (`response.patch`) |
+| Prep station offline policy | `failurePolicy: Ignore` or `failurePolicy: Fail` |
+| Moving to X-Ray scanner | Passing mutated object to **Validating Admission** phase |
+
+> **Important:** Mutating webhooks **execute strictly before Validating webhooks**. When an object is mutated, the downstream validating admission phase (and schema validation) validates the **mutated version** of the object, not the original YAML submitted by the user. If a mutating webhook introduces invalid fields or violates a security policy, the validating phase will immediately reject the entire request.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- API Server
+- Admission Controllers
+- Authentication & Authorization
+- Built-in Admission Controllers
+- Kubernetes API Objects
+- Webhooks
+
+---
+
+# Where This Chapter Fits
+
+In previous chapters, we learned:
+
+```text
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Admission Controllers
+```
+
+But organizations often need custom behavior.
+
+Examples:
+
+- Automatically inject sidecars
+- Add organization labels
+- Add annotations
+- Enforce image registry
+- Add security context
+- Inject secrets
+- Add environment variables
+
+Should Kubernetes source code be modified for every company?
+
+**No.**
+
+Instead, Kubernetes calls external webhooks.
+
+---
+
+# The Problem
+
+Suppose a company requires:
+
+Every Pod must contain:
+
+```yaml
+labels:
+  company: acme
+```
+
+Developers forget to add it.
+
+Should every developer remember?
+
+Should Kubernetes source code be modified?
+
+Neither is practical.
+
+---
+
+# Kubernetes Solution
+
+The API Server sends the request to an external service.
+
+```text
+Incoming Request
+  |
+  v
+API Server
+  |
+  v
+Webhook
+  |
+  v
+Modify Object
+  |
+  v
+Return
+  |
+  v
+Continue Admission
+```
+
+The webhook changes the object before it is stored.
+
+---
+
+# What is a Mutating Admission Webhook?
+
+A Mutating Admission Webhook is an external HTTPS service that receives Kubernetes API requests and returns modifications.
+
+Unlike built-in admission plugins,
+
+it is:
+
+- User-defined
+- Deployable
+- Configurable
+- Extensible
+
+---
+
+# High-Level Architecture
+
+```text
+                 kubectl
+  |
+  v
+                API Server
+  |
+  v
+      Mutating Admission Webhook
+
+                     |
+
+        Modify Kubernetes Object
+  |
+  v
+                API Server
+  |
+  v
+                 Persist etcd
+```
+
+---
+
+# Why Mutating Webhooks Exist
+
+Built-in admission plugins cover common use cases.
+
+Organizations often need custom behavior.
+
+Examples:
+
+- Service mesh sidecars
+- Security agents
+- Company labels
+- Internal annotations
+- Image registry rewriting
+- Secret injection
+- Custom defaults
+
+Rather than changing Kubernetes,
+
+webhooks extend Kubernetes.
+
+---
+
+# Mutation Happens Before Validation
+
+Recall the admission pipeline:
+
+```text
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Mutating
+  |
+  v
+Mutating Webhooks
+  |
+  v
+Built-in Validating
+  |
+  v
+Validating Webhooks
+  |
+  v
+Persist
+```
+
+Mutation always happens before validation.
+
+---
+
+# Complete Request Lifecycle
+
+```text
+Create Pod
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Mutating
+  |
+  v
+Mutating Webhook
+  |
+  v
+Modified Object
+  |
+  v
+Validation
+  |
+  v
+Persist
+  |
+  v
+etcd
+```
+
+---
+
+# AdmissionReview API
+
+The API Server communicates with webhooks using the **AdmissionReview** API.
+
+The request contains information about:
+
+- User
+- Operation
+- Namespace
+- Object
+- Old Object
+- Resource
+- UID
+
+The webhook returns an AdmissionReview response.
+
+---
+
+# AdmissionReview Request
+
+Conceptually:
+
+```text
+AdmissionReview
+
++--────── UID
+
++--────── Resource
+
++--────── Operation
+
++--────── UserInfo
+
++--────── Namespace
+
++--────── Object
+```
+
+The webhook receives the complete request context.
+
+---
+
+# AdmissionReview Response
+
+The webhook responds with:
+
+```text
+Allowed?
+  |
+  v
+True
+
+or
+
+False
+```
+
+For mutation,
+
+it also returns:
+
+```text
+JSON Patch
+```
+
+---
+
+# Complete Communication Flow
+
+```text
+API Server
+  |
+  v
+AdmissionReview Request
+  |
+  v
+Webhook Server
+  |
+  v
+AdmissionReview Response
+  |
+  v
+API Server
+```
+
+---
+
+# What is JSON Patch?
+
+The webhook does **not** send back the entire modified object.
+
+Instead,
+
+it returns only the changes.
+
+These changes use the JSON Patch format.
+
+---
+
+# Why JSON Patch?
+
+Imagine a Pod with:
+
+```text
+300 Fields
+```
+
+Webhook wants to add:
+
+```yaml
+label:
+  team: platform
+```
+
+Sending the whole object would waste bandwidth.
+
+Instead,
+
+the webhook returns:
+
+```text
+Only The Change
+```
+
+---
+
+# Conceptual JSON Patch
+
+```text
+Add
+  |
+  v
+/metadata/labels/team
+  |
+  v
+platform
+```
+
+The API Server applies the patch to the original object.
+
+---
+
+# JSON Patch Workflow
+
+```text
+Original Object
+  |
+  v
+JSON Patch
+  |
+  v
+API Server Applies Patch
+  |
+  v
+Modified Object
+```
+
+---
+
+# Example
+
+Incoming Pod:
+
+```yaml
+metadata:
+  labels: {}
+```
+
+Webhook patch:
+
+```text
+Add Label
+  |
+  v
+company=acme
+```
+
+Stored object:
+
+```yaml
+metadata:
+  labels:
+    company: acme
+```
+
+The developer never added it manually.
+
+---
+
+# MutatingWebhookConfiguration
+
+The API Server needs to know:
+
+- Which webhook to call
+- When to call it
+- Which resources to intercept
+
+This is configured using:
+
+```text
+MutatingWebhookConfiguration
+```
+
+---
+
+# High-Level Configuration
+
+The configuration defines:
+
+```text
+Rules
+  |
+  v
+Resources
+  |
+  v
+Operations
+  |
+  v
+Selectors
+  |
+  v
+Failure Policy
+  |
+  v
+Webhook Service
+```
+
+---
+
+# Rules
+
+Rules determine when the webhook executes.
+
+Example conditions:
+
+- CREATE
+- UPDATE
+- DELETE
+- CONNECT
+
+Resources:
+
+- Pods
+- Deployments
+- Services
+- CRDs
+- Secrets
+
+---
+
+# Workflow
+
+```text
+Incoming Request
+  |
+  v
+Matches Rule?
+  |
+  v
+Yes
+  |
+  v
+Call Webhook
+
+------------
+
+No
+  |
+  v
+Skip
+```
+
+---
+
+# Match Policy
+
+Sometimes multiple API versions exist.
+
+Example:
+
+```text
+apps/v1
+
+apps/v1beta1
+```
+
+Match Policy determines how API versions are matched against webhook rules.
+
+---
+
+# Namespace Selector
+
+Not every namespace requires mutation.
+
+Example:
+
+```text
+default
+  |
+  v
+Inject Sidecar
+
+------------
+
+kube-system
+  |
+  v
+Skip
+```
+
+Namespace selectors filter requests before the webhook is invoked.
+
+---
+
+# Object Selector
+
+Similarly,
+
+objects can be filtered.
+
+Example:
+
+```text
+label
+  |
+  v
+inject=true
+  |
+  v
+Call Webhook
+
+------------
+
+inject=false
+  |
+  v
+Skip
+```
+
+Only matching objects trigger the webhook.
+
+---
+
+# Failure Policy
+
+Suppose the webhook is unavailable.
+
+What should Kubernetes do?
+
+Two options exist.
+
+---
+
+# Fail
+
+```text
+Webhook Down
+  |
+  v
+Reject Request
+```
+
+Use for:
+
+- Security
+- Compliance
+- Critical policy
+
+---
+
+# Ignore
+
+```text
+Webhook Down
+  |
+  v
+Continue Admission
+```
+
+Use for:
+
+- Optional mutation
+- Best-effort enhancements
+
+Choosing the correct failure policy is a critical production decision.
+
+---
+
+# Timeout
+
+Webhooks should respond quickly.
+
+Example:
+
+```text
+API Server
+  |
+  v
+Wait
+  |
+  v
+Webhook
+  |
+  v
+Response
+```
+
+If the timeout expires,
+
+the Failure Policy determines what happens next.
+
+---
+
+# Side Effects
+
+Some webhooks modify external systems.
+
+Examples:
+
+- Database writes
+- Cloud API calls
+- Billing systems
+
+Mutation webhooks should ideally avoid side effects because the same request may be retried.
+
+---
+
+# Why Side Effects Are Dangerous
+
+Suppose:
+
+```text
+Webhook
+  |
+  v
+Create Cloud VM
+  |
+  v
+Timeout
+  |
+  v
+Retry
+```
+
+Now two VMs may exist.
+
+Admission webhooks should be designed to avoid or tolerate retries safely.
+
+---
+
+# Reinvocation Policy
+
+Imagine:
+
+Webhook A adds:
+
+```text
+Container
+```
+
+Webhook B modifies:
+
+```text
+All Containers
+```
+
+Should Webhook B see the newly added container?
+
+Reinvocation Policy controls whether eligible webhooks may run again after earlier mutations.
+
+---
+
+# Multiple Mutating Webhooks
+
+Example:
+
+```text
+Webhook A
+  |
+  v
+Add Sidecar
+  |
+  v
+Webhook B
+  |
+  v
+Add Labels
+  |
+  v
+Webhook C
+  |
+  v
+Inject Secrets
+```
+
+Each webhook receives the latest version of the object produced by previous mutations.
+
+---
+
+# API Server Internal Flow
+
+```text
+Incoming Request
+  |
+  v
+Built-in Mutation
+  |
+  v
+Webhook 1
+  |
+  v
+Apply Patch
+  |
+  v
+Webhook 2
+  |
+  v
+Apply Patch
+  |
+  v
+Webhook 3
+  |
+  v
+Apply Patch
+  |
+  v
+Validation
+```
+
+---
+
+# Production Example 1 — Istio Sidecar Injection
+
+Developer creates:
+
+```text
+Pod
+```
+
+Webhook:
+
+```text
+Inject Envoy
+```
+
+Stored object:
+
+```text
+Application
+
++
+
+Envoy Proxy
+```
+
+No application code changes are required.
+
+---
+
+# Production Example 2 — Linkerd
+
+Incoming Pod:
+
+```text
+Application
+```
+
+Webhook injects:
+
+- Proxy
+- Init Container
+- Configuration
+
+The service mesh becomes transparent to developers.
+
+---
+
+# Production Example 3 — Organization Labels
+
+Developer creates:
+
+```yaml
+metadata:
+  labels: {}
+```
+
+Webhook automatically adds:
+
+```text
+team
+
+environment
+
+cost-center
+
+owner
+```
+
+Every workload follows company standards.
+
+---
+
+# Production Example 4 — Security Defaults
+
+Incoming Pod:
+
+```text
+No Security Context
+```
+
+Webhook adds:
+
+- runAsNonRoot
+- seccompProfile
+- readOnlyRootFilesystem
+
+Security is standardized automatically.
+
+---
+
+# Production Example 5 — Image Registry Rewrite
+
+Developer specifies:
+
+```text
+docker.io/nginx
+```
+
+Webhook changes it to:
+
+```text
+registry.company.local/nginx
+```
+
+Organizations can enforce trusted image registries.
+
+---
+
+# End-to-End Flow
+
+```text
+Developer
+  |
+  v
+kubectl apply
+  |
+  v
+API Server
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Mutating Plugins
+  |
+  v
+Mutating Webhook
+  |
+  v
+AdmissionReview
+  |
+  v
+JSON Patch
+  |
+  v
+Modified Object
+  |
+  v
+Validation
+  |
+  v
+Persist
+  |
+  v
+etcd
+```
+
+---
+
+# Performance Considerations
+
+Unlike built-in admission plugins,
+
+Mutating Webhooks require:
+
+- HTTPS
+- Network communication
+- TLS validation
+- Serialization
+- Deserialization
+
+Every webhook increases admission latency.
+
+---
+
+# High Availability
+
+Production webhook deployments should:
+
+```text
+Multiple Replicas
+  |
+  v
+Service
+  |
+  v
+Load Balancer
+  |
+  v
+API Server
+```
+
+Avoid single points of failure.
+
+---
+
+# Production Best Practices
+
+✔ Keep mutation logic deterministic.
+
+✔ Make mutations idempotent.
+
+✔ Respond within milliseconds whenever possible.
+
+✔ Minimize network latency.
+
+✔ Avoid external side effects.
+
+✔ Use namespace selectors to reduce unnecessary invocations.
+
+✔ Use object selectors to limit webhook scope.
+
+✔ Choose Failure Policy carefully.
+
+✔ Monitor webhook latency and failures.
+
+✔ Deploy multiple webhook replicas.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Mutating Webhooks replace built-in admission plugins.
+
+**Correct:** They extend Kubernetes for organization-specific requirements.
+
+---
+
+### ❌ Misconception 2
+
+The webhook returns the entire modified object.
+
+**Correct:** It typically returns a JSON Patch describing only the required changes.
+
+---
+
+### ❌ Misconception 3
+
+Mutation happens after validation.
+
+**Correct:** Mutation always occurs before validation.
+
+---
+
+### ❌ Misconception 4
+
+Only one webhook can modify an object.
+
+**Correct:** Multiple mutating webhooks can execute sequentially.
+
+---
+
+### ❌ Misconception 5
+
+Webhooks should perform long-running work.
+
+**Correct:** Admission webhooks should respond quickly to avoid delaying API requests.
+
+---
+
+### ❌ Misconception 6
+
+Webhook failures are always ignored.
+
+**Correct:** Behavior depends on the configured Failure Policy.
+
+---
+
+### ❌ Misconception 7
+
+Mutating Webhooks should create external resources.
+
+**Correct:** They should avoid side effects because admission requests may be retried.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is a Mutating Admission Webhook?
+
+An external HTTPS service that modifies Kubernetes API requests before they are persisted.
+
+---
+
+### Q2. When is a Mutating Admission Webhook executed?
+
+After built-in mutating admission plugins and before any validating admission.
+
+---
+
+### Q3. How does the API Server communicate with a webhook?
+
+Using the AdmissionReview API.
+
+---
+
+### Q4. Why does the webhook return a JSON Patch instead of the entire object?
+
+To efficiently describe only the required modifications.
+
+---
+
+### Q5. What is MutatingWebhookConfiguration?
+
+A Kubernetes resource that tells the API Server when and how to invoke a mutating webhook.
+
+---
+
+### Q6. What is the purpose of Namespace Selectors?
+
+To limit webhook execution to specific namespaces.
+
+---
+
+### Q7. What is Failure Policy?
+
+It determines whether API requests should fail or continue if the webhook cannot be reached.
+
+---
+
+### Q8. Why should mutation logic be idempotent?
+
+Because requests may be retried or multiple admission cycles may occur.
+
+---
+
+### Q9. Why are side effects discouraged?
+
+Because admission requests can be retried, potentially causing duplicate external actions.
+
+---
+
+### Q10. Name some real-world uses of Mutating Admission Webhooks.
+
+Istio sidecar injection, Linkerd proxy injection, label injection, image registry rewriting, security defaulting, and secret injection.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Sidecar not injected | Namespace selector or object selector did not match |
+| API requests are slow | Webhook latency or timeout |
+| Requests rejected unexpectedly | Failure Policy set to `Fail` and webhook unavailable |
+| Labels not added | JSON Patch incorrect or webhook not triggered |
+| Duplicate mutations | Mutation logic is not idempotent |
+| Webhook never called | Rules do not match the request |
+| TLS errors | Invalid certificate or CA bundle configuration |
+| Webhook loops | Incorrect reinvocation handling or conflicting mutations |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is a Mutating Admission Webhook?
+2. Why do organizations use mutating webhooks?
+3. How does the AdmissionReview API work?
+4. Why is JSON Patch used?
+5. What is the purpose of MutatingWebhookConfiguration?
+6. What do Rules, Namespace Selectors, and Object Selectors control?
+7. What is the difference between `Fail` and `Ignore` Failure Policies?
+8. Why should admission webhooks avoid side effects?
+9. What is Reinvocation Policy?
+10. Why is high availability important for admission webhooks?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how **Mutating Admission Webhooks** extend Kubernetes by allowing external services to modify API requests before they are stored in etcd.
+
+You learned:
+
+- Why mutating webhooks exist
+- How the AdmissionReview protocol works
+- Why JSON Patch is used for efficient object modification
+- The role of `MutatingWebhookConfiguration`
+- How Rules, Match Policy, Namespace Selectors, and Object Selectors determine when webhooks execute
+- How Failure Policy, Timeout, Side Effects, and Reinvocation Policy affect production behavior
+- Real-world examples such as Istio sidecar injection, Linkerd proxy injection, security defaulting, and image registry rewriting
+- Performance, scalability, and reliability considerations for production clusters
+
+Mutating Admission Webhooks are the primary mechanism for dynamically transforming Kubernetes objects at admission time, enabling organizations to implement platform-wide defaults and automation without modifying Kubernetes itself.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — Validating Admission Webhooks & ValidatingAdmissionPolicy**
+
+Topics include:
+
+- What are Validating Admission Webhooks?
+- AdmissionReview Validation
+- ValidatingWebhookConfiguration
+- Allow vs Deny
+- Failure Policy
+- Match Conditions
+- ValidatingAdmissionPolicy
+- Common Expression Language (CEL)
+- Policy Binding
+- Production Validation Patterns
+```

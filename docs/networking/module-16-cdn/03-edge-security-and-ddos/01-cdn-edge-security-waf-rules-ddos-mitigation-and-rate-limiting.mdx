@@ -1,0 +1,158 @@
+---
+title: "Chapter 3 — CDN Edge Security: WAF Rules, DDoS Mitigation & Rate Limiting"
+sidebar_position: 1
+module: "Module 16.3 — Edge Security & DDoS"
+description: "Master Edge security architectures — Web Application Firewall (WAF) OWASP Core Rule Sets, Layer 3/4 vs Layer 7 DDoS mitigation, Token Bucket rate limiting, Bot Management, and Cloudflare Workers."
+---
+
+# Chapter 3 — CDN Edge Security: WAF Rules, DDoS Mitigation & Rate Limiting
+
+> **Goal:** Master edge cybersecurity and DDoS mitigation architectures deployed on global Content Delivery Networks. Understand how edge networks inspect and block malicious traffic *before* it reaches origin infrastructure, Web Application Firewall (WAF) rule engines (OWASP Top 10), Layer 3/4 volumetric DDoS absorption via Anycast, Layer 7 application-layer challenge pages (JavaScript Challenges, CAPTCHA, Managed Challenges), sliding-window rate limiting, and Bot Management.
+>
+> By the end of this chapter, you will understand:
+> 1. The difference between Layer 3/4 Volumetric DDoS (SYN floods, UDP Amplification, NTP reflection) and Layer 7 DDoS (HTTP Floods, Slowloris)
+> 2. Web Application Firewalls (WAF) at the edge: OWASP Core Rule Set (CRS), SQL Injection (SQLi), Cross-Site Scripting (XSS), and Remote Code Execution (RCE)
+> 3. BGP Anycast DDoS Absorption: distributing massive multi-terabit attacks across 300+ edge POPs
+> 4. Rate Limiting algorithms at the edge: Token Bucket, Leaky Bucket, and Sliding Window Counters
+> 5. Automated Bot Management: JA3/JA4 TLS fingerprinting, HTTP/2 fingerprinting, and behavioral ML scoring
+> 6. CLI diagnostic workflows to test WAF blocking and rate-limiting triggers
+
+---
+
+## Real-Life Analogy
+
+Think of CDN Edge Security as **a multi-layered fortress moat and biometric defense system protecting a royal castle**:
+
+- **Layer 3/4 Volumetric DDoS (A Catapult Boulder Barrage):**
+  - An invading army hurls 500,000 boulders at the castle (**500 Gbps UDP flood**).
+  - Instead of hitting the castle gate (**Origin Server**), the boulders fall harmlessly into a massive, 300-mile-wide surrounding moat (**Anycast Edge POPs**), absorbing the kinetic shock with zero damage.
+- **Layer 7 Application DDoS & WAF (Disguised Spies in the Crowd):**
+  - An assassin dresses as a legitimate merchant and whispers: `' OR 1=1 --` (**SQL Injection**).
+  - The guard at the outer drawbridge (**Edge WAF**) detects the poison dagger hidden under the coat and arrests them immediately (**HTTP 403 Forbidden**), preventing them from ever stepping foot inside the throne room (**Backend Database**).
+- **Rate Limiting (The Subway Turnstile):**
+  - A single visitor is only allowed to scan their metro card once every 2 seconds. If someone tries to swipe 50 times in 1 second, the turnstile locks (**HTTP 429 Too Many Requests**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  CDN Edge Security & Multi-Tier DDoS Mitigation
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ INCOMING CLIENT REQUESTS & MALICIOUS ATTACKS                                │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. TIER 1: L3/L4 ANYCAST VOLUMETRIC ABSORPTION                              │
+ │    - Absorbs 500+ Gbps SYN Floods, UDP Amplification, and ICMP floods       │
+ │    - Distributed across 300+ Edge POPs worldwide (Each absorbs <2 Gbps)     │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ (Clean TCP/TLS Stream)
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 2. TIER 2: EDGE BOT MANAGEMENT & TLS FINGERPRINTING                         │
+ │    - Evaluates JA3/JA4 TLS cipher order + HTTP/2 frame fingerprinting       │
+ │    - Triggers Managed Challenge (JavaScript Proof-of-Work) on suspicious bot│
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 3. TIER 3: EDGE WEB APPLICATION FIREWALL (WAF) & RATE LIMITING              │
+ │    - Evaluates OWASP Core Rules (SQLi, XSS, Path Traversal, Log4j)          │
+ │    - Sliding Window Rate Limiter (Max 100 req/min per IP / Session)         │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ Only 100% Sanitized Traffic Passes
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ PROTECTED ORIGIN BACKEND SERVER (Your Private Kubernetes Cluster)           │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Layer 3/4 vs Layer 7 DDoS Attacks
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Category             │ Attack Vectors                           │ Mitigation Strategy                      │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **Layer 3/4 DDoS**   │ SYN Flood, UDP Reflection (NTP, DNS,     │ **BGP Anycast + XDP:** Distributed across│
+ │ (Volumetric)         │ Memcached), ICMP Fragmentation           │ 300+ POPs; dropped via XDP/IP BPF maps.  │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **Layer 7 DDoS**     │ HTTP Floods, Slowloris, Cache-Busting,   │ **Edge WAF + Managed Challenges:**       │
+ │ (Application)        │ Automated Credential Stuffing            │ JA4 fingerprinting, JS Challenge, Rate LM│
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 2. Edge Bot Management & JA3/JA4 TLS Fingerprinting
+
+Automated attack bots often forge standard HTTP `User-Agent` strings (pretending to be Chrome).
+- **JA3 / JA4 Fingerprinting:** Hashes the exact ordered sequence of TLS parameters in the `ClientHello` packet (TLS Version, Supported Cipher Suites, Extensions, Elliptic Curves, and Point Formats).
+- Even if a Python script sets its `User-Agent` to `"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"`, its underlying OpenSSL TLS cipher handshake has a unique JA4 fingerprint that immediately identifies it as a Python script, allowing the WAF to block or challenge it instantly!
+
+---
+
+### 3. Rate Limiting Algorithms: Token Bucket
+
+- A token bucket holds up to $B$ tokens (**Burst Capacity**).
+- New tokens are added at a constant fill rate $r$ tokens/second.
+- Each incoming request consumes 1 token.
+- If the bucket is empty, the edge immediately returns **HTTP 429 Too Many Requests** with a `Retry-After: 60` header.
+
+---
+
+## Hands-On Lab: Testing Edge WAF & Rate Limiting via CLI
+
+```bash
+# Step 1: Test WAF blocking on an SQL Injection payload using cURL
+curl -i "https://httpbin.org/get?id=1%20UNION%20SELECT%20null,username,password%20FROM%20users"
+
+# Step 2: Test WAF blocking on a Path Traversal attack payload
+curl -i "https://httpbin.org/get?file=../../../../etc/passwd"
+
+# Step 3: Trigger a rate-limiting loop to test HTTP 429 responses
+for i in {1..20}; do
+  curl -s -o /dev/null -w "%{http_code}\n" https://httpbin.org/get
+done
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does BGP Anycast absorb a massive 1 Terabit/sec volumetric DDoS attack?**
+
+In BGP Anycast, hundreds of Edge POPs across the globe announce the identical IP address. When a distributed botnet of 100,000 infected IoT devices launches a 1 Tbps volumetric attack, the traffic does not converge on a single datacenter; instead, the global Internet routing fabric naturally disperses the attack geographically across all 300+ Edge POPs. Each individual POP only receives a modest ~3 Gbps slice of the attack, which its local **XDP / SmartNIC hardware filters easily discard at line rate** with zero origin disruption.
+
+**Q2: What is the Slowloris attack and why are traditional thread-based web servers vulnerable to it?**
+
+Slowloris is a Layer 7 DDoS attack where an attacker opens hundreds of HTTP connections and transmits incomplete HTTP headers at agonizingly slow speeds (e.g. sending 1 byte every 10 seconds: `X-Header: a...`). In thread-based web servers (like Apache prefork), each open connection holds an entire OS thread in memory. A single laptop sending 100kbps can consume all 1,000 server worker threads, taking the entire website offline. **Modern CDNs mitigate this by buffering headers in asynchronous `epoll` loops** and dropping connections that fail strict minimum header transmission rates.
+
+**Q3: How does JA4 TLS fingerprinting detect sophisticated headless scraping bots?**
+
+Scraping bots use automation frameworks (Playwright, Puppeteer, Python `requests`, Go `http`). While they can easily spoof the `User-Agent` and request headers to mimic Google Chrome, their underlying TLS cryptographic client library (OpenSSL, Go `crypto/tls`) negotiates TLS using a different set and order of cipher suites and elliptic curve extensions than real Google Chrome. **JA4 fingerprints the exact TLS handshake structure**, allowing the edge to identify the non-browser runtime regardless of header spoofing.
+
+**Q4: What is the difference between an OWASP CRS Positive Security Model and a Negative Security Model?**
+
+- **Negative Security Model (Blacklisting / Default Allow):** Blocks known bad attack patterns (e.g. signature matching for SQLi `' OR 1=1` or Log4j `${jndi:ldap://}`). Good for general protection, but vulnerable to zero-day attacks and novel obfuscations.
+- **Positive Security Model (Whitelisting / Default Deny):** Defines strictly what is allowed (e.g. URI must be `/api/v1/user`, ID must be a numeric integer, Content-Type must be `application/json`, max body size = 10KB). Any request that deviates from the schema is rejected immediately.
+
+**Q5: Why must enterprise backends enforce Origin Lockdown (e.g., Cloudflare Authenticated Origin Pulls / AWS Prefix Lists)?**
+
+If an enterprise deploys an edge WAF/CDN, but leaves its origin server's public IP address exposed on the internet, attackers who discover the direct IP (via historical DNS records or certificate transparency logs) can **bypass the CDN and WAF completely**, sending attacks directly to the origin server. **Origin Lockdown** uses mTLS (Authenticated Origin Pulls) or firewall security groups restricted to the CDN's official IP ranges, ensuring all traffic must pass through the edge WAF.
+
+---
+
+## Summary Checksheet
+
+- [ ] Differentiate L3/L4 Volumetric DDoS from L7 Application DDoS
+- [ ] Understand OWASP Core Rule Sets (SQLi, XSS, RCE, Path Traversal)
+- [ ] Master JA3/JA4 TLS and HTTP/2 client fingerprinting
+- [ ] Understand Token Bucket and Sliding Window rate limiting (HTTP 429)
+- [ ] Explain why Origin Lockdown (mTLS / IP whitelisting) is mandatory

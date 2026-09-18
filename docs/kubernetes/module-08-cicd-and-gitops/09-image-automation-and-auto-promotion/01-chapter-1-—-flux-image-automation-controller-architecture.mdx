@@ -1,0 +1,244 @@
+---
+title: "Chapter 1 — Flux Image Automation Controller"
+sidebar_position: 1
+module: "Module 8.9 — Image Automation & Promotion"
+description: "Master automated GitOps image promotion with Flux CD — ImageRepository scanning, ImagePolicy semver filtering, and ImageUpdateAutomation automated Git commits."
+---
+
+# Chapter 1 — Flux Image Automation Controller Architecture
+
+> **Goal:** Master continuous automated deployment and image promotion in **Flux CD v2** using the **Image Automation Controller** and **Image Reflector Controller** — understanding how to scan remote OCI container registries (`ImageRepository`), evaluate semantic versioning policies (`ImagePolicy` semver ranges `^1.0.0`), and automatically update, commit, and push modified image tags directly back into Git repositories (`ImageUpdateAutomation`).
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural flow of automated image reflection and Git write-back
+> 2. How `ImageRepository` continuously scans DockerHub, ECR, and GHCR for new tags
+> 3. How `ImagePolicy` selects the highest valid tag using SemVer, numerical, or regex rules
+> 4. How `ImageUpdateAutomation` parses setter comments (`# {"$imagepolicy": "..."}`) in YAML
+> 5. How automated Git commits prevent configuration drift and maintain a 100% audited Git history
+> 6. How to configure SSH commit signing and branch protection bypass for automation bots
+
+---
+
+## Real-Life Analogy
+
+Think of Flux Image Automation as **an automated personal shopping robot that monitors luxury boutique inventory and updates your home wardrobe catalog**:
+
+- **The Manual Drudgery (The Human Refresh Trap):** Every time your software team builds a new Docker container (**A new fashion release**), an engineer must manually copy the 40-character SHA hash, open the Git repository, edit `deployment.yaml`, commit the change, and create a Pull Request (**Tiresome, Repetitive, and Error-Prone**).
+- **The 3-Step Automated Robot Pipeline:**
+  - **1. The Store Window Scanner (`ImageRepository` CRD):** A robot flies past the container registry store window every 60 seconds (**`interval: 1m`**), reading every new tag on the shelves (`v1.0.1`, `v1.0.2`, `v1.1.0-alpha`).
+  - **2. The Quality Filter Judge (`ImagePolicy` CRD):** The fashion judge reads the company policy: *"We accept any stable release starting with version 1 (**`semver: "^1.0.0"`**), but REJECT all alpha and beta tags!"* The judge identifies `v1.0.2` as the winner.
+  - **3. The Master Blueprint Editor (`ImageUpdateAutomation` CRD):** The robot opens your master home catalog (**The GitOps Repository**), finds the line marked with a special yellow sticky note (**`# {"$imagepolicy": "..."}`**), types `v1.0.2`, stamps the page with an official corporate signature (**GPG Git Commit**), and pushes the commit directly to the `main` branch.
+- **Flux's `kustomize-controller` sees the new Git commit and deploys the update immediately!**
+
+---
+
+## Architecture Diagram
+
+```text
+               Flux CD v2 Image Automation & Git Write-Back Lifecycle
+
+ CI PIPELINE: Builds and pushes `payment-api:v1.4.2` to Container Registry
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER REGISTRY (GHCR / AWS ECR / Google Artifact Registry / Harbor)│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 1. Scans Registry Tags every 1m
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ IMAGE-REFLECTOR-CONTROLLER                                             │
+ │ ├── ImageRepository: Pulls tag list: `[v1.4.0, v1.4.1, v1.4.2]`        │
+ │ └── ImagePolicy: Evaluates `semver: "^1.4.0"` ──► Selects `v1.4.2`!    │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 2. Emits latest matching tag to Automation Controller
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ IMAGE-AUTOMATION-CONTROLLER                                            │
+ │ 1. Clones GitOps Repository (`branch: main`)                           │
+ │ 2. Scans for setter comment: `# {"$imagepolicy": "flux-system:payment"}`│
+ │ 3. Replaces: `image: payment-api:v1.4.1` ──► `payment-api:v1.4.2`      │
+ │ 4. Creates GPG-Signed Git Commit & Pushes to GitHub!                   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 3. Pushes Commit: "Automated update image to v1.4.2"
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GITOPS GIT REPOSITORY (Git remains 100% Single Source of Truth!)       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 4. Standard Flux Kustomization reconciles new commit!
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES PRODUCTION CLUSTER: Workload updated to v1.4.2!             │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3-Step Flux Image Automation CRD Pipeline
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Resource Kind        │ Managing Controller     │ Primary Responsibility                            │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ImageRepository`**│ `image-reflector-`      │ Periodically polls the remote registry; extracts  │
+ │                      │ `controller`            │ and caches all available image tags.              │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ImagePolicy`**    │ `image-reflector-`      │ Filters and sorts tags based on Semantic          │
+ │                      │ `controller`            │ Versioning rules, regex patterns, or timestamps.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ImageUpdate-**    │ `image-automation-`     │ Clones Git repo, finds marker comments, rewrites  │
+ │ **Automation`**      │ `controller`            │ image strings, and creates an audited Git commit. │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. `ImageRepository` Manifest
+
+```yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImageRepository
+metadata:
+  name: payment-api-repo
+  namespace: flux-system
+spec:
+  image: ghcr.io/enterprise-org/payment-api
+  interval: 1m                         # Scans registry every 60 seconds
+  secretRef:
+    name: ghcr-registry-credentials    # Pull credentials for private registries
+```
+
+---
+
+## 2. `ImagePolicy` Manifest with Semantic Versioning
+
+```yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta2
+kind: ImagePolicy
+metadata:
+  name: payment-api-policy
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: payment-api-repo
+  policy:
+    # 1. Semantic Versioning Filter (Automatically promotes minor/patch updates!)
+    semver:
+      range: "^1.4.0"                  # Matches 1.4.1, 1.4.2, 1.5.0; ignores 2.0.0
+```
+
+---
+
+## 3. Workload Manifest with Policy Setter Marker
+
+In your application's `deployment.yaml` or `kustomization.yaml`, insert the **`$imagepolicy`** comment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-api
+  namespace: production
+spec:
+  template:
+    spec:
+      containers:
+      - name: payment
+        # The automation controller matches this exact marker comment!
+        image: ghcr.io/enterprise-org/payment-api:v1.4.0 # {"$imagepolicy": "flux-system:payment-api-policy"}
+```
+
+---
+
+## 4. `ImageUpdateAutomation` Manifest (Git Write-Back)
+
+```yaml
+apiVersion: image.toolkit.fluxcd.io/v1beta1
+kind: ImageUpdateAutomation
+metadata:
+  name: payment-git-writeback
+  namespace: flux-system
+spec:
+  interval: 1m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        name: "Flux GitOps Automation Bot"
+        email: "flux-bot@enterprise.com"
+      messageTemplate: |
+        Automated image update: {{range .Updated.Images}}{{println .}}{{end}}
+    push:
+      branch: main
+  update:
+    path: ./apps/production            # Scans only files inside this directory
+    strategy: Setters
+```
+
+---
+
+## Hands-On Lab: Querying Flux Image Policies & Scanning
+
+```bash
+# Step 1: Query active ImageRepository objects and last scan timestamps
+kubectl get imagerepositories.image.toolkit.fluxcd.io -A 2>/dev/null || echo "Image Reflector CRDs active / simulated"
+
+# Step 2: Query active ImagePolicies and the latest selected image tag
+kubectl get imagepolicies.image.toolkit.fluxcd.io -A -o custom-columns=NAME:.metadata.name,LATEST_IMAGE:.status.latestImage
+
+# Step 3: Inspect active ImageUpdateAutomation objects
+kubectl get imageupdateautomations.image.toolkit.fluxcd.io -A
+
+# Step 4: Manually trigger an immediate image reflection scan via flux CLI
+# flux reconcile image repository payment-api-repo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is "Git Write-Back" critical when automating container image deployments in GitOps?**
+
+If a CI pipeline builds a container image and directly updates the live Kubernetes cluster or overrides in-cluster parameters without modifying Git, the live cluster **diverges from the Git repository (Configuration Drift)**. The next time a developer merges a PR or an automated reconciliation runs, the GitOps controller will overwrite the new container with the older image declared in Git! By having the **Image Automation Controller commit the new image tag directly back into the Git repository**, Git remains the 100% authoritative Single Source of Truth with a complete audit trail.
+
+**Q2: What is the separation of responsibilities between `image-reflector-controller` and `image-automation-controller`?**
+
+- **`image-reflector-controller`**: Responsible strictly for **read-only reflection**. It polls remote container registries (`ImageRepository`), extracts tags, and evaluates selection algorithms (`ImagePolicy`), publishing the latest winning tag to the status field.
+- **`image-automation-controller`**: Responsible strictly for **write-back mutations**. It watches `ImagePolicy` resources, clones the target Git repository, updates manifests containing marker comments, and creates signed Git commits.
+
+**Q3: How does the marker comment `# {"$imagepolicy": "..."}` work in Flux?**
+
+Flux uses the open-source **Kyaml (Kubernetes YAML)** parser. It scans YAML files for inline comments adhering to the JSON schema `# {"$imagepolicy": "<namespace>:<policy-name>"}`. When an update is needed, Flux's parser surgically rewrites the container `image` string preceding the comment while **preserving all surrounding YAML formatting, indentations, and human comments**, preventing noisy Git diff churn.
+
+**Q4: How do you configure `ImagePolicy` for non-SemVer image tags (e.g. `main-<commit-sha>-<timestamp>`)?**
+
+When CI pipelines tag images with build timestamps (e.g. `main-a1b2c3d-1692345678`), configure `ImagePolicy` with a **regex filter**:
+```yaml
+policy:
+  numerical:
+    order: asc
+  filterTags:
+    pattern: '^main-[a-f0-9]+-(?P<ts>[0-9]+)'
+    extract: '$ts'
+```
+Flux extracts the numerical timestamp named capture group `(?P<ts>...)` and sorts tags numerically to select the most recently built image.
+
+**Q5: How do you prevent Flux Image Automation from triggering infinite CI build loops?**
+
+1. **Two-Repository Pattern**: Keep application source code in an App Repo and Kubernetes manifests in a dedicated GitOps Repo. Flux writes commits *only* to the GitOps repo, so application CI tests are never re-triggered.
+2. **Commit Author Filtering**: In GitHub Actions CI pipelines, configure branch filters or commit author exclusions (e.g. `if: "!contains(github.event.head_commit.author.name, 'Flux')"`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `ImageRepository` scans remote registries for tags on an interval
+- [ ] Know how `ImagePolicy` filters tags using SemVer (`^1.0.0`), numerical, or regex
+- [ ] Know how `# {"$imagepolicy": "..."}` markers allow surgical YAML updates
+- [ ] Know that `ImageUpdateAutomation` writes and pushes signed commits back to Git
+- [ ] Know why Git write-back preserves Git as the Single Source of Truth
+- [ ] Can view latest selected image tags using `kubectl get imagepolicies -A`

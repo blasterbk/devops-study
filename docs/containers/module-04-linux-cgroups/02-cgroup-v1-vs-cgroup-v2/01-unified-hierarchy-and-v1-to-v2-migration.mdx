@@ -1,0 +1,175 @@
+---
+title: "Chapter 1 — cgroup v1 vs v2: Unified Hierarchy & Migration"
+sidebar_position: 1
+module: "Module 4.2 — cgroup v1 vs v2"
+description: "Master the architectural evolution from cgroup v1 to cgroup v2 — the multi-hierarchy writeback flaw, the unified single tree, control file mapping, and migration."
+---
+
+# Chapter 1 — cgroup v1 vs v2: Unified Hierarchy & Migration
+
+> **Goal:** Master the historical architectural shift, kernel redesign, and production migration from **cgroup v1** to **cgroup v2 (The Unified Hierarchy)** — understanding why v1's multi-hierarchy design suffered from fatal **buffered I/O page cache accounting bugs**, analyzing how v2 unifies controllers under a single tree in **`/sys/fs/cgroup/`**, mapping legacy v1 control files to modern v2 parameters, and executing node migrations.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural flaws that caused the Linux kernel community to redesign cgroups in v2
+> 2. Why cgroup v1 could not throttle buffered disk writes and how v2 solved it
+> 3. The architecture of the Unified Single Hierarchy and `cgroup.subtree_control`
+> 4. The exact parameter mapping between cgroup v1 and cgroup v2 control files
+> 5. How to check if your Linux kernel is running `cgroup2fs` or legacy `tmpfs` v1 mounts
+> 6. How to configure kernel boot parameters to enforce cgroups v2 across your fleet
+
+---
+
+## Real-Life Analogy
+
+Think of the difference between cgroup v1 and cgroup v2 as **the difference between 10 separate disconnected city utility ledgers versus a single unified municipal digital database**:
+
+- **The cgroup v1 Nightmare (10 Disconnected Paper Ledgers):**
+  - In v1, the city manages 10 separate departments in different buildings: the Water Dept has one ledger (**`/sys/fs/cgroup/memory/`**), the Electric Dept has another ledger (**`/sys/fs/cgroup/cpu/`**), and the Road Dept has a third (**`/sys/fs/cgroup/blkio/`**).
+  - A factory (**A container**) writes 10GB of data into RAM (**Water Dept**). Later, the operating system's background flusher writes that memory to the physical hard drive (**Road Dept**).
+  - Because the Road Dept cannot read the Water Dept's ledger, **the disk write is attributed to the kernel root system instead of the factory**!
+  - Result: A rogue container could flood the disk with buffered writes and destroy host I/O throughput with **zero throttling**!
+- **The cgroup v2 Solution (The Unified Municipal Database):**
+  - In v2, all departments share a **single master building and unified digital database** (**`/sys/fs/cgroup/`**).
+  - When the factory writes data into memory, the database tags the memory pages with the factory's cgroup ID. When the flusher writes to disk, the I/O is billed directly to the factory, instantly triggering throttles (**Buffered Writeback Accounting**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               cgroup v1 Multi-Hierarchy Flaw vs cgroup v2 Unified Single Hierarchy
+
+ 1. cGROUP v1 ARCHITECTURE (Multiple Disconnected Trees):
+ ┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+ │ /sys/fs/cgroup/cpu/      │  │ /sys/fs/cgroup/memory/   │  │ /sys/fs/cgroup/blkio/    │
+ │ ├── docker-container-01/ │  │ ├── docker-container-01/ │  │ ├── docker-container-01/ │
+ └──────────────────────────┘  └──────────────────────────┘  └──────────────────────────┘
+ 💥 Flaw: Disconnected trees cannot correlate memory page caches with disk I/O writeback!
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. cGROUP v2 ARCHITECTURE (Unified Single Tree Hierarchy):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ UNIFIED ROOT: `/sys/fs/cgroup/` (Mounted as `cgroup2fs`)               │
+ │ ├── `cgroup.controllers`: `cpu memory io pids rdma cpuset`            │
+ │ ├── `cgroup.subtree_control`: `+cpu +memory +io +pids`                 │
+ │ │                                                                      │
+ │ └── `docker-container-01/` (All controllers unified in ONE directory!) │
+ │     ├── `cpu.max`       (Replaces `cpu.cfs_quota_us`)                  │
+ │     ├── `memory.max`    (Replaces `memory.limit_in_bytes`)             │
+ │     ├── `io.max`        (Unified buffered writeback throttling!)       │
+ │     └── `pids.max`      (Process count ceiling)                        │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why cgroup v1 was Broken: The Buffered I/O Flaw
+
+In Linux, when an application writes to disk (`write()`), data is not written to the physical SSD immediately; it is cached in RAM as **Dirty Page Cache memory**.
+
+- **In cgroup v1**: The `blkio` controller only intercepted direct synchronous I/O. When the kernel's background flusher threads (`kswapd` / `flush`) asynchronously wrote dirty page cache to disk, the I/O occurred in the **root kernel context**. The container's `blkio` throttle was completely bypassed!
+- **In cgroup v2**: The `memory` and `io` controllers are unified. The kernel tracks the cgroup ownership of every page cache memory page. When dirty pages are flushed, **the I/O is throttled against the container's `io.max` limit**, eliminating I/O starvation across the cluster.
+
+---
+
+## The cgroup v1 to cgroup v2 Control File Translation Matrix
+
+```text
+ ┌──────────────────────────────────┬──────────────────────────────────┬──────────────────────────────┐
+ │ cgroup v1 Control File           │ cgroup v2 Control File           │ Semantic Meaning             │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `cpu.cfs_quota_us` +             │ **`cpu.max`**                    │ CFS Bandwidth Limit:         │
+ │ `cpu.cfs_period_us`              │ (e.g. `200000 100000`)           │ `[quota] [period]` in $\mu$s.│
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `cpu.shares`                     │ **`cpu.weight`**                 │ Proportional CPU share       │
+ │ (Default: 1024, Range: 2–262144) │ (Default: 100, Range: 1–10000)   │ weight during contention.    │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `memory.limit_in_bytes`          │ **`memory.max`**                 │ Hard memory ceiling (OOM).   │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `memory.soft_limit_in_bytes`     │ **`memory.high`**                │ Throttle & reclaim boundary. │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `memory.kmem.limit_in_bytes`     │ **Integrated in `memory.max`**   │ Kernel memory unified.       │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `memory.oom_control`             │ **`memory.oom.group`**           │ Kill whole group on OOM (1/0)│
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `pids.max`                       │ **`pids.max`**                   │ Fork-bomb limit (Unchanged). │
+ └──────────────────────────────────┴──────────────────────────────────┴──────────────────────────────┘
+```
+
+---
+
+## Verifying & Migrating to cgroup v2
+
+### Checking the Active cgroup Version:
+```bash
+stat -fc %T /sys/fs/cgroup/
+```
+- **If output is `cgroup2fs`**: The host is running **cgroup v2** (Modern standard).
+- **If output is `tmpfs`**: The host is running legacy **cgroup v1**.
+
+### Enabling cgroup v2 via Kernel Boot Parameters:
+Edit `/etc/default/grub` and add:
+```text
+GRUB_CMDLINE_LINUX="systemd.unified_cgroup_hierarchy=1"
+```
+Update grub (`update-grub` / `grub2-mkconfig`) and reboot the node.
+
+---
+
+## Hands-On Lab: Inspecting the Unified Hierarchy in cgroup v2
+
+```bash
+# Step 1: Check filesystem type of /sys/fs/cgroup
+stat -fc %T /sys/fs/cgroup/
+
+# Step 2: Inspect all controllers supported by the host kernel
+cat /sys/fs/cgroup/cgroup.controllers
+
+# Step 3: Inspect active controllers enabled for delegation to subtrees
+cat /sys/fs/cgroup/cgroup.subtree_control
+
+# Step 4: Inspect our current shell process's cgroup v2 path
+cat /proc/self/cgroup
+# Output format in v2: '0::/user.slice/user-1000.slice/session-1.scope' 
+# (Notice the single '0::' prefix indicating unified hierarchy!)
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What were the major technical limitations of cgroup v1 that forced the creation of cgroup v2?**
+
+cgroup v1 had three fatal architectural flaws:
+1. **Multi-Hierarchy Complexity**: Each controller (cpu, memory, blkio) lived in an independent filesystem tree. A process could be at path `/A/B` in CPU and `/X/Y` in Memory, making cross-resource synchronization impossible.
+2. **The Buffered Writeback Flaw**: Page cache memory and block I/O could not communicate. Background disk flushes of container memory could not be throttled by `blkio`.
+3. **Inconsistent Interfaces**: Every controller had completely different naming conventions, error-handling semantics, and notification mechanisms.
+
+**Q2: How does cgroup v2's Unified Hierarchy solve the buffered I/O writeback problem?**
+
+In cgroup v2, all controllers are unified into a single hierarchy under `/sys/fs/cgroup/`. When an application writes data to disk, the kernel marks the dirty page cache memory with the specific cgroup ID of the container. When background kernel threads (`kswapd` / writeback) flush these pages to disk, the kernel attributes the I/O directly to that cgroup, successfully enforcing the container's **`io.max` (bandwidth/IOPS)** limits.
+
+**Q3: What is the difference between `memory.high` and `memory.max` in cgroup v2?**
+
+- **`memory.max` (Hard Ceiling)**: The absolute maximum memory boundary. If a container exceeds `memory.max` and memory cannot be reclaimed via page-cache dropping, the kernel's **OOM-Killer immediately terminates processes** in the cgroup.
+- **`memory.high` (Throttling Boundary)**: A soft warning boundary. When usage crosses `memory.high`, the kernel **slows down the container's processes and aggressively reclaims page cache memory in the background**, avoiding sudden OOM crashes and providing proactive memory pressure relief.
+
+**Q4: What does the `memory.oom.group` control file do in cgroup v2?**
+
+In cgroup v1, when an OOM event occurred, the kernel killed a single arbitrary process in the container (often leaving orphaned child processes in corrupted, half-dead states). In cgroup v2, setting **`memory.oom.group: 1`** enables **All-or-Nothing OOM Killing**: if any process inside the cgroup triggers an OOM error, the kernel **atomically kills every single process within that cgroup simultaneously**, ensuring clean container restarts.
+
+**Q5: How does Kubernetes support and benefit from cgroup v2?**
+
+Starting in Kubernetes 1.25+, cgroup v2 is **Generally Available (GA)**. Running Kubernetes on cgroup v2 enables: (1) **Memory QoS**: Using `memory.high` to throttle pods before OOMKills; (2) **Container Resource Isolation for Non-Memory Resources**: Proper block I/O limits via `io.max`; (3) **Pressure Stall Information (PSI)**: Accurate real-time telemetry on CPU, memory, and I/O starvation; (4) **Rootless Kubelet and User Namespaces** support.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that v1 used multiple disconnected trees while v2 uses a single unified tree
+- [ ] Know that v2 fixes the buffered I/O writeback accounting flaw
+- [ ] Know that `cpu.max` replaces `cpu.cfs_quota_us` and `cpu.cfs_period_us`
+- [ ] Know that `memory.high` throttles processes before `memory.max` triggers OOM
+- [ ] Know that `memory.oom.group: 1` kills all processes in a container on OOM
+- [ ] Can verify cgroup v2 support using `stat -fc %T /sys/fs/cgroup/` (`cgroup2fs`)

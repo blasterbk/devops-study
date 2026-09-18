@@ -1,0 +1,241 @@
+---
+title: "Chapter 2 — Multi-Cluster Services (MCS) API"
+sidebar_position: 2
+module: "Module 9.5 — Submariner & Service Discovery"
+description: "Master Kubernetes Multi-Cluster Services (MCS) API — ServiceExport, ServiceImport CRDs, clusterset.local DNS resolution, and Lighthouse service discovery."
+---
+
+# Chapter 2 — Multi-Cluster Services API: ServiceExport & ServiceImport
+
+> **Goal:** Master the official Kubernetes SIG-Multicluster standard for cross-cluster service discovery and load balancing using the **Multi-Cluster Services (MCS) API (`multicluster.x-k8s.io`)** — understanding the declarative lifecycle of **`ServiceExport`** and **`ServiceImport`** Custom Resources, integrating with DNS resolution engines (**`clusterset.local`**), and orchestrating multi-cluster service failover with **Submariner Lighthouse** and **CoreDNS**.
+>
+> By the end of this chapter, you will understand:
+> 1. The official Kubernetes SIG-Multicluster API specification and design philosophy
+> 2. How `ServiceExport` designates standard Kubernetes Services for global federation
+> 3. How MCS controllers automatically synthesize `ServiceImport` resources in consumer clusters
+> 4. How CoreDNS resolves the standard `<service>.<namespace>.svc.clusterset.local` domain
+> 5. How Submariner Lighthouse tracks cross-cluster EndpointSlices and round-robin load balancing
+> 6. How to author production `ServiceExport` manifests and verify multi-cluster DNS lookups
+
+---
+
+## Real-Life Analogy
+
+Think of the Kubernetes Multi-Cluster Services (MCS) API as **a standardized international telephone directory service connecting distinct corporate branch office switchboards**:
+
+- **The Isolated Local Switchboard (Standard Kubernetes DNS - `cluster.local`):** In Branch Office 1 (**Cluster A**), calling extension `500` dials the local payroll office (**`payroll.finance.svc.cluster.local`**). However, an employee visiting Branch Office 2 (**Cluster B**) cannot dial `500` because Office 2 has its own completely separate phone switchboard.
+- **The Standard Export Stamp (`ServiceExport` CRD):** The payroll manager in Office 1 stamps their extension: *"Publish this extension to all international branches (**`kind: ServiceExport`**)."*
+- **The Central Directory Publisher (The MCS Controller / Lighthouse):** The multi-cluster controller detects the export stamp, assigns a global speed-dial number (**`kind: ServiceImport`**), and registers it in the international directory.
+- **The Global Speed Dial (`clusterset.local` DNS):** Now, any employee in ANY branch office across the world simply dials **`payroll.finance.svc.clusterset.local`**. The phone system automatically connects the call to a live payroll operator in Branch 1 or Branch 2 seamlessly!
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Multi-Cluster Services (MCS) API Lifecycle
+
+ PRODUCER CLUSTER (Cluster 1: `aws-east`)              CONSUMER CLUSTER (Cluster 2: `gcp-west`)
+ ┌──────────────────────────────────────────────┐     ┌──────────────────────────────────────────────┐
+ │ 1. STANDARD SERVICE: `payment-service`       │     │ Client Pod: `frontend-app`                   │
+ │ 2. CREATES: `kind: ServiceExport`            │     │ Requests: `payment.prod.svc.clusterset.local`│
+ └──────────────────────┬───────────────────────┘     └──────────────────────▲───────────────────────┘
+                        │ Export Registered!                                 │ Resolves via CoreDNS
+                        ▼                                                    │
+ ┌──────────────────────────────────────────────┐     ┌──────────────────────┴───────────────────────┐
+ │ LIGHTHOUSE CONTROLLER (Cluster 1)            │     │ LIGHTHOUSE DNS PLUGIN (Cluster 2 CoreDNS)     │
+ │ ├── Reads EndpointSlices for `payment`       │     │ ├── Intercepts `*.clusterset.local` queries   │
+ │ └── Publishes Endpoints to Central Broker    │     │ └── Returns Multi-Cluster VIP or Remote IPs!  │
+ └──────────────────────┬───────────────────────┘     └──────────────────────▲───────────────────────┘
+                        │                                                    │
+                        │ Replicates Service Metadata & EndpointSlices       │
+                        └────────────────────────────────────────────────────┘
+                                                  ▲
+                                                  │ Synthesizes Global Resource
+ ┌────────────────────────────────────────────────┴──────────────────────────────────────────────────┐
+ │ MCS CONTROLLER (Creates `kind: ServiceImport` in Cluster 2 with ClusterSet IP: `242.254.1.80`)    │
+ └───────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The MCS API Specification Workflow
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Resource Kind        │ Managing Role           │ Core Technical Function                           │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ServiceExport`**  │ Application Developer   │ Manually applied in the source cluster to declare │
+ │                      │ (Source Cluster)        │ that a specific `Service` should be exported.     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ServiceImport`**  │ MCS Controller Engine   │ Automatically created in all member clusters to   │
+ │                      │ (Destination Clusters)  │ represent the aggregated multi-cluster endpoint.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`EndpointSlice-**  │ MCS Controller Engine   │ Synchronizes live backend Pod IPs across cluster  │
+ │ **Export`**          │                         │ boundaries for direct client-to-pod load balancing│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Exporting a Service (`ServiceExport` Manifest)
+
+In the source cluster where the application is deployed, create a standard `Service` and attach a **`ServiceExport`** with the identical name and namespace:
+
+```yaml
+# Step 1: Standard Kubernetes Service in Cluster 1
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: production
+spec:
+  selector:
+    app: payment-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+# Step 2: Export to the Global ClusterSet!
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: payment-service
+  namespace: production
+```
+
+---
+
+## 2. The Auto-Generated `ServiceImport` (Consumer Cluster)
+
+The MCS controller (e.g. Submariner Lighthouse) automatically detects the export and creates a **`ServiceImport`** in all other member clusters:
+
+```yaml
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceImport
+metadata:
+  name: payment-service
+  namespace: production
+spec:
+  type: ClusterSetIP                   # Options: ClusterSetIP or Headless
+  ips:
+    - 242.254.1.80                     # Virtual ClusterSet VIP allocated globally!
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+status:
+  clusters:
+    - cluster: aws-east                # Tracks source clusters providing healthy pods!
+      healthy: true
+```
+
+---
+
+## Cross-Cluster DNS Resolution Standards
+
+The Kubernetes MCS standard defines strict DNS domain naming conventions:
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Standard MCS DNS Format:                                                                           │
+ │ `<service-name>.<namespace>.svc.clusterset.local`                                                  │
+ ├────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Example: `payment-service.production.svc.clusterset.local`                                         │
+ │                                                                                                    │
+ │ Resolution Behavior:                                                                               │
+ │ 1. In-Cluster Client: Makes DNS query for `payment-service.production.svc.clusterset.local`        │
+ │ 2. CoreDNS: Forwarded to Lighthouse DNS plugin.                                                    │
+ │ 3. Return IP: Returns virtual `ClusterSetIP` (or round-robin list of healthy remote Pod IPs).      │
+ │ 4. Routing: Traffic traverses Submariner IPSec / Cilium eBPF tunnels seamlessly!                   │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CoreDNS Configuration for `clusterset.local`
+
+Submariner Lighthouse integrates directly with CoreDNS by appending a custom zone forwarder to the `coredns` ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+        }
+        # 1. Multi-Cluster Services API Zone Forwarder!
+        clusterset.local:53 {
+            lighthouse
+        }
+        forward . /etc/resolv.conf
+        cache 30
+        reload
+    }
+```
+
+---
+
+## Hands-On Lab: Querying Multi-Cluster Services
+
+```bash
+# Step 1: Query active ServiceExport objects in the local cluster
+kubectl get serviceexports.multicluster.x-k8s.io -A 2>/dev/null || echo "ServiceExport CRDs active / simulated"
+
+# Step 2: Query automatically synchronized ServiceImport objects
+kubectl get serviceimports.multicluster.x-k8s.io -A -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace,TYPE:.spec.type,CLUSTERSET_IP:.spec.ips[0]
+
+# Step 3: Test cross-cluster DNS lookup inside a running pod
+# kubectl exec -it curl-pod -- nslookup payment-service.production.svc.clusterset.local
+
+# Step 4: Test HTTP connectivity over the clusterset.local domain
+# kubectl exec -it curl-pod -- curl -v http://payment-service.production.svc.clusterset.local:8080/healthz
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Kubernetes Multi-Cluster Services (MCS) API specification, and what problem does it solve?**
+
+The MCS API (`multicluster.x-k8s.io`) is an official Kubernetes SIG-Multicluster standard that defines **how Kubernetes services are declared, exported, and discovered across a group of clusters (a ClusterSet)**. Prior to MCS, cross-cluster service discovery relied on proprietary vendor hacks or heavy service meshes. MCS provides a clean, native declarative standard where creating a `ServiceExport` resource in one cluster automatically makes that service addressable across all member clusters via the **`clusterset.local`** DNS domain.
+
+**Q2: What is the structural difference between `ServiceExport` and `ServiceImport`?**
+
+- **`ServiceExport`**: Created by **application developers** in the cluster where the service resides. It explicitly declares: *"Make this local Service available to the entire multi-cluster fleet."*
+- **`ServiceImport`**: Automatically synthesized by the **MCS controller** (such as Submariner Lighthouse or Google MCS) in all consuming clusters across the fleet. It contains the virtual `ClusterSetIP` and aggregated ports needed by client pods to connect.
+
+**Q3: How does DNS resolution work for `<service>.<namespace>.svc.clusterset.local`?**
+
+When an application queries `<svc>.<ns>.svc.clusterset.local`:
+1. The local node's CoreDNS receives the query and routes the `clusterset.local` zone to the MCS DNS plugin (e.g. Lighthouse).
+2. The plugin looks up the corresponding `ServiceImport` and its associated `EndpointSlices`.
+3. It returns the virtual `ClusterSetIP` or a round-robin list of healthy backend Pod IPs across all exporting clusters, enabling transparent cross-cluster load balancing.
+
+**Q4: How does the MCS API handle cross-cluster service failover when local pods crash?**
+
+If a service is deployed in both Cluster A and Cluster B and exported in both, the MCS controller tracks endpoint health in both locations. If all pods in Cluster A crash, the MCS controller withdraws Cluster A's endpoints from the `ServiceImport`. Subsequent DNS queries in Cluster A will automatically resolve strictly to healthy pod endpoints in Cluster B, providing automated cross-cluster disaster failover.
+
+**Q5: Can the MCS API be used with Headless Services (StatefulSets)?**
+
+**Yes**. The MCS API explicitly supports headless services (`type: Headless` in `ServiceImport`). When a headless service is exported, the MCS DNS controller returns SRV and A records for individual named pod endpoints across all clusters (e.g. `pod-0.payment-service.production.svc.clusterset.local`), enabling distributed databases (like Cassandra, Kafka, or CockroachDB) to discover specific peer nodes across cluster boundaries.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that the MCS API (`multicluster.x-k8s.io`) is the official Kubernetes standard
+- [ ] Know that developers create `ServiceExport` in the source cluster to share a Service
+- [ ] Know that the MCS controller automatically generates `ServiceImport` in consumer clusters
+- [ ] Know the standard DNS format: `<svc>.<ns>.svc.clusterset.local`
+- [ ] Know how CoreDNS forwards `clusterset.local` to the Lighthouse DNS plugin
+- [ ] Can query active imports using `kubectl get serviceimports -A`

@@ -1,0 +1,226 @@
+---
+title: "Chapter 2 — Ray Disconnections & Kueue Starvation"
+sidebar_position: 2
+module: "Module 10.10 — AI/ML Troubleshooting Labs"
+description: "Master distributed AI troubleshooting on Kubernetes — Ray GCS heartbeat disconnections, /dev/shm memory sizing, Kueue cohort queue starvation, and NCCL multi-node hangs."
+---
+
+# Chapter 2 — Debugging Ray Disconnections & Kueue Starvation
+
+> **Goal:** Master advanced multi-node distributed AI diagnostics, cluster recovery, and collective communication troubleshooting on Kubernetes — diagnosing **Ray Global Control Store (GCS) heartbeat disconnections**, resolving **Plasma Object Store shared memory (`/dev/shm`) exhaustions**, debugging **Kueue queue starvation and cohort borrowing deadlocks**, and fixing fatal **NVIDIA NCCL multi-node GPU communication hangs** during distributed LLM training.
+>
+> By the end of this chapter, you will understand:
+> 1. How GCS heartbeat timeouts cause Ray worker pods to be forcefully evicted from clusters
+> 2. Why default container `/dev/shm` (64MB) crashes the Plasma Object Store and how to mount memory `emptyDir`
+> 3. How to diagnose Kueue Workloads stuck in `Admitted: False` using `ClusterQueue` status events
+> 4. Why multi-node distributed PyTorch hangs on `torch.distributed.init_process_group`
+> 5. How to configure `NCCL_SOCKET_IFNAME` and `NCCL_DEBUG=INFO` to resolve InfiniBand/Ethernet routing
+> 6. How to isolate, remediate, and verify distributed AI infrastructure during high-severity outages
+
+---
+
+## Real-Life Analogy
+
+Think of debugging distributed Ray clusters and Kueue queue starvation as **troubleshooting an orchestra rehearsal where violinists keep fainting and musicians are locked in the hallway**:
+
+- **The Fainting Violinist (Ray GCS Heartbeat Timeout & Shared Memory Crash):** The conductor (**Ray Head Node GCS**) expects all 50 musicians (**Worker Pods**) to tap their foot on the stage every 30 seconds (**Heartbeat**).
+  - Suddenly, Violinist #4 tries to memorize a massive 500-page symphony score in their tiny 64MB notebook (**Default container `/dev/shm` exhaustion in the Plasma Object Store**).
+  - The violinist faints from memory exhaustion, stops tapping their foot for 30 seconds, and the conductor fires them from the orchestra (**GCS marks worker DEAD and evicts the pod**).
+  - **The Fix:** You give every musician an enormous 32GB music stand (**Mounting `emptyDir: { medium: Memory }` on `/dev/shm`**).
+- **The Musicians Locked in the Hallway (Kueue Queue Starvation):** 10 musicians are standing outside the concert hall door waiting for entry (**Workloads in `LocalQueue`**). The stage manager (**Kueue**) froze the door locks because the sign on the door says *"Horn players only,"* but the orchestra hired Saxophone players (**Node Label / ResourceFlavor Mismatch**).
+- **The Silent Stare (NVIDIA NCCL Multi-Node Communication Hang):** 8 supercomputer nodes are ready to train LLaMA-3. The python script starts, and... **nothing happens for 3 hours**. The nodes are staring at each other in total silence because Node 1 is shouting over the public internet while Node 2 is listening on the private fiber cable (**`NCCL_SOCKET_IFNAME` network interface mismatch**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Distributed AI Infrastructure Failure Modes & Triage Map
+
+ 1. RAY GCS HEARTBEAT TIMEOUT & /dev/shm CRASH:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Ray Head Node (GCS Port 6379) ───[ Lost Heartbeat > 30s! ]───► Worker 01│
+ │ 💥 Error: "Worker node 10.244.2.14 dead! Plasma /dev/shm out of memory"│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Solution: Mount `emptyDir: { medium: Memory }` (Size: 64Gi)
+                    ▼
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. KUEUE WORKLOAD STARVATION & COHORT DEADLOCK:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LocalQueue: `team-nlp-queue` ──► Workload: `bert-large-job`            │
+ │ 💥 Status: `Admitted: False` (Pending for 48 Hours!)                   │
+ │ Root Cause: ResourceFlavor `nvidia-h100` nodeSelector label mismatch!  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Solution: Align Node Labels with ResourceFlavor spec
+                    ▼
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 3. NVIDIA NCCL MULTI-NODE DISTRIBUTED TRAINING HANG:
+ ┌────────────────────────┐  NCCL All-Reduce Hang!   ┌────────────────────────┐
+ │ NODE 1 (US-East-1a)    │◄──[ Packet Blackhole ]──►│ NODE 2 (US-East-1b)    │
+ │ Listening on `eth0`    │   (Wrong Interface / MTU)│ Transmitting on `ib0`  │
+ └────────────────────────┘                          └────────────────────────┘
+ (Solution: Export `NCCL_SOCKET_IFNAME=eth0,ens5` and `NCCL_IB_DISABLE=1`!)
+```
+
+---
+
+## Root Cause 1: Resolving Plasma `/dev/shm` Memory Crashes
+
+By default, Docker and Kubernetes limit `/dev/shm` (shared memory) to **only 64 Megabytes**, causing instant Plasma crashes during distributed AI tensor sharing.
+
+### Resolution: Mount a Memory-Backed `emptyDir` Volume on `/dev/shm`:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ray-worker-gpu
+  namespace: ai-workloads
+spec:
+  containers:
+  - name: ray-worker
+    image: rayproject/ray-ml:2.30.0-gpu
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+        memory: "256Gi"
+    volumeMounts:
+      # 1. Mounts high-speed RAM-backed shared memory to /dev/shm!
+      - name: dshm
+        mountPath: /dev/shm
+  volumes:
+    - name: dshm
+      emptyDir:
+        medium: Memory                 # Allocates from host RAM, bypassing 64MB limit!
+        sizeLimit: 64Gi                # 64GB dedicated to Plasma Object Store
+```
+
+---
+
+## Root Cause 2: Diagnosing NCCL Cross-Node GPU Communication Hangs
+
+When distributed PyTorch training freezes indefinitely on `torch.distributed.init_process_group()`:
+
+```text
+ ┌──────────────────────────────────┬─────────────────────────────┬───────────────────────────────────┐
+ │ Common NCCL Failure Symptom      │ Underlying Root Cause       │ Exact SRE Resolution Runbook      │
+ │───────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ Training hangs at 0% with no     │ NCCL auto-selected the wrong│ Set environment variable:         │
+ │ error messages in logs.          │ network interface (e.g.     │ `NCCL_SOCKET_IFNAME=eth0,ens5` to │
+ │                                  │ `docker0` instead of `eth0`)│ force physical network interface. │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `NCCL WARN: Call to connect      │ Firewall / Security Group   │ Allow all TCP/UDP traffic between │
+ │ returned Connection refused`     │ blocks ephemeral ports.     │ worker node internal IP subnets.  │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `NCCL WARN: Network error        │ Multi-node MTU mismatch or  │ Set `NCCL_IB_DISABLE=1` (forces   │
+ │ (Remote direct memory access)`   │ missing InfiniBand drivers. │ RoCE/TCP) or fix InfiniBand CNI.  │
+ └──────────────────────────────────┴─────────────────────────────┴───────────────────────────────────┘
+```
+
+### Debugging NCCL with Verbose Telemetry:
+```bash
+# Inject into training container environment:
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,COLL,ENV
+export NCCL_SOCKET_IFNAME=eth0
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+```
+
+---
+
+## Root Cause 3: Diagnosing Kueue Workload Starvation
+
+If a batch Job or RayJob is submitted but never starts executing:
+
+```bash
+# 1. Query the un-admitted Workload resource
+kubectl describe workload <workload-name> -n ai-workloads
+
+# Output to inspect:
+# Status:
+#   Conditions:
+#     Type:    Admitted
+#     Status:  False
+#     Reason:  Pending
+#     Message: "Workload couldn't be admitted: insufficient quota for flavor nvidia-h100 in ClusterQueue gpu-queue"
+
+# 2. Check if the parent ClusterQueue is exhausted or lacking matching nodes:
+kubectl describe clusterqueue cluster-gpu-queue
+```
+
+---
+
+## The 4-Step SRE Diagnostic Runbook for AI Cluster Failures
+
+```bash
+# STEP 1: Query all Ray cluster pods and restart counts
+kubectl get pods -n ai-workloads -l ray.io/cluster=distributed-training-cluster -o wide
+
+# STEP 2: Inspect Ray Head Node GCS health logs
+kubectl logs -n ai-workloads -l ray.io/node-type=head -c ray-head --tail=100 | grep -E "GCS|heartbeat|dead"
+
+# STEP 3: Check GPU hardware metrics across all worker nodes
+kubectl exec -it <gpu-pod> -n ai-workloads -- nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu --format=csv
+
+# STEP 4: Verify NCCL inter-node ping between worker node pods
+# kubectl exec -it worker-pod-01 -- nc -zvu <worker-pod-02-ip> 29500
+```
+
+---
+
+## Hands-On Lab: Simulating and Debugging a Distributed AI Outage
+
+```bash
+# Step 1: Query active Kueue Workloads and find all non-admitted jobs
+kubectl get workloads.kueue.x-k8s.io -A -o json 2>/dev/null | jq '.items[] | select(.status.conditions[0].status=="False") | {name: .metadata.name, queue: .spec.queueName, message: .status.conditions[0].message}' 2>/dev/null || echo "Kueue workloads active"
+
+# Step 2: Check `/dev/shm` size inside a running worker pod
+# kubectl exec -it <ray-worker-pod> -n ai-workloads -- df -h /dev/shm
+
+# Step 3: Test multi-node socket reachability on PyTorch distributed port 29500
+# nc -zvw3 <remote-node-ip> 29500
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does a distributed Ray cluster lose worker nodes with "GCS Heartbeat Timeout" errors, and how do you fix it?**
+
+The Ray Head Node's Global Control Store (GCS) expects periodic gRPC heartbeats from all worker `raylet` processes (default timeout: 30 seconds). Worker disconnections are caused by:
+1. **CPU/Memory Starvation**: Compute-heavy tasks starve the `raylet` daemon of CPU cycles, preventing it from sending heartbeats. Fix: Allocate dedicated CPU buffers for system daemons.
+2. **Plasma `/dev/shm` Exhaustion**: Large object allocations fill the default 64MB shared memory, crashing the Raylet process. Fix: Mount an `emptyDir: { medium: Memory, sizeLimit: 64Gi }` volume on `/dev/shm`.
+3. **Network Latency / MTU Drops**: Transient network packet loss across cloud zones. Fix: Tune `spec.headGroupSpec.rayStartParams.heartbeat-timeout-milliseconds: "60000"`.
+
+**Q2: What is the cause of distributed PyTorch multi-node training hanging indefinitely on `torch.distributed.init_process_group`?**
+
+This is almost always caused by **NCCL Network Interface Misidentification**. NVIDIA's NCCL collective communication library automatically scans host network interfaces to establish direct socket connections between worker GPUs. If a node has multiple virtual interfaces (e.g. `docker0`, `flannel.1`, `calico`, `eth0`), NCCL may bind to an internal container bridge on Node 1 while Node 2 attempts to connect over the physical subnet. The nodes wait forever in a TCP handshake deadlock. Fix: Explicitly set `NCCL_SOCKET_IFNAME=eth0,ens5` in container environment variables.
+
+**Q3: How do you troubleshoot a Kueue Workload that is indefinitely stuck in `Admitted: False`?**
+
+1. Run `kubectl describe workload <name>` to inspect the admission condition reason.
+2. If the message states **"insufficient quota"**: Check `kubectl describe clusterqueue <name>` to determine if the nominal quota is saturated by higher-priority jobs or if borrowing limits have been exhausted.
+3. If the message states **"flavor not found"**: Check the `ResourceFlavor` spec to ensure its `nodeLabels` match the actual labels on physical GPU nodes (e.g. checking for typos like `nvidia.com/gpu.product: A100` vs `NVIDIA-A100-SXM4-80GB`).
+
+**Q4: Why does omitting `medium: Memory` on an `emptyDir` volume for `/dev/shm` degrade Ray performance?**
+
+If `medium: Memory` is omitted, Kubernetes creates the `emptyDir` volume on the **node's local physical disk (HDD or SSD)** rather than in RAM. When Ray's Plasma Object Store reads and writes tensors to `/dev/shm`, every single zero-copy array lookup is forced to perform physical disk I/O, destroying tensor sharing performance and introducing massive latency into deep learning pipelines.
+
+**Q5: How do you diagnose silent GPU data corruption during distributed All-Reduce training?**
+
+If distributed loss curves suddenly diverge to `NaN` (Not a Number) or training crashes with `NCCL WARN: Call to connect returned Connection reset by peer`:
+1. Check for **Xid Hardware Faults** in node kernel logs (`dmesg -T | grep -i "NVRM: Xid"`).
+2. Run `nvidia-smi --query-gpu=ecc.errors.uncorrected.volatile.total --format=csv` to detect uncorrectable VRAM ECC bit flips.
+3. Run the **NVIDIA NCCL Tests suite (`all_reduce_perf`)** across all nodes to benchmark bus bandwidth and isolate failing PCIe/NVLink interconnects.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Ray GCS heartbeats disconnect if worker CPU/RAM is starved
+- [ ] Know that `/dev/shm` MUST be mounted with `emptyDir: { medium: Memory }`
+- [ ] Know how `NCCL_SOCKET_IFNAME=eth0` prevents multi-node PyTorch hangs
+- [ ] Know how `NCCL_DEBUG=INFO` provides verbose collective communication tracing
+- [ ] Know how to troubleshoot un-admitted Kueue Workloads using `kubectl describe workload`
+- [ ] Can inspect GPU hardware ECC errors using `nvidia-smi`

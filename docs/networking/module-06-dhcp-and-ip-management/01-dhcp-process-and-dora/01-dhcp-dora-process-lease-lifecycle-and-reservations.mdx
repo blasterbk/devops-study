@@ -1,0 +1,148 @@
+---
+title: "Chapter 1 — DHCP Internals: DORA Process, Lease Lifecycle & Option 82"
+sidebar_position: 1
+module: "Module 6.1 — DHCP Process & DORA"
+description: "Master Dynamic Host Configuration Protocol (DHCP, RFC 2131) — Discover, Offer, Request, Acknowledge (DORA), lease renewal timers (T1/T2), Option 82 Relay Agents, and static MAC reservations."
+---
+
+# Chapter 1 — DHCP Internals: DORA Process, Lease Lifecycle & Option 82
+
+> **Goal:** Master the Dynamic Host Configuration Protocol (DHCP, RFC 2131 & RFC 8415 for DHCPv6). Understand the 4-step DORA state machine, UDP port encapsulation (Client 68 $\to$ Server 67), lease renewal timers ($T_1$ and $T_2$), DHCP Relay Agents (Option 82), static MAC address reservations, and DHCP Starvation / Rogue Server mitigation.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4-step DORA process: Discover (Broadcast), Offer (Unicast/Broadcast), Request (Broadcast), Acknowledge (Unicast/Broadcast)
+> 2. DHCP lease states, the $T_1$ (50% renewal) and $T_2$ (87.5% rebind) timer equations
+> 3. Standard DHCP Options: Option 1 (Subnet Mask), Option 3 (Default Router), Option 6 (DNS Servers), Option 15 (Domain Name), and Option 82 (Relay Agent Information)
+> 4. DHCP Relay Agent operation crossing Layer 3 router boundaries (`ip helper-address`)
+> 5. Security mitigations: DHCP Snooping, Trusted vs Untrusted switch ports, and Dynamic ARP Inspection (DAI)
+> 6. Linux DHCP tools: `dhclient`, `dnsmasq`, `isc-dhcp-server`, and `tcpdump` packet capture
+
+---
+
+## Real-Life Analogy
+
+Think of DHCP as **renting a car at an international airport terminal**:
+
+- **Discover (Walking into the Rental Hall):**
+  - You step into the lobby and announce: *"I need a rental car!"* (**Broadcast from 0.0.0.0:68 to 255.255.255.255:67**).
+- **Offer (Rental Agent's Proposal):**
+  - A rental desk offers: *"We have Sedan #42 available for 24 hours at $50"*.
+- **Request (Signing the Agreement):**
+  - You announce: *"I accept Desk A's offer for Sedan #42; other desks can release their offers"*.
+- **Acknowledge (Handing over the Keys):**
+  - Desk A hands you the keys, gate pass, and navigation map (**IP, Subnet Mask, Gateway, DNS**).
+- **Lease Renewal ($T_1$ at 50% Time):**
+  - Halfway through your 24-hour trip (Hour 12), you call Desk A directly: *"Can I extend my rental for another 24 hours?"*
+
+---
+
+## Architecture Diagram
+
+```text
+                     The DHCP DORA Exchange State Machine
+                     
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT (No IP: 0.0.0.0)                                    DHCP SERVER      │
+ │    │                                                            │           │
+ │    │─── 1. DHCP DISCOVER (Broadcast) ──────────────────────────►│           │
+ │    │    Src: 0.0.0.0:68  Dst: 255.255.255.255:67                │           │
+ │    │    Option 53: DHCP Discover, Client MAC: 52:54:00:12:34:56 │           │
+ │    │                                                            │           │
+ │    │◄── 2. DHCP OFFER (Unicast / Broadcast) ────────────────────│           │
+ │    │    Offered IP: 192.168.1.100, Server IP: 192.168.1.1       │           │
+ │    │    Option 1: 255.255.255.0, Option 3: 192.168.1.1 (GW)     │           │
+ │    │                                                            │           │
+ │    │─── 3. DHCP REQUEST (Broadcast) ───────────────────────────►│           │
+ │    │    "I choose IP 192.168.1.100 from Server 192.168.1.1"     │           │
+ │    │                                                            │           │
+ │    │◄── 4. DHCP ACK (Unicast / Broadcast) ──────────────────────│           │
+ │    │    Lease Time: 86400s (24h), DNS: 1.1.1.1, Gateway: .1     │           │
+ │    ▼                                                            ▼           │
+ │ [BOUND STATE: IP 192.168.1.100 Assigned & Interface Configured]             │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The DHCP DORA Breakdown
+
+```text
+ ┌─────────────┬─────────────────┬──────────────────────┬───────────────────────────────────────────┐
+ │ Step        │ Message Type    │ Transport Layer      │ Purpose & Payload                         │
+ │─────────────┼─────────────────┼──────────────────────┼───────────────────────────────────────────┤
+ │ **D**iscover| Option 53 = 1   │ UDP Src: 68, Dst: 67 │ Client broadcasts looking for servers     │
+ │ **O**ffer   | Option 53 = 2   │ UDP Src: 67, Dst: 68 │ Server reserves an IP and offers parameters│
+ │ **R**equest | Option 53 = 3   │ UDP Src: 68, Dst: 67 │ Client formally requests the offered IP   │
+ │ **A**ck     | Option 53 = 5   │ UDP Src: 67, Dst: 68 │ Server confirms lease, timers, and options│
+ └─────────────┴─────────────────┴──────────────────────┴───────────────────────────────────────────┘
+```
+
+---
+
+### 2. Lease Renewal Timers ($T_1$ and $T_2$)
+
+- **$T_1$ (Renewal Timer — 50% of Lease):** At $0.5 \times \text{Lease Time}$, the client sends a **unicast DHCP Request** directly to the original DHCP server. If the server acks, the lease resets to 100%.
+- **$T_2$ (Rebinding Timer — 87.5% of Lease):** If the original server does not respond by $0.875 \times \text{Lease Time}$, the client falls back to **broadcasting a DHCP Request** to any available DHCP server on the network.
+- **Lease Expiry (100%):** If no server responds, the client immediately drops the IP and restarts the DORA process from scratch.
+
+---
+
+### 3. DHCP Option 82 & Relay Agents (`ip helper-address`)
+
+Because DHCP Discover packets are Layer 2 broadcasts (`255.255.255.255`), routers do not forward them across subnets.
+- A **DHCP Relay Agent** intercepts client broadcast Discovers on the local VLAN, encapsulates them into a **Unicast UDP packet**, appends **Option 82** (Circuit ID + Remote ID identifying the physical switch port), and forwards it to a centralized enterprise DHCP server on another subnet.
+
+---
+
+## Hands-On Lab: Capturing DHCP Traffic & Managing Leases
+
+```bash
+# Step 1: Capture live DHCP DORA exchange using tcpdump
+sudo tcpdump -n -i any "port 67 or port 68" -v
+
+# Step 2: Release existing DHCP lease on interface eth0
+sudo dhclient -r eth0 2>/dev/null || sudo ip addr flush dev eth0
+
+# Step 3: Request a fresh DHCP lease via dhclient
+sudo dhclient -v eth0 2>/dev/null
+
+# Step 4: Inspect active DHCP lease file on Debian/Ubuntu systems
+cat /var/lib/dhcp/dhclient.leases 2>/dev/null || cat /var/lib/NetworkManager/*.lease 2>/dev/null
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is the DHCP Request packet (Step 3 of DORA) broadcast instead of sent unicast to the offering server?**
+
+In a network with multiple DHCP servers (for redundancy), all servers might send a DHCP Offer. The client broadcasts its DHCP Request containing the selected server's identifier (Option 54) so that **all other DHCP servers on the subnet receive notification** that their offers were declined, allowing them to immediately release their tentatively reserved IPs back to their available pools.
+
+**Q2: What is DHCP Snooping and how does it prevent Rogue DHCP Server attacks?**
+
+A **Rogue DHCP Server** (such as an attacker's machine or an accidentally plugged-in consumer router) can hand out malicious default gateway and DNS IPs to execute Man-in-the-Middle attacks. **DHCP Snooping** on Layer 2 switches classifies ports as **Trusted** (uplinks to authorized DHCP servers) or **Untrusted** (end-user access ports). The switch drops any DHCP Offer or ACK packet arriving on an untrusted port, preventing rogue assignments.
+
+**Q3: What is a DHCP Starvation Attack and how is it mitigated?**
+
+In a starvation attack, an attacker uses tools like `yersinia` to rapidly broadcast thousands of DHCP Discovers with randomized spoofed MAC addresses, exhausting the server's entire IP pool. Mitigation includes **Port Security** on the switch (limiting the maximum number of MAC addresses learned per port to 1 or 2) and **DHCP Snooping MAC verification**.
+
+**Q4: What is the difference between Stateless DHCPv6 and Stateful DHCPv6?**
+
+- **Stateless DHCPv6:** The host configures its own IPv6 address via SLAAC using Router Advertisements. It queries DHCPv6 solely for additional options (DNS servers, domain search lists).
+- **Stateful DHCPv6:** The DHCPv6 server centrally allocates and tracks every specific IPv6 address assigned to clients (equivalent to traditional IPv4 DHCP).
+
+**Q5: What is DHCP Option 43 (Vendor-Specific Information) used for in enterprise networks?**
+
+Option 43 is used during zero-touch deployment of enterprise Wi-Fi Access Points (e.g. Cisco, Aruba) and VoIP phones. The DHCP server passes the IP address of the central Wireless LAN Controller (WLC) inside Option 43, allowing newly unboxed APs to automatically find, connect to, and download firmware from the controller upon plugging in.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 4-step DORA exchange (Ports 67 and 68)
+- [ ] Understand $T_1$ (50% unicast) and $T_2$ (87.5% broadcast) lease timers
+- [ ] Know how DHCP Relay Agents and Option 82 route across subnets
+- [ ] Understand Rogue DHCP Servers and DHCP Snooping switch protection
+- [ ] Differentiate Stateful vs Stateless DHCPv6

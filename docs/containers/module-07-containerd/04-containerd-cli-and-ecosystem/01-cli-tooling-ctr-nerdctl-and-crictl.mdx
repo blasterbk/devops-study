@@ -1,0 +1,195 @@
+---
+title: "Chapter 1 — CLI Tools: ctr, nerdctl & crictl"
+sidebar_position: 1
+module: "Module 7.4 — CLI & Ecosystem"
+description: "Master containerd CLI tooling — comparing ctr for low-level debugging, nerdctl for Docker-compatible lazy pulling, and crictl for Kubernetes CRI troubleshooting."
+---
+
+# Chapter 1 — CLI Tools: ctr, nerdctl & crictl
+
+> **Goal:** Master the operational workflows, diagnostic boundaries, and command-line syntaxes of the 3 primary containerd CLI utilities — analyzing **`ctr`** for direct, low-level containerd daemon debugging, **`nerdctl`** for Docker-compatible workflows and **eStargz lazy image pulling**, and **`crictl`** for official **Kubernetes Container Runtime Interface (CRI)** node troubleshooting.
+>
+> By the end of this chapter, you will understand:
+> 1. The specific architectural target, user audience, and scope of `ctr`, `nerdctl`, and `crictl`
+> 2. How `ctr` interacts directly with containerd namespaces, content stores, and snapshotters
+> 3. How `nerdctl` provides a drop-in Docker alternative with built-in Compose and Rootless support
+> 4. Why `crictl` is the only certified tool for diagnosing live Kubernetes worker nodes
+> 5. How to configure `/etc/crictl.yaml` for containerd and CRI-O runtimes
+> 6. How to inspect pods, containers, and image caches using the appropriate CLI utility
+
+---
+
+## Real-Life Analogy
+
+Think of `ctr`, `nerdctl`, and `crictl` as **three different specialized diagnostic tools used on an electric passenger train system**:
+
+- **1. `ctr` (The Engine Manufacturer's Raw Debugging Probe):**
+  - An un-shielded, low-level circuit probe carried by the engineer who built the electric motor (**containerd core developer tool**).
+  - It exposes raw voltages, raw transistor switches, and internal logic gates (**Content stores, raw namespaces, task services**).
+  - It lacks air conditioning or safety guards; it is built purely for engineers to test raw components in the laboratory.
+- **2. `nerdctl` (The Modern Passenger Dashboard & Steering Wheel):**
+  - A beautiful, ergonomic steering wheel and digital dashboard designed for everyday train drivers (**The Docker CLI replacement**).
+  - It features cruise control (**Docker Compose**), aerodynamic boosters (**eStargz lazy image pulling**), and standard speed gauges.
+- **3. `crictl` (The Railway Station Master's Automated Dispatch Console):**
+  - A specialized console that talks exclusively to the central rail network's computer system (**Kubernetes Kubelet / CRI**).
+  - It does not look at individual loose wheels; it looks at **Passenger Train Cars (Kubernetes Pods)** and station scheduling blocks.
+
+---
+
+## Architecture Diagram
+
+```text
+               The 3 containerd CLI Tools & Their Target Protocols
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `nerdctl` (DEVELOPER & DEVOPS WORKFLOWS - Docker Compatible)        │
+ │    - Commands: `run`, `build`, `compose`, `push`, `pull`               │
+ │    - Next-Gen: eStargz Lazy Pulling, Rootless, Cosign Image Signing   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+ ┌──────────────────┴─────────────────────────────────────────────────────┐
+ │ 2. `ctr` (LOW-LEVEL RUNTIME DEBUGGING & RESEARCH)                      │
+ │    - Commands: `content`, `images`, `containers`, `tasks`, `plugins`   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Native containerd gRPC API (`/run/containerd/containerd.sock`)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ containerd CORE DAEMON (`containerd`)                                  │
+ │ ├── Metadata BoltDB (`meta.db`) & Content Store                        │
+ │ └── Built-in CRI Plugin (`io.containerd.grpc.v1.cri`)                  │
+ └──────────────────▲─────────────────────────────────────────────────────┘
+                    │ Kubernetes CRI gRPC Protocol (`runtime.v1`)
+ ┌──────────────────┴─────────────────────────────────────────────────────┐
+ │ 3. `crictl` (KUBERNETES SRE & NODE DIAGNOSTICS)                        │
+ │    - Commands: `pods`, `ps`, `logs`, `exec`, `img`, `stats`            │
+ │    - Targets Pod Sandboxes, Pause Containers, and CRI Runtime State    │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3-Way containerd CLI Comparison Matrix
+
+```text
+ ┌───────────────────────────┬───────────────────┬───────────────────┬───────────────────┐
+ │ Technical Dimension       │ `ctr`             │ `nerdctl`         │ `crictl`          │
+ │───────────────────────────┼───────────────────┼───────────────────┼───────────────────┤
+ │ **Primary Audience**      │ containerd Devs & │ Application Devs  │ Kubernetes SREs & │
+ │                           │ Low-level SREs    │ & DevOps Engineers│ Cluster Admins    │
+ │ **Target Protocol**       │ containerd gRPC   │ containerd gRPC + │ **Kubernetes CRI**│
+ │                           │ (Direct)          │ BuildKit daemon   │ (gRPC API)        │
+ │ **Docker Compatibility**  │ ❌ Completely     │ ✅ **100% Drop-in │ ❌ Not compatible │
+ │                           │ different syntax  │ Docker CLI syntax │ (Pod-centric)     │
+ │ **Default Namespace**     │ `default`         │ `default`         │ **`k8s.io`**      │
+ │ **Kubernetes Pod Aware?** │ ❌ No (Raw tasks) │ ❌ No             │ ✅ **YES (Pods)** │
+ │ **Image Build Support?**  │ ❌ No             │ ✅ **Yes** (via   │ ❌ No             │
+ │                           │                   │ BuildKit)         │                   │
+ │ **Key Unique Feature**    │ Raw content/blob  │ eStargz/Nydus     │ Node-level CRI    │
+ │                           │ inspection        │ lazy pulling      │ pod diagnostics   │
+ └───────────────────────────┴───────────────────┴───────────────────┴───────────────────┘
+```
+
+---
+
+## 1. `crictl`: The Certified Kubernetes Node Debugger
+
+When troubleshooting a broken Kubernetes worker node, **do not use `docker ps` or `ctr`**; use **`crictl`**:
+
+### Configuring `/etc/crictl.yaml`:
+```yaml
+runtime-endpoint: "unix:///run/containerd/containerd.sock"
+image-endpoint: "unix:///run/containerd/containerd.sock"
+timeout: 10
+debug: false
+```
+
+### Essential `crictl` SRE Commands:
+```bash
+# List all active Kubernetes Pod sandboxes on this node
+sudo crictl pods
+
+# List all containers running inside Kubernetes pods
+sudo crictl ps
+
+# View logs from a specific container inside a Kubernetes pod
+sudo crictl logs <container-id>
+
+# Execute an interactive shell inside a live pod container
+sudo crictl exec -it <container-id> sh
+```
+
+---
+
+## 2. `nerdctl`: The Next-Generation Docker Alternative
+
+`nerdctl` (contai**nerd** **c**on**t**ro**l**) provides the full UX of Docker, plus cutting-edge container innovations:
+
+```bash
+# Run containers exactly like Docker
+nerdctl run -d -p 8080:80 --name web nginx:alpine
+
+# Launch multi-container stacks using Docker Compose!
+nerdctl compose -f docker-compose.yml up -d
+
+# Sub-second container startup via eStargz Lazy Image Pulling!
+nerdctl run -d --snapshotter=stargz ghcr.io/stargz-containers/python:3.9-esgz
+```
+
+---
+
+## Hands-On Lab: Managing Workloads Across CLI Tools
+
+```bash
+# Step 1: Query containerd namespaces using ctr
+sudo ctr namespaces list 2>/dev/null || echo "ctr ready"
+
+# Step 2: Query active Kubernetes Pods using crictl
+sudo crictl pods 2>/dev/null || echo "crictl ready (configured via /etc/crictl.yaml)"
+
+# Step 3: Inspect local images in the k8s.io namespace using crictl
+sudo crictl images 2>/dev/null || echo "crictl images ready"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the distinct roles of `ctr`, `nerdctl`, and `crictl` in the containerd ecosystem?**
+
+- **`ctr`**: The **built-in, low-level developer CLI** shipped directly with containerd. It operates directly against containerd's internal gRPC services (content store, snapshotters, tasks). It has an unabstracted syntax and is intended solely for debugging containerd internals.
+- **`nerdctl`**: A **Docker-compatible CLI** that acts as a user-friendly drop-in replacement for Docker. It provides full CLI parity (`nerdctl run`, `build`, `compose`) while adding modern capabilities like lazy pulling (eStargz), rootless execution, and IPFS image sharing.
+- **`crictl`**: The official **Kubernetes SIG CLI tool** designed specifically for inspecting and debugging the **Kubernetes Container Runtime Interface (CRI)**. It understands Pod Sandboxes, Pause containers, and Kubelet metadata.
+
+**Q2: Why is `crictl` mandatory for troubleshooting Kubernetes worker nodes instead of Docker or `ctr`?**
+
+In modern Kubernetes clusters, Kubelet communicates with containerd (or CRI-O) via the **CRI specification**, storing all workloads inside the **`k8s.io` namespace** with Kubernetes-specific labels. If an SRE uses `docker ps` or standard `ctr`, they will either see zero containers or raw, un-correlated container tasks with cryptic IDs. **`crictl` understands the CRI data model**, grouping containers by their parent **Kubernetes Pod Name, Pod Namespace, and Pod UID**, providing accurate logs and container statuses matching `kubectl`.
+
+**Q3: How does `nerdctl` enable "Lazy Image Pulling" with eStargz / Nydus snapshotters?**
+
+Normally, a container cannot start until 100% of its compressed image layers are downloaded and unpacked (often taking 30–60 seconds for multi-gigabyte AI/ML or Java images). When using **`nerdctl` with the eStargz snapshotter**, containerd downloads only the **eStargz metadata index (TOC)** in milliseconds and spawns the container immediately. When the application accesses a specific file during execution (e.g. `import numpy`), the snapshotter fetches only those specific bytes on-demand via HTTP Range Requests, slashing container cold-start times by over **80%**.
+
+**Q4: How do you configure `crictl` on a Linux node running containerd?**
+
+Create or edit `/etc/crictl.yaml`:
+```yaml
+runtime-endpoint: "unix:///run/containerd/containerd.sock"
+image-endpoint: "unix:///run/containerd/containerd.sock"
+timeout: 10
+debug: false
+```
+This tells `crictl` to connect to containerd's UNIX domain socket, allowing `crictl pods`, `crictl ps`, and `crictl exec` to execute immediately without needing command-line socket flags.
+
+**Q5: Why does `ctr` require specifying the `--namespace` (`-n`) flag?**
+
+containerd uses **logical namespaces** (`k8s.io`, `default`, `moby`) to isolate data within its single daemon. By default, `ctr` queries only the `default` namespace. If an engineer runs `ctr images list` on a Kubernetes node without flags, the output is empty because all Kubernetes images are stored in the **`k8s.io`** namespace. Running **`ctr --namespace k8s.io images list`** correctly directs the command to query the Kubernetes container partition.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `ctr` is the low-level developer CLI for containerd internals
+- [ ] Know that `nerdctl` is the 100% Docker-compatible CLI with lazy pulling support
+- [ ] Know that `crictl` is the official Kubernetes CLI for debugging CRI pods
+- [ ] Know that `/etc/crictl.yaml` configures the CRI runtime endpoint socket
+- [ ] Know why `ctr` commands require `-n k8s.io` on Kubernetes worker nodes
+- [ ] Can list pods on a Kubernetes node using `crictl pods`

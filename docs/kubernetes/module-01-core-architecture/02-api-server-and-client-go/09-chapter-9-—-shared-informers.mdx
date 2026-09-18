@@ -1,0 +1,314 @@
+---
+title: "Chapter 9 — Shared Informers"
+sidebar_position: 9
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand how SharedIndexInformer and SharedInformerFactory allow multiple controllers to share a single Informer and cache, reducing API Server load."
+---
+
+# Chapter 9 — Shared Informers
+
+> **Goal:** Understand why running multiple separate Informers for the same resource is wasteful, and how `SharedIndexInformer` and `SharedInformerFactory` allow multiple controllers to share a single Informer and cache.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. The problem with multiple Informers for the same resource
+> 2. What SharedIndexInformer is
+> 3. What SharedInformerFactory is
+> 4. How multiple event handlers share one Watch stream and cache
+> 5. Indexers and custom secondary indices
+> 6. How kube-controller-manager uses SharedInformerFactory
+> 7. Best practices for production usage
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Common interview questions include:
+
+> **If both the Deployment Controller and the ReplicaSet Controller watch Pods, does Kubernetes open two Watch connections to the API Server?**
+
+> **How does `kube-controller-manager` efficiently run 40+ controllers without overwhelming the API Server?**
+
+The answer is **Shared Informers** — the mechanism that allows multiple consumers to share a single Watch stream and a single in-memory cache.
+
+Without Shared Informers:
+- N controllers watching Pods = N Watch streams to kube-apiserver
+- N separate in-memory caches for the same data = N× memory usage
+- N× API Server load even though the data is identical
+- `kube-controller-manager` with 40+ controllers would be unusable
+
+---
+
+# Real-Life Analogy
+
+Think of a Shared Informer like a TV broadcast.
+
+```text
+Without Shared Informer (individual streams):
+  Controller A -> its own Watch stream -> its own cache
+  Controller B -> its own Watch stream -> its own cache
+  Controller C -> its own Watch stream -> its own cache
+  (3 streams, 3 caches, 3x API Server load)
+
+With Shared Informer (broadcast):
+  One Watch stream -> One shared cache
+  Controller A -> subscribes to cache
+  Controller B -> subscribes to cache
+  Controller C -> subscribes to cache
+  (1 stream, 1 cache, minimal API Server load)
+```
+
+| TV Broadcast | Kubernetes |
+| :--- | :--- |
+| TV station | kube-apiserver Watch stream |
+| TV broadcast signal | SharedIndexInformer Watch + cache |
+| Television sets | Multiple controllers |
+| Watching the same channel | Subscribing to the same SharedInformer |
+| Recording at home | Local cache in SharedIndexInformer Store |
+
+---
+
+# The Problem with Multiple Informers
+
+Suppose `kube-controller-manager` runs two controllers that both need to watch Pods:
+
+```text
+Without Sharing:
+
+Deployment Controller Informer
+  -> Watch /api/v1/pods
+  -> Local cache: all Pods (50MB)
+
+ReplicaSet Controller Informer
+  -> Watch /api/v1/pods   (DUPLICATE connection)
+  -> Local cache: all Pods (50MB DUPLICATE)
+
+Result:
+  2 Watch connections to kube-apiserver for the same resource
+  100MB memory for identical data
+  kube-apiserver must serve 2 streams instead of 1
+```
+
+With 40+ controllers in `kube-controller-manager`, this would be catastrophic.
+
+---
+
+# SharedIndexInformer
+
+`SharedIndexInformer` is an Informer that allows **multiple event handler registrations** on a single shared Watch stream and cache:
+
+```text
+SharedIndexInformer for Pods
+        |
+        +-- One Reflector (List+Watch stream)
+        |
+        +-- One Store (in-memory cache, shared)
+        |
+        +-- Handler 1: Deployment Controller
+        |
+        +-- Handler 2: ReplicaSet Controller
+        |
+        +-- Handler 3: Custom Controller
+```
+
+All handlers receive the same events from the same Watch stream. Only one connection to kube-apiserver exists.
+
+### Adding Multiple Handlers
+
+```go
+sharedInformer.AddEventHandler(deploymentHandler)
+sharedInformer.AddEventHandler(replicaSetHandler)
+sharedInformer.AddEventHandler(customHandler)
+```
+
+Each handler is called independently for each event — they do not interfere with each other.
+
+---
+
+# SharedInformerFactory
+
+`SharedInformerFactory` is a factory that creates and manages `SharedIndexInformer` instances, ensuring only **one Informer exists per resource type**:
+
+```go
+factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
+
+// Both calls return the SAME underlying SharedIndexInformer for Pods
+podInformer1 := factory.Core().V1().Pods()
+podInformer2 := factory.Core().V1().Pods()
+
+// Start all informers registered with the factory
+factory.Start(stopCh)
+factory.WaitForCacheSync(stopCh)
+```
+
+The factory:
+- Tracks which Informers have been requested
+- Creates each Informer only once
+- Starts all Informers together with `factory.Start()`
+- Provides `WaitForCacheSync()` to block until all caches are populated
+
+---
+
+# Indexers
+
+`SharedIndexInformer` supports custom **Indexers** for efficient secondary lookups:
+
+```go
+// Built-in: index Pods by Namespace
+cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+    cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+})
+
+// Custom: index Pods by Node name
+nodeIndex := func(obj interface{}) ([]string, error) {
+    pod := obj.(*v1.Pod)
+    return []string{pod.Spec.NodeName}, nil
+}
+indexer.AddIndexers(cache.Indexers{"byNode": nodeIndex})
+
+// Lookup all Pods on a specific Node (no API call)
+pods, _ := indexer.ByIndex("byNode", "worker-1")
+```
+
+Without indexers, finding all Pods on a Node would require iterating the entire cache. With an indexer, it is O(1) lookup.
+
+---
+
+# How kube-controller-manager Uses SharedInformerFactory
+
+`kube-controller-manager` runs all core Kubernetes controllers in a single process:
+
+```text
+kube-controller-manager starts
+  |
+  v
+Creates one SharedInformerFactory
+  |
+  v
+Initializes 40+ controllers, each requesting Informers:
+  DeploymentController  -> factory.Apps().V1().Deployments()
+                        -> factory.Core().V1().Pods()
+  ReplicaSetController  -> factory.Apps().V1().ReplicaSets()
+                        -> factory.Core().V1().Pods()  (SAME Informer as above)
+  JobController         -> factory.Batch().V1().Jobs()
+                        -> factory.Core().V1().Pods()  (SAME Informer)
+  |
+  v
+factory.Start(stopCh)  -- starts all informers in goroutines
+factory.WaitForCacheSync(stopCh)  -- waits until all caches fully populated
+  |
+  v
+Controllers start reconciliation loops
+```
+
+Result: even with 40+ controllers watching Pods, only **one Watch connection** and **one Pod cache** exist.
+
+---
+
+# WaitForCacheSync Pattern
+
+Controllers must wait for the Informer cache to be fully populated before beginning reconciliation:
+
+```text
+factory.WaitForCacheSync(stopCh)
+  |
+  v
+All requested Informers have completed their initial List
+  |
+  v
+Cache contains current cluster state
+  |
+  v
+Controller begins reconciliation
+```
+
+> **Important:** Starting a controller before the cache is synced causes it to reconcile against an incomplete (empty) view of the cluster. This can result in incorrect behavior such as creating duplicate resources.
+
+---
+
+# Complete SharedInformer Flow
+
+```text
+1. SharedInformerFactory created
+  |
+  v
+2. Controller A requests Pod Informer
+   Controller B requests Pod Informer
+   (same Informer returned both times)
+  |
+  v
+3. factory.Start() launches Reflector goroutine
+   -> LIST all Pods -> populate cache
+   -> WATCH for subsequent changes
+  |
+  v
+4. New Pod created in cluster
+   -> ADDED event arrives via Watch
+   -> Store updated
+   -> Handler for Controller A called
+   -> Handler for Controller B called
+  |
+  v
+5. Controller A enqueues key into its WorkQueue
+   Controller B enqueues key into its WorkQueue
+  |
+  v
+6. Both controllers reconcile independently
+   Both read from the SAME shared cache
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the problem that SharedIndexInformer solves?
+If multiple controllers each create their own Informer for the same resource type, each maintains a separate Watch stream and cache — wasting API Server connections and memory. SharedIndexInformer lets multiple handlers share one stream and one cache.
+
+### Q2. What is SharedInformerFactory?
+A factory that creates and manages SharedIndexInformer instances, ensuring only one Informer per resource type. Multiple calls for the same resource return the same Informer. `factory.Start()` starts all registered Informers together.
+
+### Q3. How does kube-controller-manager use SharedInformerFactory?
+It creates one `SharedInformerFactory` at startup, passes it to all 40+ controllers, and calls `factory.Start()`. Each controller requests Informers for the resources it needs. Shared resources (like Pods) have only one Informer serving all controllers.
+
+### Q4. What is an Indexer?
+An Indexer is a secondary lookup table within the Informer Store. It allows O(1) lookup of objects by a custom key (e.g., all Pods on a specific Node) without iterating the full cache.
+
+### Q5. What does WaitForCacheSync do?
+It blocks until all Informers registered with the factory have completed their initial List and populated their caches. Controllers should call this before starting their reconciliation loops to avoid operating on an incomplete view.
+
+### Q6. Do multiple handlers on the same SharedInformer interfere with each other?
+No. Each handler is called independently for each event. They run sequentially within a single event dispatch, and each handler's processing does not affect others.
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| Controller reconciles empty list at startup | Did not call `WaitForCacheSync` | Add `WaitForCacheSync` call before reconciliation loop |
+| High memory usage for many controllers | Each controller has its own separate Informer | Migrate to `SharedInformerFactory` pattern |
+| Indexer lookup returns wrong Pods | Incorrect index key function | Verify index function returns correct key for desired lookup |
+| Events delivered to wrong controller | Multiple factories; each has separate Informers | Use single shared factory across all controllers |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain the problem that SharedIndexInformer solves.
+2. Describe how multiple handlers share one Watch stream and cache.
+3. Explain the role of SharedInformerFactory.
+4. Describe how kube-controller-manager uses SharedInformerFactory.
+5. Explain what an Indexer is and give an example use case.
+6. Explain why `WaitForCacheSync` must be called before starting a reconciliation loop.
+7. Trace the complete flow from cluster event to two controllers both receiving the event via shared Informer.
+
+---
+
+# Next Chapter
+
+**Chapter 10 — Listers**
+
+In the next chapter, you'll learn how Listers provide type-safe, cache-backed access to Kubernetes objects — the standard way controllers read resources without querying the API Server.

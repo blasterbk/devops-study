@@ -1,0 +1,2007 @@
+---
+title: "Chapter 2 — API Server Request Lifecycle"
+sidebar_position: 2
+module: "Module 1.1 — Kubernetes Control Plane"
+description: "> **Goal:** Understand everything that happens internally after you run a Kubernetes command like:..."
+---
+
+# Chapter 2 — API Server Request Lifecycle
+
+> **Goal:** Understand everything that happens internally after you run a Kubernetes command like:
+>
+> ```bash
+> kubectl apply -f deployment.yaml
+> ```
+>
+> By the end of this chapter, you should be able to explain every step from the moment the request leaves your terminal until the Pod starts running.
+
+---
+
+# Why Should You Learn This?
+
+Almost every Kubernetes interview eventually asks:
+
+> **"What happens internally when you run `kubectl apply -f deployment.yaml`?"**
+
+Most people answer:
+
+> "The API Server stores it in etcd."
+
+That answer is only about **10% correct**.
+
+In reality, more than **20 internal steps** occur before a Pod is running.
+
+Understanding this chapter will help you understand:
+
+- API Server
+- etcd
+- Scheduler
+- Controller Manager
+- kubelet
+- Informers
+- Watches
+- Admission Controllers
+- RBAC
+- CRDs
+- Operators
+
+Almost every Kubernetes internal topic builds on this request lifecycle.
+
+---
+
+# High-Level Request Flow
+
+```text
+Kubernetes API Server — High-Level Request Flow
+kubectl
+  │
+  ▼
+Load kubeconfig
+  │
+  ▼
+TLS Handshake
+  │
+  ▼
+kube-apiserver
+  │
+  ├──► Authentication
+  │
+  ├──► Authorization
+  │
+  ├──► Admission Controllers
+  │
+  ├──► API Request Validation
+  │
+  ├──► Object Conversion
+  │
+  ├──► Storage Version / Encoding
+  │
+  ▼
+etcd
+  │
+  │  Persist Object
+  ▼
+Watch Event
+  │
+  ├──────────────► Controllers
+  │                    │
+  │                    ▼
+  │               Desired State
+  │
+  ├──────────────► Scheduler
+  │                    │
+  │                    ▼
+  │              Selects Node
+  │                    │
+  │                    ▼
+  │              API Server
+  │              (Bind Pod to Node)
+  │                    │
+  │                    ▼
+  │                 etcd
+  │                    │
+  │                 Watch
+  │                    ▼
+  │                 kubelet
+  │                    │
+  │                    ▼
+  │            Container Runtime
+  │                    │
+  │                    ▼
+  │              Container Starts
+  │                    │
+  │                    ▼
+  │               Pod Running
+
+After the object is stored in etcd, Kubernetes becomes event-driven:
+                    etcd
+                      │
+                 Watch Events
+                      │
+          ┌───────────┼────────────┐
+          ▼           ▼            ▼
+     Controller   Scheduler      Other
+          │           │
+          │           ▼
+          │      API Server
+          │           │
+          │        Bind Pod
+          │           │
+          └───────────┤
+                      ▼
+                    etcd
+                      │
+                    Watch
+                      ▼
+                   kubelet
+                      │
+                      ▼
+               Container Runtime
+                      │
+                      ▼
+                 Pod Running
+```
+
+Everything begins with **kubectl**.
+
+---
+
+# Step 1 — User Executes kubectl
+
+Suppose you execute:
+
+```bash
+kubectl apply -f deployment.yaml
+```
+
+While it might seem that `kubectl` directly creates Kubernetes objects, it is actually a client-side command-line tool acting as a frontend wrapper to the Kubernetes REST API.
+
+```text
+kubectl (Local Client) ──[ HTTP POST/PUT ]──► API Server (kube-apiserver)
+```
+
+---
+
+## Client-Side Operations
+
+Before sending a request to the Kubernetes API Server, **`kubectl`** performs several client-side operations:
+
+1. **YAML/JSON Parsing:** Reads the local manifest (for example, `deployment.yaml`) and decodes it into an internal Kubernetes object representation.
+
+2. **Client-Side Validation:** Performs available local validation using Kubernetes API/OpenAPI schema information to detect structural problems such as unknown fields or incorrect data types. The **API Server remains responsible for authoritative validation**.
+
+3. **API Discovery:** Uses Kubernetes API discovery information, potentially from the local discovery cache (`~/.kube/cache/discovery`), to determine the appropriate API Group, Version, and Resource (GVR) for the requested object. For example, a `Deployment` maps to the `apps/v1` API and the `deployments` resource.
+
+4. **Request Construction & Serialization:** Converts the internal object representation into the appropriate wire format, typically JSON, and constructs an HTTP request using the method required by the operation, such as `POST`, `PUT`, `PATCH`, `GET`, or `DELETE`.
+
+| `kubectl` operation | Typical HTTP method                        |
+| ------------------- | ------------------------------------------ |
+| `kubectl create`    | `POST`                                     |
+| `kubectl apply`     | `PATCH` / sometimes other request patterns |
+| `kubectl replace`   | `PUT`                                      |
+| `kubectl get`       | `GET`                                      |
+| `kubectl delete`    | `DELETE`                                   |
+| `kubectl patch`     | `PATCH`                                    |
+
+### Overall Flow
+
+```text
+deployment.yaml
+       │
+       ▼
+    kubectl
+       │
+       ├── Parse YAML
+       ├── Client-side validation
+       ├── API discovery
+       ├── Resolve GVR
+       ├── Serialize object
+       └── Build HTTP request
+                │
+                ▼
+       Kubernetes API Server
+                │
+                ├── Authentication
+                ├── Authorization
+                ├── Admission
+                ├── Validation
+                └── Persistence in etcd
+```
+
+---
+
+## Interview Question
+
+**Does kubectl create Pods?**
+
+Answer:
+
+No. It only performs client-side validation, parses the configuration, and sends HTTP REST API requests to the API Server.
+
+---
+
+# Step 2 — kubectl Reads kubeconfig
+
+To transmit the HTTP request, `kubectl` must locate the target cluster and determine how to authenticate.
+
+```text
+~/.kube/config (Context: Cluster + User + Namespace)
+       │
+       ▼
+kubectl client configuration
+```
+
+---
+
+## Under the Hood of Kubeconfig
+
+`kubectl` checks the `KUBECONFIG` environment variable or defaults to the `~/.kube/config` file to extract:
+
+1. **Clusters**: A list of API Server endpoints (URLs like `https://10.96.0.1:6443`) and their corresponding Certificate Authority (CA) certs to verify the server's identity.
+2. **Users**: Authentication credentials which can include client certificates, static bearer tokens, or references to **credential plugins** (e.g., `gcloud`, `aws-iam-authenticator`, or OIDC token helpers) that fetch temporary tokens dynamically.
+3. **Contexts**: Logical groupings that couple a specific **User** with a specific **Cluster** and define a default **Namespace** (e.g., `default` or `kube-system`).
+4. **Current Context**: Specifies the active context `kubectl` will target by default.
+
+---
+
+## Interview Question
+
+**What is kubeconfig?**
+
+Answer:
+
+A configuration file used by kubectl to determine:
+
+- **Cluster information** — API Server address and cluster CA
+- **User credentials** — client certificate/key, token, or other authentication configuration
+- **Contexts** — which user and cluster to use together
+- **Namespace** — default namespace for a context
+- **API Server endpoint** — where kubectl sends requests
+
+---
+
+# Step 3 — TLS Handshake
+
+kubectl communicates with the Kubernetes API Server over HTTPS, using TLS to provide encryption and integrity for the connection.
+
+```text
+kubectl
+   │
+   │ HTTPS / TLS
+   v
+kube-apiserver
+```
+
+```text
+kubectl
+   │
+   │ TLS handshake
+   v
+Secure TLS connection
+   │
+   │ HTTP request
+   v
+kube-apiserver
+```
+
+---
+
+## What happens during the TLS handshake?
+
+```text
+kubectl                         kube-apiserver
+   │                                  │
+   │──── TLS ClientHello ────────────►│
+   │                                  │
+   │◄── Server Certificate ───────────│
+   │                                  │
+   │──── Certificate Verification ───►│
+   │                                  │
+   │──── Key Exchange ───────────────►│
+   │                                  │
+   │◄── Secure Connection ────────────│
+   │                                  │
+   │──── HTTP API Request ───────────►│
+```
+
+---
+
+## Why?
+
+Imagine sending Secrets over plain HTTP.
+
+Anyone on the network could read:
+
+- Passwords
+- Tokens
+- Certificates
+
+TLS prevents this.
+
+---
+
+## Interview Question
+
+**Why does Kubernetes use HTTPS?**
+
+Answer:
+
+To provide:
+
+- Encryption
+- Integrity
+- Authentication
+
+---
+
+# Step 4 — API Server Receives Request
+
+The **`kube-apiserver`** acts as the central entry point (the "front door") for the Kubernetes API. Clients such as **`kubectl`**, kubelets, controllers, and the scheduler interact with the cluster through the API Server.
+
+Kubernetes control-plane components normally do not bypass the API Server to modify cluster state directly in **`etcd`**. The API Server is responsible for processing API requests and persisting Kubernetes state in `etcd`.
+
+## Architecture Diagram
+
+```text
+Client (kubectl, kubelet, controllers, scheduler)
+                        |
+                        v
+              +──────────────────+
+              |  kube-apiserver  |
+              |   (API Gateway)  |
+              +─────────┬────────+
+                        |
+                        v
+                      etcd
+```
+
+## Architectural Characteristics
+
+### 1. Stateless with Respect to Persistent State
+
+The API Server does not persist Kubernetes cluster state locally. Persistent cluster state is stored in etcd.
+
+This allows multiple kube-apiserver instances to run behind a load balancer for high availability and horizontal scaling.
+
+### 2. Concurrent Request Handling
+
+kube-apiserver is implemented in Go and uses Go's concurrency mechanisms to handle many API requests concurrently.
+
+### 3. API-Mediated Access to etcd
+
+The API Server provides the standard interface for reading and modifying Kubernetes cluster state stored in etcd.
+
+Kubernetes control-plane components normally interact with cluster state through the Kubernetes API rather than accessing etcd directly.
+
+### 4. Centralized Request Processing
+
+The API Server is responsible for processing API requests and enforcing important controls such as:
+
+- Authentication
+- Authorization
+- Admission control
+- API validation
+- API Group/Version and Resource handling
+- Persistence of accepted state in etcd
+
+## Key Architecture
+
+```text
+                    Kubernetes Control Plane
+
+
+                       +────────────────+
+                       |    kubectl     |
+                       +───────┬────────+
+                               |
+                       +───────v────────+
+                       | kube-apiserver |
+                       +───────┬────────+
+                               |
+                       +───────v────────+
+                       |      etcd      |
+                       +────────────────+
+                               ^
+                               |
+             +─────────────────+─────────────────+
+             |                 |                 |
+        Scheduler         Controllers         Kubelet
+```
+
+> **Key mental model:** `kube-apiserver` is the API gateway of Kubernetes, while `etcd` is the persistent backing store for Kubernetes cluster state.
+>
+> **Note:** In a highly available Kubernetes cluster, there can be multiple `kube-apiserver` instances running behind a load balancer. Therefore, "central API entry point" is more precise than "single physical server."
+
+---
+
+# Step 5 — HTTP Handler Chain
+
+Before routing the request to a specific API handler, the API Server processes the request through a pipeline of HTTP handlers and filters called the **HTTP Handler Chain**.
+
+### System Execution Flow
+
+```text
+1 Incoming Connection
+        |
+        v
+2 [ Filter: Log & Recovery ]
+        |
+        v
+3 [ Filter: Timeout ]
+        |
+        v
+4 [ Filter: Authentication ]
+        |
+        v
+5 [ Filter: Authorization ]
+        |
+        v
+6 [ Filter: API Priority and Fairness (APF) ]
+        |
+        v
+7 [ Filter: Impersonation ]
+        |
+        v
+8 [ Filter: Audit Logging ]
+        |
+        v
+9 [ Handler Routing ]
+```
+
+> **Note:** The exact ordering of individual filters is implementation-dependent and can vary between Kubernetes versions and configuration. The sequence above is a conceptual representation of the request-processing pipeline.
+
+---
+
+## The Filter Sequence
+
+1. **Log & Recovery:** Handles request logging and recovers from unexpected panics in handler code so that a panic does not bring down the API Server process.
+
+2. **Timeout:** Applies request time limits to prevent requests from running indefinitely and consuming API Server resources.
+
+3. **Authentication:** Determines **who is making the request** by validating credentials such as client certificates, bearer tokens, OIDC tokens, or ServiceAccount tokens.
+
+4. **Authorization:** Determines **whether the authenticated user is allowed to perform the requested operation** on the specified resource. For example, RBAC can determine whether a user can `get`, `create`, `update`, or `delete` a resource.
+
+5. **API Priority and Fairness (APF):** Classifies requests into priority levels and flow schemas and controls their concurrency and queuing. APF helps prevent one class of requests from consuming all available API Server capacity and starving other requests.
+
+6. **Impersonation:** Allows an authorized user to make a request that is evaluated as another user, group, or ServiceAccount. This is commonly used for administrative operations, troubleshooting, and testing authorization policies.
+
+7. **Auditing:** Records information about API requests for security, compliance, and troubleshooting. Depending on the configured audit policy and level, audit events can contain information such as the user identity, request URI, verb, resource, namespace, source information, and response status.
+
+8. **Route Resolution:** Parses the request URL and determines the appropriate API Group, Version, Resource (GVR), Namespace, and HTTP verb, then routes the request to the corresponding REST resource handler.
+
+---
+
+# Step 6 — Authentication
+
+After the request enters the API Server's authentication layer, the API Server must determine the caller's identity. It evaluates the request credentials using the enabled **Authentication Modules**.
+
+### System Execution Flow
+
+```text
+  Request Credentials
+           |
+           v
++──────────────────────+
+| Authentication       |
+| Modules              |
+|                      |
+| x509 Certificates    |
+| ServiceAccount Token |
+| OIDC                 |
+| Webhook              |
++──────────+───────────+
+           |
+           v
+     Authentication
+       Successful
+           |
+           v
+      UserInfo set
+```
+
+## Authentication Mechanism
+
+1. **Module Pipeline:** The API Server evaluates the request using its configured authentication mechanisms, such as client certificates, ServiceAccount tokens, OIDC tokens, and authentication webhooks.
+
+2. **Early Termination:** When an authentication mechanism successfully authenticates the request, the authentication process succeeds and the API Server associates a `user.Info` object with the request context containing:
+   - **Username:** The authenticated user's name, for example, `kubernetes-admin` or `system:serviceaccount:default:default-sa`.
+   - **UID:** A unique identifier for the authenticated user.
+   - **Groups:** Groups associated with the user, such as `system:masters` or `system:authenticated`.
+   - **Extra:** Additional custom key-value attributes associated with the authenticated identity.
+
+3. **Rejection:** If no enabled authentication mechanism successfully authenticates the request and the request cannot be treated as anonymous, the authentication layer rejects the request with `401 Unauthorized`.
+
+> **Important:** Authentication answers the question "Who are you?" It does not determine whether the user is allowed to perform the requested operation. That decision is handled by the Authorization layer.
+
+---
+
+# Step 7 — Authorization
+
+With the user's identity authenticated, the API Server determines whether the caller is authorized to perform the requested operation (for example, **`create`**, **`get`**, **`update`**, or **`delete`**) on the target resource.
+
+### System Execution Flow
+
+```text
+UserInfo
+(e.g., Alice, system:masters)
+        |
+        v
++────────────────────────────────+
+|       Authorizer Chain         |
+|                                |
+|  Node -> RBAC -> Webhook       |
++───────────────+────────────────+
+                |
+                v
+        Authorization Decision
+                |
+        +───────+────────+
+        |                |
+        v                v
+      Allow            Deny
+        |                |
+        v                v
+   Continue        403 Forbidden
+```
+
+> **Note:** The exact authorizer configuration and ordering depend on how the API Server is configured. The commonly used authorizers include Node, RBAC, and Webhook.
+
+---
+
+## How Authorization Works
+
+1. **Authorizer Sequence:** The API Server evaluates the request using its configured authorization mechanisms. An authorizer can return an allow, deny, or no opinion decision. A request can continue to another authorizer when the previous authorizer does not make the final decision.
+
+2. **RBAC Evaluation:** When Role-Based Access Control (RBAC) is enabled, the RBAC authorizer determines whether the authenticated identity has a rule that permits the requested operation.
+
+   RBAC evaluates:
+   - **Roles and ClusterRoles:** Collections of rules defining allowed API resources and verbs.
+   - **RoleBindings and ClusterRoleBindings:** Bind users, groups, or ServiceAccounts to Roles or ClusterRoles.
+   - **Resource:** The Kubernetes resource being accessed, such as pods or deployments.
+   - **Verb:** The requested operation, such as get, list, create, update, or delete.
+   - **Namespace:** The namespace in which the resource exists, when applicable.
+
+3. **Decision Making:**
+   - If an authorizer allows the request, the request can proceed.
+   - If an authorizer explicitly denies the request, authorization fails.
+   - If no configured authorizer allows the request, the API Server rejects it with `403 Forbidden`.
+
+> **Key distinction:** Authentication answers "Who are you?", while authorization answers "Are you allowed to perform this action?"
+
+---
+
+# Step 8 — Admission Controllers
+
+**Admission Controllers** are interceptors in the Kubernetes API request processing path that can **modify (mutate)** or **reject** requests based on policy, security requirements, or other rules.
+
+Unlike Authentication and Authorization, which primarily determine **who the caller is** and **whether the caller is permitted to perform an operation**, Admission Controllers inspect the **request and the object being operated on**.
+
+Admission control primarily applies to requests that create, modify, delete, or connect to Kubernetes resources.
+
+### System Execution Flow
+
+```text
+    Authorized Request
+             |
+             v
++──────────────────────────+
+|   Mutating Admission     |
+|   Controllers / Webhooks |
++────────────+─────────────+
+             |
+             v
+      Object Mutation
+             |
+             v
++──────────────────────────+
+|  Validation / Defaulting |
+|  and Resource Validation |
++────────────+─────────────+
+             |
+             v
++──────────────────────────+
+|  Validating Admission    |
+|  Controllers / Webhooks  |
++────────────+─────────────+
+             |
+        +────+─────+
+        |          |
+        v          v
+     Accepted   Rejected
+        |          |
+        v          v
+      etcd      HTTP Error
+```
+
+## The Admission Phases
+
+Admission processing has two main phases:
+
+### 1. Mutating Phase
+
+Mutating admission controllers can modify the incoming object before it is persisted.
+
+Examples include:
+- Applying default or policy-driven changes
+- Injecting sidecars through a mutating admission webhook
+- Adding labels or annotations
+- Injecting projected ServiceAccount token volumes through the appropriate ServiceAccount admission behavior
+
+Mutating admission webhooks can modify the object and return the modified version to the API Server.
+
+> **Important:** Mutating admission does not simply run repeatedly until an object reaches a "stable state." Kubernetes has specific reinvocation behavior for mutating admission webhooks when configured, but this should not be described as an unrestricted mutation loop.
+
+### 2. Validating Phase
+
+Validating admission controllers inspect the resulting object and determine whether it should be accepted.
+
+They cannot modify the object.
+
+Examples include:
+- Pod Security Admission
+- ResourceQuota
+- Validating admission webhooks
+- Other policy-based validation mechanisms
+
+If a validating controller rejects the request, the API Server rejects the operation and returns an appropriate HTTP error response, commonly 400 Bad Request for admission rejection.
+
+## External Admission Webhooks
+
+Kubernetes also supports external admission webhooks:
+- **`MutatingWebhookConfiguration`** — calls an external HTTP service that can modify the object.
+- **`ValidatingWebhookConfiguration`** — calls an external HTTP service that can validate and accept or reject the object.
+
+**Conceptually:**
+
+```text
+                   kube-apiserver
+                         |
+                         v
+                Admission Controller
+                         |
+            +────────────+────────────+
+            |                         |
+            v                         v
+     Mutating Webhook        Validating Webhook
+            |                         |
+            v                         v
+  External HTTP Service     External HTTP Service
+```
+
+The webhook service returns a response indicating whether the request should be allowed and, for a mutating webhook, may provide a patch that modifies the object.
+
+> **Important:** PodPreset is deprecated and should not be used as a current Kubernetes admission-controller example.
+
+---
+
+# Step 9 — Object Validation
+
+After the request has passed through admission processing, the API Server performs resource-specific validation before persisting the object.
+
+### Architecture Diagram
+
+```text
+          Mutated Object
+                |
+                v
+[ Schema / Structural Validation ]
+                |
+                v
+[ Semantic / Resource Validation ]
+                |
+                v
+           [ Accepted ]
+                |
+                v
+             Storage
+```
+
+## Schema and Semantic Checks
+
+1. **Schema / Structural Validation:** Verifies that the object conforms to the expected structure and data types for its API resource. This includes checking fields, data types, supported structure, and other schema-defined constraints.
+
+   For example:
+   ```yaml
+   spec:
+     replicas: 3
+   ```
+   `replicas` must have the expected integer type rather than an incompatible value such as:
+   ```yaml
+   spec:
+     replicas: "three"
+   ```
+
+2. **Semantic / Resource Validation:** Performs resource-specific validation and business rules implemented by Kubernetes for that resource.
+
+   Examples include:
+   - IP addresses must be valid where required.
+   - Label keys and values must follow Kubernetes naming rules.
+   - Required fields must be present.
+   - Resource-specific fields must contain valid values.
+   - Immutable fields cannot be changed after creation.
+
+   For example, a Service's `.spec.clusterIP` cannot normally be changed after it has been allocated.
+
+3. **Validation Failure:** If validation fails, the API Server rejects the request and returns an appropriate API error response. The object is not persisted to etcd.
+
+> **Important Architecture Note:** Do not view Step 9 as a guaranteed `Mutating Admission → Schema Validation → Validating Admission` sequence. In the Kubernetes API Server architecture, Admission Control is a broader stage that can mutate or validate, while resource-specific REST validation occurs as part of the subsequent resource handling path.
+
+---
+
+# Step 10 — Object Conversion
+
+Kubernetes supports multiple API versions for the same resource, such as **`apps/v1`** and, historically, **`apps/v1beta1`**. To provide a consistent internal representation, the API Server converts versioned API objects into its internal representation during request processing.
+
+### Architecture Diagram
+
+```text
+     Client API Version
+         (apps/v1)
+             |
+             v
+    [ Versioned Object ]
+  |Convert
+             v
+[ Internal Representation ]
+  |Convert
+             v
+    [ Storage Version ]
+             |
+             v
+            etcd
+```
+
+## The Conversion Model
+
+1. **Conversion to Internal Representation:** The API Server decodes the incoming versioned object and converts it into the internal representation used by the Kubernetes API machinery. This allows the server's internal logic to operate independently of the specific API version used by the client.
+
+2. **API Version Decoupling:** Multiple external API versions can represent the same Kubernetes resource while the API Server maintains a consistent internal representation. This allows Kubernetes to evolve API versions without requiring all internal components to work directly with every external version.
+
+3. **Conversion to Storage Version:** Before persistence, the object is converted to the resource's configured storage version and serialized for storage in etcd. The storage version is independent of the API version used by the client.
+
+4. **Response Conversion:** When an object is read, the API Server retrieves the stored representation and converts it into the API version requested by the client. This allows clients to interact with the same underlying object through different supported API versions.
+
+> **Important:** The client's API version and the storage version are not necessarily the same. For example, a client may request a resource using `apps/v1`, while the API Server handles the object internally and stores it using the resource's configured storage version.
+
+> **Terminology Note:** Avoid calling the internal representation itself the "Hub version". "Hub-and-spoke" is a useful conversion design concept in some Kubernetes APIs (like CRDs), but **"internal representation"** is clearer and more accurate for explaining the API Server's general request flow.
+
+---
+
+# Step 11 — Storage Preparation
+
+Before persisting the object in **`etcd`**, the API Server prepares the object for storage by converting it to the appropriate storage representation and serializing it into the configured storage format.
+
+### Architecture Diagram
+
+```text
+ Internal Representation
+            |
+            v
+Storage Version Conversion
+            |
+            v
+      Serialization
+    (Protobuf / JSON)
+            |
+            v
+      Storage Layer
+            |
+            v
+          etcd
+```
+
+## Storage Preparation Steps
+
+1. **Storage Version Conversion:** The API Server converts the internal object representation into the resource's configured storage version before persistence.
+
+   For example:
+   ```text
+   Internal Deployment
+          |
+          v
+   apps/v1 Storage Version
+   ```
+   The storage version is the API version used to persist the resource in etcd and is independent of the API version originally requested by the client.
+
+2. **Serialization:** The API Server serializes the object into a byte representation suitable for storage.
+
+   Kubernetes can use Protocol Buffers (Protobuf) or JSON, depending on the resource and storage configuration.
+
+   Protobuf is commonly used for built-in Kubernetes resources because it provides an efficient binary representation. JSON remains important for resources and APIs where Protobuf support is unavailable or not used.
+
+3. **Metadata and Resource Version Handling:** During persistence, Kubernetes manages system-generated metadata and storage state, including `resourceVersion`.
+
+   The `resourceVersion` identifies a particular version of an object as observed by the Kubernetes API and is used for optimistic concurrency control, watches, and consistency-related operations.
+
+   It should not be treated as a simple timestamp or as a value generated purely during serialization.
+
+### Storage Preparation Flow
+
+```text
+ Internal Representation
+            |
+            v
+Storage Version Conversion
+            |
+            v
+  Object Serialization
+     +──────+──────+
+     |             |
+     v             v
+  Protobuf        JSON
+     |             |
+     +──────+──────+
+            |
+            v
+      Storage Layer
+            |
+            v
+          etcd
+```
+
+> **Important:** Serialization converts the object into bytes; it does not itself create the object's `resourceVersion`. The API Server/storage layer obtains and manages the resource version as part of persistence and concurrency handling.
+
+---
+
+# Step 12 — Persist to etcd
+
+Now, the API Server persists the validated and serialized object to the persistent key-value store, **`etcd`**.
+
+### Architecture Diagram
+
+```text
+API Server -> [ etcd Key-Value Store ]
+                         |
+                         v
+                  Raft Consensus
+                         |
+                         v
+                 Replicated Storage
+```
+
+## Database Persistence
+
+1. **Key Generation:** The API Server's storage layer maps the Kubernetes resource to a hierarchical storage key.
+
+   For example:
+   ```text
+   /registry/deployments/default/nginx
+   ```
+   Here:
+   - `/registry` -> Kubernetes storage prefix
+   - `deployments` -> Resource
+   - `default` -> Namespace
+   - `nginx` -> Object name
+
+2. **Raft Consensus:** etcd uses the Raft consensus algorithm to replicate data across its members.
+
+   The etcd leader coordinates the write and replicates the entry to other members. The write becomes committed after a quorum (majority) of the etcd cluster has accepted the Raft entry.
+
+   For example, with a 3-member etcd cluster:
+   ```text
+   etcd-1 (Leader)
+       |
+       +──────────> etcd-2
+       |
+       +──────────> etcd-3
+   ```
+   Quorum = 2 of 3
+
+3. **MVCC and Revision:** When the write is committed, etcd advances its MVCC revision.
+
+   Kubernetes uses the storage revision information as part of its `resourceVersion` semantics for optimistic concurrency, watches, and consistency-related operations.
+
+   > **Important:** `resourceVersion` should not be treated simply as "the etcd revision copied directly into the object." Kubernetes manages the value through its storage layer and API machinery.
+
+4. **API Server Response:** After the storage operation succeeds, the API Server considers the object persisted and returns the appropriate HTTP response to the client.
+
+   For a successful create operation, the API Server normally returns:
+   ```http
+   HTTP 201 Created
+   ```
+   For an update operation, the response is typically:
+   ```http
+   HTTP 200 OK
+   ```
+   The response contains the resulting Kubernetes object, including server-managed metadata such as `resourceVersion`.
+
+## What Does "Cluster State" Mean?
+
+Imagine you run:
+```bash
+kubectl apply -f deployment.yaml
+```
+with:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 3
+```
+
+Kubernetes needs to persist information such as:
+- **Deployment:** `nginx`
+- **Desired replicas:** `3`
+- **Pod template:** nginx container specification
+- **Namespace:** `default`
+- **Labels:** if specified
+- **Selectors:** if specified
+- **Deployment configuration:** other desired-state fields
+
+This information becomes part of the Kubernetes cluster state and is persisted through the API Server into `etcd`.
+
+## Desired State vs Actual State
+
+This is one of the most important concepts in Kubernetes.
+
+When you declare: *"I want 3 nginx Pods"*, you are defining the **desired state**.
+
+```text
+                 Desired State
+                      |
+                      v
+                     etcd
+                      |
+                      v
+                 Controllers
+                      |
+                      v
+              Kubernetes Resources
+                      |
+                      v
+                Actual State
+```
+
+The controllers continuously compare the desired state with the observed actual state and take actions to reconcile the difference.
+
+For example, etcd contains the desired Deployment state:
+```yaml
+Deployment: nginx
+replicas: 3
+```
+
+But suppose the current observed state is:
+```text
+Running Pods = 1
+```
+
+The ReplicaSet controller observes the difference:
+```text
+Desired = 3
+Actual  = 1
+```
+
+It then creates additional Pods through the Kubernetes API.
+
+Eventually:
+```text
+Desired = 3
+Actual  = 3
+```
+
+The controller has successfully reconciled the system.
+
+## Important Distinction
+
+`etcd` stores Kubernetes API state; it does not directly store the live runtime state of containers.
+
+```text
+                    etcd
+  |Desired State
+                     v
+              Kubernetes API
+                     |
+                     v
+                Controllers
+                     |
+                     v
+                   Pods
+                     |
+                     v
+             Container Runtime
+                     |
+                     v
+               Running Process
+```
+
+The actual runtime state is observed from components such as the kubelet and container runtime. Controllers use this observed state together with the desired state stored through the API to continuously reconcile the cluster.
+
+> **Key mental model:** `etcd` is the durable source of truth for Kubernetes API state, while controllers continuously work to make the observed cluster state match the desired state.
+
+---
+
+# Step 13 — Watch Event Generated
+
+After the object is successfully persisted in **`etcd`**, the change becomes observable through the Kubernetes API Server's **watch mechanism**.
+
+Controllers and other interested clients use the Kubernetes API's **List/Watch** mechanism to receive changes. They do **not** continuously poll or access `etcd` directly.
+
+### Architecture Diagram
+
+```text
+                     API Server
+                         |
+                         v
+                       etcd
+  |Change Event
+                         v
+              API Server Watch Infrastructure
+                         |
+                         v
+                  Watch Notification
+                         |
+                         v
+                Informer / Local Cache
+                         |
+                         v
+               Deployment Controller
+```
+
+## How the Watch Mechanism Works
+
+1. **Object Persisted:** The API Server successfully stores the Deployment in etcd.
+2. **Change Becomes Observable:** The storage/watch infrastructure detects the change and makes the event available through the API Server's watch mechanism.
+3. **Watch Notification:** Components that have established a watch for Deployments receive a watch event describing the change.
+
+   For example:
+   ```yaml
+   Event Type: ADDED
+   Resource: Deployment
+   Name: nginx
+   Namespace: default
+   ```
+4. **Informer Updates Local Cache:** The controller's Informer receives the event and updates its local cache.
+5. **Reconciliation Triggered:** The Informer places the affected Deployment key into the controller's work queue, causing the Deployment Controller to reconcile the resource.
+
+> **Important:** Controllers normally use the Kubernetes API's List/Watch mechanism rather than continuously polling etcd directly.
+
+---
+
+# Step 14 — Deployment Controller
+
+The Deployment Controller, running inside the `kube-controller-manager`, reacts to changes observed through its Informer and local cache.
+
+The controller does not continuously poll the API Server for changes. Instead, the Informer receives watch events and triggers the controller's reconciliation process.
+
+### Architecture Diagram
+
+```text
+Deployment Watch Event
+          |
+          v
+      Informer
+          |
+          v
+    Local Cache
+          |
+          v
+     Work Queue
+          |
+          v
+Reconciliation Loop
+          |
+          v
+  Create / Update ReplicaSet
+          |
+          v
+    kube-apiserver
+```
+
+## The Reconciliation Loop
+
+1. **Compare Desired vs. Observed State:**
+
+   The Deployment Controller retrieves the Deployment and related ReplicaSets from its local Informer cache.
+
+   It compares the desired state specified by the Deployment with the currently observed state.
+
+   For example:
+   ```text
+   Desired replicas = 3
+   Current ReplicaSet = does not exist
+   ```
+   The controller determines that a ReplicaSet needs to be created.
+
+2. **Generate ReplicaSet:**
+
+   The Deployment Controller creates a ReplicaSet object based on the Deployment's Pod template and desired replica count.
+
+   The ReplicaSet contains an `ownerReferences` entry pointing to the parent Deployment:
+
+   ```yaml
+   metadata:
+     ownerReferences:
+       - apiVersion: apps/v1
+         kind: Deployment
+         name: nginx
+   ```
+
+   This establishes the ownership relationship between the Deployment and the ReplicaSet.
+
+   > **Important:** `ownerReferences` establishes the ownership relationship. The Kubernetes Garbage Collector uses this relationship to perform cascading cleanup when the owner is deleted.
+
+3. **API Call:**
+
+   The Deployment Controller sends a request to the API Server to create the ReplicaSet:
+
+   ```http
+   POST /apis/apps/v1/namespaces/default/replicasets
+   ```
+
+   The request then follows the API Server processing pipeline:
+
+   ```text
+   Deployment Controller
+            |
+            v
+       kube-apiserver
+            |
+            +── Authentication
+            +── Authorization
+            +── Admission
+            +── Validation
+            +── Persistence
+                 |
+                 v
+                etcd
+   ```
+
+4. **ReplicaSet Controller Takes Over:**
+
+   After the ReplicaSet is created, the ReplicaSet becomes observable through the API Server's watch mechanism.
+
+   The ReplicaSet Controller receives the corresponding event through its own Informer and reconciles the ReplicaSet.
+
+   For example:
+   ```text
+   ReplicaSet (replicas = 3)
+            |
+            v
+   ReplicaSet Controller
+            |
+            v
+       Creates Pods
+   ```
+
+## Complete Flow
+
+```text
+User
+  |kubectl apply
+ v
+kube-apiserver
+ |
+ v
+etcd
+ |
+ v
+Watch Infrastructure
+ |
+ v
+Deployment Informer
+ |
+ v
+Deployment Controller
+  |Create ReplicaSet
+ v
+kube-apiserver
+ |
+ v
+etcd
+ |
+ v
+Watch Infrastructure
+ |
+ v
+ReplicaSet Informer
+ |
+ v
+ReplicaSet Controller
+  |Create Pods
+ v
+kube-apiserver
+ |
+ v
+etcd
+```
+
+> **Key Mental Model:** Controllers do not directly modify `etcd`. They observe Kubernetes resources through the API Server's List/Watch mechanism, reconcile the observed state against the desired state, and make changes by sending API requests back to the API Server.
+
+---
+
+# Step 15 — ReplicaSet Controller
+
+Once the new **`ReplicaSet`** is successfully persisted through the API Server, the change becomes observable through the API Server's watch mechanism. The **ReplicaSet Controller** receives the event through its Informer and local cache and begins reconciliation.
+
+### Architecture Diagram
+
+```text
+ReplicaSet Watch Event
+          |
+          v
+      Informer
+          |
+          v
+    Local Cache
+          |
+          v
+     Work Queue
+          |
+          v
+Reconciliation Loop
+          |
+          v
+      Create Pods
+```
+
+## Creating the Pods
+
+1. **Reconciliation Check:**
+
+   The ReplicaSet Controller retrieves the ReplicaSet and its matching Pods from its local Informer cache.
+
+   It compares the desired number of replicas with the currently observed number of Pods.
+
+   For example:
+   ```text
+   Desired Pods = 3
+   Current Pods = 0
+   ```
+   The controller determines that 3 Pods need to be created.
+
+2. **Generating Pod Specifications:**
+
+   The ReplicaSet Controller creates Pod objects based on the ReplicaSet's Pod template.
+
+   Each Pod inherits information such as:
+   - Labels
+   - Container specifications
+   - Volumes
+   - Environment variables
+   - Other Pod template settings
+
+   The Pods also contain an `ownerReferences` entry pointing to the parent ReplicaSet:
+
+   ```yaml
+   metadata:
+     ownerReferences:
+       - apiVersion: apps/v1
+         kind: ReplicaSet
+         name: nginx-rs
+   ```
+
+   > **Important:** The ReplicaSet Controller does not assign a node to the Pod. The Pod's `.spec.nodeName` is normally empty at this point.
+
+3. **Creating the Objects:**
+
+   The ReplicaSet Controller sends API requests to the API Server to create the required Pod objects:
+
+   ```http
+   POST /api/v1/namespaces/default/pods
+   ```
+
+   The controller creates one Pod object per required replica.
+
+4. **Pods Become Pending:**
+
+   After the API Server accepts the Pod objects and persists them, the Pods exist as Kubernetes objects but have not yet been assigned to a node.
+
+   Conceptually:
+   ```text
+   Pod
+   │
+   ├── spec.nodeName = ""
+   └── status.phase = Pending
+   ```
+   These Pods are now candidates for scheduling.
+
+---
+
+# Step 16 — Scheduler
+
+The Kubernetes Scheduler (**`kube-scheduler`**) watches the API Server for newly created Pods that do not yet have a node assigned.
+
+When it detects an unscheduled Pod, the Scheduler runs its scheduling framework to determine an appropriate node.
+
+### Architecture Diagram
+
+```text
+Unscheduled Pod
+(spec.nodeName: empty)
+          |
+          v
+   Scheduling Cycle
+          |
+          v
+    [ Filtering ]
+          |
+          v
+   Feasible Nodes
+          |
+          v
+      [ Scoring ]
+          |
+          v
+  Best Node Selected
+          |
+          v
+       Binding
+          |
+          v
+Pod.spec.nodeName = worker-2
+```
+
+## The Scheduling Process
+
+### 1. Filtering
+
+The Scheduler evaluates available nodes and removes nodes that cannot run the Pod.
+
+Modern Kubernetes uses **scheduler plugins** rather than the older "Predicates" terminology.
+
+Common filtering plugins include:
+- **`NodeResourcesFit`:** Determines whether the node has sufficient allocatable CPU and memory for the Pod's resource requests.
+- **`NodePorts`:** Checks whether requested host ports are available on the node.
+- **`TaintToleration`:** Determines whether the Pod tolerates the node's taints.
+- **`NodeAffinity`:** Checks required node affinity constraints.
+- **`InterPodAffinity`:** Evaluates required Pod affinity and anti-affinity rules.
+
+The result is a set of feasible nodes.
+
+```text
+All Nodes
+    |
+    v
+Filtering
+    |
+    +── worker-1 [Fail]
+    +── worker-2 [Pass]
+    +── worker-3 [Fail]
+    +── worker-4 [Pass]
+             |
+             v
+      Feasible Nodes
+         worker-2
+         worker-4
+```
+
+### 2. Scoring
+
+The Scheduler then evaluates the feasible nodes and assigns scores using configured scoring plugins.
+
+Examples include:
+- **`NodeResourcesFit`:** Can score nodes according to resource allocation strategies.
+- **`ImageLocality`:** Can prefer nodes where required container images are already available.
+- **`NodeAffinity`:** Can score nodes according to preferred node affinity rules.
+- **`InterPodAffinity`:** Can score nodes based on preferred Pod affinity/anti-affinity rules.
+
+The Scheduler combines the plugin scores to determine the most suitable node.
+
+Conceptually:
+
+```text
+Feasible Nodes
+
+worker-2  -->  Score: 85
+worker-4  -->  Score: 72
+          |
+          v
+  worker-2 selected
+```
+
+> **Important:** The exact scoring plugins and weights depend on the Scheduler configuration and Kubernetes version.
+
+---
+
+# Step 17 — Binding
+
+After the Scheduler selects a suitable node during the scheduling cycle, the **binding cycle** applies that decision by binding the Pod to the selected node.
+
+### Architecture Diagram
+
+```text
+Before:
+  Pod
+  spec.nodeName: ""
+          |
+          v
+      Scheduler
+          |
+          v
+      worker-2
+
+After:
+  Pod
+  spec.nodeName: "worker-2"
+```
+
+## How Binding Works
+
+1. **Binding the Pod to a Node:** The Scheduler communicates its scheduling decision through the Kubernetes API using the Pod binding sub-resource:
+
+   ```http
+   POST /api/v1/namespaces/default/pods/nginx/binding
+   ```
+
+   The Binding identifies the selected Node:
+   ```yaml
+   target:
+     apiVersion: v1
+     kind: Node
+     name: worker-2
+   ```
+
+   After the binding is applied, the Pod's assigned node is reflected in:
+   ```yaml
+   spec:
+     nodeName: worker-2
+   ```
+   The Pod is now assigned to `worker-2`.
+
+2. **Binding Cycle:** In the modern Kubernetes Scheduling Framework, binding includes additional extension points such as `Reserve`, `Permit`, `PreBind`, `Bind`, and `PostBind`.
+
+   ```text
+   Scheduling Cycle
+         |
+         v
+      Node Selected
+         |
+         v
+   Binding Cycle
+         |
+         +── Reserve
+         +── Permit
+         +── PreBind
+         +── Bind
+         +── PostBind
+         |
+         v
+   Pod bound to Node
+   ```
+
+3. **Important — Scheduler Does Not Run Containers:**
+   The Scheduler does not start containers and does not directly control the worker node. Its responsibility is strictly to determine: *"Which node should run this Pod?"*
+
+```text
+Scheduler
+  |Select worker-2
+    v
+API Server
+    |
+    v
+Pod assigned to worker-2
+    |
+    v
+Kubelet on worker-2
+    |
+    v
+Container Runtime
+    |
+    v
+Container Started
+```
+
+> **Key Mental Model:** The ReplicaSet Controller creates the Pods, the Scheduler selects the node, and the kubelet on that node manages the Pod's containers.
+
+---
+
+# Step 18 — Kubelet Watches and Syncs
+
+The `kubelet` running on each worker node is the primary node agent responsible for ensuring that Pods assigned to that node are running.
+
+The `kubelet` runs a continuous **Sync Loop** that reconciles the desired Pod state with the actual state of containers on the node.
+
+### Architecture Diagram
+
+```text
+       Kubernetes API
+  |Pod assigned to worker-2
+              v
+           kubelet
+              |
+              v
+          Sync Loop
+              |
+              v
+     Pod Reconciliation
+              |
+      +───────+────────+
+      |                |
+      v                v
+Pod Dependencies   Container Runtime
+      |                |
+      v                v
+Volumes / Secrets     CRI
+ConfigMaps / etc.      |
+                       v
+                 Container Runtime
+```
+
+## How Kubelet Reacts
+
+1. **Pod Assignment:** The `kubelet` is responsible for Pods assigned to its node. It obtains Pod information through the Kubernetes API and local sources. A Pod assigned to `worker-2` has:
+   ```yaml
+   spec:
+     nodeName: worker-2
+   ```
+   The `kubelet` on `worker-2` processes that Pod as part of its sync loop.
+
+2. **Sync Loop:** The `kubelet` continuously reconciles the desired Pod specification with the actual state of the containers running on the node.
+
+   ```text
+   Desired State
+        |
+        v
+    Pod Spec
+        |
+        v
+   kubelet Sync Loop
+        |
+        v
+   Actual Container State
+   ```
+
+   If the desired state indicates a container should be running but the container is not running, the `kubelet` takes action to bring the node toward the desired state.
+
+3. **Resolving Pod Dependencies:** Before and during Pod startup, the `kubelet` coordinates required resources and dependencies, including:
+   - Volumes (interfacing with volume plugins and CSI drivers)
+   - Secrets
+   - ConfigMaps
+   - ServiceAccount-related tokens
+   - Pod networking (CNI driver setup)
+   - Container runtime resources
+
+4. **Container Runtime Preparation:** Once the required Pod configuration and dependencies are ready, the `kubelet` uses the Container Runtime Interface (CRI) to instruct the container runtime to create the Pod sandbox and containers.
+
+> **Important:** The `kubelet` is not simply a watch-event processor. It is an active reconciliation agent that continuously compares desired Pod state with actual node state and acts to make them match.
+
+---
+
+# Step 19 — Container Runtime
+
+The `kubelet` communicates with the container runtime through the **Container Runtime Interface (CRI)** via gRPC.
+
+### Architecture Diagram
+
+```text
+kubelet
+  |CRI (gRPC)
+   v
+Container Runtime
+   |
+   v
+OCI Runtime
+   |
+   v
+Container
+```
+
+The CRI allows the `kubelet` to work with different container runtimes without requiring Kubernetes to be rebuilt for each runtime.
+
+Common CRI-compatible runtimes include **`containerd`** and **`CRI-O`**.
+
+For example, with a standard `containerd` setup:
+
+```text
+kubelet
+  |CRI
+   v
+containerd
+   |
+   v
+OCI Runtime
+   |
+   v
+runc
+   |
+   v
+Container
+```
+
+> **Important:** `runc` is an Open Container Initiative (OCI) runtime implementation, not a CRI runtime. The `kubelet` communicates with the CRI-compatible runtime (`containerd` or `CRI-O`); it does not communicate directly with `runc`.
+
+### Container Runtime Tasks
+
+The `kubelet` instructs the runtime to perform tasks such as:
+- Pull the required container image
+- Create the Pod sandbox
+- Configure the container environment (namespaces, cgroups)
+- Create containers
+- Start containers
+- Stop and remove containers when required
+- Report container status back to the `kubelet`
+
+```text
+kubelet
+   |
+   v
+CRI
+   |
+   v
+containerd
+   |
+   +── Pull Image
+   +── Create Pod Sandbox
+   +── Create Container
+   +── Start Container
+            |
+            v
+       OCI Runtime
+            |
+            v
+         Process
+```
+
+---
+
+# Step 20 — Pod Running
+
+Once the `kubelet` and container runtime successfully create and start the Pod's containers, the `kubelet` observes the resulting container state and updates the Pod status through the Kubernetes API.
+
+### Architecture Diagram
+
+```text
+Pod Phase: Pending
+       |
+       v
+Pod Sandbox Created
+       |
+       v
+Containers Created
+       |
+       v
+Containers Started
+       |
+       v
+Pod Phase: Running
+       |
+       v
+Readiness Probes
+       |
+       v
+Pod Ready = True
+```
+
+## Pod Phase vs Pod Ready
+
+A Pod's phase and Ready condition are distinct concepts.
+
+### Pod Phase
+A Pod transitions through high-level phases:
+
+```text
+Pending
+   |
+   v
+Running
+   |
+   +──> Succeeded
+   |
+   +──> Failed
+```
+
+A Pod enters the **Running** phase once it has been bound to a node and its containers have been started successfully according to Kubernetes Pod lifecycle semantics.
+
+### Pod Ready
+**Ready** is a condition indicating whether the Pod is currently ready to serve network traffic according to its readiness probes:
+```text
+Pod Phase: Running
+Pod Ready: False
+```
+This occurs when a readiness probe is currently failing. Once the readiness conditions are satisfied:
+```text
+Pod Phase: Running
+Pod Ready: True
+```
+
+> **Important:** A Pod can be `Running` but not `Ready`.
+
+## Status Update
+
+The `kubelet` reports the observed Pod status back to the Kubernetes API Server, which persists it to `etcd`:
+
+```text
+Container Runtime
+  |Container status
+       v
+    kubelet
+  |Pod status update
+       v
+ kube-apiserver
+       |
+       v
+     etcd
+```
+
+The user can then observe the Pod using `kubectl`:
+
+```bash
+kubectl get pods
+```
+
+```text
+NAME    READY   STATUS    RESTARTS   AGE
+nginx   1/1     Running   0          30s
+```
+
+Here:
+- `STATUS = Running`
+- `READY = 1/1`
+
+This means the Pod is running and its container readiness conditions indicate that it is ready to serve traffic.
+
+---
+
+## Complete Lifecycle
+
+```text
+ReplicaSet Controller
+        |
+        v
+    Create Pod
+        |
+        v
+Pod exists with no node
+        |
+        v
+  kube-scheduler
+        |
+        v
+ Scheduling Cycle
+        |
+        +── Filtering
+        +── Scoring
+        +── Node Selected
+        |
+        v
+  Binding Cycle
+        |
+        v
+spec.nodeName = worker-2
+        |
+        v
+      kubelet
+        |
+        v
+    Sync Loop
+        |
+        v
+Pod Dependencies / Sandbox
+        |
+        v
+        CRI
+        |
+        v
+Container Runtime
+        |
+        v
+   OCI Runtime
+        |
+        v
+    Container
+        |
+        v
+  Pod Phase: Running
+        |
+        v
+   Readiness Checks
+        |
+        v
+   Pod Ready: True
+```
+
+> **Key Mental Model:** The ReplicaSet Controller creates the Pod, the Scheduler selects and binds the Pod to a Node, the `kubelet` reconciles the Pod on that Node, and the container runtime creates and runs the containers.
+
+---
+
+# Complete Internal Flow
+
+```text
+User
+
+↓
+
+kubectl
+
+↓
+
+Load kubeconfig
+
+↓
+
+TLS Handshake
+
+↓
+
+API Server
+
+↓
+
+Authentication
+
+↓
+
+Authorization
+
+↓
+
+Admission Controllers
+
+↓
+
+Validation
+
+↓
+
+Object Conversion
+
+↓
+
+Serialization
+
+↓
+
+Storage Version
+
+↓
+
+etcd
+
+↓
+
+API Server Watch
+
+↓
+
+Informer / Controller Cache
+
+↓
+
+Deployment Controller
+
+↓
+
+ReplicaSet Controller
+
+↓
+
+Pod
+
+↓
+
+Scheduler
+
+↓
+
+Binding
+
+↓
+
+API Server
+
+↓
+
+API Server Watch
+
+↓
+
+kubelet
+
+↓
+
+Container Runtime (CRI)
+
+↓
+
+OCI Runtime
+
+↓
+
+Pod Phase: Running
+
+↓
+
+Readiness Checks
+
+↓
+
+Pod Ready = True
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. Does kubectl create Pods?
+
+No.
+
+kubectl only sends REST API requests.
+
+---
+
+### Q2. Why can't the Scheduler directly update etcd?
+
+Because every component must communicate through the API Server to ensure authentication, authorization, validation, auditing, and consistent API behavior.
+
+---
+
+### Q3. Why are Watches used instead of polling?
+
+Because Watches:
+
+- Reduce CPU usage
+- Reduce network traffic
+- Reduce API Server load
+- Provide near real-time updates
+
+---
+
+### Q4. What happens if Authentication fails?
+
+The request stops immediately with:
+
+```text
+401 Unauthorized
+```
+
+---
+
+### Q5. What happens if Authorization fails?
+
+The request is rejected with:
+
+```text
+403 Forbidden
+```
+
+---
+
+### Q6. Who creates Pods?
+
+The ReplicaSet Controller (or another controller depending on the workload), not the Scheduler.
+
+---
+
+### Q7. Who starts the container?
+
+The kubelet, through the Container Runtime Interface (CRI), instructs the container runtime (for example, containerd) to create and run the container.
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What does kubectl actually do?
+2. Why is kubeconfig required?
+3. Why does Kubernetes use HTTPS?
+4. What is the role of the API Server?
+5. What is the difference between Authentication and Authorization?
+6. What do Admission Controllers do?
+7. Why does Kubernetes convert objects internally?
+8. Why is etcd the source of truth?
+9. Why are Watches better than polling?
+10. Who creates Pods?
+11. Who schedules Pods?
+12. Who starts containers?
+13. Why is the API Server considered the central gateway?
+
+---
+
+# Next Chapter
+
+**Chapter 3 — Authentication → Authorization → Admission → Storage**
+
+We'll dive deeply into Kubernetes' security and request-processing pipeline, learning:
+
+- How users and service accounts are authenticated
+- How RBAC and other authorizers decide permissions
+- How Admission Controllers mutate or reject requests
+- How validated objects are serialized and persisted into etcd
+
+By the end of that chapter, you'll understand every security checkpoint a Kubernetes API request passes through before it becomes part of the cluster's desired state.
+```

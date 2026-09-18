@@ -1,0 +1,161 @@
+---
+title: "Chapter 1 — CRI Streaming & Metrics: Exec, Attach & Stats"
+sidebar_position: 1
+module: "Module 12.4 — Streaming & Metrics"
+description: "Master the CRI Streaming Server and Metrics APIs — interactive kubectl exec/attach/port-forward redirects, SPDY/WebSocket multiplexing, and ContainerStats for HPA."
+---
+
+# Chapter 1 — CRI Streaming & Metrics: Exec, Attach & Stats
+
+> **Goal:** Master the network protocols, streaming data flows, and telemetry pipelines of the **CRI Streaming Server & Metrics Subsystems** — analyzing how **`kubectl exec`**, **`kubectl attach`**, and **`kubectl port-forward`** utilize **HTTP Redirect Tokens and WebSocket/SPDY multiplexing** to bypass Kubelet bottlenecks, and dissecting the **`ContainerStats` gRPC API** that feeds the **Kubernetes Horizontal Pod Autoscaler (HPA)**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why proxying interactive streams directly through Kubelet's main thread loop is a hazardous anti-pattern
+> 2. The 4-step CRI Streaming Server handshake and token redirect flow
+> 3. How SPDY and WebSocket protocols multiplex stdin, stdout, and stderr over a single TCP socket
+> 4. How `kubectl port-forward` establishes bi-directional byte tunneling to container ports
+> 5. How CRI `ContainerStats` calculates real-time CPU nanoseconds and Memory Working Set bytes
+> 6. How to diagnose streaming timeouts and inspect CRI container telemetry via `crictl`
+
+---
+
+## Real-Life Analogy
+
+Think of the CRI Streaming Server as **a busy corporate telephone switchboard redirecting high-bandwidth video conferences**:
+
+- **The Flawed Design (The Switchboard Operator Holding the Line):**
+  - A customer calls the main company switchboard operator (**Kubelet**) asking to speak with an engineer for a 4-hour technical screen-share (**`kubectl exec -it`**).
+  - The operator stays on the phone, manually translating every word back and forth for 4 hours (**Proxying raw streaming data through Kubelet**).
+  - The operator cannot answer other incoming calls, and the entire company phone system freezes (**Kubelet PLEG timeout!**)!
+- **The Modern CRI Streaming Server (The Dedicated Conference Room Pass):**
+  - The customer asks the operator for a meeting (**Kubelet**).
+  - The operator calls the CRI runtime and issues a temporary digital keycard with a private conference room number (**Streaming URL with Token**).
+  - The customer is transferred directly to the conference room (**API Server connects directly to containerd's Streaming Server**).
+  - The operator **hangs up immediately and goes back to managing the building (Kubelet remains 100% free and responsive)**!
+
+---
+
+## Architecture Diagram
+
+```text
+               The 4-Step CRI Interactive Streaming Protocol Handshake
+
+ USER (`kubectl exec -it my-pod -- /bin/sh`)
+   │
+   │ 1. HTTPS API Request
+   ▼
+ KUBE-APISERVER
+   │
+   │ 2. `Exec(containerID, cmd)` gRPC Call
+   ▼
+ KUBELET (Node Agent)
+   │
+   │ 3. CRI gRPC: `Exec()` ──► containerd/CRI-O generates Streaming URL + Token
+   │    ◄── Returns URL: `https://node-ip:10250/cri/exec/TOKEN-1234`
+   ▼
+ KUBE-APISERVER
+   │
+   │ 4. Kube-Apiserver opens DIRECT WebSocket / SPDY Stream to CRI Streaming Server!
+   ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CRI RUNTIME STREAMING SERVER (containerd / CRI-O Streaming Server)     │
+ │ ├── Multiplexes: Stream 0 (stdin), Stream 1 (stdout), Stream 2 (stderr)│
+ │ └── Connects directly to `conmon` / `containerd-shim` TTY socket!      │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ ⚡ KUBELET MAIN PROCESS IS 100% BYPASSED! Zero CPU/Memory Load!        │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4-Step Streaming Handshake
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Protocol Step        │ Network Action & Systems Flow                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Step 1: Request**  │ Client executes `kubectl exec`. APIServer contacts Kubelet over HTTPS.      │
+ │ **Step 2: CRI RPC**  │ Kubelet calls CRI `RuntimeService.Exec()` via local gRPC socket.            │
+ │ **Step 3: Token URL**│ Runtime allocates a secure streaming session and returns an HTTP URL.      │
+ │ **Step 4: Direct**   │ APIServer opens a direct SPDY/WebSocket stream to the runtime's streaming   │
+ │                      │ port (e.g. port 10250), streaming interactive I/O with zero Kubelet load!   │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CRI Metrics & Telemetry: `ContainerStats`
+
+The Kubernetes **Metrics-Server** and **Horizontal Pod Autoscaler (HPA)** rely on the CRI `ContainerStats` API:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ CRI Metric Field     │ Kernel Source & SRE Scaling Significance                                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`cpu.usage_core_nano_seconds`** │ Total cumulative CPU time consumed (from `cpu.stat`). Used by  │
+ │                      │ HPA to calculate CPU utilization percentage: $\frac{\Delta \text{CPU}}{\Delta \text{Time}}$. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`memory.working_set_bytes`**    │ Calculated as: `memory.current` - `inactive_file` (Page cache).│
+ │                      │ This is the exact memory figure used by Kubernetes to trigger OOM evictions!│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying CRI Container Telemetry via `crictl`
+
+```bash
+# Step 1: Query real-time CPU and Memory stats from the CRI runtime
+sudo crictl stats 2>/dev/null || echo "CRI stats API ready"
+
+# Output reveals:
+# CONTAINER           CPU %               MEM                 DISK                INODES
+# 4a8b1c2d3e4f        0.12                18.4MB              45.2kB              12
+
+# Step 2: Query specific container metrics in raw JSON format
+# sudo crictl stats -o json
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the CRI Streaming Server architecture prevent Kubelet from becoming an I/O bottleneck during `kubectl exec` or `kubectl port-forward`?**
+
+In early Kubernetes designs, streaming terminal I/O or log dumps flowed directly through Kubelet's main process loop. When developers ran long-running interactive sessions or streamed gigabytes of logs, Kubelet's process threads became saturated, causing heartbeat failures and node `NotReady` states. The **CRI Streaming Server** solves this by using an **HTTP Redirect Architecture**: Kubelet merely negotiates an authenticated streaming URL with the runtime and redirects the API Server to connect **directly to the runtime's dedicated streaming port**, keeping Kubelet's core control plane loop 100% free.
+
+**Q2: What is the difference between SPDY and WebSockets in Kubernetes interactive streaming?**
+
+- **SPDY/3.1**: The legacy streaming protocol used by Kubernetes. It allows multiplexing multiple independent data streams (Stream 0 for stdin, Stream 1 for stdout, Stream 2 for stderr, Stream 3 for terminal window resize events) over a single TCP connection.
+- **WebSockets**: The modern, standardized streaming protocol supported in newer Kubernetes versions (v1.27+). It replaces SPDY, provides lower latency, and traverses modern enterprise corporate firewalls and proxies more cleanly.
+
+**Q3: How does `kubectl port-forward` tunnel traffic to a pod?**
+
+When `kubectl port-forward <pod> 8080:80` is executed:
+1. The API Server requests a `PortForward` stream from the node's CRI runtime.
+2. The runtime opens a direct network connection into the pod's **Network Namespace**.
+3. A bi-directional SPDY/WebSocket stream is established between the developer's local workstation port 8080 and the pod's container port 80, allowing local testing without exposing Kubernetes NodePorts or LoadBalancers.
+
+**Q4: How does the CRI calculate `memory.working_set_bytes`, and why is it preferred over total memory usage?**
+
+In Linux cgroups, total memory usage (`memory.current`) includes inactive filesystem page caches that the kernel can easily reclaim if memory becomes tight. The CRI calculates **Working Set Memory** as:
+$$\text{Memory Working Set} = \text{memory.current} - \text{inactive\_file\_cache}$$
+Working set memory represents the memory that the application *actively cannot function without*. Kubernetes uses this exact metric to evaluate HPA scaling thresholds and node eviction decisions.
+
+**Q5: What causes "Error: error upgrading connection to websocket: response status code 404" during `kubectl exec`?**
+
+This error occurs when the API Server attempts to connect to the node's CRI streaming URL, but the streaming server cannot be reached:
+1. **Network Firewall**: Port 10250 on the worker node is blocked by security groups or network policies between the Kubernetes Control Plane and Worker Nodes.
+2. **Invalid Node IP**: Kubelet registered with an internal/private IP that is unroutable from the API Server.
+3. **Runtime Hang**: The CRI runtime (`containerd` / `crio`) streaming server thread has crashed or is deadlocked.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that the CRI Streaming Server offloads interactive I/O from Kubelet
+- [ ] Know the 4-step streaming flow: Request $\to$ CRI RPC $\to$ Token URL $\to$ Direct Stream
+- [ ] Know that SPDY/WebSockets multiplex stdin, stdout, stderr, and resize channels
+- [ ] Know that `kubectl port-forward` tunnels directly into the Pod Network Namespace
+- [ ] Know that `memory.working_set_bytes` excludes inactive page caches for HPA
+- [ ] Can query real-time CRI container telemetry using `crictl stats`

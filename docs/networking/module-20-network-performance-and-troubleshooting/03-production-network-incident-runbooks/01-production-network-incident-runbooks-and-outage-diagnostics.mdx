@@ -1,0 +1,180 @@
+---
+title: "Chapter 3 — Production Network Incident Runbooks: Outage Diagnostics & MTBF/MTTR"
+sidebar_position: 1
+module: "Module 20.3 — Incident Runbooks"
+description: "Master real-world enterprise and cloud network incident response — Step-by-step troubleshooting runbooks for DNS outages, BGP blackholes, MTU black holes (PMTUD), asymmetric routing loops, and TCP reset storms."
+---
+
+# Chapter 3 — Production Network Incident Runbooks: Outage Diagnostics & MTBF/MTTR
+
+> **Goal:** Master real-world, high-severity production network incident triage and post-mortem analysis. Walk through structured, step-by-step troubleshooting runbooks for the 5 most common high-severity enterprise network outages: **1) Path MTU Discovery (PMTUD) Black Holes, 2) Asymmetric Routing State Failures, 3) DNS Resolution Cascades & NXDOMAIN Outages, 4) BGP Route Leak Blackholes, and 5) TCP Reset (RST) Storms & Socket Exhaustion**.
+>
+> By the end of this chapter, you will understand:
+> 1. The Incident Response Framework: Triage $\to$ Blast Radius Containment $\to$ Root Cause Diagnosis $\to$ Mitigation $\to$ Post-Mortem
+> 2. Runbook 1: Path MTU Discovery (PMTUD) Black Hole (Handshake succeeds, large payload hangs forever)
+> 3. Runbook 2: Asymmetric Routing and Stateful Firewall Connection Drops
+> 4. Runbook 3: CoreDNS Cascading Outage and upstream rate-limiting exhaustion
+> 5. Runbook 4: BGP Route Leaks and Internet Subnet Hijacking Mitigation (RPKI ROA & Route Flap Damping)
+> 6. Runbook 5: Linux Socket Exhaustion (`TIME_WAIT` pileups and `ephemeral port` starvation)
+
+---
+
+## Real-Life Analogy
+
+Think of Network Incident Runbooks as **the emergency flight emergency checklists used by commercial airline pilots**:
+
+- **When an Engine Fails at 30,000 Feet (A Major Network Outage):**
+  - The pilot does not guess or browse internet forums. They pull out the **Emergency Quick Reference Handbook (QRH)**.
+- **The Structured Runbook:**
+  - *Step 1: Check fuel pressure (Verify Physical Link / BGP State)*
+  - *Step 2: Isolate cross-feed valve (Block Asymmetric Route / Drain Unhealthy AZ)*
+  - *Step 3: Restart auxiliary turbine (Clear Conntrack / Failover to Backup VPN)*
+  - Step-by-step, methodical, mathematically verified actions that restore service in $<5$ minutes, keeping Mean Time to Resolution (MTTR) at minimum.
+
+---
+
+## Architecture Diagram
+
+```text
+                  Path MTU Discovery (PMTUD) Black Hole Breakdown
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT HOST (MTU: 1500, MSS: 1460)                                          │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        │ 1. TCP 3-Way Handshake (SYN/ACK - 64 bytes)
+                                        ▼ (Succeeds perfectly!)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ INTERMEDIATE VPN / VXLAN TUNNEL ROUTER (MTU: 1400 due to Tunnel Header)     │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        │ 2. Client sends 1500-byte Data payload (DF Bit = 1)
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ INTERMEDIATE ROUTER: Packet is too large!                                   │
+ │ - Needs to fragment, but DF (Don't Fragment) bit is set!                    │
+ │ - Router generates ICMP Type 3 Code 4 ("Fragmentation Needed, MTU=1400")    │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        ▼ (ICMP packet sent back to client)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ OVERLY AGGRESSIVE CORPORATE FIREWALL:                                       │
+ │ - Discards 100% of all incoming ICMP packets as "security policy"!          │
+ │ - ICMP Type 3 Code 4 is DROPPED! Client never receives the warning!        │
+ └─────────────────────────────────────────────────────────────────────────────┘
+  *RESULT: Client retransmits 1500-byte packet forever. Connection hangs indefinitely!*
+```
+
+---
+
+## Deep Technical Content
+
+### Incident Runbook 1: Path MTU Discovery (PMTUD) Black Hole
+
+#### Symptoms:
+- Ping works fine (`ping host`).
+- SSH connection opens and authenticates, but typing `ls -la /usr/bin` or running `cat large_file.txt` hangs the terminal indefinitely.
+- HTTPS `curl` connects (TLS handshake completes), but the HTTP response body download never finishes.
+
+#### Root Cause:
+Intermediate router has a lower MTU (e.g. 1420 over VPN/VXLAN). A firewall on the path drops incoming **ICMP Type 3 Code 4 (Fragmentation Needed)** error packets. The client never learns to shrink its TCP Maximum Segment Size (MSS).
+
+#### Diagnostic & Remediation Steps:
+```bash
+# Step 1: Prove PMTUD Black Hole by pinging with Don't Fragment (DF) bit set
+ping -M do -s 1472 198.51.100.20 # If fails, shrink packet size until it succeeds
+ping -M do -s 1372 198.51.100.20 # If succeeds: MTU is exactly 1372 + 28 = 1400 bytes!
+
+# Step 2: Emergency Immediate Fix: Apply TCP MSS Clamping on the Linux Router / Firewall
+sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+```
+
+---
+
+### Incident Runbook 2: Linux Ephemeral Port Exhaustion (`TIME_WAIT` Pileup)
+
+#### Symptoms:
+- Client application (e.g., Python / Node.js backend calling microservices) crashes with:
+  `cURL error: Failed to connect to host: Cannot assign requested address (errno 99)`.
+
+#### Root Cause:
+Application opens a brand-new TCP connection for every single HTTP request (no HTTP keep-alive connection pooling). Sockets transition into `TIME_WAIT` for 60 seconds (`2 * MSL`). All 28,000 ephemeral ports (`32768-60999`) are consumed.
+
+#### Diagnostic & Remediation Steps:
+```bash
+# Step 1: Count active sockets by state using ss
+ss -tan | awk '{print $1}' | sort | uniq -c
+
+# Step 2: Expand local ephemeral port range
+sudo sysctl -w net.ipv4.ip_local_port_range="10240 65535"
+
+# Step 3: Enable TCP TIME_WAIT socket reuse for outgoing connections
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+
+# Step 4: Permanent Application Fix: Configure HTTP Keep-Alive / Persistent Connection Pooling!
+```
+
+---
+
+## Hands-On Lab: Simulating MTU Diagnostics & TCP MSS Clamping
+
+```bash
+# Step 1: Test Path MTU discovery against a remote web server using ping
+ping -c 2 -M do -s 1472 google.com 2>/dev/null || ping -c 2 google.com
+
+# Step 2: Inspect active TCP socket timer states and TIME_WAIT counts
+ss -s
+
+# Step 3: Inspect active kernel ephemeral port allocation range
+cat /proc/sys/net/ipv4/ip_local_port_range
+
+# Step 4: Check if TCP socket reuse is enabled
+cat /proc/sys/net/ipv4/tcp_tw_reuse
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How do you systematically troubleshoot a production incident where "Service A cannot talk to Service B in Kubernetes"?**
+
+Follow the 7-Layer bottom-up diagnostic workflow:
+1. **Layer 3 (IP Reachability):** Run `kubectl exec` from Pod A: `ping <Pod_B_IP>`. Verify Pod B IP is valid.
+2. **Layer 4 (Port & TCP):** Run `nc -zv -w 2 <Pod_B_IP> 8080`. If it hangs, inspect **Kubernetes NetworkPolicies** and security groups blocking ingress/egress.
+3. **Service Discovery / DNS (CoreDNS):** Run `dig service-b.default.svc.cluster.local`. Verify CoreDNS returns the correct ClusterIP.
+4. **Service Endpoints:** Check `kubectl get endpoints service-b` to verify backend Pods are healthy and passing Readiness Probes.
+5. **Layer 7 (HTTP):** Run `curl -v http://service-b:8080/healthz` to inspect HTTP status codes and TLS handshake logs.
+
+**Q2: What is an Asymmetric Routing loop and why does it break stateful firewalls?**
+
+Asymmetric routing occurs when an outbound packet follows Path A (Router 1 $\to$ Firewall 1 $\to$ Server), but the return response packet follows Path B (Server $\to$ Router 2 $\to$ Firewall 2 $\to$ Client). Because Firewall 2 never saw the initial TCP SYN packet on Path A, its stateful connection tracking table (`conntrack`) has no record of the session. Firewall 2 assumes the returning `SYN-ACK` or `ACK` packet is an illegal out-of-state attack and **immediately drops the connection**.
+
+**Q3: How does BGP Route Flap Damping protect global Internet routing stability?**
+
+When a flaky physical fiber link causes a router to repeatedly announce and withdraw a BGP prefix every few seconds (**Route Flapping**), thousands of core Internet routers are forced to recompute their routing tables (SPF / BGP decision algorithms), driving router CPU usage to 100%. **BGP Route Flap Damping** assigns a penalty score to flapping routes. If penalties exceed a threshold, the router **suppresses (damps) the route entirely for a cooldown period (e.g. 30 minutes)**, insulating the global Internet from the oscillating link.
+
+**Q4: What causes the `TCP Reset (RST)` packet to be sent by a Linux host?**
+
+1. **Port Closed:** A packet arrived for a TCP port where no process is listening (`ECONNREFUSED`).
+2. **Accept Queue Overflow:** The listening application's backlog queue is full (`Recv-Q > Send-Q`) and `tcp_abort_on_overflow=1` is set.
+3. **Connection Aborted in TIME_WAIT:** A packet arrived with an unexpected TCP sequence number for a closed/closing socket.
+4. **Firewall / Security Group REJECT:** A firewall rule explicitly executed `-j REJECT --reject-with tcp-reset`.
+
+**Q5: What is the post-mortem Blameless Root Cause Analysis (RCA) framework for a major network outage?**
+
+A proper blameless post-mortem documents:
+1. **Summary:** Brief description of user impact, duration, and business revenue loss.
+2. **Timeline:** Exact UTC timestamps from initial trigger, automated alert firing, responder triage, root cause identification, to final mitigation.
+3. **Root Cause:** Deep technical analysis of the underlying failure mechanism (not human error, but systemic flaws).
+4. **What Went Well / What Went Poorly:** Evaluation of monitoring, runbooks, and alerting thresholds.
+5. **Action Items:** Prioritized preventative tasks with assigned owners (e.g. adding automated canary validation, adding automated MSS clamping, tuning conntrack limits).
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Path MTU Discovery (PMTUD) Black Hole diagnostics and MSS clamping
+- [ ] Understand Asymmetric Routing stateful firewall drops
+- [ ] Master Linux `TIME_WAIT` socket exhaustion and `tcp_tw_reuse` tuning
+- [ ] Master bottom-up Kubernetes network incident triage methodology
+- [ ] Understand Blameless Post-Mortem and Root Cause Analysis (RCA) structure

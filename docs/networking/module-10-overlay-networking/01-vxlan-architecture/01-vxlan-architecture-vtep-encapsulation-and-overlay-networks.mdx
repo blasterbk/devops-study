@@ -1,0 +1,164 @@
+---
+title: "Chapter 1 — VXLAN Architecture: VTEP, Header Encapsulation & Overlay Networks"
+sidebar_position: 1
+module: "Module 10.1 — VXLAN Architecture"
+description: "Master Virtual Extensible LAN (VXLAN, RFC 7348) — 24-bit VXLAN Network Identifier (VNI), VXLAN Tunnel Endpoints (VTEP), UDP Port 4789 encapsulation, and underlay vs overlay topologies."
+---
+
+# Chapter 1 — VXLAN Architecture: VTEP, Header Encapsulation & Overlay Networks
+
+> **Goal:** Master Virtual Extensible LAN (VXLAN, RFC 7348), the foundational overlay encapsulation technology powering modern cloud datacenters, VMware NSX, and Kubernetes CNIs (Flannel, Calico, Cilium). Understand how VXLAN encapsulates Layer 2 Ethernet frames inside Layer 4 UDP packets to stretch virtual broadcast domains across routed Layer 3 physical networks.
+>
+> By the end of this chapter, you will understand:
+> 1. The limitation of legacy 12-bit IEEE 802.1Q VLANs (4,096 max) and why 24-bit VXLAN VNIs (16.7 Million) solve cloud multi-tenancy
+> 2. The complete 50-byte VXLAN packet encapsulation stack (Outer Ethernet + Outer IP + Outer UDP 4789 + VXLAN Header + Inner Frame)
+> 3. VXLAN Tunnel Endpoints (VTEPs): Software (Linux kernel `vxlan` interface) vs Hardware (Leaf Switch ASICs)
+> 4. Underlay (physical routed IP transport) vs Overlay (virtual tenant topologies)
+> 5. Data plane learning: Multicast flood-and-learn vs Static Unicast Head-End Replication (HER)
+> 6. Linux CLI commands to create, inspect, and troubleshoot kernel VXLAN interfaces
+
+---
+
+## Real-Life Analogy
+
+Think of VXLAN as **shipping a complete, sealed private delivery box inside a standard international FedEx shipping envelope**:
+
+- **The Inner Frame (The Private Payload):**
+  - Two servers inside Virtual Network #5000 want to exchange an unrouted Ethernet frame with local private MAC addresses (**Inner Frame**).
+- **The VTEP (The Packing Station):**
+  - The hypervisor's VXLAN Tunnel Endpoint (VTEP) takes the entire inner Ethernet frame, puts it inside a standardized FedEx shipping box, writes the destination hypervisor's physical IP on the outside, and stamps it with **VNI #5000** (**VXLAN Header**).
+- **The Underlay Network (The FedEx Cargo Jet):**
+  - Physical spine/leaf datacenter switches only inspect the outer FedEx address (**Outer IP/UDP 4789**). They route the packet across standard Layer 3 IP networks without knowing or caring what private tenant traffic is inside the box!
+
+---
+
+## Architecture Diagram
+
+```text
+                  VXLAN Packet Encapsulation & VTEP Tunneling
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ HOST A (VM / Pod: 10.0.0.5)                 HOST B (VM / Pod: 10.0.0.6)     │
+ │ MAC: 52:54:00:aa:aa:aa                      MAC: 52:54:00:bb:bb:bb          │
+ │ [VNI 10000: Virtual Subnet]                 [VNI 10000: Virtual Subnet]     │
+ └──────────────────────┬──────────────────────────────────────▲───────────────┘
+                        │                                      │
+                        ▼                                      │
+ ┌──────────────────────────────────────┐     ┌────────────────────────────────┐
+ │ VTEP A (Hypervisor 1: 192.168.1.11)  │     │ VTEP B (Hypervisor 2: 192.168.1.12)
+ │ - Encapsulates frame into UDP 4789   │     │ - Decapsulates outer UDP/IP    │
+ │ - Stamped with VNI = 10000           │     │ - Delivers inner frame to VM   │
+ └──────────────────────┬───────────────┘     └────────────────▲───────────────┘
+                        │ Outer UDP Packet                     │
+                        ▼                                      │
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ PHYSICAL UNDERLAY NETWORK (Layer 3 IP Fabric - Spine / Leaf Switches)       │
+ │                                                                             │
+ │ Outer Eth | Outer IP (Src: 192.168.1.11, Dst: 192.168.1.12) | UDP (4789)    │
+ │ | VXLAN Header (VNI: 10000) | Inner Ethernet | Inner IP (10.0.0.5->10.0.0.6) │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The 50-Byte VXLAN Header Overhead
+
+```text
+ ┌───────────────────────────┬──────────────┬────────────────────────────────────────────────────────┐
+ │ Encapsulation Layer       │ Size         │ Purpose & Field Contents                               │
+ │───────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+ │ **Outer Ethernet Header** │ 14 Bytes     │ Source/Dest MAC of local physical switch hop           │
+ │ **Outer IPv4 Header**     │ 20 Bytes     │ Source/Dest IP of VTEP hypervisors                     │
+ │ **Outer UDP Header**      │ 8 Bytes      │ Dest Port = **4789** (RFC 7348), Src Port = Hash (ECMP)│
+ │ **VXLAN Header**          │ 8 Bytes      │ 8-bit Flags (`I=1`) + **24-bit VNI** (16.7M spaces)    │
+ │ **Inner Ethernet Frame**  │ Variable     │ Original payload frame generated by VM or Container    │
+ │───────────────────────────┼──────────────┼────────────────────────────────────────────────────────┤
+ │ **TOTAL OVERHEAD**        │ **50 Bytes** │ Requires physical MTU of at least **1550** bytes!      │
+ └───────────────────────────┴──────────────┴────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. The 24-Bit VNI vs 12-Bit VLAN
+
+$$\text{Legacy 802.1Q VLAN Limit} = 2^{12} = 4,096 \text{ networks}$$
+
+$$\text{VXLAN VNI Address Space} = 2^{24} = 16,777,216 \text{ isolated tenant networks}$$
+
+---
+
+### 3. VTEP Source Port Hashing for ECMP
+
+The outer UDP source port is dynamically calculated by hashing the inner frame's 5-tuple:
+
+$$\text{Outer UDP Src Port} = \text{Hash}(\text{Inner 5-Tuple}) \pmod{16384} + 49152$$
+
+Because the outer source port varies per tenant flow, intermediate physical datacenter switches automatically balance VXLAN traffic across all Equal-Cost Multi-Path (ECMP) links.
+
+---
+
+## Hands-On Lab: Creating a Linux Kernel VXLAN Interface
+
+```bash
+# Step 1: Create a Linux VXLAN interface (VNI 100, listening on UDP port 4789)
+sudo ip link add vxlan100 type vxlan \
+  id 100 \
+  dstport 4789 \
+  local 192.168.1.10 \
+  remote 192.168.1.20 \
+  dev eth0
+
+# Step 2: Assign an overlay IP address to the VXLAN interface
+sudo ip addr add 10.200.0.1/24 dev vxlan100
+
+# Step 3: Bring up the VXLAN interface
+sudo ip link set up dev vxlan100
+
+# Step 4: Inspect the VXLAN link parameters and FDB forwarding database
+ip -d link show vxlan100
+bridge fdb show dev vxlan100
+
+# Step 5: Clean up test interface
+sudo ip link del vxlan100
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does VXLAN encapsulation require adjusting MTU on physical underlay switches?**
+
+VXLAN adds **50 bytes of overhead** (14B Outer Ethernet + 20B Outer IP + 8B Outer UDP + 8B VXLAN). If guest virtual machines generate standard 1500-byte packets, the encapsulated frame becomes **1550 bytes**. If physical underlay switches have standard 1500-byte MTUs, packets will be fragmented or dropped by DF flags. Production datacenters must enable **Jumbo Frames (MTU 9000 or 9216)** across all underlay switches to allow VXLAN to run unfragmented at line rate.
+
+**Q2: What is a VTEP and what are its two primary operating modes?**
+
+A **VXLAN Tunnel Endpoint (VTEP)** is the device responsible for originating and terminating VXLAN tunnels (performing encapsulation and decapsulation).
+- **Software VTEP:** Runs in the hypervisor or container host kernel (e.g. Linux Kernel `vxlan` driver, OVS, Cilium).
+- **Hardware VTEP:** Runs directly on physical Top-of-Rack Leaf Switch ASICs (e.g., Cisco Nexus, Arista 7050), allowing non-virtualized bare-metal database servers to connect seamlessly to virtual VXLAN networks.
+
+**Q3: How does VXLAN handle BUM (Broadcast, Unknown Unicast, Multicast) traffic in the data plane?**
+
+When a VM issues an ARP broadcast (`FF:FF:FF:FF:FF:FF`) for an unknown MAC:
+1. **Multicast Mode:** The VTEP maps the VNI to an underlay Multicast Group (e.g. `239.1.1.100`). The underlay network replicates the packet to all VTEPs subscribed to that group.
+2. **Head-End Replication (HER):** The VTEP sends individual unicast copies to every known remote VTEP in its static list.
+3. **BGP EVPN (Modern Standard):** Eliminates BUM flooding by distributing MAC/IP bindings via a BGP control plane.
+
+**Q4: What is the official IANA UDP destination port for VXLAN?**
+
+The standard IANA-assigned UDP port for VXLAN is **`4789`** (RFC 7348). *(Note: Early pre-standard implementations, such as early Linux kernels and VMware releases, used port `8472`)*.
+
+**Q5: How does the outer UDP source port enable ECMP load balancing in datacenter spine-leaf fabrics?**
+
+Physical spine-leaf switches only inspect the outer 5-tuple of packets. If all VXLAN packets had identical source and destination ports, all traffic across all VMs would hash to the exact same physical link. By setting the **outer UDP source port to a hash of the inner VM packet's 5-tuple**, different VM conversations generate different outer source ports, allowing physical ECMP switches to distribute flows evenly across all spine switches.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 50-byte VXLAN encapsulation stack (Outer Eth/IP/UDP 4789/VNI)
+- [ ] Understand 24-bit VNI capacity ($16.7\text{ million networks}$)
+- [ ] Explain why underlay networks must support Jumbo Frames ($\text{MTU} \ge 1550$)
+- [ ] Differentiate Software VTEPs from Hardware Leaf Switch VTEPs
+- [ ] Know how outer UDP source port hashing enables underlay ECMP balancing

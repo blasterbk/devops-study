@@ -1,0 +1,358 @@
+---
+title: "Chapter 5 — Multus"
+sidebar_position: 5
+module: "Module 2.2 — CNI Plugins"
+description: "Deep dive into Multus — the meta-CNI plugin that enables multiple network interfaces per Pod. Covers its architecture, NetworkAttachmentDefinition CRD, delegation model, and use cases including SR-IOV, DPDK, and 5G network functions."
+---
+
+# Chapter 5 — Multus: Multiple Network Interfaces per Pod
+
+> **Goal:** Understand how Multus enables Pods to have multiple network interfaces, how it delegates to primary and secondary CNI plugins, and when multiple interfaces are needed (telco, HPC, storage, security isolation).
+>
+> By the end of this chapter, you will understand:
+> 1. Why some workloads need multiple network interfaces
+> 2. How Multus works as a meta-plugin that delegates to other CNIs
+> 3. The `NetworkAttachmentDefinition` CRD — how to define secondary networks
+> 4. How to attach secondary interfaces to Pods via annotations
+> 5. Common secondary plugins: macvlan, ipvlan, SR-IOV, host-device
+> 6. Real-world use cases: telco 5G, storage networks, management planes
+
+---
+
+## Real-Life Analogy
+
+Imagine a **hospital room** (Pod) that normally has one connection to the hospital network (one NIC). But the ICU needs:
+- A **public network** for patients to use internet (primary interface — normal CNI)
+- A **medical device network** for vital sign monitors (secondary interface — isolated VLAN)
+- A **high-speed imaging network** for MRI data (secondary interface — SR-IOV NIC for speed)
+
+A normal hospital room has one phone jack. Multus is the **upgrade that gives the room three phone jacks**, each connecting to a different network — without changing the hospital's main wiring system.
+
+---
+
+## Architecture Diagram
+
+```text
+                        Multus Architecture
+
+  Pod with 3 interfaces:
+  ┌──────────────────────────────────────────────────────────┐
+  │  eth0     ← Primary interface (Calico / Flannel / etc)   │
+  │  net1     ← Secondary: macvlan on storage VLAN           │
+  │  net2     ← Secondary: SR-IOV Virtual Function (VF)      │
+  └──────────────────────────────────────────────────────────┘
+
+  How it happens:
+  ┌────────────────────────────────────────────────────────────┐
+  │  containerd calls Multus (configured as primary CNI)       │
+  │       ↓                                                    │
+  │  Multus reads Pod annotations:                             │
+  │    k8s.v1.cni.cncf.io/networks: storage-net,sriov-net     │
+  │       ↓                                                    │
+  │  Step 1: Delegate to primary CNI (Calico) → creates eth0  │
+  │       ↓                                                    │
+  │  Step 2: Delegate to macvlan CNI → creates net1            │
+  │  (reads NetworkAttachmentDefinition "storage-net")         │
+  │       ↓                                                    │
+  │  Step 3: Delegate to SR-IOV CNI → creates net2             │
+  │  (reads NetworkAttachmentDefinition "sriov-net")           │
+  └────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How Multus Works
+
+Multus is a **meta-plugin** — it doesn't create network interfaces itself. Instead, it acts as a coordinator that calls other CNI plugins in sequence:
+
+```text
+Without Multus:
+  containerd → single CNI plugin (Calico) → eth0 only
+
+With Multus:
+  containerd → Multus (configured as the ONE CNI plugin)
+                  │
+                  ├── Primary delegation → Calico → eth0
+                  ├── Secondary delegation → macvlan CNI → net1
+                  └── Secondary delegation → SR-IOV CNI → net2
+```
+
+Multus configuration replaces the primary CNI config in `/etc/cni/net.d/`:
+
+```json
+{
+  "cniVersion": "0.3.1",
+  "name": "multus-cni-network",
+  "type": "multus",
+  "kubeconfig": "/etc/cni/net.d/multus.d/multus.kubeconfig",
+  "delegates": [
+    {
+      "name": "calico-k8s-network",
+      "type": "calico",
+      "kubeconfig": "/etc/cni/net.d/calico-kubeconfig"
+    }
+  ]
+}
+```
+
+---
+
+## NetworkAttachmentDefinition: Defining Secondary Networks
+
+Secondary networks are defined as Kubernetes CRDs called `NetworkAttachmentDefinition` (NAD):
+
+```yaml
+# Example 1: macvlan secondary interface
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: storage-network
+  namespace: default
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "storage-network",
+      "type": "macvlan",
+      "master": "eth1",          ← Host interface to attach to
+      "mode": "bridge",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "192.168.100.0/24",
+        "rangeStart": "192.168.100.10",
+        "rangeEnd": "192.168.100.100",
+        "routes": [
+          { "dst": "192.168.100.0/24" }
+        ]
+      }
+    }
+```
+
+```yaml
+# Example 2: SR-IOV secondary interface (high-performance)
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sriov-network
+  namespace: default
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: intel.com/intel_sriov_netdevice
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "sriov-network",
+      "type": "sriov",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "10.56.217.0/24"
+      }
+    }
+```
+
+---
+
+## Attaching Secondary Networks to Pods
+
+Pods request secondary networks via the `k8s.v1.cni.cncf.io/networks` annotation:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-multus-pod
+  annotations:
+    # Attach one secondary network
+    k8s.v1.cni.cncf.io/networks: storage-network
+
+    # Attach multiple secondary networks
+    k8s.v1.cni.cncf.io/networks: storage-network,sriov-network
+
+    # With specific interface names
+    k8s.v1.cni.cncf.io/networks: |
+      [
+        {"name": "storage-network", "interface": "net1"},
+        {"name": "sriov-network", "interface": "net2"}
+      ]
+
+    # With specific IP request
+    k8s.v1.cni.cncf.io/networks: |
+      [
+        {
+          "name": "storage-network",
+          "ips": ["192.168.100.50"],
+          "mac": "02:aa:bb:cc:dd:01"
+        }
+      ]
+spec:
+  containers:
+  - name: app
+    image: nginx
+    resources:
+      limits:
+        intel.com/intel_sriov_netdevice: "1"  # Request SR-IOV VF
+```
+
+---
+
+## Interface Types for Secondary Networks
+
+### macvlan
+
+Creates virtual interfaces that share the host NIC's MAC address but have their own MAC. Useful for connecting Pods directly to a VLAN on the physical network.
+
+```bash
+# macvlan creates a virtual interface linked to the host NIC
+# Pod gets direct access to the physical network segment
+ip link add link eth1 name net1 type macvlan mode bridge
+```
+
+Modes: `bridge` (Pods can talk to each other via the host NIC), `private` (Pods can't talk to each other via the macvlan), `passthru` (one-to-one NIC to Pod).
+
+### ipvlan
+
+Similar to macvlan but all virtual interfaces share the **same** MAC address. Useful in environments where MAC learning is disabled on switches.
+
+```bash
+# ipvlan L2 mode: same MAC, different IPs, Layer 2 connectivity
+# ipvlan L3 mode: same MAC, different IPs, Layer 3 routing (no ARP)
+```
+
+### SR-IOV (Single Root I/O Virtualization)
+
+SR-IOV allows a physical NIC to present multiple **Virtual Functions (VFs)** to the OS. Each VF is a dedicated hardware queue with near bare-metal performance:
+
+```text
+Physical NIC (PF: Physical Function)
+├── VF0 → Pod A's net2 interface
+├── VF1 → Pod B's net2 interface
+└── VF2 → Pod C's net2 interface
+
+Each VF has:
+- Dedicated hardware TX/RX queues
+- Hardware-enforced isolation
+- Near wire-speed performance (no veth/bridge overhead)
+```
+
+SR-IOV requires:
+1. SR-IOV capable NIC and BIOS/kernel config
+2. SR-IOV Network Device Plugin (`k8s-network-device-plugin`)
+3. SR-IOV CNI plugin
+
+### host-device
+
+Moves an entire host network interface into the Pod's namespace. Used for physical NIC pass-through:
+
+```json
+{
+  "type": "host-device",
+  "device": "eth2"
+}
+```
+
+---
+
+## Real-World Use Cases
+
+### Telco / 5G Network Functions
+
+5G network functions (gNB-CU, UPF, SMF) require multiple interfaces:
+- **eth0** — management/Kubernetes control plane (primary CNI)
+- **n3** — user plane interface to RAN (SR-IOV for 25Gbps throughput)
+- **n6** — user plane interface to internet (SR-IOV)
+- **n9** — inter-UPF interface (DPDK/SR-IOV)
+
+```yaml
+# 5G UPF Pod with multiple SR-IOV interfaces
+annotations:
+  k8s.v1.cni.cncf.io/networks: |
+    [
+      {"name": "n3-network", "interface": "n3"},
+      {"name": "n6-network", "interface": "n6"},
+      {"name": "n9-network", "interface": "n9"}
+    ]
+```
+
+### Storage Networks
+
+Separate storage traffic (iSCSI, NFS, Ceph) from application traffic:
+- **eth0** — application network (Calico)
+- **net1** — storage network (macvlan on dedicated 10GbE NIC)
+
+Benefits: storage traffic doesn't compete with app traffic, dedicated bandwidth, lower latency.
+
+### Security Isolation
+
+Separate public and private traffic:
+- **eth0** — public-facing interface
+- **net1** — internal management interface on isolated VLAN (no internet routing)
+
+---
+
+## Hands-On: Inspecting Multus
+
+```bash
+# 1. Check Multus is installed as primary CNI
+ls /etc/cni/net.d/ | head -1
+# Should show: 00-multus.conf (lowest number = primary)
+
+# 2. List all NetworkAttachmentDefinitions
+kubectl get net-attach-def -A
+
+# 3. Check Pod's network interfaces
+kubectl exec -it my-multus-pod -- ip addr
+# eth0: 10.244.1.5   ← primary (Calico)
+# net1: 192.168.100.20  ← secondary (macvlan)
+# net2: 10.56.217.3  ← secondary (SR-IOV)
+
+# 4. View Multus status annotation (set after Pod starts)
+kubectl get pod my-multus-pod -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}'
+# Returns JSON with all interfaces and IPs
+
+# 5. Check SR-IOV VF allocation
+kubectl exec -it my-multus-pod -- ls /sys/class/net/net2/device/
+
+# 6. Debug Multus failures
+kubectl describe pod my-multus-pod
+# Look for: "failed to delegate add"
+# or: "NetworkAttachmentDefinition not found"
+
+# 7. Check Multus logs
+kubectl logs -n kube-system kube-multus-<id>
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Multus and why is it needed?**
+
+Multus is a meta-CNI plugin that enables Pods to have multiple network interfaces. Standard Kubernetes provides one network interface per Pod (eth0) via a single CNI plugin. Multus sits as the primary CNI, receives all Pod networking requests, delegates eth0 creation to the primary CNI (Calico, Cilium, etc.), and then attaches additional interfaces based on Pod annotations. It's needed for workloads that require multiple isolated network paths — 5G network functions, storage networks, security isolation.
+
+**Q2: What is a NetworkAttachmentDefinition and how does a Pod request it?**
+
+`NetworkAttachmentDefinition` (NAD) is a Kubernetes CRD that encodes a CNI plugin configuration for a secondary network. It defines which CNI plugin to use (macvlan, SR-IOV, etc.), the master interface, and IPAM settings. A Pod requests secondary networks by adding the annotation `k8s.v1.cni.cncf.io/networks: <nad-name>`. Multus reads this annotation, looks up the NAD CRD, and invokes the corresponding CNI plugin to create the secondary interface.
+
+**Q3: What is SR-IOV and why is it used with Multus?**
+
+SR-IOV (Single Root I/O Virtualization) is a hardware feature where one physical NIC (Physical Function) presents multiple Virtual Functions (VFs) to the OS. Each VF has its own hardware queues and can be assigned to a Pod, giving near bare-metal NIC performance with no veth/bridge overhead. SR-IOV is used in Multus secondary networks for workloads with extreme bandwidth requirements — 25/100Gbps for 5G user planes, RDMA for HPC, DPDK for packet processing.
+
+**Q4: Can NetworkPolicy apply to secondary Multus interfaces?**
+
+No. Kubernetes NetworkPolicy only applies to the primary CNI interface (eth0). Secondary interfaces created by Multus are outside the scope of standard NetworkPolicy. For policy on secondary interfaces, you'd need to use the secondary CNI's own policy mechanisms (if it has them) or configure Linux iptables rules directly in the Pod.
+
+**Q5: What is the difference between macvlan and ipvlan for Multus secondary networks?**
+
+Both create virtual interfaces on top of a host NIC. `macvlan` gives each virtual interface its own MAC address — Pods can send and receive as if they had their own physical NIC on the switch. `ipvlan` gives all virtual interfaces the same MAC address as the host NIC, using only IP differentiation. ipvlan is used when the switch doesn't support MAC learning or when you hit the switch's MAC table size limit. ipvlan L3 mode routes at the IP layer without ARP, enabling connection to networks that don't support broadcast.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know Multus is a meta-plugin that delegates to other CNIs — it doesn't create interfaces itself
+- [ ] Understand `NetworkAttachmentDefinition` (NAD) CRD — defines secondary network config
+- [ ] Know how Pods request secondary interfaces via the `k8s.v1.cni.cncf.io/networks` annotation
+- [ ] Know the four secondary interface types: macvlan, ipvlan, SR-IOV, host-device
+- [ ] Understand SR-IOV: physical NIC presents Virtual Functions (VFs) with near bare-metal performance
+- [ ] Know the real-world use cases: 5G telco (n3/n6/n9 interfaces), storage networks, security isolation
+- [ ] Can inspect secondary interfaces with `kubectl exec -- ip addr` and network-status annotation

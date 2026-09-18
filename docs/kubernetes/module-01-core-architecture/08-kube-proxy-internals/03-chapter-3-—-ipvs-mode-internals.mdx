@@ -1,0 +1,1403 @@
+---
+title: "Chapter 3 — IPVS Mode Internals"
+sidebar_position: 3
+module: "Module 1.8 — kube-proxy Internals"
+description: "> **Goal:** Understand how Kubernetes implements Services using **IPVS (IP Virtual Server)**. Learn why IPVS was introduced, how it differs from iptables, how t..."
+---
+
+# Module 1.8 — kube-proxy Internals
+
+# Chapter 3 — IPVS Mode Internals
+
+> **Goal:** Understand how Kubernetes implements Services using **IPVS (IP Virtual Server)**. Learn why IPVS was introduced, how it differs from iptables, how the Linux kernel performs high-performance load balancing, how kube-proxy programs IPVS, and how connection persistence is maintained.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why IPVS was introduced: overcoming iptables scalability limits
+> 2. Linux IPVS kernel architecture and Netfilter hook points
+> 3. IPVS data structures: ipset and hash tables for O(1) matching
+> 4. Virtual Servers (VIP + port) and Real Servers (Pod IP + port)
+> 5. IPVS scheduling algorithms: Round Robin (rr), Least Connections (lc), Source Hash (sh)
+> 6. IPVS NAT packet traversal and connection state management
+> 7. Why IPVS mode still relies on iptables for SNAT and packet filtering
+> 8. Performance benchmarking: IPVS vs iptables at 10,000+ Services scale
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of IPVS mode like an airport departure board with smart automated routing.
+
+```text
+Airport Departure Board Analogy:
+
+Traveler (packet) arrives with a Flight Code (Service VIP)
+Instead of walking through a 5,000-page book line-by-line (iptables)
+Traveler looks up Flight Code instantly in an indexed digital screen (IPVS hash table O(1))
+Screen immediately routes traveler to Gate 4B (Pod IP) using chosen strategy:
+  - Alternate gates evenly (Round Robin)
+  - Choose gate with fewest passengers (Least Connections)
+Routing happens instantly regardless of whether there are 10 or 10,000 flights
+```
+
+| Airport Board | IPVS Mode |
+| :--- | :--- |
+| Flight Code | Service Virtual IP (ClusterIP:Port) |
+| Digital index lookup | IPVS hash table lookup ($O(1)$ complexity) |
+| Departure Gates | Real Servers (Backend Pod IPs) |
+| Gate assignment algorithm | Scheduling algorithms (`rr`, `lc`, `sed`, `sh`) |
+| Boarding ticket stamp | IPVS connection entry + Netfilter NAT |
+
+> **Important:** IPVS uses **kernel hash tables with $O(1)$ lookup time**. Unlike iptables, the rule evaluation time in IPVS does not increase as you add more Services. However, IPVS **does not completely eliminate iptables** — kube-proxy still programs a minimal set of iptables rules and `ipset` sets for packet marking, source NAT (SNAT/MASQUERADE), and handling NodePort/ExternalIP traffic.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes Services
+- kube-proxy Architecture
+- Linux Networking
+- iptables Mode
+- conntrack (basic understanding)
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapter we learned:
+
+```text
+Client
+  |
+  v
+ClusterIP
+  |
+  v
+iptables
+  |
+  v
+Pod
+```
+
+This works well.
+
+But imagine a very large Kubernetes cluster.
+
+```text
+100 Pods
+  |
+  v
+500 Services
+  |
+  v
+5,000 Services
+  |
+  v
+50,000 Services
+```
+
+As the number of Services grows,
+
+iptables must manage increasingly large rule sets.
+
+This is why Kubernetes introduced another dataplane:
+
+```text
+IPVS
+```
+
+---
+
+# The Problem with Large iptables Rule Sets
+
+iptables works by evaluating rules until a match is found.
+
+Conceptually:
+
+```text
+Rule 1
+  |
+  v
+Rule 2
+  |
+  v
+Rule 3
+  |
+  v
+...
+  |
+  v
+Rule N
+  |
+  v
+Match
+```
+
+Although modern kernels optimize many operations, very large rule sets increase synchronization cost and can increase packet processing overhead.
+
+---
+
+# Why IPVS Was Introduced
+
+Linux already had a mature load-balancing subsystem.
+
+It was called:
+
+```text
+IPVS
+
+(IP Virtual Server)
+```
+
+Instead of maintaining long NAT rule chains,
+
+IPVS maintains efficient lookup tables inside the kernel.
+
+---
+
+# What is IPVS?
+
+IPVS is a Linux kernel load balancer.
+
+Originally designed for:
+
+- Layer 4 Load Balancing
+- High-performance TCP Load Balancing
+- High-performance UDP Load Balancing
+
+Kubernetes later adopted it as an alternative Service dataplane.
+
+---
+
+# High-Level Architecture
+
+```text
+              API Server
+
+                    |
+
+          Services / EndpointSlices
+
+                    |
+
+                    ▼
+
+              kube-proxy
+
+                    |
+
+              IPVS API
+
+                    |
+
+                    ▼
+
+              Linux Kernel
+
+                    |
+
+            IPVS Lookup Table
+
+                    |
+
+                    ▼
+
+               Backend Pods
+```
+
+---
+
+# IPVS vs iptables Philosophy
+
+iptables says:
+
+```text
+Packet
+  |
+  v
+Evaluate Rules
+  |
+  v
+Find Match
+```
+
+IPVS says:
+
+```text
+Packet
+  |
+  v
+Lookup Service
+  |
+  v
+Choose Backend
+```
+
+Instead of rule chains,
+
+IPVS maintains dedicated load-balancing data structures.
+
+---
+
+# Linux IPVS Architecture
+
+Internally:
+
+```text
+Packet
+  |
+  v
+Netfilter Hook
+  |
+  v
+IPVS
+  |
+  v
+Scheduler
+  |
+  v
+Backend Selection
+  |
+  v
+Forward Packet
+```
+
+Notice that IPVS still integrates with Linux networking.
+
+It is not a separate network stack.
+
+---
+
+# Important Relationship
+
+Many engineers assume:
+
+```text
+IPVS
+  |
+  v
+No iptables
+```
+
+This is **not completely true**.
+
+In Kubernetes,
+
+IPVS mode still uses a small number of iptables rules for functions such as directing traffic into the IPVS datapath and handling certain NAT scenarios.
+
+IPVS replaces most Service load-balancing logic—not every iptables rule.
+
+---
+
+# IPVS Components
+
+The major IPVS components are:
+
+```text
+Virtual Server
+  |
+  v
+Scheduler
+  |
+  v
+Real Servers
+  |
+  v
+Connection Table
+```
+
+Each component has a specific responsibility.
+
+---
+
+# Component Overview
+
+```text
+             Virtual Server
+
+                    |
+
+                    ▼
+
+              Scheduler
+
+        ┌────────┼────────┐
+
+        ▼        ▼        ▼
+
+      Pod A    Pod B    Pod C
+
+        |        |        |
+
+        +--──────┼────────┘
+
+                 ▼
+
+          Connection Table
+```
+
+---
+
+# Virtual Server
+
+The **Virtual Server** represents the Kubernetes Service.
+
+Example:
+
+```text
+ClusterIP
+
+10.96.0.15
+```
+
+Inside IPVS:
+
+```text
+Virtual Server
+  |
+  v
+10.96.0.15:80
+```
+
+It does **not** represent a Pod.
+
+It represents the Service.
+
+---
+
+# Virtual Server Responsibilities
+
+A Virtual Server stores:
+
+- Service IP
+- Port
+- Protocol
+- Scheduler
+- Backend List
+
+Think of it as:
+
+```text
+Service Object
+  |
+  v
+Kernel Representation
+```
+
+---
+
+# Real Servers
+
+A **Real Server** is an actual backend endpoint.
+
+Example:
+
+```text
+Pod A
+
+10.244.1.5
+
+────────────
+
+Pod B
+
+10.244.2.8
+
+────────────
+
+Pod C
+
+10.244.3.9
+```
+
+Each Pod becomes a Real Server.
+
+---
+
+# Relationship
+
+```text
+Virtual Server
+  |
+  v
+Backend List
+  |
+  v
+Real Servers
+```
+
+One Virtual Server can have many Real Servers.
+
+---
+
+# Scheduler
+
+The Scheduler decides:
+
+```text
+Which Backend?
+  |
+  v
+Pod A?
+
+Pod B?
+
+Pod C?
+```
+
+Every new connection passes through the scheduler.
+
+---
+
+# Scheduling Algorithms
+
+IPVS supports many scheduling algorithms.
+
+The most commonly discussed are:
+
+- Round Robin
+- Least Connections
+- Source Hash
+- Weighted Round Robin
+
+---
+
+# Round Robin
+
+The simplest scheduler.
+
+Traffic rotates evenly.
+
+```text
+Request 1
+  |
+  v
+Pod A
+
+────────────
+
+Request 2
+  |
+  v
+Pod B
+
+────────────
+
+Request 3
+  |
+  v
+Pod C
+
+────────────
+
+Request 4
+  |
+  v
+Pod A
+```
+
+Every backend receives traffic in turn.
+
+---
+
+# Advantages
+
+✔ Simple
+
+✔ Fair distribution
+
+✔ Works well for identical Pods
+
+---
+
+# Limitations
+
+Not ideal when:
+
+- One Pod is slower
+- Different hardware capacities exist
+- Existing connection counts differ
+
+---
+
+# Least Connections
+
+Instead of rotating,
+
+choose:
+
+```text
+Fewest Active Connections
+```
+
+Example:
+
+```text
+Pod A
+
+5 Connections
+
+────────────
+
+Pod B
+
+20 Connections
+
+────────────
+
+Pod C
+
+8 Connections
+```
+
+Next request:
+
+```text
+v
+
+Pod A
+```
+
+---
+
+# Advantages
+
+Works well for:
+
+- Long-lived TCP connections
+- Uneven workloads
+- Variable request duration
+
+---
+
+# Source Hash
+
+Hash based on:
+
+```text
+Client IP
+```
+
+Example:
+
+```text
+Client A
+  |
+  v
+Pod A
+
+────────────
+
+Client A
+  |
+  v
+Pod A
+
+Again
+```
+
+The same client generally reaches the same backend while the backend set remains stable.
+
+---
+
+# Advantages
+
+Useful for:
+
+- Client affinity
+- Session persistence
+- Cache locality
+
+---
+
+# Weighted Round Robin
+
+Not every server is equal.
+
+Example:
+
+```text
+Pod A
+
+Weight 1
+
+────────────
+
+Pod B
+
+Weight 3
+
+────────────
+
+Pod C
+
+Weight 2
+```
+
+Traffic distribution:
+
+```text
+Pod B
+  |
+  v
+Most Requests
+```
+
+Higher-capacity servers receive proportionally more traffic.
+
+---
+
+# Scheduler Summary
+
+| Algorithm | Best For |
+|------------|----------|
+| Round Robin | Equal backend capacity |
+| Least Connections | Long-running connections |
+| Source Hash | Client affinity |
+| Weighted Round Robin | Mixed hardware capacity |
+
+---
+
+# IPVS Packet Flow
+
+Let's follow a packet.
+
+Client:
+
+```text
+192.168.1.20
+```
+
+Destination:
+
+```text
+10.96.0.15
+```
+
+---
+
+# Step 1
+
+Packet arrives.
+
+---
+
+# Step 2
+
+Linux networking receives it.
+
+---
+
+# Step 3
+
+Packet enters:
+
+```text
+IPVS
+```
+
+---
+
+# Step 4
+
+Virtual Server located.
+
+```text
+10.96.0.15
+```
+
+---
+
+# Step 5
+
+Scheduler executes.
+
+---
+
+# Step 6
+
+Backend selected.
+
+Example:
+
+```text
+Pod B
+```
+
+---
+
+# Step 7
+
+Destination rewritten.
+
+```text
+10.96.0.15
+  |
+  v
+10.244.2.8
+```
+
+---
+
+# Step 8
+
+Connection recorded.
+
+---
+
+# Step 9
+
+Packet forwarded.
+
+---
+
+# Complete Packet Flow
+
+```text
+Client
+  |
+  v
+ClusterIP
+  |
+  v
+Netfilter
+  |
+  v
+IPVS
+  |
+  v
+Virtual Server
+  |
+  v
+Scheduler
+  |
+  v
+Real Server
+  |
+  v
+Pod
+```
+
+---
+
+# kube-proxy + IPVS
+
+kube-proxy does not implement IPVS itself.
+
+Instead,
+
+it programs the Linux IPVS subsystem.
+
+Workflow:
+
+```text
+API Server
+  |
+  v
+EndpointSlice
+  |
+  v
+kube-proxy
+  |
+  v
+IPVS API
+  |
+  v
+Kernel Tables
+```
+
+---
+
+# Endpoint Update
+
+Suppose:
+
+```text
+Deployment
+
+3 Pods
+```
+
+Later:
+
+```text
+Deployment
+
+5 Pods
+```
+
+Workflow:
+
+```text
+EndpointSlice Updated
+  |
+  v
+kube-proxy
+  |
+  v
+Add New Real Servers
+  |
+  v
+Kernel Updated
+```
+
+No Service restart occurs.
+
+---
+
+# Connection Persistence
+
+One important feature:
+
+```text
+TCP Connection
+  |
+  v
+Same Backend
+```
+
+Suppose:
+
+```text
+Packet 1
+  |
+  v
+Pod A
+```
+
+Packet 2:
+
+```text
+v
+
+Pod A
+```
+
+Packet 500:
+
+```text
+v
+
+Pod A
+```
+
+The scheduler is **not** consulted for every packet.
+
+It is consulted when the connection is established.
+
+---
+
+# Internal Connection Table
+
+IPVS maintains:
+
+```text
+Client
+  |
+  v
+Virtual Server
+  |
+  v
+Chosen Backend
+```
+
+Future packets reuse the existing mapping until the connection expires.
+
+---
+
+# Connection Workflow
+
+```text
+New Connection
+  |
+  v
+Scheduler
+  |
+  v
+Real Server
+  |
+  v
+Store Mapping
+  |
+  v
+Future Packets
+  |
+  v
+Reuse Backend
+```
+
+This improves performance and preserves TCP session integrity.
+
+---
+
+# Failure Handling
+
+Suppose:
+
+```text
+Pod B
+  |
+  v
+Deleted
+```
+
+Workflow:
+
+```text
+EndpointSlice Updated
+  |
+  v
+kube-proxy
+  |
+  v
+Remove Real Server
+  |
+  v
+New Connections
+  |
+  v
+Healthy Pods
+```
+
+Existing connections may terminate depending on application behavior and timing.
+
+---
+
+# Dynamic Scaling
+
+Initial state:
+
+```text
+2 Pods
+```
+
+Later:
+
+```text
+10 Pods
+```
+
+Workflow:
+
+```text
+Deployment
+  |
+  v
+EndpointSlice
+  |
+  v
+kube-proxy
+  |
+  v
+Update IPVS Table
+  |
+  v
+Traffic Distributed
+```
+
+Applications remain unaware of the change.
+
+---
+
+# Performance Characteristics
+
+IPVS was designed specifically for load balancing.
+
+Compared to large iptables rule sets:
+
+- Faster backend lookup
+- Better scalability
+- Efficient kernel data structures
+- Multiple scheduling algorithms
+
+Rule synchronization is also generally more efficient for large numbers of Services.
+
+---
+
+# Memory Usage
+
+IPVS stores:
+
+```text
+Virtual Servers
+  |
+  v
+Real Servers
+  |
+  v
+Connection Table
+```
+
+Memory usage grows with:
+
+- Number of Services
+- Number of Endpoints
+- Number of Active Connections
+
+---
+
+# IPVS vs iptables
+
+| Feature | iptables | IPVS |
+|----------|----------|------|
+| Primary Mechanism | Netfilter Rules | Kernel Load Balancer |
+| Backend Lookup | Rule Matching | Table Lookup |
+| Scheduling Algorithms | Limited | Multiple |
+| Large Cluster Performance | Good | Better |
+| Connection Table | conntrack | IPVS + conntrack integration |
+| Rule Synchronization | Larger rule updates | Kernel table updates |
+
+---
+
+# When Should IPVS Be Used?
+
+Historically,
+
+large production clusters often selected IPVS mode because of its scalability and scheduling capabilities.
+
+However,
+
+today many new Kubernetes environments adopt eBPF-based dataplanes instead of either iptables or IPVS.
+
+---
+
+# Complete Internal Architecture
+
+```text
+               API Server
+
+                    |
+
+       Services / EndpointSlices
+
+                    |
+
+                    ▼
+
+              kube-proxy
+
+                    |
+
+              IPVS API
+
+                    |
+
+                    ▼
+
+             Linux Kernel
+
+                    |
+
+           Virtual Server
+
+                    |
+
+              Scheduler
+
+          ┌────────┼────────┐
+
+          ▼        ▼        ▼
+
+       Real A   Real B   Real C
+
+          |        |        |
+
+          +--──────┼────────┘
+
+                   ▼
+
+             Connection Table
+
+                   ▼
+
+                 Response
+```
+
+---
+
+# Production Example 1
+
+Large SaaS Platform
+
+```text
+30,000 Services
+  |
+  v
+IPVS
+  |
+  v
+Fast Backend Lookup
+```
+
+---
+
+# Production Example 2
+
+Streaming Platform
+
+```text
+Long TCP Sessions
+  |
+  v
+Least Connections
+  |
+  v
+Balanced Utilization
+```
+
+---
+
+# Production Example 3
+
+Mixed Hardware Cluster
+
+```text
+Large Nodes
+  |
+  v
+Weight 5
+
+────────────
+
+Small Nodes
+  |
+  v
+Weight 1
+```
+
+Weighted Round Robin sends proportionally more traffic to larger Nodes or higher-capacity backends.
+
+---
+
+# Production Example 4
+
+Rolling Deployment
+
+```text
+Old Pod Removed
+  |
+  v
+New Pod Added
+  |
+  v
+IPVS Updated
+  |
+  v
+Traffic Automatically Redirected
+```
+
+No client configuration changes are required.
+
+---
+
+# Production Best Practices
+
+✔ Use IPVS for large clusters if operating a kube-proxy IPVS dataplane.
+
+✔ Monitor connection counts and active sessions.
+
+✔ Choose scheduling algorithms based on workload characteristics.
+
+✔ Keep kube-proxy synchronized with EndpointSlice updates.
+
+✔ Monitor backend health and connection persistence.
+
+✔ Understand that IPVS still relies on parts of the Linux networking stack and may coexist with some iptables rules.
+
+✔ Evaluate eBPF-based dataplanes for new deployments where appropriate.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+IPVS replaces Linux networking.
+
+**Correct:** IPVS is a Linux kernel subsystem that works within the existing networking stack.
+
+---
+
+### ❌ Misconception 2
+
+IPVS does not use iptables at all.
+
+**Correct:** Kubernetes IPVS mode still relies on a limited set of iptables rules for certain traffic handling and integration tasks.
+
+---
+
+### ❌ Misconception 3
+
+Every packet is scheduled independently.
+
+**Correct:** The scheduler selects a backend when a new connection is created. Existing packets in that connection reuse the stored mapping.
+
+---
+
+### ❌ Misconception 4
+
+A Virtual Server is a Pod.
+
+**Correct:** A Virtual Server represents a Kubernetes Service.
+
+---
+
+### ❌ Misconception 5
+
+A Real Server is a physical machine.
+
+**Correct:** In Kubernetes, a Real Server corresponds to a backend endpoint, typically a Pod IP.
+
+---
+
+### ❌ Misconception 6
+
+IPVS always uses Round Robin.
+
+**Correct:** IPVS supports multiple scheduling algorithms, each optimized for different scenarios.
+
+---
+
+### ❌ Misconception 7
+
+IPVS is always the preferred Kubernetes dataplane.
+
+**Correct:** Many modern clusters now use eBPF-based dataplanes, depending on operational requirements and platform choice.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why was IPVS introduced?
+
+To provide a more scalable and feature-rich kernel load-balancing implementation than large iptables rule sets.
+
+---
+
+### Q2. What is a Virtual Server?
+
+The kernel representation of a Kubernetes Service.
+
+---
+
+### Q3. What is a Real Server?
+
+A backend endpoint associated with a Service, typically a Pod IP.
+
+---
+
+### Q4. What does the IPVS Scheduler do?
+
+It selects the backend for new connections according to the configured scheduling algorithm.
+
+---
+
+### Q5. What scheduling algorithms does IPVS support?
+
+Examples include Round Robin, Least Connections, Source Hash, and Weighted Round Robin.
+
+---
+
+### Q6. Does kube-proxy perform load balancing itself?
+
+No. kube-proxy programs the Linux IPVS subsystem, which performs the actual backend selection.
+
+---
+
+### Q7. Why do packets in one TCP connection reach the same backend?
+
+Because IPVS stores a connection mapping and reuses it for subsequent packets.
+
+---
+
+### Q8. Is IPVS completely independent of iptables?
+
+No. Kubernetes IPVS mode still uses some iptables rules for integration and packet handling.
+
+---
+
+### Q9. What happens when a Deployment scales?
+
+kube-proxy updates the IPVS Virtual Server and Real Server configuration based on EndpointSlice changes.
+
+---
+
+### Q10. When is IPVS generally preferable to iptables?
+
+Traditionally in larger clusters where scalable backend lookup and richer scheduling capabilities are beneficial.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Service unreachable | Missing Virtual Server, kube-proxy synchronization issue, or networking problem |
+| Traffic reaches only one backend | Single healthy endpoint, scheduler configuration, or connection persistence behavior |
+| New Pods receive no traffic | EndpointSlice not synchronized to IPVS tables |
+| Connections fail after Pod removal | Backend removed while active sessions still existed |
+| Uneven traffic distribution | Scheduler choice, backend health, or long-lived persistent connections |
+| High memory usage | Large connection table or many Services and endpoints |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why was IPVS introduced?
+2. What is the difference between a Virtual Server and a Real Server?
+3. How does kube-proxy interact with IPVS?
+4. What happens when a new connection arrives?
+5. What scheduling algorithms are available?
+6. Why is Least Connections useful?
+7. How does Source Hash provide client affinity?
+8. How does IPVS maintain connection persistence?
+9. How does IPVS differ from iptables?
+10. Why do many modern platforms now favor eBPF-based dataplanes?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes uses **IPVS** to implement high-performance Service load balancing.
+
+You learned:
+
+- Why IPVS was introduced as an alternative to large iptables rule sets
+- The architecture of the Linux IPVS subsystem
+- The roles of Virtual Servers, Real Servers, Schedulers, and Connection Tables
+- How different scheduling algorithms distribute traffic
+- The complete packet flow through the IPVS dataplane
+- How kube-proxy programs the kernel IPVS tables using EndpointSlice updates
+- How connection persistence ensures that packets within the same session continue reaching the same backend
+- The scalability advantages and operational trade-offs of IPVS compared with iptables
+
+IPVS demonstrates how Kubernetes can leverage specialized Linux kernel subsystems to provide efficient Service networking. By replacing long rule chains with optimized lookup structures and configurable scheduling algorithms, IPVS significantly improves scalability while maintaining the same Kubernetes Service abstraction.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — conntrack Internals**
+
+Topics include:
+
+- What is conntrack?
+- Linux Connection Tracking
+- Stateful Connections
+- TCP State Tracking
+- UDP Tracking
+- NAT Integration
+- conntrack Tables
+- Connection Lifecycle
+- Timeouts
+- Connection Reuse
+- conntrack Exhaustion
+- Production Tuning
+- Common Problems
+```

@@ -1,0 +1,207 @@
+---
+title: "Chapter 2 — GPU Time-Slicing vs MIG vs MPS"
+sidebar_position: 2
+module: "Module 10.9 — FinOps & GPU Optimization"
+description: "Master GPU sharing and FinOps optimization — GPU Time-Slicing vs Multi-Instance GPU (MIG) vs Multi-Process Service (MPS) for high-density inference and development."
+---
+
+# Chapter 2 — GPU Time-Slicing vs MIG Cost Optimization
+
+> **Goal:** Master multi-tenant GPU bin-packing, hardware virtualization, and compute cost optimization in Kubernetes — comparing the 3 foundational GPU sharing technologies (**Software Time-Slicing**, **Hardware Multi-Instance GPU - MIG**, and **NVIDIA Multi-Process Service - MPS**), evaluating memory isolation vs oversubscription trade-offs, configuring fractional GPU quotas via the NVIDIA Device Plugin, and selecting the optimal sharing architecture for inference, development, and training workloads.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural differences between Time-Slicing (Temporal), MIG (Physical), and MPS (Spatial)
+> 2. How GPU Time-Slicing advertises multiple virtual GPU slots for a single physical chip
+> 3. Why Time-Slicing lacks memory isolation and how a single OOM crash affects co-located pods
+> 4. When to choose MIG hardware slicing for strict production SLA guarantees
+> 5. How NVIDIA MPS enables concurrent spatial kernel execution for lightweight inference
+> 6. How to author production NVIDIA Device Plugin Time-Slicing ConfigMaps and Pod specs
+
+---
+
+## Real-Life Analogy
+
+Think of the 3 GPU sharing technologies as **different ways to share a single commercial kitchen among multiple restaurant chefs**:
+
+- **1. GPU Time-Slicing (The Rotating Chef Schedule - Temporal Sharing):**
+  - There is only 1 kitchen stove (**1 Physical GPU**).
+  - Chef A cooks for 10 milliseconds, then Chef B cooks for 10 milliseconds, then Chef C cooks for 10 milliseconds (**Time-Slicing context switching**).
+  - **The Disaster:** Chef A accidentally spills a bucket of water on the entire stove (**A CUDA Out of Memory crash**). Because they share the exact same physical countertop (**No VRAM isolation**), Chef B and Chef C's meals are instantly ruined (**All 10 pods crash simultaneously**).
+- **2. Multi-Instance GPU - MIG (The 7 Soundproof Private Kitchen Cubicles - Physical Slicing):**
+  - You build 7 separate, private, stainless-steel mini-kitchens inside the restaurant (**Physical Hardware Partitioning on A100/H100**).
+  - Each chef has their own private burners, private refrigerator, and private gas line (**Dedicated SMs and isolated VRAM**).
+  - If Chef A starts a fire in Room 1, Room 2 through 7 are **100% unharmed and continue cooking at full speed**.
+- **3. Multi-Process Service - MPS (The Collaborative Team at the Same Table - Spatial Sharing):**
+  - Multiple chefs stand at the exact same large counter preparing small sushi rolls together (**Concurrent spatial execution**).
+  - They execute tasks simultaneously without waiting for turns, maximizing every square inch of counter space.
+
+---
+
+## Architecture Diagram
+
+```text
+               GPU Sharing Architectures: Time-Slicing vs MIG vs MPS
+
+ 1. GPU TIME-SLICING (Temporal Sharing - All GPUs supported, Zero VRAM Isolation):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PHYSICAL NVIDIA L4 / T4 GPU (Shared VRAM: 24GB)                        │
+ │ ├── Time Slot 1 [0..10ms]:   Pod A (Embedding Model - Uses 6GB VRAM)   │
+ │ ├── Time Slot 2 [10..20ms]:  Pod B (OCR Model - Uses 8GB VRAM)         │
+ │ └── Time Slot 3 [20..30ms]:  💥 Pod C (OOM Crash ──► Kills Pod A & B!) │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. MULTI-INSTANCE GPU - MIG (Hardware Silicon Slicing - A100/H100 Only):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PHYSICAL NVIDIA A100 80GB (Partitioned into 7 Hardware Slices)         │
+ │ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌──────────────┐ │
+ │ │ Slice 1: 10GB │ │ Slice 2: 10GB │ │ Slice 3: 10GB │ │ Slice 7: 10GB│ │
+ │ │ (Dedicated)   │ │ (Dedicated)   │ │ (Dedicated)   │ │ (Dedicated)  │ │
+ │ └───────────────┘ └───────────────┘ └───────────────┘ └──────────────┘ │
+ └────────────────────────────────────────────────────────────────────────┘
+ (100% Hardware QoS, Dedicated Memory Bandwidth, and Zero OOM Contagion!)
+```
+
+---
+
+## GPU Sharing Technologies Comparison Matrix
+
+```text
+ ┌───────────────────────────┬───────────────────┬───────────────────┬───────────────────────────────┐
+ │ Feature / Dimension       │ GPU Time-Slicing  │ Multi-Instance MIG│ Multi-Process Service (MPS)   │
+ │───────────────────────────┼───────────────────┼───────────────────┼───────────────────────────────┤
+ │ **GPU Hardware Support**  │ **ALL GPUs**      │ A100, A30, H100,  │ Volta, Ampere, Hopper,        │
+ │                           │ (T4, L4, V100, A100, H100, RTX).│ H200 only.        │ Ada Lovelace.                 │
+ │ **Memory Isolation**      │ **ZERO.** Shared  │ **100% Hardware** │ **Software Quotas.** Set via  │
+ │                           │ address space.    │ isolated VRAM.    │ `CUDA_MPS_PINNED_DEVICE_MEM`. │
+ │ **Fault Isolation (OOM)** │ **Fatal.** 1 OOM  │ **Total.** OOM is │ **Fatal.** One crash kills the│
+ │                           │ crashes all pods. │ isolated to slice.│ shared MPS control daemon.    │
+ │ **Over-Subscription**     │ **Yes.** Can run  │ **No.** Strict    │ **Yes.** High thread packing  │
+ │                           │ 10x virtual GPUs. │ fixed slice count.│ efficiency.                   │
+ │ **Ideal Workload**        │ Dev / Test pods,  │ Production multi- │ Small, latency-sensitive      │
+ │                           │ light embeddings. │ tenant infer/train│ micro-batch inferencing.      │
+ └───────────────────────────┴───────────────────┴───────────────────┴───────────────────────────────┘
+```
+
+---
+
+## 1. Configuring GPU Time-Slicing via NVIDIA Device Plugin
+
+Configure the `nvidia-device-plugin` ConfigMap to divide 1 physical GPU into 4 virtual slices:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: gpu-operator
+data:
+  any: |-
+    version: v1
+    flags:
+      migStrategy: "none"
+    sharing:
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4                # Advertises 4 virtual GPU slots per physical GPU!
+```
+
+---
+
+## 2. Pod Requesting a Time-Sliced Virtual GPU Slot
+
+Applications request `nvidia.com/gpu: 1` normally, but multiple pods are scheduled onto the same physical chip:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lightweight-ocr-service
+  namespace: ai-inference
+spec:
+  containers:
+  - name: ocr-worker
+    image: ghcr.io/enterprise-org/ocr-service:v1.0
+    resources:
+      limits:
+        # Consumes 1 of the 4 virtual time-sliced slots on the physical GPU!
+        nvidia.com/gpu: 1
+        memory: "8Gi"
+        cpu: "2"
+```
+
+---
+
+## 3. Production Workload Decision Tree
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ SRE Decision Flowchart for GPU Sharing:                                                            │
+ ├────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1. Are you running Large Language Models (LLMs) or Multi-GPU Pre-Training?                         │
+ │    ──► Use DEDICATED FULL GPUs (No Sharing).                                                       │
+ │                                                                                                    │
+ │ 2. Do you have A100/H100 GPUs and require 100% Memory QoS and SLA Guarantees for Customers?       │
+ │    ──► Use MULTI-INSTANCE GPU (MIG) Slicing (`mig-1g.10gb` / `mig-2g.20gb`).                     │
+ │                                                                                                    │
+ │ 3. Are you running Low-Cost Dev/Test Environments, Student Sandboxes, or Lightweight Embeddings?   │
+ │    ──► Use GPU TIME-SLICING (`replicas: 4` to `10`) for 80% cloud cost reductions!                 │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying Time-Sliced GPU Allocations
+
+```bash
+# Step 1: Query total allocatable GPUs on a time-sliced worker node
+kubectl get node <gpu-node-name> -o jsonpath='{.status.allocatable.nvidia\.com/gpu}'
+
+# (If physical node has 2 GPUs with replicas: 4, allocatable will show '8'!)
+
+# Step 2: Query all pods co-located on the same physical GPU device
+kubectl get pods -A -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace,NODE:.spec.nodeName,GPU_REQ:.spec.containers[*].resources.limits.nvidia\.com/gpu
+
+# Step 3: Inspect active GPU context switching utilization via nvidia-smi
+# kubectl exec -it <gpu-pod> -- nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is GPU Time-Slicing in Kubernetes, and how is it configured?**
+
+GPU Time-Slicing is a **software-level scheduling mechanism** supported by the NVIDIA Kubernetes Device Plugin. It allows a single physical GPU to be shared among multiple container pods by alternating execution time slices on the GPU. It is configured by creating a ConfigMap with `sharing.timeSlicing.resources: [{ name: "nvidia.com/gpu", replicas: 4 }]`. The Device Plugin advertises 4 virtual GPU units to the Kubelet for every 1 physical GPU, allowing the scheduler to place 4 separate pods on the same card.
+
+**Q2: What is the primary security and operational risk of GPU Time-Slicing?**
+
+The primary risk is **Lack of Memory and Fault Isolation**:
+1. **Zero Memory Limits**: Time-Slicing does not enforce hard memory boundaries. If Pod A allocates 20GB on a 24GB GPU, Pod B has only 4GB left.
+2. **Cascading OOM Failures**: If Pod A exceeds remaining VRAM and triggers a `CUDA Out of Memory` error, the CUDA driver crashes the entire GPU hardware context, causing **all other co-located pods on that physical GPU to crash simultaneously**.
+
+**Q3: How does NVIDIA Multi-Process Service (MPS) differ from GPU Time-Slicing?**
+
+- **Time-Slicing**: Executes tasks **temporally** (one process runs on the GPU, then the hardware switches context to the next process). Context switching introduces latency penalties for small batch requests.
+- **NVIDIA MPS**: Executes tasks **spatially** (multiple processes submit CUDA kernels simultaneously through a shared control daemon). The GPU's hardware scheduler interweaves warps across Streaming Multiprocessors in parallel, eliminating context-switch overhead and achieving maximum GPU throughput for small inference tasks.
+
+**Q4: Why does Multi-Instance GPU (MIG) prevent cascading crashes across co-located workloads?**
+
+MIG physically partitions the GPU silicon at the hardware level into independent GPU Instances (GIs). Each MIG slice possesses **dedicated Streaming Multiprocessors, dedicated memory crossbar buses, and dedicated DRAM memory controllers**. A memory exhaustion or kernel panic in MIG Slice 1 is physically contained within its own hardware partition and cannot leak into or affect the memory controllers of sibling MIG slices.
+
+**Q5: Can GPU Time-Slicing be combined with Multi-Instance GPU (MIG)?**
+
+**Yes**. In advanced enterprise configurations, platform teams can first partition a physical NVIDIA A100 (80GB) into 7 distinct hardware MIG slices (`1g.10gb`). Then, they can apply **Time-Slicing on top of each individual MIG slice** (e.g. `replicas: 2` per MIG slice), hosting 14 lightweight development sandboxes while maintaining hardware isolation boundaries between teams.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Time-Slicing divides 1 GPU into multiple virtual slots temporally
+- [ ] Know that Time-Slicing works on all NVIDIA GPUs but lacks memory isolation
+- [ ] Know that a single OOM error in Time-Slicing can crash all co-located pods
+- [ ] Know that MIG provides true hardware silicon memory and compute isolation
+- [ ] Know that MPS enables concurrent spatial execution for small inference tasks
+- [ ] Can configure time-slicing replicas in the `nvidia-device-plugin` ConfigMap

@@ -1,0 +1,198 @@
+---
+title: "Chapter 1 — BuildKit Caching: Inline, Registry, S3 & GHA"
+sidebar_position: 1
+module: "Module 10.3 — Caching Mechanisms"
+description: "Master BuildKit distributed caching — comparing Inline, Registry, S3, and GitHub Actions (GHA) cache backends, cache modes (min vs max), and cache invalidation rules."
+---
+
+# Chapter 1 — BuildKit Caching: Inline, Registry, S3 & GHA
+
+> **Goal:** Master the distributed caching architectures, remote storage backends, and cache invalidation rules of **BuildKit** — analyzing **`--cache-to`** and **`--cache-from`**, evaluating **`mode=min` vs `mode=max`**, comparing the 4 primary cache backends (**`inline`**, **`registry`**, **`gha`**, and **`s3`**), and eliminating slow cold-cache builds across ephemeral cloud CI/CD runners.
+>
+> By the end of this chapter, you will understand:
+> 1. How BuildKit decouples build cache storage from the physical build runner
+> 2. The critical difference between `mode=min` (final stage only) and `mode=max` (all intermediate stages)
+> 3. When to deploy `inline`, `registry`, `gha`, or `s3` cache backends
+> 4. How cache invalidation propagates down the LLB directed acyclic graph
+> 5. How to configure multi-tenant GitHub Actions CI pipelines with sub-minute build times
+> 6. How to author production BuildKit cache export and import commands
+
+---
+
+## Real-Life Analogy
+
+Think of BuildKit distributed cache backends as **different ways a traveling master chef access prepared ingredients across different restaurant kitchens**:
+
+- **The Old Local Model (No Distributed Cache):**
+  - The chef arrives at a newly rented kitchen (**An ephemeral CI runner**).
+  - The refrigerator is completely empty (**Zero local cache**).
+  - The chef must spend 4 hours chopping onions, boiling stock, and baking bread from scratch (**Slow 40-minute build**).
+- **1. Inline Cache (`type=inline` - The In-Box Prepared Garnish):**
+  - When the chef serves a plate of food (**The final production image**), they place a tiny plastic container of pre-chopped parsley inside the box (**Cache metadata embedded in the image config**).
+  - Simple, but only holds garnish for the final dish (**`mode=min` only; intermediate stockpot steps are lost**).
+- **2. Registry Cache (`type=registry,mode=max` - The Dedicated Cold Storage Locker):**
+  - The chef rents a private industrial cold-storage unit at the local food warehouse (**A dedicated cache repository in the container registry**).
+  - Every intermediate sauce, broth, and pastry dough from all 10 cooking stages is labeled with a barcode and frozen (**`mode=max`**).
+  - Any kitchen in the city can open the locker and finish cooking in **3 minutes flat**!
+- **3. GitHub Actions Cache (`type=gha` - The Kitchen Conveyor Belt):**
+  - High-speed conveyor belts built directly into the GitHub cloud datacenter (**Direct API cache streaming**).
+
+---
+
+## Architecture Diagram
+
+```text
+               BuildKit Distributed Cache Architecture & Backends
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ EPHEMERAL CI/CD RUNNER (Spins up with 0 MB local disk cache!)          │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 1. Import Cache: `--cache-from type=...`
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ DISTRIBUTED CACHE BACKENDS:                                            │
+ │                                                                        │
+ │ ├── 1. REGISTRY BACKEND: `harbor.io/org/app:buildcache` (mode=max)     │
+ │ │   - Stores full intermediate multi-stage layer tarballs!             │
+ │ │                                                                      │
+ │ ├── 2. GITHUB ACTIONS: `type=gha,scope=my-feature-branch`              │
+ │ │   - Streams layers via GitHub Actions Cache API (High bandwidth)     │
+ │ │                                                                      │
+ │ ├── 3. AWS S3 / MINIO: `type=s3,bucket=my-ci-cache,prefix=buildkit`   │
+ │ │   - Unlimited cloud object storage cache for private enterprise clusters
+ │ │                                                                      │
+ │ └── 4. INLINE BACKEND: Embedded directly inside `my-app:latest`        │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 2. Instant Cache Hit! ⚡ (Builds in 4.2 seconds!)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. Export Cache: `--cache-to type=registry,ref=harbor.io/...:buildcache`│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Cache Modes: `mode=min` vs `mode=max`
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Cache Mode Parameter │ Caching Scope & Multi-Stage Behavior                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`mode=min`**       │ **Default.** Exports cache layers ONLY for the **final target image stage**.│
+ │                      │ Intermediate build stages (e.g. Go compiler, Webpack build) are discarded. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`mode=max`**       │ **Recommended for CI/CD.** Exports cache layers for **ALL intermediate     │
+ │                      │ stages and branches** in the Dockerfile, guaranteeing full cache hits!      │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5-Way BuildKit Cache Backend Comparison Matrix
+
+```text
+ ┌──────────────────────┬───────────────────┬───────────────────┬───────────────────┬───────────────────┬───────────────────┐
+ │ Feature Dimension    │ `inline`          │ `registry`        │ `gha` (GitHub)    │ `s3` (AWS S3)     │ `local` (Host FS) │
+ │──────────────────────┼───────────────────┼───────────────────┼───────────────────┼───────────────────┼───────────────────┤
+ │ **Target Location**  │ Image Config JSON │ Separate Image Tag│ GitHub Cache API  │ S3 Object Bucket  │ Host Local Disk   │
+ │ **`mode=max` Support?**│ ❌ **No (min only)**│ ✅ **YES**      │ ✅ **YES**        │ ✅ **YES**        │ ✅ **YES**        │
+ │ **Storage Limit**    │ None (in image)   │ Infinite (Registry│ 10 GB per repo    │ Infinite (S3)     │ Host disk quota   │
+ │ **Best Use Case**    │ Single-stage apps │ **Enterprise CI** │ GitHub Actions CI │ Self-hosted K8s CI│ Local Developer PC│
+ │ **Network Speed**    │ Registry line-rate│ Registry line-rate│ **Ultra-fast GHA**│ Cloud LAN line-rate│ **Instant (Disk)**│
+ └──────────────────────┴───────────────────┴───────────────────┴───────────────────┴───────────────────┴───────────────────┘
+```
+
+---
+
+## GitHub Actions CI Workflow Example
+
+Using BuildKit's native GitHub Actions cache backend (`type=gha`):
+
+```yaml
+name: Build & Push Image
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
+    - uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build & Push with GHA Caching
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ghcr.io/${{ github.repository }}:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+```
+
+---
+
+## Hands-On Lab: Remote Registry Caching with `mode=max`
+
+```bash
+# Step 1: Build and export full intermediate cache to dedicated registry tag
+# docker buildx build \
+#   --cache-to type=registry,ref=localhost:5000/my-app:buildcache,mode=max \
+#   --cache-from type=registry,ref=localhost:5000/my-app:buildcache \
+#   --tag localhost:5000/my-app:v1.0.0 \
+#   --push .
+
+# Step 2: Simulate a completely clean CI machine with zero local cache
+# docker builder prune -a -f
+
+# Step 3: Re-run the build pulling cache from the remote registry!
+# docker buildx build \
+#   --cache-from type=registry,ref=localhost:5000/my-app:buildcache \
+#   --tag localhost:5000/my-app:v1.0.1 \
+#   --push .
+# Notice: 100% CACHED steps! Build finishes in < 2 seconds!
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the critical difference between `mode=min` and `mode=max` in BuildKit caching?**
+
+- **`mode=min`**: Exports cache layers only for the **final stage of the Dockerfile**. If a multi-stage Dockerfile has a `builder` stage that takes 15 minutes to compile C++/Go code, `mode=min` **discards the builder stage's cache**. Subsequent CI builds will re-compile the builder stage from scratch.
+- **`mode=max`**: Exports cache layers for **every single intermediate stage and build branch** across the entire LLB DAG. Subsequent builds on clean ephemeral CI runners achieve a 100% cache hit across all stages, cutting build times from minutes to seconds.
+
+**Q2: How does the `type=registry` cache backend work, and where is the cache stored?**
+
+The `type=registry` backend pushes the build cache directly to an OCI container registry as a dedicated image tag (e.g. `ref=myregistry.io/app:cache`). The cache layers are stored as standard OCI blobs, and the cache metadata is stored in an OCI Cache Manifest. When another CI runner executes `docker buildx build --cache-from type=registry,ref=...`, BuildKit queries the remote cache manifest over HTTP, pulls only the required cached layers, and skips recompilation.
+
+**Q3: What are the limitations of the `type=inline` cache backend?**
+
+The `type=inline` backend embeds cache metadata directly inside the final container image's configuration JSON. Key limitations: (1) **`mode=max` is Unsupported**: It can only cache the final image stage (`mode=min`), making it ineffective for multi-stage Dockerfiles; (2) **Image Bloat**: Adding cache metadata slightly increases the size of the production image config; (3) **Coupling**: The cache lifecycle is permanently coupled to the production image release tag.
+
+**Q4: How does the GitHub Actions (`type=gha`) cache backend optimize CI build times?**
+
+The `type=gha` backend connects BuildKit directly to GitHub's internal **GitHub Actions Cache Service API**. Instead of uploading cache layers to an external Docker registry over the internet, BuildKit streams compressed layer blobs directly to GitHub's high-speed internal cache infrastructure within the same datacenter. It supports branch-scoped caching (`scope=branch-name`) and fallback to main branch caches (`cache-from=type=gha,scope=main`), providing sub-minute builds in CI workflows.
+
+**Q5: What factors cause cache invalidation in a BuildKit build step?**
+
+BuildKit invalidates a cache vertex and all downstream dependent vertices in the DAG if:
+1. **Command Modification**: Any character change in a `RUN`, `ENV`, or `ENTRYPOINT` directive.
+2. **File Checksum Change**: Any file copied via `COPY` or `ADD` has a modified SHA-256 hash or file permission mode.
+3. **Build Arg Changes**: An `ARG` value used within that step changes.
+4. **Parent Invalidation**: Any upstream parent layer was invalidated, causing all subsequent steps to re-execute.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `--cache-to` and `--cache-from` decouple caches from local runners
+- [ ] Know that `mode=max` caches all intermediate multi-stage layers (Mandatory for CI!)
+- [ ] Know that `type=registry` stores dedicated cache manifests in container registries
+- [ ] Know that `type=gha` streams cache directly to GitHub Actions Cache API
+- [ ] Know that `type=inline` only supports `mode=min` and embeds cache in the image
+- [ ] Can configure high-speed multi-stage caching using `mode=max`

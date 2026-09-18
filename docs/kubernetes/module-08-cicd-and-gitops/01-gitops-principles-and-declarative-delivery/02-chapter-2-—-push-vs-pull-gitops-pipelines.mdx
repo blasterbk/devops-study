@@ -1,0 +1,195 @@
+---
+title: "Chapter 2 — Push vs Pull GitOps Pipelines"
+sidebar_position: 2
+module: "Module 8.1 — GitOps Principles & Delivery"
+description: "Master Push vs Pull GitOps delivery pipelines — security blast radius comparisons, zero-credential in-cluster reconcilers, firewall isolation, and CI vs CD repository separation."
+---
+
+# Chapter 2 — Push vs Pull GitOps Pipelines
+
+> **Goal:** Master the security architecture, operational trade-offs, and design patterns of **Push-Based vs Pull-Based** deployment pipelines in Kubernetes — analyzing why legacy CI push models (Jenkins, GitLab CI, GitHub Actions) introduce critical credential exposure and firewall attack surfaces, dissecting how in-cluster **Pull-Based Reconcilers** (Argo CD, Flux CD) operate behind closed inbound firewalls with zero external cluster admin credentials, and structuring the boundary between **Application Code Repositories** and **GitOps Configuration Repositories**.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural differences between Push-based CI/CD and Pull-based GitOps
+> 2. The critical security vulnerabilities of storing `kubeconfig` admin tokens inside CI systems
+> 3. How in-cluster Pull reconcilers eliminate inbound firewall openings to port 6443
+> 4. Why Push models fail to detect or remediate out-of-band runtime configuration drift
+> 5. How to architect the clean separation between Application Source Repos and GitOps Manifest Repos
+> 6. How CI pipelines securely hand off newly built container image tags to GitOps repositories
+
+---
+
+## Real-Life Analogy
+
+Think of Push vs Pull deployment models as **the difference between giving an external delivery driver a master key to your front door versus having an internal household robotic butler collect packages from the mailbox**:
+
+- **The Push-Based Delivery (The Master Key Vulnerability):** You give the FedEx driver a master physical key and alarm security code to your private home (**Storing Cluster Admin `kubeconfig` inside GitHub Actions / Jenkins**). Every time a package arrives, the external driver unlocks your front door, walks into your living room, and rearranges your furniture (**Direct `kubectl apply` over the internet**). If the FedEx driver's van is robbed (**CI credential breach**), the thief has full master access to unlock every room in your house!
+- **The Pull-Based Delivery (The Internal Robot Butler - GitOps):** You never give keys to external delivery drivers (**Zero external cluster access**). The FedEx driver simply drops the package into a locked mailbox at the end of the driveway (**Pushing a new commit to the Git Repository**).
+- **The Inside Job (In-Cluster Reconciliation):** Your internal household robotic butler (**Argo CD / Flux CD**) opens the front door from the inside, walks to the mailbox, inspects the delivery, verifies the cryptographic signature, and brings the item inside (**Outbound HTTPS polling only; zero inbound firewall ports open!**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Push-Based CI/CD vs Pull-Based GitOps Architecture
+
+ 1. LEGACY PUSH-BASED MODEL (High Security Risk & Open Firewalls!):
+ ┌──────────────────────┐      ┌──────────────────────────────┐      ┌──────────────────────────────┐
+ │ External CI Runner   │      │ Public Internet / Firewall   │      │ Production Kubernetes Cluster│
+ │ (GitHub Actions /    │─────►│ Port 6443 MUST BE OPEN!      │─────►│ Kube-APIServer (Port 6443)   │
+ │ Jenkins Server)      │ WAN  │ (Vulnerable to credential    │      │ Executes: `kubectl apply`    │
+ │ [ Holds Admin Token! ]      │  theft & internet attacks!)  │      │                              │
+ └──────────────────────┘      └──────────────────────────────┘      └──────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ 2. MODERN PULL-BASED GITOPS MODEL (Zero Inbound Ports & Zero External Credentials!):
+ ┌──────────────────────┐      ┌──────────────────────────────┐      ┌──────────────────────────────┐
+ │ Developer / CI Build │      │ GIT REPOSITORY (GitHub/GitLab│      │ Production Kubernetes Cluster│
+ │ Builds Docker Image  │─────►│ Stores Declarative Manifests │      │ (INBOUND FIREWALL: CLOSED!)  │
+ │ Updates image tag in │ Push │ (Versioned & Encrypted)      │      │                              │
+ │ GitOps Repo via PR   │      └──────────────▲───────────────┘      │ ┌──────────────────────────┐ │
+ └──────────────────────┘                     │                      │ │ In-Cluster Reconciler    │ │
+                                              │ Outbound HTTPS (443) │ │ (Argo CD / Flux CD)      │ │
+                                              └──────────────────────┼─┤ Polls Git & Applies to   │ │
+                                                                     │ │ local Kube-APIServer!    │ │
+                                                                     │ └──────────────────────────┘ │
+                                                                     └──────────────────────────────┘
+```
+
+---
+
+## Push vs Pull: The Architectural Comparison Matrix
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Architectural Dimension   │ Push-Based Deployment (CI)      │ Pull-Based GitOps (CD)          │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Execution Location**    │ **Outside the cluster**         │ **Inside the cluster**          │
+ │                           │ (GitHub Actions, Jenkins VM).   │ (Argo CD / Flux controller).    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Cluster Credentials**   │ **Exported externally.** Stored │ **Never leave the cluster.**    │
+ │                           │ as CI secrets (High attack risk)│ Uses in-cluster ServiceAccounts.│
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Firewall Requirements** │ Port 6443 must be reachable     │ **Zero inbound ports.** Outbound│
+ │                           │ from external CI runner networks│ HTTPS (Port 443) to Git only.   │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Drift Management**      │ **Blind to drift.** Only runs on│ **Continuous.** Reconciles and  │
+ │                           │ code commits; misses manual edits│ auto-heals drift every 3 mins.  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Blast Radius**          │ Single CI breach compromises    │ A Git breach cannot directly    │
+ │                           │ entire multi-cluster estate.    │ access cluster shell/runtime.   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The Two-Repository Architecture: App Repo vs GitOps Repo
+
+Enterprise production systems maintain a strict separation between application source code and deployment manifests:
+
+```text
+ ┌──────────────────────────────────────────────────┐      ┌──────────────────────────────────────────────────┐
+ │ 1. APPLICATION SOURCE REPO (`repo: backend-app`) │      │ 2. GITOPS CONFIG REPO (`repo: k8s-gitops-infra`) │
+ ├──────────────────────────────────────────────────┤      ├──────────────────────────────────────────────────┤
+ │ - Java / Go / Node.js source code                │      │ - Kubernetes YAML manifests                      │
+ │ - Unit tests & Integration tests                 │      │ - Kustomize Base & Overlays (dev, staging, prod) │
+ │ - `Dockerfile`                                   │      │ - Helm values files & Chart dependencies         │
+ │ - CI Workflow (`.github/workflows/ci.yaml`):     │      │ - Argo CD / Flux Application CRDs                │
+ │   1. Runs Unit Tests                             │      │ - RBAC, NetworkPolicies, ResourceQuotas          │
+ │   2. Builds & scans container image              │      │                                                  │
+ │   3. Pushes image to Registry (e.g. `api:v2.4.1`)│      │ (In-Cluster GitOps Agent watches THIS repo!)     │
+ │   4. Opens PR on GitOps Repo with new image tag! │      │                                                  │
+ └──────────────────────────────────────────────────┘      └──────────────────────────────────────────────────┘
+```
+
+---
+
+## Secure CI-to-GitOps Handoff Pattern
+
+In GitHub Actions, the CI pipeline never touches the Kubernetes cluster. It updates the image tag in the GitOps repository via a clean Git commit:
+
+```yaml
+# .github/workflows/ci-build.yaml in Application Source Repo
+name: Build and Promote Image
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Build and Push Container Image
+      run: |
+        IMAGE_TAG=${{ github.sha }}
+        docker build -t ghcr.io/company/payment-api:${IMAGE_TAG} .
+        docker push ghcr.io/company/payment-api:${IMAGE_TAG}
+
+    # SECURE HANDOFF: Update GitOps repository via Git Commit (No K8s credentials needed!)
+    - name: Update Image Tag in GitOps Manifest Repo
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITOPS_PROMOTION_TOKEN }}
+        script: |
+          // Uses GitHub API to update kustomization.yaml image tag in GitOps repo!
+          console.log("Promoted image tag to GitOps repository.");
+```
+
+---
+
+## Hands-On Lab: Observing In-Cluster Pull Reconcilers
+
+```bash
+# Step 1: Query in-cluster GitOps controllers
+kubectl get pods -n argocd 2>/dev/null || kubectl get pods -n flux-system 2>/dev/null || echo "GitOps controllers active / simulated"
+
+# Step 2: Verify that API Server has NO inbound connections from external CI runners
+# Active inbound traffic is strictly internal cluster IPs!
+kubectl get endpoints kubernetes -n default
+
+# Step 3: Verify the Git repository source linked to the active GitOps agent
+# kubectl get gitrepositories.source.toolkit.fluxcd.io -A 2>/dev/null || kubectl get applications.argoproj.io -A -o custom-columns=NAME:.metadata.name,REPO:.spec.source.repoURL,BRANCH:.spec.source.targetRevision
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the primary security risks of using a Push-based deployment pipeline for Kubernetes?**
+
+In a push-based deployment model (e.g. Jenkins or GitHub Actions running `kubectl apply`), the CI system requires high-privilege credentials (such as a cluster-admin `kubeconfig` or service account token) with network access to port 6443 on the Kubernetes API server. This creates two critical security flaws: (1) If the CI system is compromised or a developer executes malicious code in a CI build step, the attacker gains direct cluster-admin access to production; and (2) The Kubernetes API server must be exposed to the public internet or complex cross-VPC peering networks.
+
+**Q2: How does the Pull-based GitOps model improve cluster firewall security?**
+
+Pull-based GitOps operators (like Argo CD and Flux) run entirely **inside** the target Kubernetes cluster. The cluster does not accept any inbound traffic from external CI systems; instead, the in-cluster agent initiates **outbound HTTPS connections on standard port 443** to poll the Git repository or receive signed webhooks. The Kubernetes API server can remain completely private, enclosed within a hardened VPC with zero public internet ingress.
+
+**Q3: Why can a Push-based pipeline never provide true Drift Correction?**
+
+A Push-based CI pipeline is **event-driven on code commits**: it executes only when a developer pushes code to Git. Between CI runs (which might be hours or days apart), the CI system has no visibility into the cluster. If a developer manually runs `kubectl delete` or an automated script scales down a deployment, the cluster remains in a degraded, drifted state indefinitely. In contrast, pull-based GitOps controllers run continuous control loops (evaluating every 10–180 seconds), detecting and correcting drift in real time.
+
+**Q4: Why is it best practice to separate Application Source Code from GitOps Configuration in two distinct repositories?**
+
+1. **Avoid CI Infinite Loops**: If app code and manifests are in the same repo, updating an image tag triggers another CI build and test run, creating infinite loops.
+2. **Access Control & RBAC**: Developers who write application code do not necessarily need permission to modify production replica counts, resource quotas, or network policies.
+3. **Clean Audit History**: GitOps configuration repos maintain a clean, readable history consisting purely of release promotions, environment overrides, and configuration changes.
+
+**Q5: How do multi-cluster enterprise environments scale using Pull-based GitOps?**
+
+In multi-cluster environments, each individual Kubernetes cluster (Dev, Staging, Prod-US, Prod-EU) runs its own local lightweight GitOps agent. All agents pull from the central Git repository, watching their respective environment overlay directories. If one cluster is compromised or experiences a network outage, all other clusters continue operating independently with zero shared credentials.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Push models expose admin credentials externally; Pull models keep credentials inside
+- [ ] Know that Pull models require zero inbound firewall openings (outbound HTTPS port 443 only)
+- [ ] Know why Push pipelines fail to detect or self-heal runtime configuration drift
+- [ ] Know the Two-Repo Pattern: Application Source Repo vs GitOps Manifest Repo
+- [ ] Know how CI builds hand off container tags to GitOps repos via PRs or Git commits
+- [ ] Can inspect in-cluster GitOps controllers in `argocd` or `flux-system` namespaces

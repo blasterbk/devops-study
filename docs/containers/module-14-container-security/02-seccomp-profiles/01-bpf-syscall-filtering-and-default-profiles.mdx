@@ -1,0 +1,192 @@
+---
+title: "Chapter 1 — Seccomp: BPF Syscall Sandboxing"
+sidebar_position: 1
+module: "Module 14.2 — Seccomp Profiles"
+description: "Master Linux Seccomp (Secure Computing Mode) — BPF system call filtering, analyzing default container profiles, custom JSON filters, and RuntimeDefault enforcement."
+---
+
+# Chapter 1 — Seccomp: BPF Syscall Sandboxing
+
+> **Goal:** Master the kernel-level system call interception, Berkeley Packet Filter (BPF) execution rules, and security profiles of **Linux Seccomp (Secure Computing Mode)** — analyzing how the Linux kernel evaluates **350+ system calls**, mastering the **5 Seccomp Action Codes (`SCMP_ACT_ALLOW`, `SCMP_ACT_ERRNO`, `SCMP_ACT_LOG`, `SCMP_ACT_KILL`)**, dissecting the **default container seccomp profile**, and enforcing **`RuntimeDefault` in Kubernetes**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why system call filtering is the most powerful defense against kernel zero-day exploits
+> 2. How Seccomp-BPF attaches an in-kernel bytecode filter to a process thread
+> 3. The exact operational differences between the 5 Seccomp Action types
+> 4. Which dangerous system calls (`bpf`, `keyctl`, `reboot`, `kexec_load`) are blocked by default
+> 5. How to write and audit custom JSON Seccomp profiles for specialized microservices
+> 6. How to enforce cluster-wide Seccomp policies using Kubernetes PodSecurityStandards
+
+---
+
+## Real-Life Analogy
+
+Think of Seccomp as **an armed security checkpoint officer at the entrance of a high-security embassy**:
+
+- **No Seccomp (Unrestricted Embassy Access):**
+  - A visitor can walk in and speak any language, make any request, or pull any lever in the building (**Execute all 350+ Linux kernel system calls**).
+  - If the building's electrical circuit has a rare hidden flaw (**A zero-day kernel bug in `keyctl()` or `bpf()`**), the visitor pulls that lever and burns down the building (**Host kernel compromise**)!
+- **Seccomp-BPF (The Strict Protocol Checklist):**
+  - The security officer holds a laminated card listing approved actions (**The Seccomp Profile**).
+  - You can say: *"Hello"* (**`read()`**), *"Here is my passport"* (**`write()`**), and *"Thank you"* (**`exit()`**).
+  - If you try to say: *"Open the missile silo"* (**`kexec_load()` or `reboot()`**), the officer immediately slaps your hand (**`SCMP_ACT_ERRNO`**) or vaporizes you on the spot (**`SCMP_ACT_KILL_PROCESS`**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Seccomp-BPF Kernel System Call Interception Pipeline
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ APPLICATION PROCESS (Inside Container): Makes Syscall `sys_reboot()`   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Triggers CPU Interrupt (0x80 / `syscall`)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX KERNEL ENTRYPOINT: SECCOMP-BPF ENGINE (Ring 0)                   │
+ │                                                                        │
+ │ [ BPF INSTRUCTION BYTECODE EVALUATOR ]                                 │
+ │ ├── Syscall Number: `169 (sys_reboot)` ──► MATCH: Blocked List!        │
+ │ ├── Action Evaluated: `SCMP_ACT_ERRNO` (Return EPERM - Operation Denied│
+ │ │                                                                      │
+ │ └── Other Actions:                                                     │
+ │     ├── `SCMP_ACT_ALLOW`: Executes syscall natively                    │
+ │     ├── `SCMP_ACT_LOG`: Executes syscall but writes audit log to dmesg │
+ │     └── `SCMP_ACT_KILL_PROCESS`: Terminates process immediately!       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Returns Error Code without executing system call!
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ APPLICATION RECEIVES: `EPERM (Operation not permitted)`                │
+ │ 🛡️ HOST KERNEL IS 100% PROTECTED FROM REBOOT EXPLOITS!                 │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 5 Core Seccomp Action Codes
+
+```text
+ ┌──────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+ │ Seccomp Action Code          │ Kernel Behavior on System Call Match                                │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`SCMP_ACT_ALLOW`**         │ Allows the system call to proceed and execute in the kernel.        │
+ │ **`SCMP_ACT_ERRNO`**         │ **Blocks the system call** and returns an error code (e.g. `EPERM`  │
+ │                              │ or `ENOSYS`) to the process **without terminating the application**. │
+ │ **`SCMP_ACT_LOG`**           │ **Allows the call**, but records an audit log to `/var/log/audit/`. │
+ │                              │ Ideal for dry-run testing in staging environments!                  │
+ │ **`SCMP_ACT_TRACE`**         │ Notifies an attached `ptrace` tracer to inspect or emulate the call.│
+ │ **`SCMP_ACT_KILL_PROCESS`**  │ **Instantly terminates the entire process** and dumps core.         │
+ └──────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## What the Default Container Profile Blocks
+
+Container runtimes (Docker, containerd, CRI-O) apply a default Seccomp profile that **blocks approximately 44 out of 350+ Linux syscalls**:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Blocked Syscall      │ Attack Vector Prevented by Default Seccomp Profile                          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`reboot`**         │ Prevents a container from rebooting the physical host node.                 │
+ │ **`kexec_load`**     │ Prevents loading and booting a new Linux kernel in memory.                  │
+ │ **`bpf`**            │ Prevents containers from loading arbitrary eBPF programs into host kernel.  │
+ │ **`keyctl`**         │ Prevents exploiting Linux kernel key management vulnerabilities.            │
+ │ **`userfaultfd`**    │ Blocks user-space page fault handlers frequently used in kernel race-exploits│
+ │ **`acct`**           │ Prevents enabling or disabling BSD process accounting on the host.          │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Enforcing Seccomp in Kubernetes (`RuntimeDefault`)
+
+In Kubernetes 1.25+, the **`RuntimeDefault`** profile is the official production security standard:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened-seccomp-pod
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault            # 🛡️ Enforces containerd/CRI-O default seccomp profile!
+  containers:
+  - name: app
+    image: alpine
+    command: ["sleep", "3600"]
+```
+
+---
+
+## Hands-On Lab: Writing a Custom Seccomp Profile
+
+```bash
+# Step 1: Create a custom JSON Seccomp profile blocking `mkdir`
+cat << 'EOF' > block-mkdir.json
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "names": ["mkdir", "mkdirat"],
+      "action": "SCMP_ACT_ERRNO",
+      "args": []
+    }
+  ]
+}
+EOF
+
+# Step 2: Run a container applying the custom Seccomp profile
+docker run --rm -it --security-opt seccomp=block-mkdir.json alpine sh -c "mkdir /test" 2>/dev/null || echo "Blocked by Seccomp!"
+
+# Output: mkdir: can't create directory '/test': Operation not permitted
+
+# Cleanup
+rm -f block-mkdir.json
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Seccomp (Secure Computing Mode), and how does Seccomp-BPF work in Linux?**
+
+Seccomp is a Linux kernel security feature that restricts the **system calls** a process can issue to the kernel. Traditional seccomp was rigid (allowing only `read`, `write`, `exit`, `sigreturn`). **Seccomp-BPF (Filter Mode)** allows developers to attach a **Berkeley Packet Filter (cBPF) program** to a process. When the process executes any system call, the kernel passes the syscall number and arguments through the BPF filter before execution. The filter evaluates rules and returns an action code (`ALLOW`, `ERRNO`, `KILL`), preventing vulnerable or malicious syscalls from ever touching kernel subsystems.
+
+**Q2: What is the difference between `SCMP_ACT_ERRNO` and `SCMP_ACT_KILL_PROCESS` in a Seccomp profile?**
+
+- **`SCMP_ACT_ERRNO`**: When a blocked syscall is executed, the kernel intercepts the call, cancels execution, and immediately returns a POSIX error code (such as `EPERM` - Operation Not Permitted) to the calling application. The application does not crash and can handle the error gracefully.
+- **`SCMP_ACT_KILL_PROCESS`**: When a blocked syscall is executed, the kernel immediately sends a `SIGSYS` signal and terminates all threads in the process group, logging a fatal security event.
+
+**Q3: Why is enforcing `seccompProfile: { type: RuntimeDefault }` critical in Kubernetes?**
+
+Without an explicit Seccomp profile (or running with `type: Unconfined`), a container process is permitted to issue **all 350+ Linux system calls** directly to the host kernel. Because the vast majority of historical Linux privilege-escalation vulnerabilities (e.g. Dirty COW, Dirty Pipe, BPF verifier exploits) reside in rarely used or complex kernel syscalls, applying `RuntimeDefault` automatically blocks the ~44 most hazardous syscalls, neutralizing entire categories of zero-day exploits before patches are even published.
+
+**Q4: How do you develop and audit a custom Seccomp profile for an unknown microservice?**
+
+1. **Audit Mode with `SCMP_ACT_LOG`**: Create a baseline profile where the default action for unlisted syscalls is `SCMP_ACT_LOG`.
+2. **Run Staging Workloads**: Run the microservice under full integration and load test suites.
+3. **Analyze Audit Logs**: Query `/var/log/audit/audit.log` or `journalctl` for `type=SECCOMP` events to extract every legitimate syscall executed by the application.
+4. **Enforce Deny Rule**: Convert the unlisted default action to `SCMP_ACT_ERRNO` and deploy the whitelist profile to production.
+
+**Q5: What is the relationship between Linux Capabilities and Seccomp?**
+
+Linux Capabilities and Seccomp operate as **complementary defense-in-depth layers**:
+- **Capabilities**: Coarse-grained permission checks governing high-level kernel subsystems (e.g. `CAP_NET_ADMIN` allows network configuration).
+- **Seccomp**: Fine-grained syscall-level filters (e.g. blocking `unshare()`, `bpf()`, or `reboot()` entirely, regardless of capabilities).
+Even if a process runs as root with capabilities, a Seccomp filter can permanently prevent it from executing specific system calls.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Seccomp filters 350+ Linux kernel system calls using BPF bytecode
+- [ ] Know the 5 action types: `ALLOW`, `ERRNO`, `LOG`, `TRACE`, `KILL_PROCESS`
+- [ ] Know that default profiles block ~44 hazardous syscalls (`reboot`, `bpf`, `keyctl`)
+- [ ] Know how `seccompProfile: { type: RuntimeDefault }` hardens Kubernetes pods
+- [ ] Know how to use `SCMP_ACT_LOG` to profile microservice syscalls
+- [ ] Can author custom JSON Seccomp profiles and verify `EPERM` enforcement

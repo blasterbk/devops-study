@@ -1,0 +1,242 @@
+---
+title: "Chapter 2 — LimitRanges & Default Injection"
+sidebar_position: 2
+module: "Module 7.7 — Quotas & LimitRanges"
+description: "Master Kubernetes LimitRanges — default CPU/memory injection, min/max container boundaries, maxLimitRequestRatio overcommit controls, and storage PVC sizing."
+---
+
+# Chapter 2 — LimitRanges & Default Resource Injection
+
+> **Goal:** Master container-level resource constraints and automated default injection in Kubernetes using **`LimitRange`** — understanding how mutating admission controllers automatically inject `defaultRequest` and `defaultLimit` into unconfigured Pod specs, enforcing minimum and maximum resource boundaries (`min`, `max`), controlling overcommit ratios with **`maxLimitRequestRatio`**, and establishing storage sizing guardrails for PersistentVolumeClaims.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural difference: `LimitRange` (Per-Container) vs `ResourceQuota` (Per-Namespace)
+> 2. How the LimitRange admission plugin mutates Pod specs to inject default CPU and memory
+> 3. How `min` and `max` boundaries prevent developers from deploying microscopic or monster pods
+> 4. How `maxLimitRequestRatio` prevents dangerous overcommit ratios and host node instability
+> 5. How LimitRanges enforce minimum and maximum storage capacity for PersistentVolumeClaims
+> 6. How to diagnose and resolve `403 Forbidden: Pod is not valid: LimitRange` rejections
+
+---
+
+## Real-Life Analogy
+
+Think of a `LimitRange` as **the standardized luggage size template and default baggage allowance at an airport check-in counter**:
+
+- **`ResourceQuota` vs `LimitRange` (The Airplane Cargo Hold vs The Passenger Suitcase):**
+  - **`ResourceQuota` (The Total Airplane Cargo Weight):** The airline says: *"The total weight of ALL bags in the entire cargo hold cannot exceed 20,000 lbs (**Namespace Aggregate Sum**)."*
+  - **`LimitRange` (The Individual Suitcase Constraints):** The airline says: *"No individual passenger bag can be larger than 50 lbs (**`max.memory`**) or smaller than 1 lb (**`min.memory`**). If you don't declare a weight on your ticket, we automatically stamp it with the standard 20 lb default (**`defaultRequest` & `defaultLimit`**)."*
+- **Default Injection (The Free Complimentary Standard Carry-On):** If a rookie traveler walks up to the gate with an unlabelled cardboard box (**A Pod with zero resource declarations**), the airline clerk automatically slaps a standard blue tag on it (**`defaultRequest: 100m CPU / 256Mi RAM`**) so it can pass security checks.
+- **`maxLimitRequestRatio` (The Overbook Elasticity Rule):** The airline says: *"You cannot reserve a 5 lb seat and demand the right to expand to 500 lbs on a whim (**Max Limit-to-Request ratio of 3x**)."*
+
+---
+
+## Architecture Diagram
+
+```text
+               LimitRange Mutating & Validating Admission Control Pipeline
+
+ DEVELOPER: Submits a Pod with ZERO resource requests/limits specified
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER: Authenticates & Authorizes Client                      │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ STEP 1: MUTATING ADMISSION PHASE
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `LimitRanger` MUTATING ADMISSION CONTROLLER                            │
+ │ - Detects: `resources.requests` is empty!                              │
+ │ - Action: Injects default values declared in namespace `LimitRange`:   │
+ │   ──► `resources.requests.cpu: 100m`, `memory: 256Mi`                  │
+ │   ──► `resources.limits.cpu: 500m`,   `memory: 512Mi`                  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ STEP 2: VALIDATING ADMISSION PHASE
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `LimitRanger` VALIDATING ADMISSION CONTROLLER                          │
+ │ - Checks Min/Max Constraints: Is `100m >= min(50m)` AND `<= max(2)`?   │
+ │ - Checks Limit-Request Ratio: Is `limit / request <= 3.0`?             │
+ │                                                                        │
+ │ ALL CONSTRAINTS VALIDATED! ──► Pod Spec is Accepted!                   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Passes to ResourceQuota Plugin & Scheduler
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ POD SUCCESSFULLY STORED IN ETCD & SCHEDULED TO WORKER NODE!            │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `LimitRange` vs `ResourceQuota`: Core Architectural Differences
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ `LimitRange`                    │ `ResourceQuota`                 │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Scope of Enforcement**  │ **Per-Container / Per-Pod / PVC**│ **Cumulative Namespace Total**  │
+ │ **Admission Phase**       │ **Mutating AND Validating**     │ **Validating Only**             │
+ │ **Default Injection?**    │ **YES.** Injects default specs  │ **NO.** Rejects unconfigured    │
+ │                           │ if omitted by developer.        │ pods immediately.               │
+ │ **Boundary Controls**     │ Min / Max sizes, Ratio limits.  │ Hard total sum caps.            │
+ │ **Target Types**          │ `Container`, `Pod`, `PVC`       │ `cpu`, `memory`, `storage`, objs│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## LimitRange Configuration Parameters
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Parameter            │ Description & Operational Purpose                                           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`default`**        │ **Default Resource Limit:** Automatically injected into container specs if  │
+ │                      │ `resources.limits` is not specified by the developer.                       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`defaultRequest`** │ **Default Resource Request:** Automatically injected into container specs if│
+ │                      │ `resources.requests` is not specified by the developer.                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`min`**            │ **Minimum Allowed Boundary:** Rejects containers requesting less than this  │
+ │                      │ amount (Prevents starvation / microscopic broken containers).               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`max`**            │ **Maximum Allowed Boundary:** Rejects containers requesting more than this   │
+ │                      │ amount (Prevents monster pods from monopolizing single nodes).              │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`maxLimitRequest-**│ **Maximum Overcommit Ratio:** Sets maximum allowed ratio:                   │
+ │ **Ratio`**           │ $\text{Ratio} = \frac{\text{Limit}}{\text{Request}} \le \text{Threshold}$   │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `LimitRange` Manifest
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: standard-tenant-limits
+  namespace: production
+spec:
+  limits:
+  # 1. Container-Level Compute Constraints & Default Injection
+  - type: Container
+    default:
+      cpu: "500m"                      # Default Limit: 0.5 CPU Cores
+      memory: "512Mi"                  # Default Limit: 512 MiB RAM
+    defaultRequest:
+      cpu: "100m"                      # Default Request: 0.1 CPU Cores
+      memory: "256Mi"                  # Default Request: 256 MiB RAM
+    min:
+      cpu: "50m"                       # Minimum allowed container request
+      memory: "64Mi"
+    max:
+      cpu: "4000m"                     # Maximum allowed container limit (4 Cores)
+      memory: "8Gi"                    # Maximum allowed container limit (8 GiB)
+    maxLimitRequestRatio:
+      cpu: "4"                         # Limit cannot exceed 4x the Request!
+      memory: "2"                      # Memory limit cannot exceed 2x the Request!
+
+  # 2. PersistentVolumeClaim Storage Sizing Constraints
+  - type: PersistentVolumeClaim
+    min:
+      storage: "10Gi"                  # Smallest allowed PVC is 10 GiB
+    max:
+      storage: "500Gi"                 # Largest allowed PVC is 500 GiB
+```
+
+---
+
+## Why `maxLimitRequestRatio` is Critical for Node Stability
+
+If a developer requests `cpu: 100m` and sets `limits.cpu: 10000m` (a **100x overcommit ratio**):
+- The scheduler places 50 of these pods onto a single 8-core worker node based on their low 100m requests ($50 \times 100\text{m} = 5\text{ Cores}$).
+- When traffic bursts, all 50 pods attempt to consume 10 cores each ($50 \times 10 = 500\text{ Cores}$).
+- **The worker node collapses into extreme CPU starvation and kernel load spikes!**
+
+Setting `maxLimitRequestRatio: { cpu: 4, memory: 2 }` forces developers to request realistic capacity, guaranteeing node scheduling stability.
+
+---
+
+## Hands-On Lab: Observing Default Resource Injection
+
+```bash
+# Step 1: Create a test namespace
+kubectl create namespace limit-lab
+
+# Step 2: Apply the LimitRange manifest
+cat <<EOF | kubectl apply -f - -n limit-lab
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: lab-limits
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: "300m"
+      memory: "256Mi"
+    defaultRequest:
+      cpu: "100m"
+      memory: "128Mi"
+    min:
+      cpu: "50m"
+      memory: "64Mi"
+    max:
+      cpu: "2"
+      memory: "2Gi"
+EOF
+
+# Step 3: Deploy a Pod with ZERO resource specifications
+kubectl run bare-pod --image=alpine:latest --command -- sleep 3600 -n limit-lab
+
+# Step 4: Inspect the Pod spec to confirm automatic default injection!
+kubectl get pod bare-pod -n limit-lab -o jsonpath='{.spec.containers[0].resources}'
+# Output shows: {"limits":{"cpu":"300m","memory":"256Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}
+
+# Step 5: Test deploying a Pod exceeding the max boundary (should be REJECTED!)
+kubectl run monster-pod --image=alpine:latest --requests='cpu=4' -n limit-lab 2>&1 || echo "Monster pod successfully blocked!"
+
+# Step 6: Clean up lab
+kubectl delete namespace limit-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between a `LimitRange` and a `ResourceQuota`?**
+
+- **`LimitRange`**: Enforces constraints on **individual objects** (per-container, per-pod, per-PVC). It operates as both a mutating admission controller (injecting default requests/limits) and a validating controller (enforcing min/max boundaries and overcommit ratios).
+- **`ResourceQuota`**: Enforces hard ceilings on the **cumulative aggregate sum** of all resources consumed across the entire namespace (e.g. max 50 total cores or max 10 total load balancers).
+
+**Q2: How does the LimitRange admission controller mutate incoming Pod specifications?**
+
+When a client submits a Pod manifest without declaring `resources.requests` or `resources.limits`, the `LimitRanger` mutating admission webhook intercepts the object before it is stored in `etcd`. It inspects the active `LimitRange` in that namespace and automatically injects the configured `defaultRequest` and `defaultLimit` values into each container's specification, allowing the pod to satisfy downstream `ResourceQuota` validation requirements.
+
+**Q3: What is the purpose of `maxLimitRequestRatio` in a LimitRange?**
+
+`maxLimitRequestRatio` restricts the allowable spread between a container's `resources.limits` and `resources.requests` ($\text{Ratio} = \text{Limit} / \text{Request}$). Without this constraint, developers can set microscopic requests (to easily schedule onto crowded nodes) with enormous limits. When workloads burst, dozens of high-limit containers overwhelm physical host CPU and memory, destabilizing the worker node. Enforcing a ratio (e.g. max 2x or 4x) ensures that burst ceilings remain bounded.
+
+**Q4: How do LimitRanges manage PersistentVolumeClaim (PVC) provisioning?**
+
+LimitRanges support the `type: PersistentVolumeClaim` section, allowing administrators to define `min` and `max` storage capacity constraints (e.g. `min: 10Gi`, `max: 500Gi`). If a developer attempts to create a PVC requesting 1GiB (which cloud CSI storage providers like AWS EBS gp3 cannot provision) or requesting 10TB (which violates cloud budget limits), the API server rejects the PVC creation immediately.
+
+**Q5: What happens if a Pod specifies a resource request that is lower than `min` or higher than `max` in a LimitRange?**
+
+The API server's `LimitRanger` validating admission plugin rejects the Pod creation during the admission review phase with an HTTP `403 Forbidden` error:
+`Error from server (Forbidden): pods "my-pod" is forbidden: minimum cpu usage per Container is 50m, but request is 10m`. The pod is not written to `etcd` and will not be scheduled until the developer updates the spec to fall within the `[min, max]` range.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that LimitRanges enforce constraints per-container, per-pod, and per-PVC
+- [ ] Know how `defaultRequest` and `defaultLimit` automatically inject missing specs
+- [ ] Know how `min` and `max` parameters prevent microscopic or oversized containers
+- [ ] Know how `maxLimitRequestRatio` prevents dangerous host overcommit ratios
+- [ ] Know that LimitRanges can enforce min/max storage sizes on PVC objects
+- [ ] Know that LimitRanges operate during mutating and validating admission phases
+- [ ] Can view active limits using `kubectl describe limitrange <name>`

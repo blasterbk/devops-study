@@ -1,0 +1,1626 @@
+---
+title: "Chapter 3 — Scheduling Cycle"
+sidebar_position: 3
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand the complete Kubernetes Scheduling Cycle from the moment a Pod enters the Scheduling Queue until the Scheduler selects the best Node and ..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 3 — Scheduling Cycle
+
+> **Goal:** Understand the complete Kubernetes Scheduling Cycle from the moment a Pod enters the Scheduling Queue until the Scheduler selects the best Node and hands the Pod to the Binding Cycle. Learn how Queue processing, PreFilter, Filter, Score, Reserve, and Permit work together to make every scheduling decision.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. How the Scheduling Cycle begins: Pod dequeued from ActiveQ
+> 2. PreFilter — pre-processing and cycle-level state initialization
+> 3. Filter — eliminating unsuitable Nodes (runs in parallel)
+> 4. PostFilter / Preemption — fallback when no Node passes Filter
+> 5. PreScore — shared state before scoring
+> 6. Score — ranking feasible Nodes (normalized 0-100 per plugin)
+> 7. Reserve — marking resources as tentatively allocated
+> 8. Permit — final approval gate before binding begins
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Scheduling Cycle like apartment hunting.
+
+```text
+Apartment Hunting Analogy:
+
+You have requirements (budget, location, size) -> Filter
+You see all available apartments -> candidate Nodes
+You eliminate unaffordable or unsuitable ones -> Filter phase
+You rank remaining apartments by preference -> Score phase
+You put a holding deposit on the best one -> Reserve phase
+Landlord does final background check -> Permit phase
+You sign the lease -> Binding cycle begins
+```
+
+| Apartment Hunt | Scheduling Cycle |
+| :--- | :--- |
+| Your requirements | Pod resource requests + affinity rules |
+| All apartments available | All Nodes in the cluster |
+| Eliminating unsuitable ones | Filter plugins |
+| Ranking by preference | Score plugins |
+| Holding deposit | Reserve phase (in-memory resource hold) |
+| Background check / approval | Permit phase |
+| Signing the lease | Binding cycle (writing spec.nodeName) |
+
+> **Important:** If **no Node passes the Filter phase**, the Pod is moved to the **Unschedulable queue** — it is **not deleted**. It remains pending and is retried when cluster state changes (new Node added, resource freed, affinity rules relaxed). The event `FailedScheduling` is emitted.
+
+---
+
+# Prerequisites
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Scheduler Architecture
+- Scheduling Framework
+- Scheduler Cache
+- Scheduling Queue
+- Informers
+- API Server
+- etcd
+
+---
+
+# What is the Scheduling Cycle?
+
+One of the biggest misconceptions is:
+
+> **Scheduling means assigning a Pod to a Node.**
+
+That is only partially correct.
+
+Scheduling is actually divided into **two major phases**:
+
+```text
+Scheduling Cycle
+
+v
+
+Binding Cycle
+```
+
+The Scheduling Cycle **chooses** a Node.
+
+The Binding Cycle **commits** that decision.
+
+---
+
+# Simple Definition
+
+The Scheduling Cycle is:
+
+> **The process of evaluating the cluster and selecting the most appropriate Node for an unscheduled Pod.**
+
+No changes are written to the API Server yet.
+
+It is only a decision-making process.
+
+---
+
+# Scheduling vs Binding
+
+| Scheduling Cycle | Binding Cycle |
+|------------------|---------------|
+| Finds the best Node | Assigns the Pod to that Node |
+| Runs plugins | Calls the API Server |
+| Uses Scheduler Cache | Updates Pod `spec.nodeName` |
+| Makes a decision | Persists the decision |
+| No cluster modification | Cluster state changes |
+
+---
+
+# Why Two Separate Cycles?
+
+Imagine this workflow:
+
+```text
+Find Node
+
+v
+
+Write API
+
+v
+
+Find Node
+
+v
+
+Write API
+```
+
+Every scheduling decision would wait for API operations.
+
+Instead:
+
+```text
+Scheduling
+
+v
+
+Decision
+
+v
+
+Binding
+
+v
+
+API Update
+```
+
+This separation improves:
+
+- Throughput
+- Concurrency
+- Extensibility
+- Failure recovery
+
+---
+
+# High-Level Scheduling Cycle
+
+```text
+Scheduling Queue
+
+v
+
+Get Next Pod
+
+v
+
+Create Snapshot
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Select Best Node
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Trigger Binding Cycle
+```
+
+---
+
+# Complete Scheduler Timeline
+
+```text
+Pod Created
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+Scheduler Queue
+
+v
+
+Scheduling Cycle
+
+v
+
+Best Node Selected
+
+v
+
+Binding Cycle
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+kubelet
+
+v
+
+Running Pod
+```
+
+---
+
+# Step 1 — Pod Enters Scheduling Queue
+
+Suppose a user creates:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+```
+
+API Server stores:
+
+```text
+Pod
+
+v
+
+etcd
+```
+
+The Scheduler receives:
+
+```text
+Watch Event
+```
+
+Immediately.
+
+---
+
+# Queue Processing
+
+The Pod enters:
+
+```text
+Active Queue
+```
+
+Example:
+
+```text
+Head
+
+v
+
+Pod A
+
+v
+
+Pod B
+
+v
+
+Pod C
+```
+
+The Scheduler picks:
+
+```text
+Pod A
+```
+
+---
+
+# Queue → Scheduling Cycle
+
+```text
+Scheduling Queue
+
+v
+
+Pop Pod
+
+v
+
+Start Scheduling Cycle
+```
+
+Everything from this point happens inside one scheduling attempt.
+
+---
+
+# Step 2 — Create Scheduler Snapshot
+
+Before evaluating Nodes,
+
+the Scheduler creates a consistent snapshot.
+
+```text
+Scheduler Cache
+
+v
+
+Snapshot
+
+v
+
+Scheduling Plugins
+```
+
+All plugins see the same cluster state.
+
+---
+
+# Why Snapshot?
+
+Imagine:
+
+During scheduling,
+
+another Pod starts.
+
+Without a snapshot:
+
+```text
+Plugin A
+
+Sees
+
+Old State
+
+Plugin B
+
+Sees
+
+New State
+```
+
+Decision becomes inconsistent.
+
+Snapshots prevent this.
+
+---
+
+# Snapshot Contents
+
+A Scheduler Snapshot typically contains:
+
+```text
+Nodes
+
+Running Pods
+
+Requested Resources
+
+Allocatable Resources
+
+Images
+
+Volumes
+
+Topology Information
+```
+
+This data remains stable during the scheduling cycle.
+
+---
+
+# Step 3 — PreFilter Phase
+
+The first plugin stage is:
+
+```text
+PreFilter
+```
+
+Runs:
+
+```text
+Once
+
+Per Pod
+```
+
+---
+
+# Purpose of PreFilter
+
+PreFilter performs preparation.
+
+Examples:
+
+- Calculate total CPU request
+- Calculate total memory request
+- Parse affinity rules
+- Parse topology constraints
+- Validate scheduling metadata
+
+Instead of repeating work later.
+
+---
+
+# Example
+
+Pod requests:
+
+```yaml
+resources:
+  requests:
+    cpu: 4
+    memory: 8Gi
+```
+
+PreFilter computes:
+
+```text
+CPU Needed
+
+v
+
+4
+
+Memory Needed
+
+v
+
+8Gi
+```
+
+Stored for later phases.
+
+---
+
+# Step 4 — Filter Phase
+
+Now the Scheduler evaluates every candidate Node.
+
+Question:
+
+```text
+Can
+
+This Pod
+
+Run Here?
+```
+
+---
+
+# Filter Execution
+
+Suppose:
+
+```text
+Cluster
+
+v
+
+Node1
+
+Node2
+
+Node3
+
+Node4
+```
+
+Each Filter Plugin runs against every Node.
+
+---
+
+# Example
+
+Node resources:
+
+```text
+Node1
+
+2 CPU
+
+v
+
+Reject
+
+Node2
+
+8 CPU
+
+v
+
+Pass
+
+Node3
+
+4 CPU
+
+v
+
+Pass
+
+Node4
+
+No Disk
+
+v
+
+Reject
+```
+
+Remaining:
+
+```text
+Node2
+
+Node3
+```
+
+---
+
+# Multiple Filter Plugins
+
+Filtering is collaborative.
+
+Example:
+
+```text
+NodeResourcesFit
+
+v
+
+NodeAffinity
+
+v
+
+TaintToleration
+
+v
+
+VolumeBinding
+
+v
+
+PodTopology
+```
+
+Every plugin must agree.
+
+One rejection removes the Node.
+
+---
+
+# Filter Workflow
+
+```text
+Candidate Node
+
+v
+
+Plugin 1
+
+v
+
+Plugin 2
+
+v
+
+Plugin 3
+
+v
+
+Pass?
+
+v
+
+Yes
+
+v
+
+Next Phase
+```
+
+Otherwise:
+
+```text
+Rejected
+```
+
+---
+
+# Parallel Filtering
+
+Large cluster:
+
+```text
+500 Nodes
+```
+
+Scheduler does not evaluate them sequentially.
+
+Instead:
+
+```text
+500 Nodes
+
+v
+
+Parallel Workers
+
+v
+
+Filter Results
+```
+
+Massively improving throughput.
+
+---
+
+# What if Every Node Fails?
+
+Suppose:
+
+```text
+Node1
+
+Reject
+
+Node2
+
+Reject
+
+Node3
+
+Reject
+```
+
+No candidates remain.
+
+Scheduler enters:
+
+```text
+PostFilter
+```
+
+Which may:
+
+- Trigger preemption
+- Retry later
+- Mark the Pod as unschedulable
+
+---
+
+# Step 5 — PreScore Phase
+
+Candidate Nodes now exist.
+
+Example:
+
+```text
+Node2
+
+Node3
+```
+
+Before scoring,
+
+PreScore prepares calculations.
+
+Runs:
+
+```text
+Once
+
+Per Pod
+```
+
+---
+
+# Why PreScore?
+
+Suppose:
+
+Topology spread requires:
+
+```text
+Current Zone Counts
+```
+
+Rather than calculating repeatedly,
+
+PreScore computes it once.
+
+---
+
+# Step 6 — Score Phase
+
+Now Kubernetes answers:
+
+> **Among all valid Nodes, which one is the best?**
+
+Unlike Filter:
+
+```text
+Pass
+
+or
+
+Fail
+```
+
+Score produces:
+
+```text
+Number
+```
+
+---
+
+# Example
+
+Scores:
+
+```text
+Node2
+
+88
+
+Node3
+
+94
+```
+
+Winner:
+
+```text
+Node3
+```
+
+---
+
+# Multiple Score Plugins
+
+Each plugin generates its own score.
+
+Example:
+
+```text
+NodeResourcesBalancedAllocation
+
+80
+
+ImageLocality
+
+100
+
+TopologySpread
+
+70
+
+NodeAffinity
+
+90
+```
+
+Framework combines them.
+
+---
+
+# Score Aggregation
+
+Conceptually:
+
+```text
+Node
+
+v
+
+Plugin Scores
+
+v
+
+Weights Applied
+
+v
+
+Final Score
+
+v
+
+Winner
+```
+
+Highest score wins.
+
+---
+
+# Example Calculation
+
+```text
+Node A
+
+Plugin1
+
+80
+
+Plugin2
+
+90
+
+Plugin3
+
+70
+
+v
+
+Final
+
+240
+```
+
+Node B:
+
+```text
+90
+
+95
+
+85
+
+v
+
+270
+```
+
+Node B wins.
+
+(The actual framework performs normalization and weighting, but this illustrates the concept.)
+
+---
+
+# Step 7 — Select Best Node
+
+After all scores are calculated:
+
+```text
+Highest Score
+
+v
+
+Selected Node
+```
+
+Example:
+
+```text
+Node3
+```
+
+Decision made.
+
+Still:
+
+```text
+Nothing Written
+
+To API Server
+```
+
+---
+
+# Step 8 — Reserve Phase
+
+Now the Scheduler reserves resources.
+
+Purpose:
+
+Prevent another scheduling cycle from selecting the same resources simultaneously.
+
+---
+
+# Why Reserve?
+
+Imagine:
+
+Two Pods.
+
+One Node.
+
+Available:
+
+```text
+4 CPU
+```
+
+Pod A:
+
+```text
+Needs
+
+4 CPU
+```
+
+Pod B:
+
+```text
+Needs
+
+4 CPU
+```
+
+Without reservation:
+
+Both could choose:
+
+```text
+Node1
+```
+
+Race condition.
+
+---
+
+# Reserve Workflow
+
+```text
+Best Node
+
+v
+
+Reserve Resources
+
+v
+
+Continue
+```
+
+Reservation exists only inside the Scheduler until binding succeeds or fails.
+
+---
+
+# Reservation Failure
+
+Suppose:
+
+Reserve Plugin fails.
+
+Scheduler performs:
+
+```text
+Unreserve
+
+v
+
+Retry
+```
+
+Cluster remains consistent.
+
+---
+
+# Step 9 — Permit Phase
+
+Permit is optional.
+
+Purpose:
+
+Allow plugins to:
+
+```text
+Approve
+
+Reject
+
+Wait
+```
+
+---
+
+# Example
+
+Gang Scheduling.
+
+Need:
+
+```text
+8 Pods
+
+Together
+```
+
+Permit waits.
+
+```text
+Pods Ready?
+
+v
+
+No
+
+v
+
+Wait
+```
+
+Later:
+
+```text
+Approve
+```
+
+Scheduling continues.
+
+---
+
+# Permit Outcomes
+
+```text
+Approve
+
+v
+
+Binding
+
+Reject
+
+v
+
+Scheduling Failed
+
+Wait
+
+v
+
+Pause
+```
+
+Only approved Pods continue.
+
+---
+
+# Step 10 — Trigger Binding Cycle
+
+Scheduling is complete.
+
+The Scheduler now has:
+
+```text
+Pod
+
+v
+
+Best Node
+```
+
+Next:
+
+```text
+Trigger
+
+Binding Cycle
+```
+
+This hands control to the next phase.
+
+---
+
+# Scheduling Cycle Ends Here
+
+The Scheduling Cycle finishes after:
+
+```text
+Node Selected
+
+v
+
+Reserved
+
+v
+
+Permitted
+```
+
+The Binding Cycle performs:
+
+```text
+API Server
+
+v
+
+Bind
+
+v
+
+Persist
+```
+
+We'll study that in the next chapter.
+
+---
+
+# Complete Scheduling Workflow
+
+```text
+Pod Created
+
+v
+
+Scheduling Queue
+
+v
+
+Scheduler Snapshot
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+Candidate Nodes
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Winning Node
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Binding Cycle
+```
+
+---
+
+# Internal Scheduler Workflow
+
+```text
+while true
+
+v
+
+Get Next Pod
+
+v
+
+Create Snapshot
+
+v
+
+Run PreFilter
+
+v
+
+Run Filter
+
+v
+
+Any Node Left?
+
+v
+
+No
+
+v
+
+PostFilter
+
+v
+
+Retry
+
+v
+
+Yes
+
+v
+
+Run PreScore
+
+v
+
+Run Score
+
+v
+
+Choose Best Node
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Start Binding Cycle
+
+v
+
+Repeat
+```
+
+---
+
+# Real Production Example
+
+Cluster:
+
+```text
+100 Nodes
+```
+
+Pod:
+
+```yaml
+cpu: 8
+memory: 16Gi
+```
+
+Scheduling proceeds:
+
+```text
+100 Nodes
+
+v
+
+Filter
+
+v
+
+18 Nodes
+
+v
+
+Score
+
+v
+
+Top Node
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+The Scheduler evaluates many Nodes but binds only one.
+
+---
+
+# Why Scheduling Must Be Fast
+
+Imagine:
+
+```text
+5,000 Pods
+
+Created
+
+In One Minute
+```
+
+The Scheduler must:
+
+- Process Pods efficiently
+- Minimize API calls
+- Use cached state
+- Execute filters in parallel
+- Keep scheduling latency low
+
+This is why the Scheduling Cycle is highly optimized.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Informer
+
+v
+
+Scheduling Queue
+
+v
+
+Scheduling Cycle
+
+v
+
+Framework
+
+v
+
+Plugins
+
+v
+
+Selected Node
+
+v
+
+Binding Cycle
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+kubelet
+```
+
+This chapter focuses on the decision-making portion of that flow.
+
+---
+
+# Production Best Practices
+
+✔ Keep Filter plugins lightweight.
+
+✔ Use PreFilter for expensive calculations performed once per Pod.
+
+✔ Avoid unnecessary custom Score plugins.
+
+✔ Monitor scheduling latency.
+
+✔ Monitor queue depth.
+
+✔ Ensure Scheduler Cache remains synchronized.
+
+✔ Use appropriate plugin weights instead of overly complex scoring logic.
+
+✔ Profile scheduling performance in large clusters.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Scheduling immediately updates the Pod.
+
+Wrong.
+
+Scheduling only selects a Node.
+
+Binding updates the Pod.
+
+---
+
+### ❌ Misconception 2
+
+The Scheduler queries the API Server for every Node.
+
+Wrong.
+
+It uses the Scheduler Cache snapshot.
+
+---
+
+### ❌ Misconception 3
+
+Filtering chooses the best Node.
+
+Wrong.
+
+Filtering only eliminates unsuitable Nodes.
+
+Scoring chooses the winner.
+
+---
+
+### ❌ Misconception 4
+
+Reserve permanently allocates resources.
+
+Wrong.
+
+Reserve is temporary until binding succeeds.
+
+---
+
+### ❌ Misconception 5
+
+Permit always executes.
+
+Wrong.
+
+Permit plugins are optional and only run when configured.
+
+---
+
+### ❌ Misconception 6
+
+The Scheduling Cycle modifies cluster state.
+
+Wrong.
+
+Cluster state changes during the Binding Cycle.
+
+---
+
+### ❌ Misconception 7
+
+Plugins see changing cluster state while scheduling.
+
+Wrong.
+
+They evaluate a consistent Scheduler Snapshot.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the Scheduling Cycle?
+
+The Scheduling Cycle is the process of selecting the most appropriate Node for an unscheduled Pod without modifying cluster state.
+
+---
+
+### Q2. Why is the Scheduling Cycle separated from the Binding Cycle?
+
+To improve concurrency, throughput, and fault isolation by separating decision-making from API updates.
+
+---
+
+### Q3. Why does the Scheduler create a snapshot before scheduling?
+
+To ensure every plugin evaluates the same consistent view of the cluster during a scheduling attempt.
+
+---
+
+### Q4. What is the purpose of the Filter phase?
+
+To eliminate Nodes that cannot run the Pod.
+
+---
+
+### Q5. What is the purpose of the Score phase?
+
+To rank all remaining candidate Nodes and select the best one.
+
+---
+
+### Q6. Why does the Reserve phase exist?
+
+To temporarily reserve resources and prevent race conditions before binding.
+
+---
+
+### Q7. What can happen during the Permit phase?
+
+A plugin may approve, reject, or temporarily delay scheduling.
+
+---
+
+### Q8. When does the Scheduling Cycle end?
+
+After a Node has been selected, reserved, permitted (if applicable), and the Binding Cycle has been triggered.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod remains Pending | No Node passed the Filter phase or Permit rejected the scheduling attempt |
+| Slow scheduling | Expensive Filter/Score plugins, large queue, or high cluster load |
+| Unexpected Node selected | Plugin weights, scoring configuration, or Scheduler Profile behavior |
+| Frequent scheduling retries | Resource shortages, affinity conflicts, taints, or transient cluster state |
+| Reservation failures | Reserve plugin errors or resource conflicts during scheduling |
+| High Scheduler CPU usage | Large clusters, expensive scoring algorithms, or inefficient custom plugins |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is the Scheduling Cycle?
+2. Why is it separate from the Binding Cycle?
+3. How does a Pod move from the Scheduling Queue into the Scheduling Cycle?
+4. Why does the Scheduler create a snapshot?
+5. What happens during PreFilter?
+6. What is the purpose of the Filter phase?
+7. How does the Score phase choose the winning Node?
+8. Why is the Reserve phase necessary?
+9. What are the three possible outcomes of the Permit phase?
+10. At what point is the Binding Cycle triggered?
+11. Why are Filter plugins executed in parallel across Nodes?
+12. What happens if no Node passes the Filter phase?
+
+---
+
+# Chapter Summary
+
+In this chapter, you followed a Pod through the complete Scheduling Cycle—from leaving the Scheduling Queue to selecting the best Node.
+
+You learned:
+
+- Why Kubernetes separates scheduling from binding
+- How the Scheduler builds a consistent snapshot of cluster state
+- How Pods are evaluated through the PreFilter, Filter, PreScore, and Score phases
+- How candidate Nodes are filtered and ranked
+- Why the Reserve phase prevents resource races
+- How the optional Permit phase enables advanced scheduling patterns such as gang scheduling
+- When the Scheduling Cycle ends and the Binding Cycle begins
+
+The Scheduling Cycle is the heart of Kubernetes placement logic. Every Pod that does not specify a `spec.nodeName` passes through this pipeline before it can run anywhere in the cluster.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — Binding Cycle**
+
+In the next chapter, we'll study what happens **after** the Scheduler selects a Node.
+
+Topics include:
+
+- What is the Binding Cycle?
+- Pod Binding Object
+- API Server Binding Request
+- Default Binder
+- PreBind Plugins
+- Bind Plugins
+- PostBind Plugins
+- kubelet Integration
+- Binding Failures
+- Retry Logic
+- Production Binding Workflow
+
+You'll learn how Kubernetes transforms a scheduling decision into a persistent assignment that the kubelet can execute.
+```

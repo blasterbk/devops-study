@@ -1,0 +1,1348 @@
+---
+title: "Chapter 9 — Defragmentation"
+sidebar_position: 9
+module: "Module 1.3 — etcd Internals"
+description: "> **Goal:** Understand why etcd databases continue to consume disk space even after compaction, how BoltDB stores data internally using B+ Trees and fixed-size ..."
+---
+
+# Module 1.3 — etcd Internals
+
+# Chapter 9 — Defragmentation
+
+> **Goal:** Understand why etcd databases continue to consume disk space even after compaction, how BoltDB stores data internally using B+ Trees and fixed-size pages, how fragmentation occurs, how online defragmentation reclaims storage, and how defragmentation impacts production performance.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why compaction alone does not reduce etcd's on-disk size
+> 2. BoltDB B+ Tree and fixed-size page internals
+> 3. How free pages accumulate (fragmentation)
+> 4. Online defragmentation: what etcdctl defrag does
+> 5. Space reclamation: how disk usage is reduced after defrag
+> 6. Performance impact: defrag blocks the member being defragmented
+> 7. Production maintenance strategy (rolling defrag, maintenance windows)
+> 8. Monitoring: db_size vs db_size_in_use
+> ```
+
+---
+
+> **Important:** Defragmentation is **blocking** on the member being defragmented. The targeted etcd member is unavailable for reads and writes for the entire duration of the defrag operation. In production, defrag must be run as a **rolling operation** — one member at a time — during a planned maintenance window to avoid quorum loss.
+
+---
+
+# Why Should You Learn Defragmentation?
+
+One of the most common etcd interview questions is:
+
+> **Why is my etcd database still 20 GB after compaction?**
+
+Or,
+
+> **Why didn't compaction reduce disk usage?**
+
+Or,
+
+> **What is the difference between Compaction and Defragmentation?**
+
+The answer is:
+
+```text
+Defragmentation
+```
+
+Compaction removes:
+
+```text
+History
+```
+
+Defragmentation reclaims:
+
+```text
+Disk Space
+```
+
+These are two different operations.
+
+---
+
+# Review: What Compaction Does
+
+In the previous chapter,
+
+Compaction removed:
+
+```text
+Old MVCC Revisions
+```
+
+Example:
+
+Before:
+
+```text
+Revision
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+```
+
+After Compaction:
+
+```text
+7
+
+8
+```
+
+Historical revisions disappeared.
+
+---
+
+# What Compaction Does NOT Do
+
+Many people assume:
+
+```text
+Old Revisions Deleted
+
+v
+
+Database Shrinks
+```
+
+Wrong.
+
+The database file often remains exactly the same size.
+
+Why?
+
+Because:
+
+```text
+BoltDB
+
+Does Not
+
+Immediately Shrink Files
+```
+
+---
+
+# Real-Life Analogy
+
+Imagine a library.
+
+Initially:
+
+```text
+100 Books
+```
+
+You remove:
+
+```text
+70 Books
+```
+
+Now:
+
+```text
+Shelves
+
+Still Exist
+```
+
+The library building did not become smaller.
+
+There are simply:
+
+```text
+Empty Shelves
+```
+
+Compaction removes books.
+
+Defragmentation rebuilds the library.
+
+---
+
+# Understanding Fragmentation
+
+Suppose a database contains:
+
+```text
+Page 1
+
+Page 2
+
+Page 3
+
+Page 4
+
+Page 5
+```
+
+Delete data inside:
+
+```text
+Page 2
+
+Page 4
+```
+
+Now:
+
+```text
+Page1
+
+Empty
+
+Page3
+
+Empty
+
+Page5
+```
+
+The empty pages still occupy disk space.
+
+This is:
+
+```text
+Fragmentation
+```
+
+---
+
+# What is Disk Fragmentation?
+
+Disk fragmentation means:
+
+> **The database file contains unused internal space that is no longer storing active data but is still allocated on disk.**
+
+The file size remains unchanged.
+
+Unused pages remain inside the file.
+
+---
+
+# Internal View
+
+Before:
+
+```text
++---------------------------+
+
+DATA
+
+DATA
+
+DATA
+
+DATA
+
+DATA
+
++---------------------------+
+```
+
+After many deletions:
+
+```text
++---------------------------+
+
+DATA
+
+EMPTY
+
+DATA
+
+EMPTY
+
+DATA
+
++---------------------------+
+```
+
+The file is the same size.
+
+---
+
+# Why Fragmentation Happens
+
+Remember MVCC.
+
+Every update creates:
+
+```text
+New Version
+```
+
+Compaction later removes:
+
+```text
+Old Version
+```
+
+The old pages become:
+
+```text
+Free Pages
+```
+
+But the file itself is not rewritten.
+
+---
+
+# Continuous Lifecycle
+
+```text
+Write
+
+v
+
+Update
+
+v
+
+MVCC History
+
+v
+
+Compaction
+
+v
+
+Free Pages
+
+v
+
+More Writes
+
+v
+
+More Free Pages
+```
+
+Over time,
+
+fragmentation increases.
+
+---
+
+# BoltDB Overview
+
+etcd stores data using:
+
+```text
+BoltDB
+```
+
+BoltDB is an embedded,
+
+memory-mapped,
+
+B+ Tree database.
+
+Internally,
+
+everything is stored in:
+
+```text
+Fixed-Size Pages
+```
+
+---
+
+# BoltDB Architecture
+
+```text
+            BoltDB
+
+               |
+
+       B+ Tree Structure
+
+               |
+
+     Fixed-Size Pages
+
+               |
+
+          Database File
+```
+
+The database file is divided into many pages.
+
+---
+
+# What is a Page?
+
+A page is:
+
+> **The basic storage unit inside BoltDB.**
+
+Think of pages as:
+
+```text
+Storage Blocks
+```
+
+Everything stored in BoltDB eventually occupies one or more pages.
+
+---
+
+# Example
+
+Suppose:
+
+```text
+Database
+
+16 MB
+```
+
+Internally:
+
+```text
+Page
+
+v
+
+Page
+
+v
+
+Page
+
+v
+
+Page
+
+v
+
+...
+
+v
+
+Thousands of Pages
+```
+
+Each page stores part of the database.
+
+---
+
+# B+ Tree Overview
+
+BoltDB organizes pages using a:
+
+```text
+B+ Tree
+```
+
+A B+ Tree is a balanced tree optimized for disk storage.
+
+Unlike a binary tree,
+
+one node can contain many keys.
+
+---
+
+# Simplified B+ Tree
+
+```text
+                 Root
+
+           /      |      \
+
+         /        |        \
+
+     Node      Node      Node
+
+     /  \      /  \      /  \
+
+   Leaf Leaf Leaf Leaf Leaf Leaf
+```
+
+Actual data resides in leaf pages.
+
+Internal nodes guide searches.
+
+---
+
+# Why Use B+ Trees?
+
+Searching:
+
+```text
+Millions
+
+of Keys
+```
+
+requires only a few page reads.
+
+Instead of scanning:
+
+```text
+Entire Database
+```
+
+BoltDB follows:
+
+```text
+Root
+
+v
+
+Internal Node
+
+v
+
+Leaf Page
+```
+
+Very efficient.
+
+---
+
+# Page Types
+
+Conceptually,
+
+BoltDB contains pages such as:
+
+```text
+Meta Pages
+
+Branch Pages
+
+Leaf Pages
+
+Free Pages
+```
+
+Each has a different purpose.
+
+---
+
+# Meta Pages
+
+Contain database metadata.
+
+Example:
+
+```text
+Database Version
+
+Root Location
+
+Transaction Information
+```
+
+Usually,
+
+only a small number exist.
+
+---
+
+# Branch Pages
+
+Contain:
+
+```text
+Tree Navigation
+```
+
+Example:
+
+```text
+Key Range
+
+v
+
+Next Page
+```
+
+They direct searches toward the correct leaf pages.
+
+---
+
+# Leaf Pages
+
+Leaf pages contain:
+
+```text
+Actual Keys
+
+v
+
+Actual Values
+```
+
+Most user data eventually resides here.
+
+---
+
+# Free Pages
+
+When records are removed,
+
+their pages become:
+
+```text
+Free Pages
+```
+
+They remain inside the database file.
+
+Future writes may reuse them,
+
+but until then,
+
+disk usage does not decrease.
+
+---
+
+# Internal Layout
+
+```text
++--------------------------------------+
+
+Meta
+
+Branch
+
+Leaf
+
+Leaf
+
+Free
+
+Leaf
+
+Branch
+
+Free
+
+Leaf
+
++--------------------------------------+
+```
+
+Notice:
+
+Free pages still occupy space.
+
+---
+
+# Fragmentation Example
+
+Suppose:
+
+```text
+1000 Pages
+```
+
+After compaction:
+
+```text
+300 Pages
+
+Become Free
+```
+
+Database file:
+
+```text
+Still
+
+1000 Pages
+```
+
+Actual data:
+
+```text
+700 Pages
+```
+
+Unused:
+
+```text
+300 Pages
+```
+
+---
+
+# Why Free Pages Are Not Removed
+
+Imagine moving furniture.
+
+Removing:
+
+```text
+Chair
+```
+
+does not automatically shrink:
+
+```text
+House
+```
+
+Similarly,
+
+free pages remain allocated.
+
+---
+
+# Space Reuse
+
+Free pages are useful.
+
+Suppose:
+
+New Pod created.
+
+BoltDB may reuse:
+
+```text
+Previously Free Page
+```
+
+Instead of allocating new disk space.
+
+Therefore,
+
+fragmentation is not always harmful.
+
+---
+
+# When Fragmentation Becomes a Problem
+
+Imagine:
+
+```text
+Database File
+
+40 GB
+```
+
+Actual data:
+
+```text
+8 GB
+```
+
+Unused pages:
+
+```text
+32 GB
+```
+
+Large amounts of unused space waste storage and may affect operational efficiency.
+
+---
+
+# Defragmentation
+
+Defragmentation rewrites the database.
+
+Workflow:
+
+```text
+Old Database
+
+v
+
+Read Active Pages
+
+v
+
+Create New Database
+
+v
+
+Copy Live Data
+
+v
+
+Discard Empty Pages
+
+v
+
+Replace Old Database
+```
+
+Unused pages disappear.
+
+---
+
+# Online Defragmentation
+
+Modern etcd supports:
+
+```text
+Online Defrag
+```
+
+Meaning:
+
+The member remains running,
+
+although defragmentation is a resource-intensive maintenance task.
+
+During the operation,
+
+the member rewrites its database to eliminate unused pages.
+
+---
+
+# Online Defrag Workflow
+
+```text
+Running Member
+
+v
+
+Pause Internal Writes Briefly
+
+v
+
+Copy Live Pages
+
+v
+
+Rewrite Database
+
+v
+
+Replace File
+
+v
+
+Resume Normal Operation
+```
+
+The member remains part of the cluster,
+
+but performance may temporarily decrease.
+
+---
+
+# Visual Example
+
+Before:
+
+```text
++----------------------------+
+
+DATA
+
+EMPTY
+
+DATA
+
+EMPTY
+
+DATA
+
+EMPTY
+
++----------------------------+
+```
+
+After Defrag:
+
+```text
++-------------------+
+
+DATA
+
+DATA
+
+DATA
+
++-------------------+
+```
+
+The file becomes physically smaller.
+
+---
+
+# Space Reclamation
+
+This is the primary goal.
+
+Before:
+
+```text
+Database
+
+20 GB
+```
+
+Live data:
+
+```text
+5 GB
+```
+
+After defrag:
+
+```text
+Database
+
+≈5 GB
+```
+
+Only active pages remain.
+
+---
+
+# Difference Between Compaction and Defragmentation
+
+| Compaction | Defragmentation |
+|------------|-----------------|
+| Removes old MVCC history | Reclaims physical disk space |
+| Logical cleanup | Physical storage rewrite |
+| Current data remains | Current data copied into a new compact layout |
+| Does not shrink file | Shrinks database file when possible |
+| Enables watch cleanup | Improves storage efficiency |
+
+---
+
+# Complete Lifecycle
+
+```text
+Write
+
+v
+
+MVCC History
+
+v
+
+Compaction
+
+v
+
+Free Pages
+
+v
+
+Defragmentation
+
+v
+
+Smaller Database
+```
+
+Both operations are needed.
+
+---
+
+# Internal Storage Lifecycle
+
+```text
+Write
+
+v
+
+Leaf Page
+
+v
+
+Update
+
+v
+
+New Leaf Page
+
+v
+
+Old Page Free
+
+v
+
+Compaction
+
+v
+
+Page Unused
+
+v
+
+Defragmentation
+
+v
+
+Page Removed
+```
+
+---
+
+# Performance Effects
+
+Defragmentation is beneficial,
+
+but not free.
+
+During execution:
+
+- Disk I/O increases.
+- CPU usage may rise.
+- Memory activity increases.
+- Request latency may temporarily increase.
+
+For this reason,
+
+production clusters typically schedule defragmentation during maintenance windows or periods of lower activity.
+
+---
+
+# Large Cluster Example
+
+Suppose:
+
+```text
+5-Member Cluster
+```
+
+Recommended approach:
+
+```text
+Defrag
+
+Member 1
+
+v
+
+Wait Healthy
+
+v
+
+Member 2
+
+v
+
+Wait Healthy
+
+v
+
+Member 3
+
+v
+
+...
+
+```
+
+Avoid defragmenting all members simultaneously.
+
+---
+
+# Why Sequential Defragmentation?
+
+Suppose:
+
+Every member pauses heavy storage work simultaneously.
+
+Result:
+
+```text
+Reduced Cluster Performance
+
+v
+
+Possible Timeouts
+
+v
+
+Leader Election Risk
+```
+
+Sequential maintenance minimizes risk.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+RAFT
+
+v
+
+MVCC
+
+v
+
+History
+
+v
+
+Compaction
+
+v
+
+Free Pages
+
+v
+
+BoltDB
+
+v
+
+Defragmentation
+
+v
+
+Space Reclaimed
+```
+
+Compaction creates free pages.
+
+Defragmentation removes them physically.
+
+---
+
+# Production Monitoring
+
+Monitor:
+
+- Database size
+- In-use database size
+- Free space ratio
+- Storage growth
+- Disk latency
+- Defragmentation duration
+
+A growing difference between total database size and active data often indicates fragmentation.
+
+---
+
+# Production Best Practices
+
+✔ Run compaction regularly.
+
+✔ Defragment only after sufficient fragmentation has accumulated.
+
+✔ Defragment members one at a time.
+
+✔ Verify cluster health before beginning maintenance.
+
+✔ Monitor disk I/O during defragmentation.
+
+✔ Keep recent snapshots before major maintenance.
+
+✔ Avoid unnecessary defragmentation if the free space ratio is low.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Compaction frees disk space.
+
+Wrong.
+
+Compaction removes historical MVCC revisions logically.
+
+Defragmentation reclaims physical storage.
+
+---
+
+### ❌ Misconception 2
+
+Free pages disappear automatically.
+
+Wrong.
+
+They remain inside the database file until reused or removed by defragmentation.
+
+---
+
+### ❌ Misconception 3
+
+BoltDB stores data in ordinary files without structure.
+
+Wrong.
+
+BoltDB organizes data using a B+ Tree and fixed-size pages.
+
+---
+
+### ❌ Misconception 4
+
+Defragmentation improves correctness.
+
+Wrong.
+
+Its purpose is storage optimization, not data correctness.
+
+---
+
+### ❌ Misconception 5
+
+Online defragmentation has zero impact.
+
+Wrong.
+
+It can temporarily increase resource usage and latency.
+
+---
+
+### ❌ Misconception 6
+
+You should defragment every day.
+
+Wrong.
+
+Only perform defragmentation when fragmentation justifies the operational cost.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why doesn't compaction reduce database file size?
+
+Because it removes historical MVCC revisions logically but does not rewrite the BoltDB file.
+
+---
+
+### Q2. What is fragmentation?
+
+Unused pages remain allocated inside the database file after data has been removed.
+
+---
+
+### Q3. What is a BoltDB page?
+
+The basic fixed-size storage unit used by BoltDB to store metadata and user data.
+
+---
+
+### Q4. What is a B+ Tree?
+
+A balanced tree structure optimized for disk-based storage, where internal nodes guide searches and leaf nodes store actual data.
+
+---
+
+### Q5. What is online defragmentation?
+
+A process that rewrites the database while the etcd member remains running, reclaiming unused space.
+
+---
+
+### Q6. Why shouldn't all etcd members be defragmented simultaneously?
+
+Because doing so may temporarily reduce cluster performance and increase operational risk.
+
+---
+
+### Q7. What is space reclamation?
+
+The process of physically removing unused pages so the database file becomes smaller.
+
+---
+
+### Q8. What is the difference between free pages and deleted data?
+
+Deleted historical data creates free pages. Those pages remain allocated until reused or removed by defragmentation.
+
+---
+
+### Q9. Is fragmentation always bad?
+
+No.
+
+Free pages can be reused efficiently. Defragmentation is most valuable when a significant amount of disk space is unused.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Database file remains large after compaction | Defragmentation has not been performed |
+| High disk usage despite little active data | Large number of free pages due to fragmentation |
+| Increased latency during defragmentation | Expected temporary resource usage during database rewrite |
+| Frequent storage growth | High write volume combined with delayed maintenance |
+| Database size greatly exceeds in-use size | Significant fragmentation; evaluate whether defragmentation is appropriate |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why doesn't compaction reduce file size?
+2. What is disk fragmentation?
+3. What is a BoltDB page?
+4. Why does BoltDB use a B+ Tree?
+5. What are branch pages?
+6. What are leaf pages?
+7. What are free pages?
+8. How does online defragmentation work?
+9. How does defragmentation reclaim space?
+10. Why shouldn't all etcd members be defragmented simultaneously?
+11. What is the difference between compaction and defragmentation?
+12. When should production clusters perform defragmentation?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned:
+
+- Why compaction alone does not reduce database size
+- How BoltDB organizes data using B+ Trees and fixed-size pages
+- How free pages accumulate after MVCC history is compacted
+- Why fragmentation occurs naturally in long-running clusters
+- How online defragmentation rewrites the database to eliminate unused pages
+- How physical disk space is reclaimed
+- Why defragmentation temporarily affects performance
+- Why production clusters perform sequential, carefully planned maintenance
+
+Defragmentation is the final step in etcd's storage maintenance lifecycle. While compaction cleans the logical history, defragmentation optimizes the physical storage layout, ensuring the database remains compact, efficient, and performant even after years of continuous Kubernetes activity.
+
+---
+
+# Next Chapter
+
+**Chapter 10 — Performance Tuning**
+
+Now that you've learned how etcd stores, versions, compacts, and maintains data, we'll explore how to optimize it for production-scale Kubernetes clusters.
+
+We'll cover:
+
+- Read Performance
+- Write Performance
+- Memory Usage
+- Disk I/O Optimization
+- SSD vs HDD
+- Network Latency
+- Leader Placement
+- Request Batching
+- Database Sizing
+- Production Monitoring
+- Common Performance Bottlenecks
+- Best Practices for Large Kubernetes Clusters
+
+This chapter will connect everything you've learned so far into a complete production performance tuning guide for etcd.
+```

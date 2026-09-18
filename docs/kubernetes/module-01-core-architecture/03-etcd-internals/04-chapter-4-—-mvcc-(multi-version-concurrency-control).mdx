@@ -1,0 +1,1592 @@
+---
+title: "Chapter 4 — MVCC (Multi-Version Concurrency Control)"
+sidebar_position: 4
+module: "Module 1.3 — etcd Internals"
+description: "> **Goal:** Understand how etcd stores multiple versions of every key using MVCC (Multi-Version Concurrency Control). Learn how revisions, versions, historical ..."
+---
+
+# Module 1.3 — etcd Internals
+
+# Chapter 4 — MVCC (Multi-Version Concurrency Control)
+
+> **Goal:** Understand how etcd stores multiple versions of every key using MVCC (Multi-Version Concurrency Control). Learn how revisions, versions, historical reads, optimistic concurrency, transactions, and Compare-And-Swap (CAS) work, and how Kubernetes `resourceVersion` is built on top of etcd revisions.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What MVCC is and why it replaces locking
+> 2. Global Revisions — the etcd cluster-level counter
+> 3. Per-key Versions (version, createRevision, modRevision)
+> 4. Historical reads at a specific revision
+> 5. Optimistic Concurrency Control using Compare-And-Swap
+> 6. Transactions (If/Then/Else)
+> 7. How Kubernetes resourceVersion maps to etcd revision
+> 8. How Watches use revision for ordered event delivery
+> ```
+
+---
+
+# Why Should You Learn MVCC?
+
+One of the most common Kubernetes interview questions is:
+
+> **What is `resourceVersion`?**
+
+Or,
+
+> **How does Kubernetes detect update conflicts?**
+
+Or,
+
+> **How do Watches know where to continue after a disconnect?**
+
+The answer starts with:
+
+```text
+MVCC
+```
+
+Without MVCC:
+
+- Watches would not know what changed.
+- Controllers would overwrite each other's updates.
+- Kubernetes could not detect stale objects.
+- Historical reads would be impossible.
+- Optimistic locking would not exist.
+
+MVCC is one of the most important building blocks inside etcd.
+
+---
+
+# Real-Life Analogy
+
+Think of MVCC like a git repository where every commit is permanent and retrievable.
+
+```text
+Git Repository Analogy:
+
+Every file change creates a new commit (new revision)
+Old commits are never overwritten
+You can checkout any historical commit
+Two developers can read the same file simultaneously without locking
+Merge conflicts detected at commit time (not at read time)
+```
+
+| Git | etcd MVCC |
+| :--- | :--- |
+| Repository | etcd key space |
+| File | etcd key |
+| Commit hash | Global Revision number |
+| File content at commit | Key value at a specific revision |
+| `git log` | MVCC revision history |
+| Merge conflict | Compare-And-Swap failure |
+| `git checkout <commit>` | Historical read at `--rev=<revision>` |
+
+> **Important:** Kubernetes `resourceVersion` is **directly the etcd global revision**, stored as a string. When you read a Pod and see `resourceVersion: "183042"`, that `183042` is the etcd cluster revision at which that Pod was last written. This is why `resourceVersion` is monotonically increasing and cluster-wide.
+
+---
+
+# What is MVCC?
+
+MVCC stands for:
+
+```text
+Multi-Version
+
+Concurrency
+
+Control
+```
+
+Instead of replacing data immediately,
+
+MVCC creates:
+
+```text
+New Version
+
+for
+
+Every Modification
+```
+
+Older versions remain available for a period of time.
+
+---
+
+# Traditional Database
+
+Suppose a key stores:
+
+```text
+replicas = 3
+```
+
+Update:
+
+```text
+replicas = 5
+```
+
+Traditional overwrite:
+
+```text
+Old Value
+
+v
+
+Destroyed
+
+v
+
+New Value
+```
+
+History disappears.
+
+---
+
+# MVCC Database
+
+Instead:
+
+```text
+Version 1
+
+replicas = 3
+
+v
+
+Version 2
+
+replicas = 5
+
+v
+
+Version 3
+
+replicas = 10
+```
+
+Nothing is immediately destroyed.
+
+History exists.
+
+---
+
+# Why Keep Old Versions?
+
+Imagine:
+
+Controller A reads:
+
+```yaml
+replicas: 3
+```
+
+At the same time,
+
+Controller B updates:
+
+```yaml
+replicas: 5
+```
+
+If Controller A later updates using stale data,
+
+Kubernetes must detect the conflict.
+
+MVCC makes this possible.
+
+---
+
+# High-Level Architecture
+
+```text
+Client
+
+v
+
+RAFT
+
+v
+
+Committed Log
+
+v
+
+MVCC Store
+
+v
+
+Backend (BoltDB)
+```
+
+RAFT guarantees:
+
+```text
+Correct Order
+```
+
+MVCC guarantees:
+
+```text
+Version History
+```
+
+---
+
+# Global Revision
+
+The most important concept.
+
+Every successful write increments one global counter.
+
+Example:
+
+```text
+Revision
+
+1
+
+v
+
+2
+
+v
+
+3
+
+v
+
+4
+
+v
+
+5
+```
+
+This is called:
+
+```text
+Global Revision
+```
+
+The revision belongs to the entire database, not a single key.
+
+---
+
+# Example
+
+Suppose:
+
+Create Pod:
+
+```text
+Revision = 1
+```
+
+Create Deployment:
+
+```text
+Revision = 2
+```
+
+Update ConfigMap:
+
+```text
+Revision = 3
+```
+
+Delete Secret:
+
+```text
+Revision = 4
+```
+
+The counter never decreases.
+
+---
+
+# One Global Clock
+
+Think of the revision as:
+
+```text
+Logical Clock
+```
+
+Not:
+
+```text
+Wall Clock
+```
+
+Example:
+
+```text
+Revision
+
+101
+
+v
+
+102
+
+v
+
+103
+```
+
+It represents:
+
+```text
+Order
+
+Not
+
+Time
+```
+
+---
+
+# Key Version
+
+Every individual key also tracks:
+
+```text
+Version
+```
+
+Example:
+
+Key:
+
+```text
+/registry/pods/default/nginx
+```
+
+Updates:
+
+```text
+Created
+
+v
+
+Updated
+
+v
+
+Updated
+
+v
+
+Updated
+```
+
+Version:
+
+```text
+1
+
+v
+
+2
+
+v
+
+3
+
+v
+
+4
+```
+
+This version belongs only to that key.
+
+---
+
+# Difference Between Revision and Version
+
+Example:
+
+```text
+Pod A Created
+
+Revision = 10
+
+Version = 1
+```
+
+Later:
+
+```text
+Deployment Updated
+
+Revision = 11
+```
+
+Pod A:
+
+```text
+Version = 1
+```
+
+No change.
+
+Later:
+
+```text
+Pod Updated
+
+Revision = 12
+
+Version = 2
+```
+
+Revision is global.
+
+Version is per key.
+
+---
+
+# Visual Example
+
+```text
+Global Revision
+
+100
+
+101
+
+102
+
+103
+
+104
+
+-----------------------
+
+Pod Version
+
+1
+
+1
+
+2
+
+2
+
+3
+```
+
+---
+
+# Create Revision
+
+Every key records:
+
+```text
+Create Revision
+```
+
+This never changes.
+
+Example:
+
+```text
+Pod Created
+
+Revision = 25
+```
+
+Later:
+
+```text
+Updated
+
+Revision = 40
+```
+
+Still:
+
+```text
+Create Revision = 25
+```
+
+---
+
+# Modify Revision
+
+Every update changes:
+
+```text
+Mod Revision
+```
+
+Example:
+
+```text
+Created
+
+Revision = 25
+```
+
+v
+
+Update
+
+```text
+Revision = 40
+```
+
+v
+
+Update
+
+```text
+Revision = 52
+```
+
+Current:
+
+```text
+Mod Revision = 52
+```
+
+---
+
+# Example Table
+
+| Revision | Version | Create Revision | Mod Revision |
+|-----------|----------|-----------------|--------------|
+| Create | 1 | 10 | 10 |
+| Update | 2 | 10 | 25 |
+| Update | 3 | 10 | 41 |
+| Update | 4 | 10 | 73 |
+
+Notice:
+
+Create Revision never changes.
+
+---
+
+# Metadata Stored Per Key
+
+Each key maintains metadata similar to:
+
+```text
+Key
+
+Version
+
+Create Revision
+
+Modify Revision
+
+Lease
+
+Value
+```
+
+This metadata enables watches, transactions, leases, and conflict detection.
+
+---
+
+# Historical Reads
+
+One of MVCC's biggest advantages.
+
+Suppose current revision:
+
+```text
+150
+```
+
+Database history:
+
+```text
+Revision 120
+
+v
+
+Revision 130
+
+v
+
+Revision 140
+
+v
+
+Revision 150
+```
+
+You can ask:
+
+```text
+Give me data
+
+At Revision 130
+```
+
+Provided that revision has not yet been compacted.
+
+---
+
+# Why Historical Reads?
+
+Suppose:
+
+Watch disconnects.
+
+Current revision:
+
+```text
+200
+```
+
+Watch last processed:
+
+```text
+180
+```
+
+Instead of:
+
+```text
+Restart Everything
+```
+
+Watch resumes:
+
+```text
+Revision 181
+
+v
+
+182
+
+v
+
+183
+
+v
+
+...
+
+v
+
+200
+```
+
+This is possible because MVCC preserves history until compaction.
+
+---
+
+# MVCC Timeline
+
+```text
+Revision 1
+
+Create Pod
+
+v
+
+Revision 2
+
+Update Pod
+
+v
+
+Revision 3
+
+Scale Deployment
+
+v
+
+Revision 4
+
+Delete Service
+
+v
+
+Revision 5
+
+Create Secret
+```
+
+History forms a complete timeline.
+
+---
+
+# Concurrency Problem
+
+Imagine:
+
+Two controllers.
+
+Both read:
+
+```yaml
+replicas: 3
+```
+
+Controller A:
+
+```text
+Scale To 5
+```
+
+Controller B:
+
+```text
+Scale To 10
+```
+
+Without concurrency control:
+
+Last writer wins.
+
+One update disappears.
+
+---
+
+# Optimistic Concurrency
+
+Instead of locking,
+
+MVCC assumes conflicts are rare.
+
+Workflow:
+
+```text
+Read Object
+
+v
+
+Remember Revision
+
+v
+
+Modify
+
+v
+
+Write
+
+v
+
+Revision Still Same?
+
+v
+
+Yes
+
+v
+
+Success
+
+------------------
+
+No
+
+v
+
+Conflict
+```
+
+This is called:
+
+```text
+Optimistic Concurrency Control
+```
+
+---
+
+# Why "Optimistic"?
+
+Because the system optimistically assumes:
+
+```text
+Nobody Else
+
+Changed
+
+The Object
+```
+
+Most Kubernetes objects are not modified simultaneously.
+
+So this approach is efficient.
+
+---
+
+# Example
+
+Controller A reads:
+
+```text
+Revision 100
+```
+
+Controller B updates.
+
+Current revision:
+
+```text
+101
+```
+
+Controller A attempts update.
+
+Server checks:
+
+```text
+Expected
+
+100
+
+Current
+
+101
+```
+
+Mismatch.
+
+Update rejected.
+
+---
+
+# Conflict Detection
+
+Workflow:
+
+```text
+Client
+
+v
+
+Read Revision
+
+v
+
+Modify
+
+v
+
+Send Update
+
+v
+
+Revision Match?
+
+v
+
+Yes
+
+v
+
+Commit
+
+-----------------
+
+No
+
+v
+
+409 Conflict
+```
+
+The client must:
+
+- Re-read the object
+- Apply its changes again
+- Retry the update
+
+---
+
+# Transactions
+
+MVCC supports atomic transactions.
+
+Multiple operations become:
+
+```text
+One
+
+Atomic
+
+Unit
+```
+
+Either:
+
+```text
+Everything Succeeds
+```
+
+Or:
+
+```text
+Nothing Happens
+```
+
+---
+
+# Transaction Components
+
+An etcd transaction consists of:
+
+```text
+Compare
+
+v
+
+Then
+
+v
+
+Else
+```
+
+Conceptually:
+
+```text
+IF condition
+
+THEN operations
+
+ELSE alternate operations
+```
+
+---
+
+# Transaction Workflow
+
+```text
+Compare Revision
+
+v
+
+Matches?
+
+v
+
+Yes
+
+v
+
+Execute Writes
+
+v
+
+Commit
+
+-------------------
+
+No
+
+v
+
+Execute Failure Path
+```
+
+Everything is atomic.
+
+---
+
+# Compare-And-Swap (CAS)
+
+CAS is one of the most common transaction patterns.
+
+Example:
+
+```text
+IF
+
+Version == 5
+
+THEN
+
+Update Value
+
+ELSE
+
+Reject
+```
+
+No race conditions.
+
+---
+
+# CAS Example
+
+Current:
+
+```text
+Version = 4
+```
+
+Client expects:
+
+```text
+Version = 4
+```
+
+Update succeeds.
+
+Another client:
+
+```text
+Version = 4
+```
+
+But current:
+
+```text
+Version = 5
+```
+
+Update fails.
+
+Conflict detected.
+
+---
+
+# Why CAS Matters
+
+Suppose two controllers try to become leader.
+
+Without CAS:
+
+```text
+Controller A
+
+Leader
+
+------------
+
+Controller B
+
+Leader
+```
+
+With CAS:
+
+Only one successfully updates the shared key.
+
+Leader election becomes safe.
+
+---
+
+# Kubernetes Update Workflow
+
+Suppose:
+
+```bash
+kubectl apply -f deployment.yaml
+```
+
+Workflow:
+
+```text
+API Server
+
+v
+
+Read Object
+
+v
+
+Current Revision
+
+v
+
+Apply Changes
+
+v
+
+Compare Revision
+
+v
+
+Match?
+
+v
+
+Yes
+
+v
+
+Update etcd
+
+v
+
+New Revision
+
+v
+
+Return Success
+```
+
+If another client updated the object first,
+
+the update fails with a conflict.
+
+---
+
+# Relationship with resourceVersion
+
+One of Kubernetes' most important fields:
+
+```yaml
+metadata:
+  resourceVersion: "12345"
+```
+
+Many people think:
+
+```text
+Random Number
+```
+
+Wrong.
+
+It originates from the storage layer and represents the object's version for concurrency and watch semantics. In Kubernetes backed by etcd, it is derived from the underlying MVCC revision information.
+
+---
+
+# Example
+
+Pod:
+
+```yaml
+metadata:
+  resourceVersion: "200"
+```
+
+Update Pod.
+
+Now:
+
+```yaml
+resourceVersion: "201"
+```
+
+Every successful modification results in a newer value.
+
+---
+
+# Why resourceVersion Exists
+
+Suppose:
+
+Client reads:
+
+```yaml
+resourceVersion: 500
+```
+
+Later updates.
+
+API Server checks:
+
+```text
+Current
+
+500?
+
+v
+
+Yes
+
+v
+
+Update
+
+----------------
+
+Current
+
+501?
+
+v
+
+Conflict
+```
+
+Exactly the optimistic concurrency workflow.
+
+---
+
+# Watches and resourceVersion
+
+Watch request:
+
+```text
+Start Watching
+
+Revision 1000
+```
+
+Server sends:
+
+```text
+1001
+
+v
+
+1002
+
+v
+
+1003
+```
+
+If the watch disconnects,
+
+the client resumes from the last observed `resourceVersion` (or an equivalent revision chosen by the API Server), allowing it to continue from where it left off if the history is still available.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Client
+
+v
+
+API Server
+
+v
+
+RAFT
+
+v
+
+Committed Log
+
+v
+
+MVCC
+
+v
+
+Revision++
+
+v
+
+BoltDB
+
+v
+
+Disk
+```
+
+RAFT guarantees agreement.
+
+MVCC guarantees version history.
+
+---
+
+# Internal MVCC Architecture
+
+```text
+                Write
+
+                  |
+
+                  ▼
+
+          Global Revision++
+
+                  |
+
+        ┌─────────┴─────────┐
+
+        ▼                   ▼
+
+  Key Version++      Mod Revision
+
+        |
+
+        ▼
+
+ Historical Versions
+
+        |
+
+        ▼
+
+   BoltDB Storage
+```
+
+---
+
+# Complete Lifecycle
+
+```text
+Create Object
+
+v
+
+Revision 10
+
+Version 1
+
+v
+
+Update
+
+v
+
+Revision 11
+
+Version 2
+
+v
+
+Update
+
+v
+
+Revision 12
+
+Version 3
+
+v
+
+Watch Reads Revision
+
+v
+
+Client Updates
+
+v
+
+Compare Revision
+
+v
+
+Commit
+
+v
+
+Revision 13
+```
+
+---
+
+# Production Benefits
+
+MVCC provides:
+
+✓ Historical reads
+
+✓ Watch support
+
+✓ Conflict detection
+
+✓ Optimistic locking
+
+✓ Safe transactions
+
+✓ CAS operations
+
+✓ Recovery after disconnects
+
+✓ Ordered change history
+
+Without MVCC,
+
+modern Kubernetes would not function as it does today.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+A Revision belongs to one key.
+
+Wrong.
+
+A revision is global across the entire etcd database.
+
+---
+
+### ❌ Misconception 2
+
+Version and Revision are the same.
+
+Wrong.
+
+Revision is global.
+
+Version belongs to a single key.
+
+---
+
+### ❌ Misconception 3
+
+Create Revision changes after updates.
+
+Wrong.
+
+It remains fixed for the lifetime of the key.
+
+---
+
+### ❌ Misconception 4
+
+Historical data is stored forever.
+
+Wrong.
+
+Old revisions are eventually removed during **Compaction**, which we'll study in a later chapter.
+
+---
+
+### ❌ Misconception 5
+
+Optimistic concurrency locks the database.
+
+Wrong.
+
+It avoids locks by detecting conflicts using revisions.
+
+---
+
+### ❌ Misconception 6
+
+`resourceVersion` is simply a timestamp.
+
+Wrong.
+
+It is a version identifier used by Kubernetes for concurrency control and watch semantics. It is not a wall-clock timestamp.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is MVCC?
+
+MVCC (Multi-Version Concurrency Control) allows etcd to maintain multiple versions of data, enabling historical reads, watches, and optimistic concurrency.
+
+---
+
+### Q2. What is a Global Revision?
+
+A monotonically increasing counter that increments for every successful write in the etcd database.
+
+---
+
+### Q3. What is the difference between Revision and Version?
+
+Revision is global to the database.
+
+Version tracks how many times a particular key has been modified.
+
+---
+
+### Q4. What is Create Revision?
+
+The revision at which the key was first created. It never changes.
+
+---
+
+### Q5. What is Modify Revision?
+
+The revision of the most recent successful update to the key.
+
+---
+
+### Q6. Why are historical reads useful?
+
+They allow clients and watches to observe past database states and recover from temporary disconnections without starting over, as long as the required history has not been compacted.
+
+---
+
+### Q7. What is Optimistic Concurrency Control?
+
+A concurrency model where updates succeed only if the object has not changed since it was read.
+
+---
+
+### Q8. What is Compare-And-Swap (CAS)?
+
+A transactional pattern that updates a value only if a specified condition (such as the expected version or revision) still holds.
+
+---
+
+### Q9. How is `resourceVersion` related to MVCC?
+
+Kubernetes uses version information derived from etcd's MVCC storage to implement optimistic concurrency control and watch continuation.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| HTTP 409 Conflict during update | The object was modified after it was read; retry with the latest version |
+| Watch cannot resume | Requested revision has already been compacted |
+| Controller repeatedly conflicts | Multiple controllers updating the same object simultaneously |
+| Stale reads | Client is using an older object revision than the current state |
+| Transaction fails unexpectedly | Compare condition in the transaction evaluated to false |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is MVCC?
+2. Why does etcd keep multiple versions of data?
+3. What is a Global Revision?
+4. What is a Key Version?
+5. What is the difference between Revision and Version?
+6. What is Create Revision?
+7. What is Modify Revision?
+8. Why are historical reads important?
+9. How does optimistic concurrency work?
+10. What is a transaction in etcd?
+11. What is Compare-And-Swap?
+12. How does MVCC enable Kubernetes `resourceVersion`?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned:
+
+- How MVCC stores multiple versions of data
+- The difference between global revisions and per-key versions
+- The roles of Create Revision and Modify Revision
+- How historical reads support watches and recovery
+- How optimistic concurrency prevents lost updates
+- How transactions and Compare-And-Swap provide atomic operations
+- How Kubernetes `resourceVersion` is built on MVCC concepts
+
+MVCC is the bridge between RAFT's ordered log and the higher-level Kubernetes APIs. It enables conflict detection, watch continuation, transactions, and consistent object versioning across the entire cluster.
+
+---
+
+# Next Chapter
+
+**Chapter 5 — etcd Watches**
+
+Now that you understand how every change creates a new revision, we'll explore how clients observe those changes in real time.
+
+We'll cover:
+
+- Watch API
+- Watch Streams
+- Revision-based Watches
+- Progress Notifications
+- Watch Recovery
+- Watch Performance
+- How Kubernetes Informers are built on top of etcd Watches
+
+This chapter explains how etcd continuously streams changes to the Kubernetes API Server and how those changes eventually reach Informers, Controllers, and Reconcilers.
+```

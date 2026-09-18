@@ -1,0 +1,213 @@
+---
+title: "Chapter 1 — Rancher Fleet Management"
+sidebar_position: 1
+module: "Module 9.3 — Fleet Management at Scale"
+description: "Master Rancher Fleet architecture — GitRepo, Bundle, ClusterGroup CRDs, two-tier controller/agent scaling, and delivering GitOps to 10,000+ edge clusters."
+---
+
+# Chapter 1 — Fleet Management Architecture: Rancher Fleet
+
+> **Goal:** Master massive-scale multi-cluster GitOps orchestration using **Rancher Fleet** — understanding how Fleet scales declarative delivery to **10,000+ distributed clusters** where centralized GitOps engines hit API server connection limits, dissecting the two-tier architecture (**`fleet-controller`** in the hub vs **`fleet-agent`** in spoke clusters), managing the CRD hierarchy (**`GitRepo`**, **`Bundle`**, **`BundleDeployment`**, **`ClusterGroup`**), and comparing Fleet against Argo CD ApplicationSets and Flux.
+>
+> By the end of this chapter, you will understand:
+> 1. Why centralized GitOps architectures hit connection bottlenecks when managing 1,000+ clusters
+> 2. The two-tier architecture of `fleet-controller` (Hub) and `fleet-agent` (Edge Spokes)
+> 3. How `GitRepo` compiles raw manifests into distributed `Bundle` Custom Resources
+> 4. How `ClusterGroup` dynamically targets clusters using metadata labels (`region: emea`, `tier: edge`)
+> 5. How Fleet bundles leverage in-cluster Helm engines for local deployment and rollback
+> 6. How to author production `GitRepo` and `ClusterGroup` manifests for massive fleet rollouts
+
+---
+
+## Real-Life Analogy
+
+Think of Rancher Fleet as **a global national courier franchise managing 10,000 local retail shipping branch offices**:
+
+- **The Centralized Bottleneck (The Single Overworked Delivery Van - Argo CD Central):** The central headquarters in Chicago tries to send one delivery driver in a van to physically visit 10,000 retail stores across the country every 3 minutes (**A single central controller holding 10,000 active TLS connections to remote API servers**). The driver gets stuck in traffic, the headquarters network crashes, and remote stores stop receiving deliveries (**Connection Exhaustion**).
+- **The Fleet Franchise Model (The Local Branch Agent - Rancher Fleet):**
+  - **The Central Logistics Hub (`fleet-controller`):** The Chicago headquarters doesn't visit the stores. It compresses the master store manual into a single standardized parcel (**`Bundle` CRD**).
+  - **The Local Store Manager (`fleet-agent`):** Every local retail store has its own full-time on-site manager (**The in-cluster `fleet-agent`**). The local manager checks the central warehouse mailbox once an hour, downloads the parcel, and unpacks the boxes inside their own store (**Local in-cluster deployment**).
+  - **The Dynamic Store Grouping (`ClusterGroup`):** Head office says: *"Send Bundle A to all stores labeled `climate: tropical` and Bundle B to stores labeled `climate: arctic`."*
+
+---
+
+## Architecture Diagram
+
+```text
+               Rancher Fleet: Two-Tier Massive-Scale GitOps Architecture
+
+ MANAGEMENT HUB CLUSTER (Central Management Plane)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. GitRepo: Watches `https://github.com/org/fleet-manifests.git`       │
+ │ 2. FLEET-CONTROLLER: Compiles manifests into deployable `Bundle` CRDs  │
+ │ 3. Dynamically targets `ClusterGroup` (Label: `tier: retail-store`)    │
+ └──────┬───────────────────────────────────────────────────────┬─────────┘
+        │ Outbound Pull over gRPC / HTTPS                       │ Outbound Pull over gRPC / HTTPS
+        ▼                                                       ▼
+ ┌──────────────────────────────────────┐             ┌───────────────────────────────────┐
+ │ EDGE CLUSTER 0001 (Retail Store #1)  │             │ EDGE CLUSTER 9999 (Retail #9999)  │
+ │ ┌──────────────────────────────────┐ │             │ ┌───────────────────────────────┐ │
+ │ │ FLEET-AGENT (Runs In-Cluster)    │ │             │ │ FLEET-AGENT (Runs In-Cluster) │ │
+ │ │ - Pulls assigned `Bundle`        │ │             │ │ - Pulls assigned `Bundle`     │ │
+ │ │ - Applies via internal Helm SDK  │ │             │ │ - Applies via internal Helm   │ │
+ │ │ - Reconciles and reports status! │ │             │ │ - Reconciles & reports status!│ │
+ │ └──────────────────────────────────┘ │             │ └───────────────────────────────┘ │
+ └──────────────────────────────────────┘             └───────────────────────────────────┘
+```
+
+---
+
+## Why Standard GitOps Struggles at Edge Scale
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Scaling Bottleneck   │ Centralized Model (Argo CD) vs Fleet Two-Tier Model                         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. API Server**    │ Centralized controllers hold persistent TCP/mTLS sockets to 5,000+ API      │
+ │ **Connections**      │ servers, exhausting file descriptors and RAM. Fleet uses lightweight agents.│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Unreliable**    │ If an edge store loses WAN connectivity for 3 days, centralized push syncs  │
+ │ **WAN Links**        │ fail and time out. Fleet agents poll asynchronously when link recovers.     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Management**    │ Managing 5,000 individual Application YAML files causes massive Git churn.  │
+ │ **Overhead**         │ Fleet uses a single `GitRepo` with dynamic cluster group label selectors.   │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Rancher Fleet CRD Hierarchy
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Resource Kind        │ Location / Scope        │ Core Responsibility                               │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`GitRepo`**        │ Hub Cluster             │ Tracks Git repository, branch, and target paths.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Bundle`**         │ Hub Cluster             │ The compiled deployable unit (manifests/charts)   │
+ │                      │                         │ generated automatically by `fleet-controller`.    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ClusterGroup`**   │ Hub Cluster             │ Groups target clusters dynamically using labels.  │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Bundle-**         │ Spoke Cluster           │ Represents the active local deployment of a Bundle│
+ │ **Deployment`**      │ (Managed by agent)      │ on an individual target cluster.                  │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `GitRepo` & `ClusterGroup` Manifests
+
+### 1. `ClusterGroup` (Dynamic Fleet Grouping by Labels):
+```yaml
+apiVersion: fleet.cattle.io/v1alpha1
+kind: ClusterGroup
+metadata:
+  name: emea-retail-stores
+  namespace: fleet-default
+spec:
+  selector:
+    matchLabels:
+      region: emea
+      tier: retail-store
+      env: production
+```
+
+---
+
+### 2. `GitRepo` Manifest (Targeting 2,000+ EMEA Retail Stores):
+```yaml
+apiVersion: fleet.cattle.io/v1alpha1
+kind: GitRepo
+metadata:
+  name: point-of-sale-app
+  namespace: fleet-default
+spec:
+  repo: https://github.com/enterprise-org/pos-gitops-manifests.git
+  branch: main
+  paths:
+    - /apps/pos-terminal
+  # 1. Target Fleet Specification
+  targets:
+    - name: emea-stores
+      clusterGroup: emea-retail-stores
+      clusterGroupSelector:
+        matchLabels:
+          region: emea
+  # 2. Phased Rollout Controls (Canary across 2,000 clusters!)
+  rollout:
+    strategy:
+      rollingUpdate:
+        maxUnavailable: 10%            # Upgrades at most 10% of stores at once!
+```
+
+---
+
+## Fleet vs Argo CD vs Flux: Multi-Cluster Comparison
+
+```text
+ ┌───────────────────────────┬───────────────────┬───────────────────┬───────────────────────────────┐
+ │ Dimension                 │ Rancher Fleet     │ Argo CD AppSets   │ Flux CD v2                    │
+ │───────────────────────────┼───────────────────┼───────────────────┼───────────────────────────────┤
+ │ **Target Scale**          │ **10,000+ Edge**  │ 100 – 1,000 Cloud │ 100 – 500 Clusters            │
+ │                           │ clusters.         │ clusters.         │ (Lightweight agents).         │
+ │ **Architecture**          │ **Hub & Spoke**   │ Centralized Push  │ Decentralized Pull            │
+ │                           │ (Agent on Spoke). │ (Central server). │ (Agent per cluster).          │
+ │ **Bandwidth Usage**       │ **Minimal.**      │ Moderate.         │ Moderate (Pulls Git directly).│
+ │                           │ Bundles compressed│ Direct API calls. │                               │
+ │ **UI Experience**         │ Rancher Dashboard │ Native Argo CD UI │ Headless / Weave GitOps       │
+ └───────────────────────────┴───────────────────┴───────────────────┴───────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying Fleet Clusters & Bundles
+
+```bash
+# Step 1: Query all registered Fleet clusters in the management plane
+kubectl get clusters.fleet.cattle.io -A 2>/dev/null || echo "Fleet CRDs active / simulated"
+
+# Step 2: Query active ClusterGroups and cluster counts
+kubectl get clustergroups.fleet.cattle.io -A
+
+# Step 3: Query GitRepo synchronization status across the fleet
+kubectl get gitrepos.fleet.cattle.io -A -o custom-columns=NAME:.metadata.name,READY:.status.readyClusters,DESIRED:.status.desiredReadyClusters
+
+# Step 4: Query generated Bundles and deployment progress
+kubectl get bundles.fleet.cattle.io -A
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why was Rancher Fleet designed as a two-tier architecture rather than a centralized push model?**
+
+Centralized GitOps engines (like centralized Argo CD) run a single controller that connects outbound over the internet/WAN to the Kubernetes API server of every managed cluster. While this works well for 50–200 large cloud clusters, it completely breaks down when managing **10,000+ edge or retail store clusters** (due to socket exhaustion, API server connection limits, and fragile edge WAN networks). Fleet's two-tier architecture runs a lightweight **`fleet-agent` on each edge cluster** that pulls compressed `Bundle` payloads asynchronously, allowing the system to scale to tens of thousands of nodes with minimal hub overhead.
+
+**Q2: What is a `Bundle` in Rancher Fleet, and how is it generated?**
+
+A `Bundle` is Fleet's atomic deployment unit. When the `fleet-controller` on the hub cluster reads a `GitRepo` manifest, it compiles the raw Kubernetes YAML, Kustomize overlays, or Helm charts into an immutable, self-contained `Bundle` Custom Resource. The bundle contains all deployment instructions, helm values, and target matching rules, which are distributed downstream to matching spoke clusters.
+
+**Q3: How does `ClusterGroup` enable dynamic fleet targeting in Fleet?**
+
+Instead of hardcoding hundreds of cluster names into deployment manifests, `ClusterGroup` defines a dynamic query based on **cluster metadata labels** (e.g. `selector: { matchLabels: { region: apac, store_type: flagship } }`). When a new retail store cluster boots up, registers with the hub, and receives these labels, Fleet's controller automatically assigns all matching `Bundles` to the new cluster without requiring any changes to GitOps manifests.
+
+**Q4: How does Fleet execute phased rolling upgrades across a fleet of 5,000 clusters?**
+
+In the `GitRepo` specification under `spec.rollout.strategy.rollingUpdate`, administrators configure **`maxUnavailable`** (e.g. `maxUnavailable: 5%` or `maxUnavailable: 50`). Fleet's controller divides the 5,000 clusters into sequential batches, deploying the new bundle to at most 5% of clusters simultaneously. It verifies that the local `fleet-agent` reports the bundle as `Ready` before advancing to the next batch, preventing broken software updates from taking down the entire global fleet.
+
+**Q5: What happens if an edge cluster loses WAN connectivity to the Fleet hub cluster?**
+
+Because the `fleet-agent` executes entirely within the edge cluster, the edge workloads **continue running completely undisturbed**. If a local pod crashes, the local Kubelet restarts it; if a node dies, the local scheduler reschedules it. When WAN connectivity to the hub cluster is restored, the `fleet-agent` reconnects, reports its local health status, and pulls any new bundles that were published during the blackout.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Rancher Fleet is designed to scale GitOps to 10,000+ edge clusters
+- [ ] Know the two-tier model: `fleet-controller` (Hub) and `fleet-agent` (Spoke)
+- [ ] Know the CRD hierarchy: `GitRepo` $\to$ `Bundle` $\to$ `ClusterGroup` $\to$ `BundleDeployment`
+- [ ] Know how `ClusterGroup` dynamically targets clusters using metadata label selectors
+- [ ] Know how `maxUnavailable` safely executes phased rollouts across massive fleets
+- [ ] Can view fleet cluster status using `kubectl get clusters.fleet.cattle.io -A`

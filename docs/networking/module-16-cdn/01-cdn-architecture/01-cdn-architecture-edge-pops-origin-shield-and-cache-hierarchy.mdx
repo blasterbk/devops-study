@@ -1,0 +1,144 @@
+---
+title: "Chapter 1 — CDN Architecture: Edge POPs, Origin Shielding & Tiered Cache Hierarchies"
+sidebar_position: 1
+module: "Module 16.1 — CDN Architecture"
+description: "Master Content Delivery Network (CDN) architecture — globally distributed Edge Points of Presence (POPs), BGP Anycast routing, Origin Shielding, tiered caching hierarchies, and cache purging."
+---
+
+# Chapter 1 — CDN Architecture: Edge POPs, Origin Shielding & Tiered Cache Hierarchies
+
+> **Goal:** Master the global architecture and caching topology of modern Content Delivery Networks (CDNs: Cloudflare, Fastly, CloudFront, Akamai). Understand how BGP Anycast terminates TCP and TLS connections within 2ms of the end-user, tiered caching hierarchies (L1 Edge $\to$ L2 Regional Core), Origin Shielding to protect centralized backend databases from cache stamps, and cache invalidation mechanics (Purge by URL, Tag, and Prefix).
+>
+> By the end of this chapter, you will understand:
+> 1. The CDN value proposition: Latency reduction, bandwidth cost savings, and origin infrastructure offload (90%+ cache hit ratio)
+> 2. Edge Points of Presence (POPs): BGP Anycast edge routing vs Unicast DNS Geo-routing
+> 3. Tiered Cache Hierarchy: Edge Cache $\to$ Regional Cache $\to$ Origin Shield $\to$ Origin Server
+> 4. Dynamic vs Static caching rules and Cache Key normalization (URI, Query Strings, Headers)
+> 5. Cache Invalidation: Soft Purge vs Hard Purge, Surrogate-Keys / Cache-Tags
+> 6. CLI diagnostic workflows with `curl` to analyze CDN cache headers (`CF-Cache-Status`, `X-Cache`)
+
+---
+
+## Real-Life Analogy
+
+Think of a global CDN as **a worldwide network of local neighborhood convenience store branches for a master central bakery**:
+
+- **Without a CDN (Traveling to Paris for Every Croissant):**
+  - If a customer in Tokyo or Sydney wants a croissant (**Web page / Image**), they must fly across the globe to the central Paris bakery (**Origin Server**). The round-trip flight takes 20 hours (**250ms latency**), and the Paris bakery gets crushed with millions of international tourists (**Server Overload Crash**).
+- **With a CDN (Local Neighborhood Corner Stores):**
+  - The bakery deploys 300 refrigerated corner stores in Tokyo, Sydney, London, and New York (**Edge POPs**).
+  - When the first Tokyo customer orders, the Tokyo store fetches one fresh batch from Paris, stores it in its display case (**Edge Cache**), and serves all subsequent 50,000 Tokyo customers in **5 seconds (2ms latency)**.
+- **Origin Shield (The Regional Central Warehouse):**
+  - A giant Tokyo regional warehouse sits between the local convenience stores and the Paris bakery. If 10 local Tokyo stores all run out of croissants simultaneously, they query the Tokyo Regional Warehouse (**Origin Shield**) instead of hammering the Paris bakery all at once.
+
+---
+
+## Architecture Diagram
+
+```text
+                  Global CDN Tiered Caching & Origin Shielding
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT USERS WORLDWIDE                                                      │
+ │                                                                             │
+ │   [User in Tokyo]                           [User in London]                │
+ └──────────┬──────────────────────────────────────────┬───────────────────────┘
+            │ 2ms Latency (BGP Anycast)                │ 2ms Latency
+            ▼                                          ▼
+ ┌──────────────────────────────────────┐   ┌──────────────────────────────────┐
+ │ TOKYO EDGE POP (L1 Cache)            │   │ LONDON EDGE POP (L1 Cache)       │
+ │ - Terminates TLS 1.3 in 1 RTT        │   │ - Terminates TLS 1.3 in 1 RTT    │
+ │ - Serves 95% of requests (CACHE HIT) │   │ - Serves 95% of requests (HIT)   │
+ └──────────────────┬───────────────────┘   └──────────────────┬───────────────┘
+                    │ (Cache Miss)                             │ (Cache Miss)
+                    ▼                                          ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ REGIONAL ORIGIN SHIELD (L2 Tiered Cache Hub in Frankfurt / Ashburn)         │
+ │ - Collapses duplicate backend requests (Request Coalescing)                 │
+ │ - Shields origin from global cache thundering herds                         │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ Single Uplink Fetch
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ CENTRAL ORIGIN SERVER (Your AWS / GCP Kubernetes Cluster)                   │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The CDN Cache Response Headers
+
+```text
+ ┌──────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ Header Value         │ Operational Meaning & CDN State                                        │
+ │──────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **`HIT`**            │ Asset was served directly from the local Edge POP memory/disk cache.   │
+ │ **`MISS`**           │ Asset was not present in cache; fetched from origin and stored in cache.│
+ │ **`EXPIRED`**        │ Asset was present but TTL expired; revalidated with origin via `ETag`. │
+ │ **`STALE`**          │ Asset TTL expired, but served stale due to `stale-while-revalidate`.   │
+ │ **`BYPASS` / `DYNAMIC`| Request bypassed cache due to cookies/auth or custom rule (e.g. POST).│
+ └──────────────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Request Coalescing (Collapsing Forward Requests)
+
+If 5,000 users simultaneously request a viral video file that is not yet in cache:
+- **Without Request Coalescing:** The Edge POP sends 5,000 duplicate backend requests to the Origin Server, crashing the database.
+- **With Request Coalescing (Origin Shield):** The Edge POP holds 4,999 user requests in a waiting queue and sends **exactly 1 request** to the origin. When the payload returns, the edge broadcasts the single response to all 5,000 waiting users and saves it to cache.
+
+---
+
+## Hands-On Lab: Analyzing CDN Cache Status via cURL
+
+```bash
+# Step 1: Query an asset twice to observe the transition from MISS to HIT
+curl -I https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js | grep -E "(CF-Cache-Status|X-Cache|Age|Cache-Control)"
+
+# Step 2: Query an API endpoint with custom cache-control headers
+curl -I https://httpbin.org/response-headers?Cache-Control=max-age%3D3600
+
+# Step 3: Inspect Anycast edge POP location via Cloudflare trace endpoint
+curl -s https://cloudflare.com/cdn-cgi/trace | grep -E "(colo|loc|tls|sni)"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is an Origin Shield in CDN architecture and why is it necessary?**
+
+An Origin Shield is an intermediate, centralized caching tier (L2 cache) placed between hundreds of globally distributed Edge POPs and your origin datacenter. If 300 global Edge POPs experience a cache miss for a newly published asset simultaneously, all 300 POPs would hammer the origin at once (**Cache Stampede**). With an Origin Shield, all 300 POPs query the Shield; the Shield fetches the asset **exactly once** from the origin and distributes it to the edge POPs, reducing origin traffic by up to $99\%$.
+
+**Q2: What is the difference between Purge by URL, Purge by Prefix, and Purge by Cache-Tag (Surrogate-Key)?**
+
+- **Purge by URL:** Invalidates a single specific URL (e.g. `/images/banner.jpg`). Fast, but requires issuing thousands of API calls for bulk updates.
+- **Purge by Prefix:** Invalidates an entire folder path (e.g. `/assets/v2/*`).
+- **Purge by Cache-Tag / Surrogate-Key (Industry Best Practice):** During origin response, the server adds `Surrogate-Key: product_42 category_shoes`. When product 42 is updated, the server sends a single purge API call for tag `product_42`, instantly invalidating product pages, search result snippets, and recommendation widgets across the entire global CDN in $<150$ milliseconds.
+
+**Q3: How does BGP Anycast enable sub-millisecond CDN routing compared to GeoDNS?**
+
+- **GeoDNS:** Relies on DNS resolvers to estimate client geography and return a regional IP. If the user's recursive resolver is far away (e.g. public DNS resolver in another state), GeoDNS directs the client to the wrong datacenter. Furthermore, DNS TTL caching prevents instant failover during outages.
+- **BGP Anycast:** The exact same IP address is announced from all 300+ global Edge POPs. The global Internet BGP routing fabric automatically forwards packets to the topologically closest physical POP. If a POP goes offline, BGP withdraws the route, triggering instant failover in seconds.
+
+**Q4: What is the "Cache Key" in a CDN and why is Cache Key Normalization important?**
+
+The Cache Key is the unique hash identifier used to store and retrieve an object from memory (Default: `Scheme + Hostname + Path + QueryString`). If users request `/item?color=red&size=L` and `/item?size=L&color=red`, standard CDNs treat them as two different cache keys (wasting cache memory). **Cache Key Normalization** reorders query parameters alphabetically, strips unnecessary tracking cookies (e.g. `utm_source`), and normalizes case to maximize the Cache Hit Ratio.
+
+**Q5: What is the difference between a "Hard Purge" and a "Soft Purge" on modern CDNs (like Fastly or Cloudflare)?**
+
+- **Hard Purge:** Immediately deletes the cached asset from edge memory. The next user request suffers a cache miss and must wait for a full origin round-trip.
+- **Soft Purge (Stale Revalidation):** Marks the asset as expired (stale) in memory rather than deleting it. The CDN immediately serves the stale asset to the next user with zero latency while asynchronously triggering a background fetch to the origin to update the cache.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Edge POPs, Tiered Caching, and Origin Shielding
+- [ ] Understand Cache Status headers (`HIT`, `MISS`, `EXPIRED`, `DYNAMIC`)
+- [ ] Master Request Coalescing to prevent origin cache stampedes
+- [ ] Understand Cache-Tag / Surrogate-Key invalidation
+- [ ] Know how Cache Key Normalization optimizes cache hit ratios

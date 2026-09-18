@@ -1,0 +1,233 @@
+---
+title: "Chapter 2 — etcd Compaction, Defrag & Alarms"
+sidebar_position: 2
+module: "Module 7.2 — etcd Operations"
+description: "Master Kubernetes etcd maintenance — MVCC historical revision compaction, online defragmentation, 8GB quota limits, and the step-by-step NOSPACE alarm emergency runbook."
+---
+
+# Chapter 2 — etcd Compaction, Defragmentation & Alarm Handling
+
+> **Goal:** Master the deep internal database maintenance and emergency recovery procedures for Kubernetes `etcd` — understanding the Multi-Version Concurrency Control (MVCC) architecture, analyzing why deleting objects does not reclaim disk space, executing online **historical compaction** (`etcdctl compact`) and **defragmentation** (`etcdctl defrag`), managing the default 8GB backend storage quota (`--quota-backend-bytes`), and executing the 5-step emergency runbook to clear the cluster-freezing **`NOSPACE` alarm**.
+>
+> By the end of this chapter, you will understand:
+> 1. How etcd's MVCC data model retains historical revisions and tombstone records
+> 2. Why compaction frees internal database pages into a freelist without shrinking on-disk file size
+> 3. How `etcdctl defrag` rewrites the B-tree file to release physical disk space back to the OS
+> 4. Why reaching the 8GB storage quota triggers a `NOSPACE` alarm that locks etcd into read-only mode
+> 5. The exact step-by-step procedure to compact, defrag, and disarm active etcd alarms
+> 6. How to configure automated compaction policies in control-plane static pod manifests
+
+---
+
+## Real-Life Analogy
+
+Think of etcd's storage engine and maintenance as **a physical loose-leaf corporate binder with a strict 500-page limit (The 8GB Quota)**:
+
+- **The Multi-Version Ledger (MVCC Revisions):** Whenever someone edits a page or fires an employee (**Deleting a Pod**), they don't erase the page with rubber. They cross out the name in red ink and insert a brand new page behind it with a higher version number (**Tombstone Record**). Every single historical change remains in the binder.
+- **The Page Shredder (Compaction - `etcdctl compact`):** The manager shreds all outdated crossed-out pages older than last week. However, the binder rings and cardboard cover are still 500 pages wide (**Compaction frees space in memory/freelist, but the on-disk file size does NOT shrink!**).
+- **The Paper Compressor (Defragmentation - `etcdctl defrag`):** The clerk takes all active pages out, stacks them tightly together, slides them into a brand new, thin 50-page binder, and throws away the empty space (**Physical disk space is returned to the OS host!**).
+- **The Red Lock Alarm (`NOSPACE` Alarm):** If the binder reaches 500 pages, a mechanical metal lock snaps shut across the front cover (**`NOSPACE` Alarm Triggered**). You can still read existing pages (**Read-Only Mode**), but the clerk violently slaps your hand if you try to write anything new (**All `POST/PUT/DELETE` API calls fail with `500 Server Error`**).
+- **The Master Key (Disarm Alarm - `etcdctl alarm disarm`):** Once you shred old pages and compress the binder, you must turn the key to unlock the latch (**Disarm**) before the company can resume operations.
+
+---
+
+## Architecture Diagram
+
+```text
+               etcd MVCC Compaction & Defragmentation Lifecycle
+
+ 1. DATABASE EXPANSION (MVCC Revisions):
+ High-churn CI/CD creates/deletes 100,000 Pods ──► DB File grows from 1GB ──► 8GB (QUOTA HIT!)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ BOLTDB FILE ON DISK (8 GiB Storage Limit Tripped!)                     │
+ │ [ Rev 1 (Dead) ] [ Rev 2 (Dead) ] [ Rev 3 (Live) ] [ Rev 4 (Dead) ]    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ etcd triggers alarm: `NOSPACE`!
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CLUSTER IN READ-ONLY LOCKDOWN: (kube-apiserver rejects all writes!)    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+ 2. EMERGENCY REMEDIATION RUNBOOK:  │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 1: COMPACTION (`etcdctl compact 2548901`)                         │
+ │ Purges revisions 1, 2, 4 ──► Frees internal B-tree pages into FREELIST │
+ │ (Note: On-disk file size is STILL 8 GiB!)                              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 2: DEFRAGMENTATION (`etcdctl defrag`)                             │
+ │ Rewrites live pages sequentially ──► DB File shrinks from 8GB ──► 1GB! │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 3: DISARM ALARM (`etcdctl alarm disarm`)                          │
+ │ Removes NOSPACE flag ──► Full cluster write functionality restored!   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Compaction vs Defragmentation: Core Mechanics
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Database Compaction             │ Database Defragmentation        │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Command**               │ `etcdctl compact <revision>`    │ `etcdctl defrag`                │
+ │ **Target Layer**          │ **Logical MVCC Revisions**      │ **Physical On-Disk File System**│
+ │ **File Size Effect**      │ **Does NOT shrink the DB file** │ **Shrinks the physical DB file**│
+ │                           │ on host disk (Adds to freelist).│ and returns storage to Linux OS.│
+ │ **Execution Scope**       │ Cluster-wide (Leader replicates │ **Node-Local** (Must be executed│
+ │                           │ compaction to all followers).   │ on each etcd member one by one).│
+ │ **Cluster Blocking?**     │ Zero impact (Runs in background)│ Takes a brief write-lock on the │
+ │                           │                                 │ local member (~100ms–2s).       │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The 8GB Storage Quota & `NOSPACE` Alarm
+
+etcd enforces a hard backend storage quota to prevent unbounded memory-mapped B-tree fragmentation:
+
+$$\text{Default Storage Quota} = 2\text{ GiB} \quad (\text{Configured up to } 8\text{ GiB max via } \text{--quota-backend-bytes}=8589934592)$$
+
+```text
+ The NOSPACE Panic:
+ When `db_total_size_in_bytes` >= `quota-backend-bytes`:
+ 1. etcd raises the `NOSPACE` alarm.
+ 2. etcd shifts into Maintenance Read-Only Mode.
+ 3. All write requests fail with: `etcdserver: mvcc: database space exceeded`.
+ 4. Kubernetes deployments, pod scheduling, and leader leases FAIL immediately!
+```
+
+---
+
+## The 5-Step Emergency `NOSPACE` Recovery Runbook
+
+When an on-call SRE receives a `NOSPACE` alert, execute this exact runbook:
+
+```bash
+# 1. Identify active alarms across all cluster members
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  alarm list
+
+# 2. Get current latest revision number
+CURRENT_REV=$(ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint status --write-out=json | jq '.[0].Status.header.revision')
+
+echo "Compacting database up to current revision: $CURRENT_REV"
+
+# 3. Compact historical revisions (Releases logical space)
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  compact $CURRENT_REV
+
+# 4. Defragment all etcd endpoints (Releases physical disk space!)
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  defrag
+
+# 5. Disarm the NOSPACE alarm to unlock write operations!
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  alarm disarm
+```
+
+---
+
+## Configuring Automated Compaction & Quota in Static Pods
+
+To prevent `NOSPACE` alarms from ever occurring, configure automated compaction in `/etc/kubernetes/manifests/etcd.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd
+  namespace: kube-system
+spec:
+  containers:
+  - name: etcd
+    image: registry.k8s.io/etcd:3.5.13-0
+    command:
+    - etcd
+    - --auto-compaction-retention=1h   # 1. Automatically compact revisions every 1 hour!
+    - --auto-compaction-mode=periodic  # 2. Periodic hourly compaction mode
+    - --quota-backend-bytes=8589934592 # 3. Set maximum 8 GiB quota ceiling!
+    - --snapshot-count=10000           # 4. Trigger WAL snapshot every 10k transactions
+```
+
+---
+
+## Hands-On Lab: Querying etcd Fragmentation & Health
+
+```bash
+# Step 1: Query etcd endpoint status and calculate fragmentation ratio
+# Fragmentation Ratio = (Total Size - In-Use Size) / Total Size
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint status --write-out=table 2>/dev/null || echo "etcd status active / simulated"
+
+# Step 2: Check for active alarms
+# ETCDCTL_API=3 etcdctl alarm list
+
+# Step 3: Run a test defragmentation on local member
+# ETCDCTL_API=3 etcdctl defrag --endpoints=https://127.0.0.1:2379
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does deleting 50,000 pods or secrets in Kubernetes not reduce the size of the etcd database file on disk?**
+
+`etcd` uses a Multi-Version Concurrency Control (MVCC) data model backed by a BoltDB B-tree storage engine. When an object is deleted, etcd does not erase the bytes or shrink the file; it appends a new **Tombstone Revision** to record the deletion history for API watch streams. Even after historical revisions are purged via `etcdctl compact`, the freed storage pages are simply placed in an internal in-memory **Freelist** for future writes. The physical `.db` file on the Linux host filesystem will **never shrink until `etcdctl defrag` is executed**.
+
+**Q2: What is the operational difference between `etcdctl compact` and `etcdctl defrag`?**
+
+- `etcdctl compact <revision>`: Purges historical MVCC revisions prior to the specified revision number. It is a **cluster-wide logical operation** replicated across all followers by the Raft leader. It does not shrink the physical file size on host disk.
+- `etcdctl defrag`: Rewrites the underlying BoltDB B-tree file sequentially to eliminate fragmented gaps and returns unused disk blocks to the host operating system. It is a **node-local operation** that must be executed sequentially on each etcd member individually.
+
+**Q3: What causes a `NOSPACE` alarm in etcd, and what is its impact on the Kubernetes cluster?**
+
+A `NOSPACE` alarm triggers when the total size of the etcd database file exceeds the configured `--quota-backend-bytes` limit (default 2GB, maximum recommended 8GB). When `NOSPACE` fires, etcd enters a defensive **Read-Only Maintenance Mode**: all write operations (`POST`, `PUT`, `DELETE`, `PATCH`) are rejected with `etcdserver: mvcc: database space exceeded`. The cluster freezes: pods cannot be scheduled, deployments cannot be rolled out, and lease renewals fail.
+
+**Q4: Why must `etcdctl defrag` be executed sequentially one node at a time in an HA cluster?**
+
+During defragmentation, etcd blocks the local BoltDB database engine for hundreds of milliseconds to several seconds while it copies and compacts internal B-tree pages. If an administrator runs `defrag` on all 3 members simultaneously, all nodes will block their event loops, causing Raft heartbeat timeouts, leader election failure, and a total control-plane outage. Defragmentation must always be executed **sequentially** (Node 1 $\to$ wait for health $\to$ Node 2 $\to$ wait for health $\to$ Node 3).
+
+**Q5: What is the difference between `auto-compaction-mode=periodic` and `auto-compaction-mode=revision`?**
+
+- `periodic`: Compacts historical revisions based on a rolling time window (e.g. `--auto-compaction-retention=1h` compacts revisions older than 1 hour). This is the **standard production configuration** for general Kubernetes clusters.
+- `revision`: Compacts historical revisions based on a strict revision count (e.g. `--auto-compaction-retention=10000` keeps only the latest 10,000 revisions), purging older revisions regardless of how much time has passed.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that MVCC stores every update/delete as a new revision
+- [ ] Know that `compact` frees internal pages but DOES NOT shrink disk file size
+- [ ] Know that `defrag` rewrites BoltDB to return physical disk space to the OS
+- [ ] Know that exceeding the 8GB storage quota triggers a cluster-locking `NOSPACE` alarm
+- [ ] Know the 5-step NOSPACE runbook: `alarm list` $\to$ `compact` $\to$ `defrag` $\to$ `alarm disarm` $\to$ verify
+- [ ] Know that `defrag` must be run sequentially member-by-member across HA nodes
+- [ ] Can check database fragmentation using `etcdctl endpoint status -w table`

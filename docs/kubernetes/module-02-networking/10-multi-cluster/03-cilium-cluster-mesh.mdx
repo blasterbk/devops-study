@@ -1,0 +1,282 @@
+---
+title: "Chapter 3 — Cilium Cluster Mesh"
+sidebar_position: 3
+module: "Module 2.10 — Multi-Cluster"
+description: "Deep dive into Cilium Cluster Mesh — native multi-cluster networking using eBPF. Covers the shared etcd model, cross-cluster service discovery with global services, load balancing across clusters, and network policy enforcement across the mesh."
+---
+
+# Chapter 3 — Cilium Cluster Mesh
+
+> **Goal:** Understand Cilium Cluster Mesh as a native, eBPF-powered multi-cluster solution — how it uses a shared kvstore to synchronize cluster state, how global services enable cross-cluster load balancing, and how network policies enforce security across the mesh.
+>
+> By the end of this chapter, you will understand:
+> 1. What Cilium Cluster Mesh is and how it differs from gateway-based solutions
+> 2. The shared kvstore (etcd) model for cluster state synchronization
+> 3. Global Services — cross-cluster load balancing with a single service name
+> 4. Clustermesh-aware network policies
+> 5. How to set up and verify a Cilium Cluster Mesh
+> 6. Cilium Cluster Mesh vs Submariner — when to use which
+
+---
+
+## Real-Life Analogy
+
+Submariner builds **highways (tunnels) between cities** and each city has its own phone book.
+
+Cilium Cluster Mesh is like a **unified metropolitan transit system and shared phone book**: all cities (clusters) contribute their directory entries to a shared database. Any city resident (Pod) can look up anyone in the metro area by name and the transit system (eBPF datapath) routes them directly — no dedicated highway per city pair, just the existing metro network.
+
+The key difference: Cilium Cluster Mesh doesn't add new tunnels — it shares identity and policy information across clusters and uses the existing network for pod-to-pod routing, with eBPF providing efficient lookup.
+
+---
+
+## Architecture Diagram
+
+```text
+              Cilium Cluster Mesh Architecture
+
+  Cluster A (10.0.0.0/16)         Cluster B (10.1.0.0/16)
+  ┌──────────────────────────┐    ┌──────────────────────────┐
+  │  Cilium Agent            │    │  Cilium Agent            │
+  │  (eBPF on every node)    │    │  (eBPF on every node)    │
+  │  ┌────────────────────┐  │    │  ┌────────────────────┐  │
+  │  │ Local etcd (kvstore)│  │    │  │ Local etcd (kvstore)│  │
+  │  │ Cluster A state    │◀─┼────┼─▶│ Cluster B state    │  │
+  │  └────────────────────┘  │    │  └────────────────────┘  │
+  │                          │    │                          │
+  │  Global Service:         │    │  Global Service:         │
+  │  api-svc → [10.0.1.5,   │    │  api-svc → [10.0.1.5,   │
+  │             10.1.2.3]   │    │             10.1.2.3]   │
+  └──────────────────────────┘    └──────────────────────────┘
+         Direct Pod-to-Pod routing (no tunnel overhead)
+```
+
+---
+
+## Prerequisites: Non-Overlapping CIDRs
+
+```bash
+# Cilium Cluster Mesh REQUIRES non-overlapping Pod CIDRs
+# Plan before cluster creation:
+# Cluster A: --pod-cidr 10.0.0.0/16   --cluster-id 1
+# Cluster B: --pod-cidr 10.1.0.0/16   --cluster-id 2
+# Cluster C: --pod-cidr 10.2.0.0/16   --cluster-id 3
+
+# Each cluster also needs a unique cluster ID (1-255):
+helm install cilium cilium/cilium \
+  --set cluster.id=1 \
+  --set cluster.name=cluster-a \
+  --set ipam.mode=cluster-pool \
+  --set ipam.operator.clusterPoolIPv4PodCIDRList="10.0.0.0/16"
+```
+
+---
+
+## Setting Up Cluster Mesh
+
+```bash
+# Install cilium CLI
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+curl -L https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz | tar xz
+
+# Enable cluster mesh on each cluster
+cilium clustermesh enable --context cluster-a \
+  --service-type LoadBalancer
+
+cilium clustermesh enable --context cluster-b \
+  --service-type LoadBalancer
+
+# Connect the clusters
+cilium clustermesh connect \
+  --context cluster-a \
+  --destination-context cluster-b
+
+# Verify mesh is operational
+cilium clustermesh status --context cluster-a
+# ClusterMesh: OK
+# Clusters:
+#   cluster-b: OK (2 nodes, 15 endpoints)
+
+# Run connectivity tests
+cilium connectivity test \
+  --context cluster-a \
+  --multi-cluster cluster-b
+```
+
+---
+
+## Global Services: Cross-Cluster Load Balancing
+
+The key feature of Cluster Mesh — a single service name load-balances across both clusters:
+
+```yaml
+# In Cluster A: annotate service as global
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+  annotations:
+    service.cilium.io/global: "true"    # Make this service global
+    # Optional: share only (don't load-balance locally — forward to remote cluster)
+    # service.cilium.io/shared: "true"
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 8080
+    targetPort: 8080
+```
+
+```yaml
+# In Cluster B: same service with same annotation
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+  annotations:
+    service.cilium.io/global: "true"
+spec:
+  selector:
+    app: api
+  ports:
+  - port: 8080
+```
+
+```text
+Result:
+  A Pod in Cluster A calls "api-service"
+  Cilium's eBPF datapath sees this is a global service
+  It has endpoints from BOTH clusters: [10.0.1.5, 10.0.1.6, 10.1.2.3, 10.1.2.4]
+  Load balances across all 4 endpoints
+  If a cluster is unreachable: eBPF fails over to the other cluster's endpoints
+
+Topology-aware routing:
+  Prefer local cluster (lower latency), fall back to remote if unavailable
+  annotation: service.cilium.io/affinity: local  ← prefer local endpoints
+```
+
+---
+
+## Cluster Mesh Network Policy
+
+```yaml
+# Block cross-cluster access for sensitive services
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: restrict-db-to-local-cluster
+  namespace: database
+spec:
+  endpointSelector:
+    matchLabels:
+      app: postgres
+  ingressDeny:
+  - fromEndpoints:
+    - matchLabels:
+        # Block Pods from other clusters (cluster-b label auto-applied)
+        io.cilium.k8s.policy.cluster: cluster-b
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: api
+        io.cilium.k8s.policy.cluster: cluster-a   # Only cluster-a api Pods
+    toPorts:
+    - ports:
+      - port: "5432"
+        protocol: TCP
+```
+
+Cilium automatically labels all endpoints with their source cluster (`io.cilium.k8s.policy.cluster`), enabling fine-grained cross-cluster network policies.
+
+---
+
+## Cluster Mesh vs Submariner
+
+| Feature | Cilium Cluster Mesh | Submariner |
+|---------|--------------------|-----------:|
+| **CNI requirement** | Cilium only | Any CNI |
+| **Networking model** | Native eBPF (no tunnels) | IPsec/WireGuard tunnels |
+| **CIDR overlap** | Not supported | Supported (with NAT) |
+| **Setup complexity** | Simple CLI (`cilium clustermesh connect`) | More complex (broker + gateways) |
+| **Cross-cluster LB** | Native (global services) | Via ServiceImport (MCS) |
+| **Network policy** | Cluster-aware CiliumNetworkPolicy | Via Submariner + separate policy tool |
+| **Encryption** | Via Cilium encryption (WireGuard/IPsec at CNI level) | Built-in IPsec/WireGuard tunnel |
+| **Observability** | Full Hubble across mesh | Limited |
+| **When to use** | All clusters already use Cilium | Mixed CNI environments |
+
+---
+
+## Hands-On: Verifying Cluster Mesh
+
+```bash
+# 1. Check mesh status
+cilium clustermesh status
+
+# 2. Verify endpoints are shared across clusters
+kubectl exec -n kube-system cilium-<id> -- \
+  cilium endpoint list | grep "cluster-b"
+
+# 3. Test cross-cluster connectivity
+kubectl run test -n production --image=curlimages/curl \
+  --rm -it --restart=Never -- \
+  curl http://api-service.production.svc.cluster.local:8080
+# Should hit endpoints from BOTH clusters
+
+# 4. Verify global service load balancing
+kubectl exec -n kube-system cilium-<id> -- \
+  cilium service list | grep api-service
+# Should show endpoints from both clusters
+
+# 5. Check cross-cluster endpoint learning
+kubectl exec -n kube-system cilium-<id> -- \
+  cilium k8s endpoints list | grep "remote-cluster"
+
+# 6. Test affinity (prefer local cluster)
+kubectl annotate service api-service \
+  service.cilium.io/affinity=local -n production
+
+# 7. Hubble cross-cluster observability
+hubble observe --cluster cluster-a \
+  --namespace production --follow
+# Shows flows including cross-cluster (annotated with source cluster)
+
+# 8. Monitor mesh health
+cilium clustermesh status --wait
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Cilium Cluster Mesh differ from overlay/tunnel-based approaches like Submariner?**
+
+Cilium Cluster Mesh shares cluster state (endpoint identities and IPs) via a shared kvstore (etcd synchronization), then uses the **existing network** for direct Pod-to-Pod routing — no additional tunnels. Submariner builds encrypted tunnels (IPsec/WireGuard) between cluster gateway nodes; all cross-cluster traffic traverses these tunnels. Cluster Mesh requires: Cilium as CNI in ALL clusters, non-overlapping Pod CIDRs, and L3 reachability between clusters. The reward: no tunnel overhead, native eBPF performance, cluster-aware load balancing, and Hubble observability across the mesh.
+
+**Q2: What is a Global Service in Cilium Cluster Mesh?**
+
+A Global Service is a Kubernetes Service annotated with `service.cilium.io/global: "true"` that exists in multiple clusters with the same name and namespace. Cilium Cluster Mesh merges the endpoint lists — a service in Cluster A with 3 Pods and the same global service in Cluster B with 2 Pods results in a merged service with 5 endpoints visible to Cilium on every node in both clusters. Load balancing happens across all endpoints natively in eBPF. With `service.cilium.io/affinity: local`, local cluster endpoints are preferred, and remote endpoints are used only for failover.
+
+**Q3: What are the prerequisites for Cilium Cluster Mesh?**
+
+Three mandatory prerequisites: (1) **Cilium CNI** — all clusters must use Cilium (not Calico, Flannel, etc.); (2) **Non-overlapping Pod CIDRs** — each cluster must have a unique Pod CIDR block (e.g., cluster 1: 10.0.0.0/16, cluster 2: 10.1.0.0/16); (3) **L3 connectivity** — nodes in different clusters must be able to route to each other's Pod CIDRs directly (VPC peering, BGP, or flat network). Each cluster also needs a unique **cluster ID** (integer 1-255) and **cluster name** set at Cilium install time.
+
+**Q4: How does Cilium Cluster Mesh handle network policy across clusters?**
+
+Cilium automatically adds identity labels to all endpoints based on their source cluster (`io.cilium.k8s.policy.cluster: <cluster-name>`). `CiliumNetworkPolicy` can use these labels in `fromEndpoints` and `toEndpoints` selectors — allowing or denying traffic based on source cluster. For example: allow only Pods from `cluster-a` to access a database, deny all Pods from `cluster-b`. Standard Kubernetes `NetworkPolicy` is not cluster-aware, but Cilium's extended policies enable fine-grained cross-cluster access control.
+
+**Q5: When should you choose Cilium Cluster Mesh over Submariner?**
+
+Choose **Cilium Cluster Mesh** when: all clusters already use Cilium (or you can standardize on Cilium), you want native eBPF performance (no tunnel overhead), you need Hubble's cross-cluster observability, and you can plan non-overlapping CIDRs. Choose **Submariner** when: clusters use different CNI plugins (Flannel, Calico, Weave), you have CIDR overlap that you cannot fix (Submariner supports NAT), or you need CNCF-standard MCS API (`ServiceExport`/`ServiceImport`) compatibility with multiple implementations.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know Cluster Mesh requires: Cilium CNI + non-overlapping CIDRs + L3 connectivity + unique cluster IDs
+- [ ] Know the shared kvstore model: clusters sync endpoint identities via etcd interconnection
+- [ ] Know global services: `service.cilium.io/global: "true"` → merged endpoints from all clusters
+- [ ] Know `service.cilium.io/affinity: local` → prefer local cluster, failover to remote
+- [ ] Know `io.cilium.k8s.policy.cluster` label enables cross-cluster NetworkPolicy in CiliumNetworkPolicy
+- [ ] Know Cluster Mesh vs Submariner: Cilium-only vs CNI-agnostic; no-tunnel vs tunnel; no CIDR overlap vs CIDR overlap support
+- [ ] Can set up with `cilium clustermesh enable` + `cilium clustermesh connect` + `cilium clustermesh status`

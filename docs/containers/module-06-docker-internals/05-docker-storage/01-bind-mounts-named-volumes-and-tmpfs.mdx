@@ -1,0 +1,185 @@
+---
+title: "Chapter 1 — Docker Storage: Bind Mounts, Volumes & tmpfs"
+sidebar_position: 1
+module: "Module 6.5 — Docker Storage"
+description: "Master Docker storage mounts — architectural comparison of Bind Mounts, Named Volumes, and tmpfs, mount propagation rules, volume drivers, and UID/GID permission sync."
+---
+
+# Chapter 1 — Docker Storage: Bind Mounts, Volumes & tmpfs
+
+> **Goal:** Master the storage abstractions, filesystem persistence layers, and permission mechanics of **Docker Storage** — contrasting **Bind Mounts** (host path mapping), **Named Volumes** (Docker-managed persistence), and **`tmpfs` In-Memory Mounts**, configuring advanced **Mount Propagation (`rshared`, `rslave`)**, selecting cloud **Volume Drivers (NFS, AWS EFS)**, and resolving the classic **Host-Container UID/GID File Ownership Dilemma**.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural differences, security profiles, and lifecycle rules of the 3 Docker mount types
+> 2. How Docker Named Volumes isolate storage management from host directory paths
+> 3. How `tmpfs` mounts protect sensitive cryptographic secrets in volatile RAM
+> 4. Why files created inside containers appear as root on the host and how to fix it with `gosu`
+> 5. How mount propagation controls bidirectional filesystem event sharing
+> 6. How to author production storage configurations using `--mount` syntax
+
+---
+
+## Real-Life Analogy
+
+Think of the 3 Docker Storage Mount types as **different ways of storing and accessing files inside a corporate enterprise office**:
+
+- **1. The Bind Mount (The Window to the Master Host Office Desk):**
+  - You cut a hole in the container's wall and reach your arm directly onto the host boss's desk (**`/home/developer/workspace`**).
+  - When the boss edits a file on their desk, the container sees the edit instantly (**Hot reloading during local development**).
+  - **The Risk:** If the container runs wild, it can knock over the boss's coffee cup or delete confidential contracts on the host desk (**Host Security Hazard**)!
+- **2. The Named Volume (The Fireproof Central Bank Deposit Vault):**
+  - A secure, dedicated storage vault managed by the building's certified logistics department (**`/var/lib/docker/volumes/<name>/_data`**).
+  - The container has a key to its private safety deposit box. Even if the office room is demolished and rebuilt 100 times (**Container destroyed**), the fireproof vault remains **100% intact and permanent**!
+- **3. The `tmpfs` Mount (The Dry-Erase Whiteboard in RAM):**
+  - A blank whiteboard on the wall. You write temporary passwords and secret session tokens during the meeting (**RAM execution**).
+  - When the meeting ends and lights go out, the whiteboard is automatically wiped clean with zero trace left on permanent physical storage!
+
+---
+
+## Architecture Diagram
+
+```text
+               The 3 Docker Storage Mount Types & Filesystem Hierarchy
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER MOUNT NAMESPACE (Inside Container Process)                   │
+ │ ├── `/app/src`          ◄── Mounted from Bind Mount                    │
+ │ ├── `/var/lib/mysql`    ◄── Mounted from Named Volume                  │
+ │ └── `/tmp/secrets`      ◄── Mounted from `tmpfs` In-Memory Mount       │
+ └──────┬──────────────────────┬──────────────────────┬───────────────────┘
+        │                      │                      │
+        ▼                      ▼                      ▼
+ ┌────────────────┐  ┌─────────────────────┐  ┌───────────────────────────┐
+ │ 1. BIND MOUNT  │  │ 2. NAMED VOLUME     │  │ 3. `tmpfs` MOUNT          │
+ ├────────────────┤  ├─────────────────────┤  ├───────────────────────────┤
+ │ ANY Arbitrary  │  │ Managed by Docker:  │  │ Resides EXCLUSIVELY in    │
+ │ Host Path:     │  │ `/var/lib/docker/`  │  │ Host RAM / Virtual Swap!  │
+ │ `/home/user/   │  │ `volumes/db-data/`  │  │ Never touches SSD blocks. │
+ │  my-source-code│  │ `_data/`            │  │ Lost on container exit.   │
+ └────────────────┘  └─────────────────────┘  └───────────────────────────┘
+```
+
+---
+
+## 3-Way Docker Storage Comparison Matrix
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Technical Dimension       │ Bind Mounts                     │ Named Volumes                   │ `tmpfs` In-Memory Mounts        │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Mount Syntax**          │ `--mount type=bind,src=...,...` │ `--mount type=volume,src=...`   │ `--mount type=tmpfs,dst=...`    │
+ │ **Host Location**         │ **Any arbitrary host path**     │ `/var/lib/docker/volumes/`      │ **Host RAM / Virtual Memory**   │
+ │                           │ (e.g. `/etc`, `/home/user`).    │ (Managed exclusively by Docker).│ (Zero disk I/O).                │
+ │ **Primary Use Case**      │ Local development code syncing, │ Production databases, persistent│ Sensitive tokens, session keys, │
+ │                           │ host config file injection.     │ state, shared storage (NFS/EFS).│ fast temporary scratch files.   │
+ │ **Driver Ecosystem**      │ None (Standard host filesystem) │ **Extensible Plugins** (NFS,    │ None (Kernel tmpfs)             │
+ │                           │                                 │ AWS EFS, NetApp, Portworx).     │                                 │
+ │ **Security Boundary**     │ **High Risk** (Container can    │ **High Security** (Isolated     │ **Maximum Security** (Volatile; │
+ │                           │ overwrite host OS root files).  │ from host OS directory trees).  │ data never written to disk).    │
+ │ **Lifecycle & Delete**    │ Retained on host forever.       │ Retained until `volume rm`.     │ **Destroyed on container stop**.│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Resolving the Host-Container UID/GID Ownership Problem
+
+### The Problem:
+When a container process running as root (`UID 0`) creates a file in a bind mount, the file is written to the host filesystem with **`owner: root (UID 0)`**. The local developer cannot edit or delete the file without running `sudo`!
+
+### The Production Solutions:
+
+#### 1. Specifying User at Runtime:
+```bash
+docker run -u $(id -u):$(id -g) -v $(pwd):/app my-image
+```
+
+#### 2. The `gosu` Dynamic Privilege Drop Pattern:
+The container boots as root, changes directory ownership to the local user UID passed via environment variable, and uses **`gosu`** to step down to that unprivileged user *before* executing the application:
+
+```dockerfile
+# Standard Entrypoint script pattern:
+#!/bin/sh
+USER_ID=${LOCAL_UID:-1000}
+useradd -u $USER_ID -m appuser
+chown -R appuser /app
+exec gosu appuser "$@"
+```
+
+---
+
+## Mount Propagation Modes
+
+When creating nested bind mounts, **Mount Propagation** dictates how mount events in the host propagate to the container and vice versa:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Propagation Mode     │ Event Propagation Flow                                                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`rprivate`**       │ **Default.** Mount events NEVER propagate in either direction.              │
+ │ **`rshared`**        │ **Bi-Directional.** Host mount events propagate into container AND container│
+ │                      │ mount events propagate back to the host! (Mandatory for CSI plugins).       │
+ │ **`rslave`**         │ **One-Way.** Host mount events propagate into container, but container      │
+ │                      │ mounts NEVER leak back to the host.                                         │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Comparing Volumes, Bind Mounts & tmpfs
+
+```bash
+# Step 1: Create a named volume
+docker volume create my-persistent-vault
+
+# Step 2: Write data into the named volume
+docker run --rm -v my-persistent-vault:/data alpine sh -c "echo 'Bank Vault Data 2026' > /data/vault.txt"
+
+# Step 3: Verify data persists across completely different containers!
+docker run --rm -v my-persistent-vault:/data alpine cat /data/vault.txt
+
+# Step 4: Test a volatile tmpfs mount
+docker run --rm --tmpfs /ramdisk alpine sh -c "echo 'Secret In Memory' > /ramdisk/secret.txt && cat /ramdisk/secret.txt"
+
+# Step 5: Clean up
+docker volume rm my-persistent-vault
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the primary differences between Docker Named Volumes, Bind Mounts, and `tmpfs` mounts?**
+
+- **Named Volumes**: Managed entirely by Docker under `/var/lib/docker/volumes/`. They are the gold standard for production state persistence because they are isolated from host filesystem structures, support pluggable storage drivers (NFS, AWS EFS), and survive container destruction.
+- **Bind Mounts**: Mount an **arbitrary directory or file directly from the host filesystem** (e.g. `/home/user/code`) into the container. Ideal for local development source code hot-reloading, but risky in production if containers gain write access to sensitive host directories (`/etc`, `/var`).
+- **`tmpfs` Mounts**: Stored **exclusively in host volatile RAM**. Writes never hit physical storage media, making them ultra-fast and ideal for temporary scratch files or sensitive cryptographic tokens that must vanish when the container stops.
+
+**Q2: Why is the newer `--mount` syntax preferred over legacy `-v` (`--volume`) flags?**
+
+The `--mount` syntax is explicit, structured, and strictly typed (`--mount type=bind,source=/src,target=/dst,readonly`). Key advantages:
+1. **Explicit Error Handling**: If a bind mount source directory does not exist on the host, `-v` silently creates a new empty directory owned by root, causing silent bugs. `--mount` **fails immediately with a clear error**.
+2. **Advanced Capabilities**: Enables fine-grained configuration of volume drivers, volume options, tmpfs sizes, and mount propagation (`bind-propagation=rshared`) that are unsupported by `-v`.
+
+**Q3: How do you solve the issue where files generated by a container in a bind mount are owned by `root:root` on the host?**
+
+Files inherit the UID/GID of the process running inside the container. Because containers run as `UID 0 (root)` by default, generated files become owned by host root. To resolve this: (1) Run the container with the host developer's UID/GID using **`docker run -u $(id -u):$(id -g)`**; (2) In `docker-compose.yml`, set `user: "${UID}:${GID}"`; (3) Use the **`gosu` entrypoint pattern** to dynamically create a matching internal user and drop root privileges before launching the application.
+
+**Q4: What is Mount Propagation, and why do Kubernetes Storage CSI plugins require `rshared`?**
+
+Mount Propagation determines whether filesystems mounted *inside* a mount namespace are visible to parent namespaces. By default (`rprivate`), mounts made inside a container are strictly hidden from the host. Kubernetes CSI storage plugins run inside containers but must mount external storage volumes (e.g. AWS EBS blocks) into pod directories on the host. Setting **`mountPropagation: Bidirectional` (`rshared`)** ensures that filesystem mounts executed inside the CSI container **propagate outward and mount onto the host operating system**.
+
+**Q5: What happens to a Docker Named Volume when a container referencing it is deleted via `docker rm -f`?**
+
+The Named Volume **remains 100% intact on the host disk** at `/var/lib/docker/volumes/<name>/_data`. Docker decouples volume lifecycles from container lifecycles to prevent accidental data loss. The volume will persist indefinitely until an administrator or automation script explicitly deletes it via **`docker volume rm <name>`** or **`docker volume prune`**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 3 storage types: Bind Mounts (Host path), Named Volumes (Docker managed), tmpfs (RAM)
+- [ ] Know that Named Volumes survive container deletion and live in `/var/lib/docker/volumes/`
+- [ ] Know that `tmpfs` writes volatile data directly to RAM with zero disk persistence
+- [ ] Know why `--mount` is preferred over `-v` for strict error handling and safety
+- [ ] Know how to solve root file ownership using `-u $(id -u):$(id -g)` or `gosu`
+- [ ] Know that CSI plugins require `Bidirectional` (`rshared`) mount propagation

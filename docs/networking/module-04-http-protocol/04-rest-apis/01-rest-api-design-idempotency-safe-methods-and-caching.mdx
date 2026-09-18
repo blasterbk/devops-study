@@ -1,0 +1,157 @@
+---
+title: "Chapter 4 — REST API Design: Idempotency, Safe Methods & HTTP Caching"
+sidebar_position: 1
+module: "Module 4.4 — REST APIs"
+description: "Master REST architecture constraints, HTTP method semantics, safe vs idempotent operations, optimistic locking with ETags, and advanced Cache-Control policies."
+---
+
+# Chapter 4 — REST API Design: Idempotency, Safe Methods & HTTP Caching
+
+> **Goal:** Master Representational State Transfer (REST) architectural principles. Understand HTTP verb semantics (GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD), the mathematical definition of Idempotency vs Safety, conditional requests with ETags (`If-Match` / `If-None-Match`), and production caching headers.
+>
+> By the end of this chapter, you will understand:
+> 1. Roy Fielding's 6 REST architectural constraints (Client-Server, Stateless, Cacheable, Uniform Interface, Layered System, Code-on-Demand)
+> 2. The Semantic Idempotency & Safety Matrix across all HTTP verbs
+> 3. `PUT` (full replacement) vs `PATCH` (JSON Merge Patch RFC 7386 vs JSON Patch RFC 6902)
+> 4. Optimistic concurrency control and race condition prevention with `ETag` and `If-Match`
+> 5. HTTP Cache-Control directives: `max-age`, `s-maxage`, `no-cache`, `no-store`, `must-revalidate`, and `stale-while-revalidate`
+> 6. CLI testing with `curl` for conditional requests and cache validation
+
+---
+
+## Real-Life Analogy
+
+Think of REST API operations as **managing safety deposit boxes in a bank vault**:
+
+- **Safe Operations (`GET`, `HEAD`):**
+  - Walking into the vault to look at the contents of Box #42. Merely looking does not change or alter anything inside the box (**Zero side-effects**).
+- **Idempotent Operations (`PUT`, `DELETE`):**
+  - **`PUT`:** *"Set the contents of Box #42 to exactly $100."* If you shout this instruction once or 100 times in a row, the final state of the box is identical ($100).
+  - **`DELETE`:** *"Destroy Box #42."* The first time you execute it, Box #42 is deleted. If you repeat the command 5 more times, the box is still gone. The end state remains identical.
+- **Non-Idempotent Operations (`POST`):**
+  - *"Deposit another $50 into the vault and create a new deposit slip."* If you execute this 5 times, you create 5 separate deposit slips and add $250.
+
+---
+
+## Architecture Diagram
+
+```text
+               Safe vs Idempotent vs Non-Idempotent HTTP Methods
+               
+ ┌──────────┬────────┬────────────┬──────────────────┬─────────────────────────────┐
+ │ Method   │ Safe?  │ Idempotent?│ Cacheable?       │ RFC Semantics & Purpose     │
+ │──────────┼────────┼────────────┼──────────────────┼─────────────────────────────┤
+ │ `GET`    │  YES   │    YES     │  YES (Default)   │ Retrieve representation     │
+ │ `HEAD`   │  YES   │    YES     │  YES             │ Headers only (no body)      │
+ │ `OPTIONS`│  YES   │    YES     │  NO              │ CORS / Allowed methods query│
+ │ `PUT`    │  NO    │    YES     │  NO              │ Complete resource overwrite │
+ │ `DELETE` │  NO    │    YES     │  NO              │ Resource removal            │
+ │ `POST`   │  NO    │    NO      │  Conditional     │ Create subordinate resource │
+ │ `PATCH`  │  NO    │    NO*     │  Conditional     │ Partial resource update     │
+ └──────────┴────────┴────────────┴──────────────────┴─────────────────────────────┘
+ (* PATCH is technically non-idempotent by RFC spec, though specific delta patches may behave idempotently).
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The Mathematical Definition of Idempotency
+
+An operation $f(x)$ is **idempotent** if applying it multiple times produces the exact same side-effect on the system state as applying it once:
+
+$$f(f(x)) = f(x)$$
+
+- **`PUT /users/42` with `{"name": "Alice"}`:** Idempotent. The database record will have `name="Alice"` regardless of whether the network retries the request 1 time or 10 times.
+- **`POST /users` with `{"name": "Alice"}`:** Non-Idempotent. Retrying 10 times creates 10 distinct user records with 10 unique IDs in the database.
+
+---
+
+### 2. Optimistic Concurrency Control (ETags & If-Match)
+
+To prevent the **Lost Update Problem** when two users edit the same resource concurrently:
+
+```text
+ User A                                 Server API                              User B
+   │                                        │                                      │
+   │─── GET /api/v1/doc/1 ─────────────────►│                                      │
+   │◄── 200 OK (ETag: "v1_hash") ───────────│◄─── GET /api/v1/doc/1 ───────────────│
+   │                                        │───► 200 OK (ETag: "v1_hash") ────────│
+   │                                        │                                      │
+   │─── PUT /api/v1/doc/1 ─────────────────►│                                      │
+   │    If-Match: "v1_hash"                 │ (ETag matches -> Saves & generates "v2")
+   │◄── 200 OK (ETag: "v2_hash") ───────────│                                      │
+   │                                        │                                      │
+   │                                        │◄─── PUT /api/v1/doc/1 ───────────────│
+   │                                        │     If-Match: "v1_hash"              │
+   │                                        │     (MISMATCH: Current is "v2_hash") │
+   │                                        │───► 412 Precondition Failed ─────────│
+```
+
+---
+
+### 3. Cache-Control Header Directives Breakdown
+
+```http
+Cache-Control: public, max-age=3600, s-maxage=86400, stale-while-revalidate=600
+```
+
+- **`public`:** Can be cached by intermediate CDNs and proxies.
+- **`private`:** Can only be cached by the end-user's local browser (e.g. user profile data).
+- **`no-cache`:** Must revalidate with the origin server via `ETag` before using cached copy.
+- **`no-store`:** Never write to disk or memory cache (used for sensitive financial/auth data).
+- **`s-maxage`:** Overrides `max-age` for shared public caches (CDNs).
+- **`stale-while-revalidate`:** Serve stale cached asset instantly to client while fetching update in the background.
+
+---
+
+## Hands-On Lab: Testing REST Caching & Optimistic Locking
+
+```bash
+# Step 1: Query an API resource and inspect ETag and Cache-Control headers
+curl -i https://httpbin.org/etag/test-version-1
+
+# Step 2: Test conditional request validation (If-None-Match -> 304 Not Modified)
+curl -i -H 'If-None-Match: "test-version-1"' https://httpbin.org/etag/test-version-1
+
+# Step 3: Test optimistic locking failure (If-Match mismatch -> 412 Precondition Failed)
+curl -i -X PUT -H 'If-Match: "wrong-etag-value"' https://httpbin.org/etag/test-version-1
+
+# Step 4: Test Cache-Control headers inspection on a CDN-backed asset
+curl -I https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the architectural difference between `PUT` and `PATCH`?**
+
+`PUT` is a complete replacement of the target resource representation; any fields omitted in the request body are erased or reset to defaults. `PATCH` is a partial modification; only the fields explicitly provided in the payload delta are updated, leaving all existing untouched fields preserved.
+
+**Q2: What is the purpose of an Idempotency-Key header in distributed payment systems?**
+
+In payment APIs (like Stripe), `POST /charges` is inherently non-idempotent. If a network timeout occurs after the payment was charged but before the client received the `200 OK`, a naive client retry could double-charge the customer. The client attaches a unique `Idempotency-Key: uuid-v4` header. The server logs the key in Redis/DB with the charge result. If the retry arrives with the identical key, the server skips re-processing and returns the cached payment response.
+
+**Q3: What is the difference between `no-cache` and `no-store` in the `Cache-Control` header?**
+
+- **`no-cache`:** Does **not** mean "do not cache". It instructs the browser or CDN to store the asset, but **forces validation with the origin server** via `If-None-Match` before serving it. If unchanged, server returns `304 Not Modified`.
+- **`no-store`:** Instructs the browser and all intermediate proxies to **never store any part of the request or response** in memory or disk cache under any circumstances.
+
+**Q4: How does `stale-while-revalidate` improve Web Vitals and user perceived latency?**
+
+When an asset's `max-age` expires, `stale-while-revalidate=N` permits the browser/CDN to immediately serve the expired (stale) cached asset to the user with **0ms latency**, while asynchronously issuing a background HTTP request to fetch the fresh version from the origin server for future requests.
+
+**Q5: What is HATEOAS and why is it rarely implemented in modern microservices?**
+
+HATEOAS (Hypermedia As The Engine Of Application State) is a REST constraint where API responses contain hypermedia links (`_links`) guiding clients on all possible next actions (e.g. `rel="cancel"`, `href="/orders/123/cancel"`). It is rarely implemented in modern high-performance microservices due to increased JSON payload bloat, complexity in client parsing, and the universal adoption of strict OpenAPI/gRPC schema contracts.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the Safety and Idempotency definitions across all HTTP methods
+- [ ] Understand `PUT` (full replace) vs `PATCH` (partial delta)
+- [ ] Master optimistic locking using `ETag` and `If-Match` (412 Precondition Failed)
+- [ ] Master Cache-Control directives (`max-age`, `no-cache`, `no-store`, `stale-while-revalidate`)
+- [ ] Explain how distributed payment APIs achieve idempotency via `Idempotency-Key`

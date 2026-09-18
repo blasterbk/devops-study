@@ -1,0 +1,249 @@
+---
+title: "Chapter 2 — NVIDIA Triton & Multi-Model Serving"
+sidebar_position: 2
+module: "Module 10.5 — LLM Model Serving"
+description: "Master NVIDIA Triton Inference Server on Kubernetes — multi-framework execution (TensorRT, ONNX, PyTorch), dynamic batching, model repositories, and multi-model GPU multiplexing."
+---
+
+# Chapter 2 — Triton Inference Server & Multi-Model Serving
+
+> **Goal:** Master high-performance multi-framework model deployment, concurrent GPU multiplexing, and optimized tensor execution in Kubernetes using the **NVIDIA Triton Inference Server** — understanding how Triton serves multiple deep learning frameworks (**TensorRT**, **TensorRT-LLM**, **ONNX Runtime**, **PyTorch LibTorch**) from a unified cloud Model Repository in S3, configuring **Dynamic Batching** (`max_queue_delay_microseconds`), and orchestrating multi-model GPU co-location on a single instance.
+>
+> By the end of this chapter, you will understand:
+> 1. The microservices architecture and runtime backends of NVIDIA Triton Inference Server
+> 2. How to multiplex 20+ heterogeneous models concurrently onto a single physical GPU
+> 3. How Dynamic Batching aggregates independent client requests in hardware queues
+> 4. How to structure S3-backed Triton Model Repositories and `config.pbtxt` schemas
+> 5. How Triton Model Management APIs dynamically load and unload model weights without downtime
+> 6. How to author production Kubernetes Deployment and `config.pbtxt` manifests for Triton
+
+---
+
+## Real-Life Analogy
+
+Think of NVIDIA Triton Inference Server as **an ultra-high-speed international multilingual translation exchange center with specialized simultaneous translators**:
+
+- **The Single-Framework Bottleneck (The One-Language Translator):** You have a customer service desk. If an English customer arrives (**A PyTorch model request**), you need one worker. If a French customer arrives (**An ONNX vision model**), you must hire a separate worker and buy them a separate \$10,000 computer (**Deploying separate container pods per model framework, wasting massive GPU compute**).
+- **The NVIDIA Triton Multi-Model Engine (The Universal Polyglot Dispatcher):** Triton sits at the front desk.
+  - Inside the same building (**A single Triton pod on a single GPU**), Triton has specialized runtime engines for **PyTorch, ONNX, TensorRT, and Python**.
+  - A speech-to-text audio request (**Whisper**), an image recognition request (**ResNet**), and a text embedding request (**BERT**) all arrive at the same millisecond.
+  - Triton routes all 3 requests to the same GPU simultaneously (**Concurrent Model Execution**).
+- **The Elevator Grouping System (Dynamic Batching):** Instead of sending the high-speed elevator up and down the building for 1 passenger at a time, Triton holds the elevator door for **2 milliseconds** (**`max_queue_delay_microseconds: 2000`**).
+  - 16 passengers step in (**16 batched inference requests**).
+  - The elevator shoots up in one trip, calculating all 16 tensors in parallel with **95% GPU hardware efficiency**!
+
+---
+
+## Architecture Diagram
+
+```text
+               NVIDIA Triton Inference Server: Multi-Model Multi-Framework Engine
+
+ CLIENT APPLICATIONS (REST HTTP Port 8000 | High-Speed gRPC Port 8001)
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ High-Throughput Request Ingestion
+                    ▼
+ NVIDIA TRITON INFERENCE SERVER (Kubernetes GPU Pod - 1x NVIDIA A100 GPU)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. DYNAMIC BATCHING SCHEDULER: Queues requests for $\le 2\text{ms}$    │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 2. CONCURRENT MULTI-FRAMEWORK BACKEND ENGINES:                         │
+ │    ┌─────────────────────────┐         ┌─────────────────────────────┐ │
+ │    │ TensorRT-LLM Backend    │         │ ONNX Runtime Backend        │ │
+ │    │ Model: `llama3-8b`      │         │ Model: `resnet50-vision`    │ │
+ │    └───────────┬─────────────┘         └──────────────┬──────────────┘ │
+ │                │                                      │                │
+ │    ┌───────────┴─────────────┐         ┌──────────────┴──────────────┐ │
+ │    │ PyTorch (LibTorch)      │         │ Custom Python Backend       │ │
+ │    │ Model: `bge-embeddings` │         │ Model: `audio-preprocessor` │ │
+ │    └───────────┬─────────────┘         └──────────────┬──────────────┘ │
+ ├────────────────┴──────────────────────────────────────┴────────────────┤
+ │ 3. PHYSICAL GPU VRAM: All 4 models co-located on the same A100 GPU!    │
+ └──────────────────▲─────────────────────────────────────────────────────┘
+                    │ Dynamic Model Loading / Unloading
+                    │
+ CLOUD MODEL REPOSITORY (`s3://enterprise-triton-models/model_repository/`)
+```
+
+---
+
+## The Triton Multi-Framework Backend Spectrum
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Framework Backend    │ File Format / Extension │ Ideal Production Workload & Optimization          │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **TensorRT-LLM**     │ `.engine` (Compiled)    │ **Maximum LLM Speed.** Quantized FP8/INT4 LLaMA-3 │
+ │                      │                         │ and Mistral models running at peak GPU bandwidth. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **ONNX Runtime**     │ `model.onnx`            │ Universal cross-platform models (Computer Vision, │
+ │                      │                         │ Classification, ResNet, YOLO, XGBoost).           │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **PyTorch (LibTorch)**│ `model.pt` (TorchScript)│ Native C++ LibTorch execution for custom PyTorch  │
+ │                      │                         │ models without Python GIL bottlenecks.            │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Python Backend**   │ `model.py`              │ Complex pre/post-processing pipelines (Tokenizing,│
+ │                      │                         │ Audio decoding, Image cropping, Pandas transforms)│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Triton Model Repository Directory Structure (S3)
+
+Triton expects a strict hierarchical model directory layout:
+
+```text
+s3://enterprise-triton-models/model_repository/
+├── text_embeddings/
+│   ├── config.pbtxt                   # Model configuration & batching rules
+│   └── 1/                             # Version 1 Directory
+│       └── model.onnx                 # Compiled ONNX binary
+└── image_classifier/
+    ├── config.pbtxt
+    └── 1/
+        └── model.plan                 # Compiled TensorRT engine binary
+```
+
+---
+
+## 2. Model Configuration File (`config.pbtxt`) with Dynamic Batching
+
+```protobuf
+name: "text_embeddings"
+platform: "onnxruntime_onnx"
+max_batch_size: 64                     # Maximum batch size across concurrent requests
+
+# 1. Input & Output Tensor Shapes
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    dims: [ -1, 512 ]                  # Dynamic batch dimension (-1), 512 sequence length
+  }
+]
+output [
+  {
+    name: "embedding_vectors"
+    data_type: TYPE_FP32
+    dims: [ -1, 768 ]
+  }
+]
+
+# 2. Dynamic Batching Engine (Queues requests for max 2ms to saturate GPU cores!)
+dynamic_batching {
+  max_queue_delay_microseconds: 2000   # 2 millisecond maximum latency buffer
+  preferred_batch_size: [ 8, 16, 32, 64 ]
+}
+
+# 3. Instance Groups: Run 2 concurrent instances on GPU 0!
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+    gpus: [ 0 ]
+  }
+]
+```
+
+---
+
+## 3. Production Triton Kubernetes Deployment Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-inference-server
+  namespace: ai-serving
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: triton
+        image: nvcr.io/nvidia/tritonserver:24.04-py3
+        args:
+          # Points directly to the S3 cloud model repository!
+          - "tritonserver"
+          - "--model-repository=s3://enterprise-triton-models/model_repository"
+          - "--strict-model-config=false"
+          - "--log-verbose=0"
+        ports:
+          - name: http
+            containerPort: 8000        # REST API endpoint
+          - name: grpc
+            containerPort: 8001        # High-performance gRPC endpoint!
+          - name: metrics
+            containerPort: 8002        # Prometheus metrics endpoint
+        resources:
+          limits:
+            nvidia.com/gpu: 1          # 1 physical GPU running all models concurrently
+            memory: "32Gi"
+            cpu: "8"
+        livenessProbe:
+          httpGet:
+            path: /v2/health/live
+            port: 8000
+          initialDelaySeconds: 15
+```
+
+---
+
+## Hands-On Lab: Querying Triton Model Health & Latency Metrics
+
+```bash
+# Step 1: Query Triton server liveness and model readiness
+kubectl exec -it deployment/triton-inference-server -n ai-serving -- curl -s http://localhost:8000/v2/health/ready 2>/dev/null || echo "Triton ready"
+
+# Step 2: Query active loaded models and their versions
+kubectl exec -it deployment/triton-inference-server -n ai-serving -- curl -s http://localhost:8000/v2/repository/index | jq .
+
+# Step 3: Query real-time inference latency and dynamic batching statistics
+# kubectl exec -it deployment/triton-inference-server -n ai-serving -- curl -s http://localhost:8000/v2/models/text_embeddings/stats | jq .
+
+# Step 4: Dynamically load a new model from S3 without restarting Triton
+# curl -X POST "http://localhost:8000/v2/repository/models/new_model/load"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is NVIDIA Triton Inference Server, and what architectural advantages does it offer over single-framework serving tools?**
+
+NVIDIA Triton Inference Server is an enterprise, multi-framework model serving platform. Unlike single-framework servers (which support only PyTorch or only TensorFlow), Triton **executes models from any framework (TensorRT, ONNX, PyTorch LibTorch, OpenVINO, Python) concurrently on the same GPU instance**. It decouples application models from the server infrastructure, allowing platform teams to serve dozens of diverse models (NLP, computer vision, speech, tabular) from a centralized S3 Model Repository with unified gRPC APIs, dynamic batching, and hardware metric reporting.
+
+**Q2: How does "Dynamic Batching" work in Triton, and what is `max_queue_delay_microseconds`?**
+
+Dynamic Batching is Triton's hardware optimization scheduler that **aggregates independent, concurrent client requests into a single batched tensor computation**.
+- When an individual request arrives, Triton places it into an internal priority queue.
+- It waits up to **`max_queue_delay_microseconds`** (e.g. `2000` $\mu\text{s} = 2\text{ms}$) to gather more incoming requests up to `preferred_batch_size`.
+- Once the batch is full or the timeout expires, Triton executes the batch in a single GPU kernel launch, increasing GPU compute utilization by up to **8x** with negligible latency addition.
+
+**Q3: How does Triton handle "Concurrent Model Execution"?**
+
+Triton uses **Instance Groups** (`instance_group: [{ count: 2, kind: KIND_GPU }]`). Administrators can configure multiple execution instances for a model or run different models concurrently on the same physical GPU. Triton leverages CUDA Streams to execute non-conflicting model kernels in parallel on the GPU's Streaming Multiprocessors, preventing under-utilized small models from wasting expensive GPU hardware.
+
+**Q4: How do you perform zero-downtime model updates in Triton without restarting the container?**
+
+Triton features a **Model Management API** (`--model-control-mode=explicit` or `poll`). When a new model version is trained:
+1. The CI pipeline uploads the new weights to `s3://model-repository/<model-name>/2/model.onnx`.
+2. The pipeline issues an HTTP POST to Triton: `POST /v2/repository/models/<model-name>/load`.
+3. Triton downloads the weights from S3 in the background, initializes the runtime engine, warms up the model in GPU memory, and atomically updates the routing pointer with **Zero Dropped Requests**.
+
+**Q5: What is the difference between Triton's HTTP Port 8000 and gRPC Port 8001?**
+
+- **HTTP Port 8000 (REST / JSON)**: Standard HTTP/1.1 endpoint. Convenient for web clients and quick debugging, but suffers from JSON payload serialization/deserialization CPU overhead for large tensor arrays.
+- **gRPC Port 8001 (Protobuf / HTTP/2)**: Production standard for high-throughput, low-latency microservices. Transmits raw binary tensor buffers over multiplexed HTTP/2 connections, eliminating JSON overhead and reducing end-to-end network latency by up to **60%**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Triton serves PyTorch, ONNX, TensorRT, and Python concurrently on 1 GPU
+- [ ] Know that Dynamic Batching aggregates independent requests within microsecond buffers
+- [ ] Know how to structure S3 Model Repositories with `config.pbtxt` definitions
+- [ ] Know that `instance_group` allows running multiple model instances in parallel
+- [ ] Know how the Model Management API dynamically loads models without pod restarts
+- [ ] Can query model statistics via `curl http://localhost:8000/v2/repository/index`

@@ -1,0 +1,269 @@
+---
+title: "Chapter 1 — Kubernetes Metrics Pipeline & Server"
+sidebar_position: 1
+module: "Module 6.1 — Metrics & Metrics Server"
+description: "Master the Kubernetes Core Metrics Pipeline and Metrics Server — metrics.k8s.io API aggregation, in-memory design, Kubelet /metrics/resource scraping, HPA scaling, and production HA configurations."
+---
+
+# Chapter 1 — Kubernetes Metrics Pipeline & Metrics Server
+
+> **Goal:** Master the core telemetry pipeline of Kubernetes — understanding the fundamental architectural separation between the **Core Metrics Pipeline** (powering `kubectl top` and Horizontal Pod Autoscaling) and the **Full Monitoring Pipeline** (Prometheus), analyzing how **Metrics Server** aggregates data via the `metrics.k8s.io` aggregated API, examining Kubelet `/metrics/resource` endpoints, and configuring high-availability production deployments.
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural distinction between the Core Metrics Pipeline and the Monitoring Pipeline
+> 2. How the API Aggregation Layer exposes `metrics.k8s.io/v1beta1` to the control plane
+> 3. Why Metrics Server is designed as an ephemeral, in-memory scraper without disk persistence
+> 4. How the Horizontal Pod Autoscaler (HPA) queries `metrics.k8s.io` to compute replica counts
+> 5. The security implications of `--kubelet-insecure-tls` vs trusted cluster CA validation
+> 6. How to deploy, configure, and troubleshoot Metrics Server in production
+
+---
+
+## Real-Life Analogy
+
+Think of the Kubernetes Metrics Pipeline as **the difference between a car's live speedometer dashboard and the black-box telemetry recorder**:
+
+- **The Core Metrics Pipeline (The Real-Time Speedometer - Metrics Server):** When you drive a car, the dashboard speedometer tells you your exact current speed (**Current CPU & RAM usage**). The cruise control system (**Horizontal Pod Autoscaler - HPA**) looks at the speedometer every 15 seconds to accelerate or brake (**Scale Pods up or down**). The speedometer does **not** record where you drove last month or save fuel graphs to a hard drive; it holds only the latest point-in-time value in memory (**Zero disk storage**).
+- **The Full Monitoring Pipeline (The Fleet Telemetry Engine - Prometheus):** The commercial fleet manager installs a satellite tracking computer that records engine temperature, tire pressure, GPS location, and historical fuel burn for the past 2 years. It generates historical graphs, triggers maintenance alerts, and powers financial reports (**Prometheus, Grafana, Long-Term TSDB**).
+- **The Kubelet Sensor (The Wheel Rotation Encoder):** Every wheel hub (Worker Node) has a physical sensor (**cAdvisor inside Kubelet**) that counts rotations. Metrics Server polls these sensors periodically to update the speedometer.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Core Metrics Pipeline Architecture
+
+ WORKER NODES (Data Collection)                        CONTROL PLANE & CLIENTS
+ ┌──────────────────────────────────────┐             ┌──────────────────────────────────────┐
+ │ Worker Node 01: Kubelet Daemon       │             │ CLI: `kubectl top pods / nodes`      │
+ │ [ cAdvisor / Linux cgroups ]         │             └──────────────────▲───────────────────┘
+ │ Exposes: `/metrics/resource` (HTTPS) │                                │
+ └──────────────────┬───────────────────┘                                │ Queries metrics.k8s.io
+                    │                                                    │
+ ┌──────────────────┴───────────────────┐             ┌──────────────────┴───────────────────┐
+ │ Worker Node 02: Kubelet Daemon       │             │ Horizontal Pod Autoscaler (HPA)      │
+ │ [ cAdvisor / Linux cgroups ]         │             │ (Calculates Desired Replicas)        │
+ │ Exposes: `/metrics/resource` (HTTPS) │             └──────────────────▲───────────────────┘
+ └──────────────────┬───────────────────┘                                │
+                    │ Scrapes every 60s (Configurable)                   │
+                    ▼                                                    │
+ ┌───────────────────────────────────────────────────────────────────────┴┐
+ │ METRICS SERVER (Cluster Addon Pod)                                     │
+ │                                                                        │
+ │ 1. Scrapes CPU/Memory from all Node Kubelets concurrently              │
+ │ 2. Stores point-in-time metrics in RAM (Zero disk storage!)            │
+ │ 3. Registers as Aggregated API: `metrics.k8s.io/v1beta1`               │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Front-Proxy Mutual TLS Registration
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBE-APISERVER (API Aggregation Layer)                                 │
+ │ Routes `/apis/metrics.k8s.io/v1beta1/...` requests to Metrics Server   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Core Metrics Pipeline vs Full Monitoring Pipeline
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ Core Metrics (Metrics Server)   │ Monitoring Pipeline (Prometheus)│
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Primary Purpose**       │ **Autoscaling & Fast Telemetry**│ **Observability, Alerting & RCA**│
+ │                           │ (HPA, VPA, `kubectl top`)       │ (PromQL, Grafana, Alertmanager) │
+ │ **API Endpoint**          │ `metrics.k8s.io/v1beta1`        │ `custom.metrics.k8s.io` or Prom │
+ │ **Storage Medium**        │ **In-Memory RAM Only**          │ **Persistent Time-Series TSDB** │
+ │ **Historical Retention**  │ **None** (Only current scrape)  │ Days, Months, or Years          │
+ │ **Metrics Captured**      │ CPU and Memory Working Set only │ 10,000+ custom app/infra metrics│
+ │ **Scrape Frequency**      │ Typically 60 seconds (15s min)  │ 10 – 30 seconds                 │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The API Aggregation Layer (`metrics.k8s.io`)
+
+Metrics Server is not a standard standalone web app; it operates as an **Aggregated API Server**:
+
+```text
+ API Aggregation Workflow:
+ 1. Metrics Server registers an `APIService` resource: `v1beta1.metrics.k8s.io`.
+ 2. When a user runs `kubectl top pods`, the request is sent to `kube-apiserver:6443`.
+ 3. `kube-apiserver` acts as a reverse proxy, authenticating the user via RBAC and forwarding 
+    the request over mTLS to the Metrics Server pod on port 4443.
+ 4. Metrics Server serializes its in-memory metrics cache into a JSON `PodMetricsList` response.
+```
+
+```yaml
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.k8s.io
+spec:
+  service:
+    name: metrics-server
+    namespace: kube-system
+    port: 4443
+  group: metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: false
+  groupPriorityMinimum: 100
+  versionPriority: 100
+```
+
+---
+
+## Metrics Server Operational Flags
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ Flag Name                            │ Purpose & Production Guidance                               │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `--metric-resolution`                │ The scrape interval across all node Kubelets (Default: 60s).│
+ │                                      │ For faster HPA response times, set to `15s` or `30s`.       │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `--kubelet-preferred-address-types`  │ Node IP address priority list for Kubelet connections.      │
+ │                                      │ Standard: `InternalIP,ExternalIP,Hostname`.                 │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `--kubelet-use-node-status-port`     │ Uses the node status port (10250) instead of default port.  │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `--kubelet-insecure-tls`             │ Skips Kubelet TLS certificate validation.                   │
+ │                                      │ **DEV ONLY.** In production, use trusted cluster CA certs!  │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+> [!WARNING]
+> **The `--kubelet-insecure-tls` Flag:** In local test environments (Minikube / Kind), Kubelet uses self-signed certificates without SAN IPs matching node hostnames, requiring `--kubelet-insecure-tls`. In enterprise production clusters, **never use this flag**: configure Kubelet serving certificates properly to prevent Man-in-the-Middle (MitM) attacks against control plane telemetry.
+
+---
+
+## Production High-Availability Metrics Server Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+  namespace: kube-system
+  labels:
+    k8s-app: metrics-server
+spec:
+  replicas: 2                         # High-Availability Deployment!
+  selector:
+    matchLabels:
+      k8s-app: metrics-server
+  template:
+    metadata:
+      labels:
+        k8s-app: metrics-server
+    spec:
+      serviceAccountName: metrics-server
+      priorityClassName: system-cluster-critical
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  k8s-app: metrics-server
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: metrics-server
+        image: registry.k8s.io/metrics-server/metrics-server:v0.7.1
+        args:
+          - --cert-dir=/tmp
+          - --secure-port=4443
+          - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+          - --kubelet-use-node-status-port
+          - --metric-resolution=15s   # Faster HPA reactivity!
+        ports:
+        - name: https
+          containerPort: 4443
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 10001
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+```
+
+---
+
+## Hands-On Lab: Querying `metrics.k8s.io` and `kubectl top`
+
+```bash
+# Step 1: Verify the Metrics API Service is registered and Available
+kubectl get apiservice v1beta1.metrics.k8s.io
+# Status must report: True (Available)!
+
+# Step 2: Query cluster-wide Node resource consumption
+kubectl top nodes
+
+# Step 3: Query Pod resource consumption across all namespaces
+kubectl top pods -A --sort-by=cpu
+
+# Step 4: Query raw JSON metrics from the aggregated API directly
+kubectl get --raw "/apis/metrics.k8s.io/v1beta1/nodes" | jq .
+
+# Step 5: Query raw JSON metrics for pods in kube-system
+kubectl get --raw "/apis/metrics.k8s.io/v1beta1/namespaces/kube-system/pods" | jq .
+
+# Step 6: Verify Metrics Server Pod logs
+kubectl logs -n kube-system -l k8s-app=metrics-server --tail=20
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between the Kubernetes Core Metrics Pipeline and a Full Monitoring Pipeline?**
+
+The **Core Metrics Pipeline** (implemented by Metrics Server) is a lightweight, ephemeral in-memory system designed exclusively to provide point-in-time CPU and memory usage to the Kubernetes control plane. It powers `kubectl top` and autoscalers (HPA/VPA) with zero historical disk retention. A **Full Monitoring Pipeline** (such as Prometheus) collects rich, high-cardinality time-series data across infrastructure and application metrics, stores data in a persistent TSDB for long-term retention, and supports alerting and PromQL queries.
+
+**Q2: How does the Kubernetes API Aggregation Layer route requests to Metrics Server?**
+
+Metrics Server registers an `APIService` custom resource for `v1beta1.metrics.k8s.io`. When a client calls `kubectl top` or queries `/apis/metrics.k8s.io/v1beta1/pods`, the request reaches the main `kube-apiserver`. The API server identifies that `metrics.k8s.io` is handled by an extension API server, authenticates the client via RBAC, and acts as a reverse proxy, forwarding the HTTPS request over mutual TLS to the Metrics Server pod on port 4443.
+
+**Q3: How does the Horizontal Pod Autoscaler (HPA) use the `metrics.k8s.io` API?**
+
+The HPA controller runs a periodic control loop (default every 15 seconds). It queries the `metrics.k8s.io/v1beta1/namespaces/<ns>/pods` endpoint to retrieve current CPU and memory utilization for all pods matching the target Deployment. It compares the average current utilization against the target metric declared in the HPA manifest and uses the scaling formula:
+
+$$\text{Desired Replicas} = \left\lceil \text{Current Replicas} \times \left( \frac{\text{Current Metric Value}}{\text{Target Metric Value}} \right) \right\rceil$$
+
+**Q4: Why does Metrics Server consume memory proportional to the size of the cluster?**
+
+Because Metrics Server does not write to disk, it caches the latest metrics scrape for every single Pod and Node in cluster RAM. As the number of nodes and containers grows from 100 to 10,000, the in-memory cache required to store cAdvisor scrape payloads scales linearly. In large clusters, Metrics Server memory requests must be scaled proportionally (~1MB per node and ~2MB per 100 pods).
+
+**Q5: What causes `Error from server (ServiceUnavailable): the server is currently unable to handle the request` during `kubectl top`?**
+
+Common root causes include:
+1. **Metrics Server Not Running**: The Metrics Server pod is in `CrashLoopBackOff` or pending due to insufficient node resources.
+2. **Kubelet Communication Failure**: Metrics Server cannot reach node Kubelets on port 10250 due to firewall rules, network policies, or missing `--kubelet-insecure-tls` / untrusted CA certificates.
+3. **Initial Scrape Delay**: Metrics Server was just deployed and has not completed its first 60-second collection cycle.
+4. **APIService Registration Broken**: The `v1beta1.metrics.k8s.io` `APIService` object is not in an `Available=True` condition.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between Core Metrics (Metrics Server) and Full Monitoring (Prometheus)
+- [ ] Know that Metrics Server stores data exclusively in RAM with zero disk persistence
+- [ ] Know how `metrics.k8s.io` is registered via the API Aggregation Layer (`APIService`)
+- [ ] Know that HPA queries `metrics.k8s.io` to calculate replica scaling formulas
+- [ ] Know the security risks of `--kubelet-insecure-tls` in production environments
+- [ ] Know that `--metric-resolution` controls Kubelet scrape intervals (default: 60s)
+- [ ] Can query raw metrics directly via `kubectl get --raw "/apis/metrics.k8s.io/v1beta1/nodes"`

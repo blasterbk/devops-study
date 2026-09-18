@@ -1,0 +1,174 @@
+---
+title: "Chapter 1 — containerd-shim: Architecture & Daemonless Execution"
+sidebar_position: 1
+module: "Module 7.3 — containerd-shim"
+description: "Master containerd-shim-v2 architecture — daemonless container execution, stdio pipe management, exit code harvesting, zero-downtime daemon upgrades, and alternative shims (gVisor, Kata, Wasm)."
+---
+
+# Chapter 1 — containerd-shim: Architecture & Daemonless Execution
+
+> **Goal:** Master the systems programming architecture, process supervision boundaries, and daemonless execution mechanics of **`containerd-shim-v2`** — analyzing why modern container runtimes deploy **one dedicated shim per container or pod**, how the shim maintains **stdio streaming pipes and exit code harvesting**, how shims enable **zero-downtime container upgrades during daemon restarts**, and exploring alternative shims (**gVisor**, **Kata Containers**, and **Wasm/runwasi**).
+>
+> By the end of this chapter, you will understand:
+> 1. The 3 fundamental system problems that the containerd-shim was created to solve
+> 2. How `runc` exits immediately after container creation, delegating supervision to the shim
+> 3. How the Runtime v2 gRPC API allows containerd to control shims over UNIX sockets
+> 4. How daemonless execution guarantees zero container downtime when restarting `containerd`
+> 5. How alternative shims plug microVMs (Kata) and application kernels (gVisor) into Kubernetes
+> 6. How to inspect the host process tree to analyze shim parent-child relationships
+
+---
+
+## Real-Life Analogy
+
+Think of the `containerd-shim` as **an autonomous life-support pod and black box flight recorder attached to an astronaut in space**:
+
+- **1. The Rocket Launch Gantries (`containerd` & `runc`):**
+  - The massive rocket gantry launches the astronaut into orbit (**`containerd` invokes `runc` to execute `clone()` and `pivot_root()`**).
+  - Once the astronaut is safely floating in space (**Container is running**), the massive rocket gantry detaches and powers down (**`runc` terminates immediately**).
+- **2. The Autonomous Life-Support Backpack (`The containerd-shim`):**
+  - If the astronaut were connected directly to the Earth mission control center by a physical radio wire (**Connecting stdio pipes directly to the containerd daemon**), then whenever the Earth radio tower undergoes maintenance or reboots (**`containerd` daemon restart**), the wire would snap, and the astronaut would die (**Container terminated by `SIGPIPE`**)!
+  - Instead, the astronaut is tethered to their own lightweight, autonomous life-support backpack (**The Shim**).
+  - The backpack maintains the audio radio link (**stdio pipes**), records the flight log (**exit code recorder**), and keeps oxygen flowing smoothly.
+  - Even if Earth's mission control tower completely blows up, the astronaut continues floating safely in space with **zero disruption**!
+
+---
+
+## Architecture Diagram
+
+```text
+               The containerd-shim-v2 Process Supervision Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ containerd CORE DAEMON (Can be restarted/upgraded with ZERO impact!)   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Runtime v2 gRPC API (Anonymous UNIX Domain Socket)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `containerd-shim-v2` (One lightweight supervisor process per container)│
+ │ ├── 1. Holds open `stdin`, `stdout`, `stderr` FIFO pipes               │
+ │ ├── 2. Survives daemon restarts (Re-parents to Host PID 1 / systemd)   │
+ │ └── 3. Calls `waitpid()` to capture Container Exit Code!               │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Invokes OCI Runtime once (`runc create` / `runc start`)
+                    │ 💥 `runc` terminates and exits immediately!
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ APPLICATION CONTAINER PROCESS (e.g. `node server.js` / `nginx`)        │
+ │ - Executes directly on CPU inside Linux Namespaces & cgroups           │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 Critical Problems Solved by the Shim
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ Problem Without a Shim               │ How `containerd-shim-v2` Solves It                          │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **1. `runc` Exits Immediately**      │ `runc` is a short-lived CLI tool that terminates after      │
+ │                                      │ spawning the container. The shim acts as the long-lived     │
+ │                                      │ supervisor process that adopts the container process.       │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **2. Daemon Restarts & Upgrades**    │ If containerd held container stdio pipes directly, crashing │
+ │                                      │ or restarting containerd would close the pipes and send     │
+ │                                      │ `SIGPIPE` to all containers, crashing the entire node! The  │
+ │                                      │ shim shields containers from daemon restarts.               │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **3. Exit Code Harvesting**          │ When a container exits, its exit status must be captured via│
+ │                                      │ `waitpid()`. The shim records the exit code in memory until │
+ │                                      │ containerd or Kubelet requests it.                          │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The containerd Runtime v2 Ecosystem
+
+The containerd Runtime v2 specification allows replacing standard `runc` containers with specialized security and serverless runtimes by simply swapping the shim binary:
+
+```text
+ ┌──────────────────────────────┬─────────────────────────┬───────────────────────────────────────────┐
+ │ Shim Binary Implementation   │ Isolation Technology    │ Production Security Use Case              │
+ │──────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+ │ **`containerd-shim-runc-v2`**│ Standard Linux OCI      │ Default high-density application pods.    │
+ │                              │ (Namespaces + cgroups)  │                                           │
+ │──────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+ │ **`containerd-shim-runsc-v1`**│ **Google gVisor**       │ Multi-tenant SaaS; intercepts syscalls    │
+ │                              │ (User-space app kernel) │ in user space to block kernel zero-days!  │
+ │──────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+ │ **`containerd-shim-kata-v2`**│ **Kata Containers**     │ High-security workloads; runs each pod    │
+ │                              │ (Hardware MicroVMs)     │ inside a dedicated QEMU/Cloud-Hypervisor. │
+ │──────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+ │ **`containerd-shim-runwasi`**│ **WebAssembly (Wasm)**  │ Serverless edge computing; sub-millisecond│
+ │                              │ (Wasmtime runtime)      │ cold starts with near-zero memory footprint.│
+ └──────────────────────────────┴─────────────────────────┴───────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Observing the Shim Process Forest on Host
+
+```bash
+# Step 1: Run a background NGINX container
+docker run -d --name shim-lab -p 8092:80 nginx:alpine
+
+# Step 2: Inspect the Linux host process hierarchy tree using 'ps -ef --forest'
+ps -ef --forest 2>/dev/null | grep -E "containerd-shim|nginx" || echo "Process tree visible"
+
+# Notice the process ancestry:
+# systemd (PID 1)
+#   └─ containerd-shim-runc-v2 (PID: 51200)
+#        └─ nginx: master process (PID: 51240)
+#             └─ nginx: worker process (PID: 51280)
+
+# Step 3: Verify that the shim process is the direct PARENT of the container process
+CONTAINER_PID=$(docker inspect shim-lab --format '{{.State.Pid}}')
+ps -o ppid= -p $CONTAINER_PID
+
+# Step 4: Clean up
+docker rm -f shim-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does `containerd` create a separate `containerd-shim` process for every running container?**
+
+`containerd` creates a dedicated shim process per container to achieve **daemonless container execution**:
+1. **Stdio Persistence**: `runc` terminates immediately after container creation. The shim remains alive to hold open the container's standard input, output, and error FIFO pipes.
+2. **Daemon Decoupling**: If `containerd` crashes, restarts, or is upgraded, the shim remains running. Containers experience **zero downtime or network disruption**.
+3. **Exit Status Capture**: When the container process terminates, the shim reaps the child process via `waitpid()`, records the container's exit code, and reports it back to containerd when it reconnects.
+
+**Q2: What happens to running containers when the `containerd` daemon process is killed or upgraded?**
+
+When `containerd` is stopped or restarted:
+1. Because each container process is parented to its own independent **`containerd-shim-v2`** process (which is child to host `systemd` / PID 1), the container processes **continue executing on CPU cores without interruption**.
+2. Active TCP network connections and listening sockets remain open.
+3. When the `containerd` daemon starts back up, it scans the filesystem for active shim UNIX sockets (`/run/containerd/...`), reconnects to all running shims over gRPC, and seamlessly restores its telemetry and control plane.
+
+**Q3: What is the containerd Runtime v2 (Shim v2) API?**
+
+The Runtime v2 API is a standardized **gRPC interface implemented by shims** allowing containerd to manage different runtime types through a unified protocol. Instead of containerd executing CLI commands against `runc`, containerd communicates with the shim over a local UNIX domain socket using gRPC RPC calls (`Create`, `Start`, `Delete`, `Pids`, `State`, `Kill`). This allows containerd to manage standard Linux containers (`runc`), sandboxed containers (`gVisor`), and microVMs (`Kata`) using the exact same API.
+
+**Q4: In Kubernetes, does containerd spawn one shim per container or one shim per Pod?**
+
+In containerd Runtime v2 (`io.containerd.runc.v2`), containerd spawns **one single shim process per Kubernetes Pod sandbox**. The pod shim manages the shared network namespace, the pause container, and all application/sidecar containers residing within that pod. This reduces host process count, lowers memory overhead, and simplifies pod lifecycle synchronization.
+
+**Q5: How do alternative shims like `containerd-shim-kata-v2` and `containerd-shim-runsc-v1` work?**
+
+- **`containerd-shim-kata-v2`**: Instead of launching Linux namespaces on the shared host kernel, the Kata shim boots a lightweight **Hardware MicroVM (via QEMU, Cloud-Hypervisor, or Firecracker)** with its own private Linux guest kernel, providing hardware-enforced hypervisor isolation.
+- **`containerd-shim-runsc-v1` (gVisor)**: The gVisor shim executes the container inside a **user-space application kernel (Sentry)** written in Go. All Linux system calls made by the container are intercepted and handled in user space, completely blocking container-to-host kernel privilege escalation attacks.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 3 shim duties: Hold stdio pipes, survive daemon restarts, capture exit codes
+- [ ] Know that `runc` exits immediately after container creation
+- [ ] Know that daemonless execution allows zero-downtime containerd upgrades
+- [ ] Know that Kubernetes Runtime v2 spawns 1 shim per Pod sandbox
+- [ ] Know the alternative shims: `runc` (OCI), `runsc` (gVisor), `kata` (MicroVM), `runwasi` (Wasm)
+- [ ] Can verify shim parent-child processes using `ps -ef --forest`

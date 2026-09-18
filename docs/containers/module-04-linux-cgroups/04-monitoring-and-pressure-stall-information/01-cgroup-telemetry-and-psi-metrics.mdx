@@ -1,0 +1,197 @@
+---
+title: "Chapter 1 — cgroup Telemetry & Pressure Stall Information (PSI)"
+sidebar_position: 1
+module: "Module 4.4 — Monitoring & PSI"
+description: "Master cgroup monitoring and Linux Pressure Stall Information (PSI) — telemetry files (cpu.stat, memory.events), 'some' vs 'full' stall thresholds, and cAdvisor metrics."
+---
+
+# Chapter 1 — cgroup Telemetry & Pressure Stall Information (PSI)
+
+> **Goal:** Master low-level kernel performance telemetry, resource starvation detection, and container metrics collection — dissecting **cgroup v2 metric files** (`cpu.stat`, `memory.events`, `memory.stat`, and `io.stat`), mastering the Linux **Pressure Stall Information (PSI)** framework, distinguishing between **`some`** and **`full`** stall thresholds, and correlating kernel telemetry with **Prometheus and cAdvisor**.
+>
+> By the end of this chapter, you will understand:
+> 1. The exact accounting files exposed in `/sys/fs/cgroup/` for CPU, memory, and I/O
+> 2. How `memory.events` counts OOM kills and high-watermark throttling events
+> 3. Why traditional CPU/RAM utilization percentages fail to reflect real hardware saturation
+> 4. How Pressure Stall Information (PSI) quantifies lost CPU cycles and I/O bottlenecks
+> 5. The architectural difference between `some` (partial stall) and `full` (complete stall)
+> 6. How to read and interpret real-time PSI metrics using `/proc/pressure/` and CLI tools
+
+---
+
+## Real-Life Analogy
+
+Think of cgroup Telemetry and Pressure Stall Information (PSI) as **the medical vital-sign monitors attached to an intensive-care patient**:
+
+- **The Deceptive Old Gauge (Raw Resource Utilization %):**
+  - A doctor looks at a patient's physical activity gauge (**CPU / RAM Utilization %**).
+  - The gauge says the patient is 95% active.
+  - The doctor thinks: *"The patient is working at peak health!"*
+  - **The Reality:** The patient's heart is beating wildly because their lungs are 100% starved of oxygen (**I/O Bottleneck / Memory Thrashing**)!
+- **The Modern Truth (Pressure Stall Information - PSI):**
+  - PSI is like measuring **Oxygen Blood Saturation and Blood Pressure**:
+  - Instead of asking *"How hard is the machine working?"*, PSI asks: **"What percentage of time were productive processes completely STALLED and unable to do work because they were waiting for CPU cores, RAM pages, or Disk I/O?"**
+  - **`some` (Partial Stall):** 30% of workers are stuck in line at the coffee machine, but others are still typing code.
+  - **`full` (Complete Stall):** 100% of workers are frozen because the office building has zero electricity (**Complete Productive Collapse**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Linux Pressure Stall Information (PSI) Accounting Engine
+
+ KERNEL SCHEDULER & HARDWARE INTERRUPT SUBSYSTEMS
+ ┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+ │ CPU RUN-QUEUE SCHEDULER  │  │ MEMORY RECLAIM SUBSYSTEM │  │ BLOCK I/O WAIT QUEUE     │
+ └────────────┬─────────────┘  └────────────┬─────────────┘  └────────────┬─────────────┘
+              │ Tracks Stalled Time         │ Tracks Stalled Time         │ Tracks Stalled Time
+              ▼                             ▼                             ▼
+ LINUX PRESSURE STALL INFORMATION (PSI) ENGINE (`/proc/pressure/` & cgroup `/sys/fs/cgroup/`)
+ ┌──────────────────────────────────────────────────────────────────────────────────────┐
+ │ 1. `some avg10=14.20 avg60=8.10 avg300=2.05 total=1849201`                          │
+ │    - % of time at least ONE thread was stalled waiting for resource!                 │
+ ├──────────────────────────────────────────────────────────────────────────────────────┤
+ │ 2. `full avg10=4.15 avg60=1.20 avg300=0.00 total=482109`                           │
+ │    - % of time ALL threads were completely STALLED! (Directly wasted CPU capacity!)  │
+ └──────────────────┬───────────────────────────────────────────────────────────────────┘
+                    │ Polled by cAdvisor / Prometheus Node Exporter
+                    ▼
+ PROMETHEUS METRIC: `node_pressure_memory_waiting_seconds_total` ──► Triggers SRE Alerts!
+```
+
+---
+
+## 1. Core cgroup v2 Telemetry Files
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────────┐
+ │ cgroup v2 Telemetry File  │ Key Metric Fields               │ Systems Diagnostic Purpose          │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **`cpu.stat`**            │ `usage_usec`, `user_usec`,      │ Measures total CPU time burned,     │
+ │                           │ `nr_periods`, `nr_throttled`,   │ total CFS periods elapsed, and time │
+ │                           │ `throttled_usec`                │ lost to frozen CFS throttling.      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **`memory.events`**       │ `low`, `high`, `max`,           │ Exact cumulative counter of how     │
+ │                           │ `oom`, `oom_kill`               │ many times container was OOM-killed!│
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **`memory.stat`**         │ `anon`, `file`, `kernel`,       │ Detailed byte breakdown: Anonymous  │
+ │                           │ `slab`, `pgfault`, `pgmajfault` │ RAM, Page Cache, and Kernel memory. │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────────┤
+ │ **`io.stat`**             │ `rbytes`, `wbytes`,             │ Per-device cumulative bytes read/   │
+ │                           │ `rios`, `wios`, `dbytes`        │ written and raw I/O operations.     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## 2. Pressure Stall Information (PSI) Deep Dive
+
+PSI exposes metrics for 3 core subsystems: `/proc/pressure/cpu`, `/proc/pressure/memory`, and `/proc/pressure/io`.
+
+### Sample PSI Output:
+```text
+some avg10=2.50 avg60=1.20 avg300=0.50 total=124050
+full avg10=0.80 avg60=0.20 avg300=0.05 total=45100
+```
+- **`avg10`, `avg60`, `avg300`**: The moving percentage average of time spent in a stalled state over the last **10 seconds, 60 seconds, and 300 seconds** ($2.50 = 2.50\%$ of time stalled).
+- **`total`**: Total cumulative time spent stalled (in microseconds).
+
+### The `some` vs `full` Distinction:
+```text
+ ┌──────────────┬─────────────────────────────────────────────────────────────────────────────────────┐
+ │ Metric Type  │ Exact Kernel Definition & Operational Impact                                        │
+ │──────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+ │ **`some`**   │ At least **one task** was stalled waiting for the resource, but other tasks were   │
+ │              │ still running on other CPU cores. Indicates early resource contention.              │
+ │──────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+ │ **`full`**   │ **ALL non-idle tasks** were stalled simultaneously! No CPU was doing productive     │
+ │              │ work because all threads were blocked on memory paging or disk I/O! (Critical bug). │
+ └──────────────┴─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Prometheus & cAdvisor Metric Mapping
+
+```text
+ ┌──────────────────────────────────┬──────────────────────────────────┬──────────────────────────────┐
+ │ Linux cgroup / PSI Source        │ Prometheus / cAdvisor Metric     │ Alerting Threshold Trigger   │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `cpu.stat: throttled_usec`       │ `container_cpu_cfs_throttled_...`│ `rate(...) > 0.25`           │
+ │                                  │ `periods_total`                  │ (Over 25% periods throttled).│
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `memory.events: oom_kill`        │ `container_oom_events_total`     │ `increase(...) > 0`          │
+ │                                  │                                  │ (Container OOM-killed!).     │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `/proc/pressure/memory (some)`   │ `node_pressure_memory_waiting...`│ `avg10 > 20.0`               │
+ │                                  │ `seconds_total`                  │ (Severe memory thrashing!).  │
+ │──────────────────────────────────┼──────────────────────────────────┼──────────────────────────────┤
+ │ `/proc/pressure/io (full)`       │ `node_pressure_io_stalled_...`   │ `avg10 > 10.0`               │
+ │                                  │ `seconds_total`                  │ (Disk I/O lockup/stall!).    │
+ └──────────────────────────────────┴──────────────────────────────────┴──────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying Live Host PSI Metrics
+
+```bash
+# Step 1: Query host CPU pressure metrics
+cat /proc/pressure/cpu 2>/dev/null || echo "PSI CPU supported"
+
+# Step 2: Query host Memory pressure metrics (Notice both 'some' and 'full' lines!)
+cat /proc/pressure/memory 2>/dev/null || echo "PSI Memory supported"
+
+# Step 3: Query host Block I/O pressure metrics
+cat /proc/pressure/io 2>/dev/null || echo "PSI IO supported"
+
+# Step 4: Inspect container memory events for active OOM kill counts
+# cat /sys/fs/cgroup/system.slice/docker-<id>.scope/memory.events
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Pressure Stall Information (PSI) in the Linux kernel, and why is it superior to traditional utilization metrics?**
+
+Pressure Stall Information (PSI) is a Linux kernel subsystem (introduced in Linux 4.20) that directly measures **productive time lost to resource shortages**. Traditional utilization metrics (e.g. "CPU is at 90%") are misleading: a node running at 90% CPU might be operating smoothly, or it might be experiencing catastrophic latency because threads are waiting for memory pages. PSI tracks the exact percentage of wall-clock time that tasks were **stalled in an un-runnable state waiting for CPU, Memory, or I/O bandwidth**, providing an unambiguous signal of hardware saturation.
+
+**Q2: What is the difference between `some` and `full` in PSI metrics?**
+
+- **`some`**: Measures the percentage of time that **at least one task** in the cgroup was stalled waiting for the resource, even if other tasks were actively executing on available CPU cores. It indicates emerging resource contention.
+- **`full`**: Measures the percentage of time that **all non-idle tasks** were stalled simultaneously. During a `full` memory or I/O stall, zero productive application work is performed because every single thread is blocked waiting for page cache reclaims or disk reads, representing 100% wasted CPU capacity.
+
+**Q3: How does cgroup v2's `memory.events` file help SREs diagnose intermittent OOMKilled containers?**
+
+In cgroup v1, detecting whether a container suffered an OOMKill required parsing kernel syslog / dmesg logs for stack traces. In cgroup v2, the **`memory.events`** file maintains persistent, incrementing event counters:
+- `high`: Number of times the cgroup exceeded `memory.high` and was throttled.
+- `max`: Number of times the cgroup hit `memory.max`.
+- **`oom_kill`**: The exact cumulative count of processes inside the cgroup terminated by the OOM-Killer.
+cAdvisor and Prometheus scrape this counter directly, allowing instant alerts on container OOM events without log scraping.
+
+**Q4: How does Prometheus calculate CPU Throttling percentage from `cpu.stat`?**
+
+Prometheus scrapes `container_cpu_cfs_throttled_periods_total` and `container_cpu_cfs_periods_total` from `/sys/fs/cgroup/.../cpu.stat`. It calculates throttling percentage using PromQL:
+```promql
+sum(rate(container_cpu_cfs_throttled_periods_total[5m])) 
+/ 
+sum(rate(container_cpu_cfs_periods_total[5m])) * 100
+```
+If this value exceeds 20%, it indicates that the container is frequently exhausting its CFS quota and suffering latency degradation.
+
+**Q5: Why is `CLOCK_MONOTONIC` important when calculating cgroup CPU execution time?**
+
+`CLOCK_MONOTONIC` represents absolute monotonic elapsed time since system boot, unaffected by NTP time adjustments or daylight savings jumps. When the kernel CFS scheduler computes CPU usage (`usage_usec` in `cpu.stat`), it relies on monotonic hardware timers. Using wall-clock time (`CLOCK_REALTIME`) would cause negative time measurements or corrupted quota accounting if a system clock synchronization event occurred.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `cpu.stat` tracks `nr_throttled` and `throttled_usec`
+- [ ] Know that `memory.events` provides exact cumulative `oom_kill` counters
+- [ ] Know that PSI measures percentage of wall-clock time lost to resource stalls
+- [ ] Know the difference: `some` (at least 1 task stalled) vs `full` (all tasks stalled)
+- [ ] Know that PSI moving averages are calculated over 10s, 60s, and 300s windows
+- [ ] Can query host pressure metrics using `cat /proc/pressure/{cpu,memory,io}`

@@ -1,0 +1,210 @@
+---
+title: "Chapter 2 — Service Mesh Features: mTLS, Canary Traffic Splitting, Circuit Breaking & Retries"
+sidebar_position: 1
+module: "Module 15.2 — Mesh Features"
+description: "Master advanced Service Mesh capabilities — mutual TLS (mTLS) enforcement with SPIFFE identities, Istio VirtualService canary traffic shifting, DestinationRule circuit breaking, outlier detection, and fault injection."
+---
+
+# Chapter 2 — Service Mesh Features: mTLS, Canary Traffic Splitting, Circuit Breaking & Retries
+
+> **Goal:** Master the production traffic management and zero-trust security capabilities provided by a Service Mesh. Understand how to enforce strict Mutual TLS (mTLS) with cryptographically validated SPIFFE identities, execute precise weight-based Canary deployments using Istio `VirtualService`, protect microservices from cascading failures using `DestinationRule` Circuit Breaking and Outlier Detection, and simulate chaos with Fault Injection.
+>
+> By the end of this chapter, you will understand:
+> 1. Mutual TLS (mTLS) modes: `PERMISSIVE` (migration) vs `STRICT` (zero-trust enforcement)
+> 2. Cryptographic workload identity: SPIFFE IDs (`spiffe://trust-domain/ns/prod/sa/payment-service`)
+> 3. Traffic Shifting & Canary Releases using Istio `VirtualService` weight percentages
+> 4. Header-based / Cookie-based routing (A/B testing, internal beta testers)
+> 5. Circuit Breaking & Outlier Detection: connection pools, `consecutive5xxErrors`, and base ejection time
+> 6. Chaos Engineering: Fault Injection (HTTP aborts and latency delays)
+
+---
+
+## Real-Life Analogy
+
+Think of Service Mesh features as **an intelligent automated air traffic control and airport runway security system**:
+
+- **Strict mTLS (Biometric Security Clearances):**
+  - Planes cannot land on the runway unless both the pilot and the control tower prove their biometric identity (**Two-Way Mutual Authentication**).
+- **Canary Traffic Splitting (Canary Test Flights):**
+  - When the airline introduces a new supersonic jet (**Version 2**), air traffic control directs **95% of passengers to the reliable standard jet (v1)** and only **5% of adventurous volunteers to the new jet (v2)** (**Weight-Based Routing**).
+- **Circuit Breaking (Automatic Quarantine):**
+  - If Terminal 3 experiences an electrical fire and starts rejecting flights (**5xx Errors**), the control tower immediately stops sending new planes to Terminal 3 for 10 minutes (**Outlier Detection Ejection**), preventing airplanes from circling endlessly and running out of fuel (**Cascading Collapse**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  Canary Traffic Splitting & Circuit Breaking Workflow
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT SERVICE (Calling `http://reviews:9080`)                              │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ ISTIO VIRTUALSERVICE (Canary Traffic Splitting Rule):                       │
+ │                                                                             │
+ │                  ┌───────────────────┴───────────────────┐                  │
+ │                  │ (90% Weight)                          │ (10% Weight)     │
+ │                  ▼                                       ▼                  │
+ │      [Subset: v1 (Stable)]                   [Subset: v2 (Canary)]          │
+ └──────────────────┬───────────────────────────────────────┬──────────────────┘
+                    │                                       │
+                    ▼                                       ▼
+ ┌──────────────────────────────────────┐ ┌────────────────────────────────────┐
+ │ DESTINATIONRULE (Circuit Breaker):   │ │ DESTINATIONRULE:                   │
+ │ Max Connections: 100                 │ │ Outlier Detection:                 │
+ │ Max Pending Requests: 10             │ │ - 3 consecutive 5xx errors         │
+ │ (Rejects spikes to prevent crash)    │ │ - Ejects pod for 30 seconds        │
+ └──────────────────────────────────────┘ └────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Istio VirtualService: Canary Traffic Shifting
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: reviews-route
+spec:
+  hosts:
+    - reviews
+  http:
+    # Rule 1: Route Beta Testers with 'X-Beta-User' header to v2
+    - match:
+        - headers:
+            x-beta-user:
+              exact: "true"
+      route:
+        - destination:
+            host: reviews
+            subset: v2
+    # Rule 2: Standard Canary Traffic Split (90% v1 / 10% v2)
+    - route:
+        - destination:
+            host: reviews
+            subset: v1
+          weight: 90
+        - destination:
+            host: reviews
+            subset: v2
+          weight: 10
+      timeout: 2s
+      retries:
+        attempts: 3
+        perTryTimeout: 500ms
+        retryOn: "5xx,connect-failure,refused-stream"
+```
+
+---
+
+### 2. Istio DestinationRule: Circuit Breaking & Outlier Detection
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: reviews-circuit-breaker
+spec:
+  host: reviews
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+  trafficPolicy:
+    # 1. Enforce Mutual TLS
+    tls:
+      mode: ISTIO_MUTUAL
+    # 2. Connection Pool Limits (L4/L7 Circuit Breaking)
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 10
+        maxRequestsPerConnection: 10
+    # 3. Outlier Detection (Passive Health Checking)
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+```
+
+---
+
+## Hands-On Lab: Verifying mTLS & Traffic Routing with `istioctl`
+
+```bash
+# Step 1: Check mTLS enforcement status across all services in the cluster
+# istioctl authn tls-check <pod-name>.default
+
+# Step 2: Query active routes configured in Envoy proxy
+# istioctl proxy-config routes <pod-name>
+
+# Step 3: Inject Chaos Latency (Fault Injection) via VirtualService to test client timeouts
+# kubectl apply -f - <<EOF
+# apiVersion: networking.istio.io/v1alpha3
+# kind: VirtualService
+# metadata:
+#   name: ratings-delay
+# spec:
+#   hosts:
+#     - ratings
+#   http:
+#     - fault:
+#         delay:
+#           percentage:
+#             value: 100.0
+#           fixedDelay: 5s
+#       route:
+#         - destination:
+#             host: ratings
+#             subset: v1
+# EOF
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between Istio `PERMISSIVE` mode and `STRICT` mode for mTLS?**
+
+- **`PERMISSIVE` Mode (Default during migration):** Envoy accepts **both unencrypted plain-text traffic AND encrypted mTLS traffic**. This allows legacy non-mesh services to communicate with mesh-enabled pods while developers migrate workloads.
+- **`STRICT` Mode (Production Zero-Trust):** Envoy rejects any incoming connection that does not present a valid, cryptographically signed mTLS client certificate with a trusted SPIFFE identity, immediately dropping unauthenticated requests.
+
+**Q2: What is the difference between an Istio `VirtualService` and a `DestinationRule`?**
+
+- **`VirtualService` (Routing & Traffic Shifting):** Defines **how to route traffic to a destination**. It controls matching criteria (paths, headers), canary weight percentages (e.g. 90% v1 / 10% v2), URL rewrites, retries, and timeouts.
+- **`DestinationRule` (Policies Applied AFTER Routing):** Defines **policies applied to traffic once it reaches the destination**. It controls load balancing algorithms (Round Robin, Least Conn, Consistent Hash), mTLS settings, Connection Pool limits, and Outlier Detection circuit breaking.
+
+**Q3: How does Outlier Detection prevent Cascading Failures in a microservices architecture?**
+
+When a single backend pod begins crashing or throwing database errors (returning HTTP 500s), standard round-robin routing continues sending requests to it, causing user transaction failures and overwhelming the remaining pods. **Outlier Detection** tracks error rates; if a pod returns `consecutive5xxErrors: 3`, the Envoy proxy automatically **ejects the failing pod from the load balancing pool** for a cooldown period (`baseEjectionTime: 30s`), giving the pod time to recover or allowing Kubernetes to restart it.
+
+**Q4: How does a Service Mesh prevent Retry Storms in microservice chains?**
+
+If Service A calls Service B with 3 retries, and Service B calls Service C with 3 retries, a single user request can multiply into $3 \times 3 = 9$ aggressive retry bursts hitting an already overloaded database. Service Meshes prevent this using **Retry Budgets** (restricting retries to max 10% of total request volume) and **Context Deadline Propagation** (canceling retries if the parent request has timed out).
+
+**Q5: What is a SPIFFE ID and how is it formatted?**
+
+SPIFFE (Secure Production Identity Framework for Everyone) is a CNCF standard for cryptographic workload identity. It is formatted as a standardized URI embedded in the X.509 certificate's Subject Alternative Name (SAN):
+`spiffe://<trust-domain>/ns/<namespace>/sa/<serviceaccount-name>`
+(e.g., `spiffe://cluster.local/ns/production/sa/payment-service`). This allows Istio and Envoy to enforce strict Layer 7 authorization policies based on verified cryptographic identities rather than spoofable IP addresses.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master mTLS `PERMISSIVE` vs `STRICT` zero-trust enforcement
+- [ ] Understand SPIFFE URI identities in X.509 SAN extensions
+- [ ] Differentiate `VirtualService` (routing/weights) from `DestinationRule` (circuit breaker)
+- [ ] Master Outlier Detection ejection parameters (`consecutive5xxErrors`, `baseEjectionTime`)
+- [ ] Understand Chaos Engineering with Fault Injection (delays and aborts)

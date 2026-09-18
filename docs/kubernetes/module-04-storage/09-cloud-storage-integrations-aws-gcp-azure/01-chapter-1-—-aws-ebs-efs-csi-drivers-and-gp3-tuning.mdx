@@ -1,0 +1,271 @@
+---
+title: "Chapter 1 — AWS EBS & EFS CSI Drivers (gp3 & RWX)"
+sidebar_position: 1
+module: "Module 4.9 — Cloud Storage Integrations"
+description: "Master AWS storage in Kubernetes — EBS CSI gp3 vs io2 tuning, baseline 3000 IOPS, EFS CSI dynamic Access Points for multi-AZ ReadWriteMany, and IRSA KMS encryption."
+---
+
+# Chapter 1 — AWS EBS & EFS CSI Drivers (gp3 Tuning & RWX)
+
+> **Goal:** Master cloud-native AWS storage in Amazon EKS and self-managed Kubernetes — understanding the performance tuning and cost optimization of the AWS EBS CSI Driver (`ebs.csi.aws.com`), configuring modern `gp3` volumes with independent IOPS and throughput provisioning, securing data with AWS KMS encryption via IAM Roles for Service Accounts (IRSA), and provisioning multi-AZ `ReadWriteMany` shared filesystems using the AWS EFS CSI Driver (`efs.csi.aws.com`) with dynamic Access Points.
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural difference between AWS EBS (Single-AZ RWO Block) and AWS EFS (Multi-AZ RWX Shared File)
+> 2. Why `gp3` is 20% cheaper than legacy `gp2` while providing baseline 3,000 IOPS at any disk size
+> 3. How to independently configure IOPS and throughput parameters in `StorageClass` manifests
+> 4. How AWS EFS CSI dynamically provisions isolated tenant directories using **EFS Access Points**
+> 5. How to authenticate the EBS and EFS CSI drivers using AWS IRSA (IAM Roles for Service Accounts)
+> 6. How to troubleshoot AWS EBS attachment limits and volume stuck in `Attaching` errors
+
+---
+
+## Real-Life Analogy
+
+Think of AWS EBS and EFS as **different types of specialized corporate vehicles**:
+
+- **AWS EBS `gp3` (A High-Performance Armored Sports Car):** A sleek, dedicated vehicle bolted to one specific driver (`ReadWriteOnce`). It can accelerate to extreme speeds (16,000 IOPS, 1,000 MB/s). You can customize the engine horsepower (IOPS) independently from the trunk capacity (Gigabytes). However, it is physically confined to one single city garage (Single Availability Zone `us-east-1a`).
+- **AWS EFS (A Multi-City Regional Bus Network):** A massive passenger bus network operating across the entire state (`ReadWriteMany` spanning `us-east-1a`, `us-east-1b`, `us-east-1c`). Hundreds of employees across dozens of remote offices can board the bus simultaneously.
+- **EFS Access Points (Personal Assigned Bus Seats):** Even though all employees ride the same communal bus, each team gets an electronically locked private compartment with strict keycards (**Dynamic Access Points with POSIX UID/GID isolation**).
+
+---
+
+## Architecture Diagram
+
+```text
+               AWS EBS (Block / RWO) vs AWS EFS (Shared / RWX)
+
+ 1. AWS EBS Architecture (Single-AZ Block Storage):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Availability Zone: us-east-1a                                          │
+ │                                                                        │
+ │ Worker Node A (EC2 Instance: i-012345678)                              │
+ │   └── Pod: postgres-db (Mounts /dev/xvdf at 3,000 IOPS)                │
+ │         ▲                                                              │
+ │         │ Hypervisor PCI / NVMe Virtual Attachment                     │
+ │         ▼                                                              │
+ │   AWS EBS gp3 Volume: vol-0987654321 (Locked to us-east-1a!)           │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. AWS EFS Architecture (Multi-AZ Shared Network Filesystem):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ AWS Elastic File System (EFS): fs-01234567 (Multi-AZ NFS Fabric)       │
+ └───────┬────────────────────────────┬────────────────────────────┬──────┘
+         │ (NFS over TLS)             │ (NFS over TLS)             │
+         ▼                            ▼                            ▼
+ ┌───────────────────┐        ┌───────────────────┐        ┌───────────────────┐
+ │ Zone: us-east-1a  │        │ Zone: us-east-1b  │        │ Zone: us-east-1c  │
+ │ Worker Node 1     │        │ Worker Node 2     │        │ Worker Node 3     │
+ │ [ Pod: web-01 ]   │        │ [ Pod: web-02 ]   │        │ [ Pod: web-03 ]   │
+ └───────────────────┘        └───────────────────┘        └───────────────────┘
+ (Result: All 3 Pods read/write concurrently with ReadWriteMany access!)
+```
+
+---
+
+## AWS EBS Volume Types: `gp2` vs `gp3` vs `io2`
+
+```text
+ ┌──────────────────────┬─────────────────────────┬─────────────────────────┬─────────────────────────┐
+ │ Feature              │ Legacy `gp2`            │ Modern `gp3` (Standard) │ Extreme `io2`           │
+ │──────────────────────┼─────────────────────────┼─────────────────────────┼─────────────────────────┤
+ │ **Baseline IOPS**    │ 3 IOPS per GiB (100 min)│ **3,000 IOPS included** │ Up to 256,000 IOPS      │
+ │                      │ (Bursts via burst-bucket│ regardless of disk size!│ (Sub-millisecond)       │
+ │ **Throughput**       │ Tied to IOPS (max 250)  │ **125 MB/s included**   │ Up to 4,000 MB/s        │
+ │                      │                         │ (Scalable to 1,000 MB/s)│                         │
+ │ **Pricing**          │ Baseline price          │ **20% CHEAPER than gp2**│ Premium enterprise tier │
+ │ **Custom Tuning**    │ Tied strictly to size   │ **Independently tuned** │ Independently tuned     │
+ │ **Max IOPS**         │ 16,000 IOPS             │ 16,000 IOPS             │ 256,000 IOPS            │
+ └──────────────────────┴─────────────────────────┴─────────────────────────┴─────────────────────────┘
+```
+
+> [!TIP]
+> **The `gp3` Cost Optimization:** If a developer provisions a 20GB MySQL database disk on `gp2`, it receives only $20 \times 3 = 60\text{ IOPS}$, causing severe disk latency. On `gp3`, a 20GB disk receives **3,000 IOPS and 125 MB/s throughput** out-of-the-box while costing 20% less per gigabyte!
+
+---
+
+## Complete Production AWS EBS `gp3` StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: aws-ebs-gp3-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  type: gp3
+  # Baseline 3,000 IOPS + Provisioned 2,000 additional = 5,000 IOPS total
+  iops: "5000"
+  # Baseline 125 MB/s + Provisioned 125 additional = 250 MB/s total
+  throughput: "250"
+  # Enforce KMS encryption at rest
+  encrypted: "true"
+  kmsKeyId: "arn:aws:kms:us-east-1:123456789012:key/my-database-key"
+mountOptions:
+  - noatime
+```
+
+---
+
+## AWS EFS CSI Driver & Dynamic Access Points
+
+AWS EFS provides serverless, cross-AZ shared file storage (`ReadWriteMany`).
+
+Instead of provisioning a separate EFS filesystem for every PVC, the AWS EFS CSI Driver dynamically provisions **EFS Access Points** on a single shared EFS filesystem:
+
+```yaml
+# 1. Dynamic EFS StorageClass
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: aws-efs-dynamic-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap                   # Dynamic Access Point Mode!
+  fileSystemId: fs-0123456789abcdef0         # Pre-created EFS Filesystem ID
+  directoryPerms: "0700"
+  gidRangeStart: "1000"                      # Auto-assigns distinct POSIX UID/GID
+  gidRangeEnd: "2000"
+  basePath: "/dynamic_pvc_storage"
+mountOptions:
+  - tls                                      # Enforces in-flight encryption!
+---
+# 2. Shared Multi-Node PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-web-assets-pvc
+  namespace: web-app
+spec:
+  accessModes:
+    - ReadWriteMany                          # RWX enabled across all nodes!
+  storageClassName: aws-efs-dynamic-sc
+  resources:
+    requests:
+      storage: 100Gi                         # EFS is elastic (size is cosmetic)
+```
+
+---
+
+## IAM Roles for Service Accounts (IRSA)
+
+The EBS and EFS CSI drivers authenticate to AWS APIs using **IRSA**:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ebs-csi-controller-sa
+  namespace: kube-system
+  annotations:
+    # Binds the Kubernetes SA to an AWS IAM Role with EC2/EFS permissions!
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/AmazonEKS_EBS_CSI_DriverRole
+```
+
+---
+
+## Hands-On Lab: Deploying an AWS gp3 StorageClass & PVC
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace aws-storage-lab
+
+# Step 2: Create an AWS EBS gp3 StorageClass
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lab-ebs-gp3
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+EOF
+
+# Step 3: Create a PVC requesting the gp3 StorageClass
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ebs-claim
+  namespace: aws-storage-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lab-ebs-gp3
+  resources:
+    requests:
+      storage: 20Gi
+EOF
+
+# Step 4: Deploy a Pod consuming the EBS volume
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ebs-consumer-pod
+  namespace: aws-storage-lab
+spec:
+  volumes:
+  - name: ebs-vol
+    persistentVolumeClaim:
+      claimName: ebs-claim
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "echo 'High IOPS AWS gp3' > /data/tx.log; sleep 3600"]
+    volumeMounts:
+    - name: ebs-vol
+      mountPath: /data
+EOF
+
+# Step 5: Clean up lab
+kubectl delete namespace aws-storage-lab
+kubectl delete storageclass lab-ebs-gp3
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the key architectural advantages of AWS EBS `gp3` compared to `gp2`?**
+
+`gp3` provides three major advantages over `gp2`: (1) **Decoupled Performance**: `gp3` allows independent provisioning of IOPS (up to 16,000) and throughput (up to 1,000 MB/s) without increasing storage capacity; (2) **Generous Baseline**: Every `gp3` volume includes 3,000 IOPS and 125 MB/s throughput for free at any size; (3) **Cost Savings**: `gp3` is 20% cheaper per gigabyte than `gp2`.
+
+**Q2: When would you choose AWS EFS over AWS EBS in a Kubernetes cluster?**
+
+Choose **AWS EFS** when: (1) Workloads require concurrent read and write access across multiple Pods running on different worker nodes across multiple Availability Zones (`ReadWriteMany`); (2) Serving shared static assets (WordPress uploads, CI/CD pipeline caches); or (3) Requiring elastic serverless storage without pre-allocating fixed gigabyte quotas. Choose **AWS EBS** for single-instance, high-IOPS databases (PostgreSQL, MySQL, Redis) requiring sub-millisecond block latency.
+
+**Q3: How do Dynamic EFS Access Points work in the AWS EFS CSI Driver?**
+
+Dynamic Access Points allow hundreds of distinct PVCs to share a single root AWS EFS filesystem while maintaining security isolation. When a PVC is created, the EFS CSI driver creates an **EFS Access Point** with a dedicated POSIX root directory (e.g. `/dynamic_pvc_storage/pvc-123`), assigns a unique UID/GID, and restricts the Pod's NFS client mount strictly to that subfolder, preventing tenants from seeing or accessing other teams' files.
+
+**Q4: How does the AWS EBS CSI Driver authenticate to the AWS Cloud API?**
+
+The driver authenticates using **IAM Roles for Service Accounts (IRSA)**. The `ebs-csi-controller-sa` Kubernetes ServiceAccount in `kube-system` is annotated with an AWS IAM Role ARN (`eks.amazonaws.com/role-arn`). Kubelet injects an OIDC-signed projected JSON Web Token (JWT) into the CSI controller pod. The AWS STS service validates the JWT and returns temporary AWS credentials, eliminating hardcoded access keys.
+
+**Q5: What causes `AttachmentLimitExceeded` errors when attaching EBS volumes to AWS EC2 worker nodes?**
+
+Every AWS EC2 instance type has a hard hardware limit on the maximum number of EBS volumes that can be attached simultaneously (typically 28 volumes on modern Nitro instances, sharing slots with network interfaces). If a node reaches this limit, subsequent Pods scheduled to that node fail with `AttachmentLimitExceeded`. To fix this, enable volume limit tracking in the CSI driver or scale out worker nodes.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that AWS EBS is single-AZ block storage (`ReadWriteOnce`)
+- [ ] Know that AWS EFS is multi-AZ shared file storage (`ReadWriteMany`)
+- [ ] Know why `gp3` is 20% cheaper than `gp2` and includes baseline 3,000 IOPS
+- [ ] Know how to tune `iops` and `throughput` independently in `gp3` StorageClasses
+- [ ] Know how EFS Access Points dynamically isolate multi-tenant PVCs
+- [ ] Know that IRSA authenticates CSI drivers using OIDC ServiceAccount tokens
+- [ ] Can verify EBS volumes using `kubectl get volumeattachment`

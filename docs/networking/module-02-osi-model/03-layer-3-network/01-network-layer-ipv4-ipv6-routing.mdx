@@ -1,0 +1,184 @@
+---
+title: "Chapter 1 — Layer 3: Network Layer — IPv4, IPv6 & Packet Routing"
+sidebar_position: 1
+module: "Module 2.3 — Layer 3: Network Layer"
+description: "Master OSI Layer 3: Network Layer — IPv4 and IPv6 packet header architecture, Time-to-Live (TTL), Fragmentation vs PMTUD, RIB vs FIB, and Longest Prefix Match (LPM) routing."
+---
+
+# Chapter 1 — Layer 3: Network Layer — IPv4, IPv6 & Packet Routing
+
+> **Goal:** Master the logical end-to-end packet delivery mechanics of **OSI Layer 3 (Network Layer)** — dissecting **IPv4 vs IPv6 header architectures**, understanding **Time-to-Live (TTL)** and **Hop Limit** loop termination, comparing **Packet Fragmentation vs Path MTU Discovery (PMTUD)**, and analyzing the **Longest Prefix Match (LPM)** algorithm used by router **FIB/RIB forwarding engines**.
+>
+> By the end of this chapter, you will understand:
+> 1. Complete bit-level structure of the 20-byte IPv4 header and the streamlined 40-byte fixed IPv6 header
+> 2. Time-to-Live (TTL) decrements and ICMP Time Exceeded packet mechanics
+> 3. IP Fragmentation mechanics: Identification, Flags (DF/MF), Fragment Offset, and security risks
+> 4. Path MTU Discovery (PMTUD) using ICMP Type 3 Code 4 (Fragmentation Needed) and "Black Hole" detection
+> 5. The difference between the Control Plane (RIB - Routing Information Base) and Data Plane (FIB - Forwarding Information Base)
+> 6. How hardware TCAM routers execute Longest Prefix Match (LPM) lookups in sub-nanosecond time
+> 7. How to inspect Linux kernel routing tables, test route lookups, and trace Layer 3 packet paths via CLI
+
+---
+
+## Real-Life Analogy
+
+Think of Layer 3 (Network Layer) as **an international postal and parcel forwarding system**:
+
+- **Layer 3 Packet (The Global Parcel):**
+  - While Layer 2 MAC addresses only move packages between adjacent workers in the same mailroom, Layer 3 contains the global destination address (**Country, State, City, Street, Apartment Number / IP Address**).
+- **Time-to-Live / TTL (Max Postage Expiry Stamp):**
+  - Every package has a stamp marked: *"Maximum 64 transfers allowed"*. Every courier who touches the box decrements the number by 1. If it hits 0 because of an incorrect address or endless loop between post offices, the package is incinerated and a notice is sent back to the sender (**ICMP Time Exceeded**).
+- **IPv4 vs IPv6 Header (Old Paper Parcel vs High-Speed Barcode):**
+  - IPv4 is like a cluttered, variable-length handwritten customs declaration form where couriers must recalculate checksums at every stop. IPv6 is a streamlined, fixed-size 40-byte digital barcode optimized for laser scanning machines (**Hardware ASIC forwarding**).
+- **Longest Prefix Match (The Zip Code Sorter):**
+  - If a package is addressed to Beverly Hills, CA 90210, the postal hub chooses the specific local truck marked `90210` over the generic truck marked `90000-99999` (California) or `00000-99999` (National Default).
+
+---
+
+## Architecture Diagram
+
+```text
+               OSI Layer 3: IPv4 vs IPv6 Header Comparison
+
+  IPv4 Header (20 Bytes Variable Length)
+   0                   1                   2                   3
+   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+  ┌────────┬───────┬───────────────┬───────────────────────────────┐
+  │Version │  IHL  │  DSCP / ECN   │         Total Length          │
+  ├────────┴───────┴───────────────┼───┬───┬───────────────────────┤
+  │         Identification         │ 0 │DF │MF│   Fragment Offset   │
+  ├────────────────┬───────────────┼───┴───┴───────────────────────┤
+  │  Time to Live  │   Protocol    │        Header Checksum        │
+  ├────────────────┴───────────────┴───────────────────────────────┤
+  │                       Source IPv4 Address                     │
+  ├───────────────────────────────────────────────────────────────┤
+  │                    Destination IPv4 Address                   │
+  └───────────────────────────────────────────────────────────────┘
+
+  IPv6 Header (40 Bytes Streamlined Fixed Length)
+   0                   1                   2                   3
+   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+  ┌────────┬───────────────────────┬───────────────────────────────┐
+  │Version │     Traffic Class     │          Flow Label           │
+  ├────────┴───────────────────────┼───────────────┬───────────────┤
+  │         Payload Length         │  Next Header  │   Hop Limit   │
+  ├────────────────────────────────┴───────────────┴───────────────┤
+  │                                                               │
+  │                  Source IPv6 Address (128-bit)                │
+  │                                                               │
+  ├───────────────────────────────────────────────────────────────┤
+  │                                                               │
+  │               Destination IPv6 Address (128-bit)              │
+  │                                                               │
+  └───────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. IPv4 vs IPv6 Header Technical Comparison
+
+```text
+ ┌──────────────────────┬───────────────────────────────┬──────────────────────────────────────────────────┐
+ │ Header Field         │ IPv4 Header (20-60 Bytes)     │ IPv6 Streamlined Header (40 Bytes Fixed)         │
+ │──────────────────────┼───────────────────────────────┼──────────────────────────────────────────────────┤
+ │ **Address Size**     │ 32 bits (4.3 Billion IPs)     │ 128 bits ($3.4 \times 10^{38}$ IPs)              │
+ │ **Header Size**      │ 20 Bytes min (Variable via IHL)│ 40 Bytes Fixed (Zero CPU length calculation)     │
+ │ **TTL / Loop Limit** │ Time to Live (TTL - 8 bits)   │ Hop Limit (8 bits)                               │
+ │ **Protocol Type**    │ Protocol (e.g. 6=TCP, 17=UDP) │ Next Header (Chains Extension Headers)           │
+ │ **QoS / Prioritization│ DSCP (6 bits) + ECN (2 bits) │ Traffic Class (8 bits) + Flow Label (20 bits)    │
+ │ **Checksum**         │ Header Checksum (Recalculated │ **None** (Eliminated to speed up ASIC forwarding;│
+ │                      │ at every router hop!)         │ relies on L2 and L4 checksums)                   │
+ │ **Fragmentation**    │ Done by intermediate routers  │ **Source Host Only** (Routers never fragment!)   │
+ └──────────────────────┴───────────────────────────────┴──────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Longest Prefix Match (LPM) Routing Algorithm
+
+When an IP packet arrives at a router, the destination IP address is evaluated against all active routes in the **Forwarding Information Base (FIB)**. The route with the **most specific subnet mask (longest prefix length)** wins:
+
+```text
+   Incoming Packet Destination: 192.168.1.150
+
+   Routing Table Entries:
+   1. 0.0.0.0/0           via 10.0.0.1      (Prefix Length /0  - Default Route)
+   2. 192.168.0.0/16      via 10.0.0.2      (Prefix Length /16 - Matches!)
+   3. 192.168.1.0/24      via 10.0.0.3      (Prefix Length /24 - Matches!)
+   4. 192.168.1.128/25    via 10.0.0.4      (Prefix Length /25 - MATCHES! BEST MATCH)
+
+   Decision:
+   192.168.1.150 matches /0, /16, /24, and /25.
+   Route 4 (/25) has the longest prefix (most specific), so the packet is forwarded to 10.0.0.4!
+```
+
+---
+
+### 3. Path MTU Discovery (PMTUD) vs Packet Fragmentation
+
+- **Maximum Transmission Unit (MTU):** Standard Ethernet MTU is **1,500 bytes**.
+- **The Fragmentation Problem:** If a 1,500-byte packet hits a VPN tunnel with a 1,420-byte MTU, an IPv4 router with `DF=0` splits the packet into two fragments. If either fragment is lost, the entire 1,500-byte payload is discarded and retransmitted, crippling performance.
+- **Path MTU Discovery (PMTUD):**
+  1. The sending host sets the **Don't Fragment (DF=1)** flag on all outbound packets.
+  2. When a packet exceeds an intermediate link's MTU, the router drops the packet and responds with an **ICMP Type 3 Code 4** (*Destination Unreachable, Fragmentation Needed, MTU=1420*).
+  3. The sending host lowers its Maximum Segment Size (MSS) to match the bottleneck MTU.
+  4. **PMTUD Black Holes:** If a misconfigured firewall blocks all ICMP packets, the sender never receives the MTU alert and hangs indefinitely during large TLS handshakes.
+
+---
+
+## Hands-On Lab: Querying Routes, Testing LPM & PMTUD in Linux
+
+```bash
+# Step 1: Query the Linux kernel routing table with detailed metrics
+ip route show
+
+# Step 2: Test Longest Prefix Match (LPM) decision for a specific destination IP
+ip route get 8.8.8.8
+
+# Step 3: Perform Path MTU Discovery (PMTUD) probing to find the exact bottleneck MTU
+ping -M do -s 1472 -c 2 1.1.1.1
+# (1472 data bytes + 20 IP header + 8 ICMP header = 1500 byte full MTU frame)
+
+# Step 4: Test a packet size exceeding MTU with DF bit set (Demonstrates fragmentation block)
+ping -M do -s 1500 -c 2 1.1.1.1 2>&1 | grep -i "message too long" || echo "MTU probe completed"
+
+# Step 5: Trace packet route and identify TTL hop decrements
+traceroute -n -m 10 1.1.1.1 2>/dev/null || ip route get 1.1.1.1
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the Longest Prefix Match (LPM) algorithm determine which route a router selects?**
+
+When a router receives an IP packet, it compares the destination IP address against all subnet prefixes in its Forwarding Information Base (FIB). Multiple routing table entries may match the target destination (e.g., a default route `/0`, a summary route `/16`, and a specific subnet `/24`). The router always selects the entry with the **longest prefix length (the highest subnet mask bit count)** because it represents the most specific and direct network path. If multiple matching routes share the exact same prefix length, the router breaks the tie using Administrative Distance, metric cost, or performs Equal-Cost Multi-Path (ECMP) load balancing.
+
+**Q2: Why was the Header Checksum removed from the IPv6 packet header?**
+
+In IPv4, every single intermediate router is required to decrement the Time-to-Live (TTL) field by 1, forcing the router CPU to recalculate the 16-bit Header Checksum on every single hop for every packet. In **IPv6**, the Header Checksum was completely eliminated because data integrity is already guaranteed by Layer 2 Frame Check Sequences (CRC-32) and Layer 4 TCP/UDP checksums. Removing the checksum drastically reduces packet processing latency, enabling multi-terabit ASIC switching hardware to forward packets without CPU bottlenecks.
+
+**Q3: What is Path MTU Discovery (PMTUD) and what causes an "ICMP Black Hole"?**
+
+Path MTU Discovery (PMTUD) is a mechanism (RFC 1191) where a host sends IP packets with the **Don't Fragment (DF)** bit set to 1. If an intermediate router cannot forward the packet because its egress link MTU is smaller than the packet size, the router drops the packet and sends back an **ICMP Type 3 Code 4** (*Fragmentation Needed and DF set*) packet containing the next-hop MTU value. An **ICMP Black Hole** occurs when a misconfigured perimeter firewall drops all inbound ICMP packets. The sender never receives the MTU alert and retransmits the same large packet indefinitely, causing web pages and SSH sessions to hang during initial data transfer.
+
+**Q4: What is the difference between the Routing Information Base (RIB) and the Forwarding Information Base (FIB)?**
+
+The **Routing Information Base (RIB)** resides in the router's **Control Plane** (software/CPU). It contains all candidate routes learned from dynamic routing protocols (BGP, OSPF, EIGRP) and static configurations, including administrative distances and metrics. The **Forwarding Information Base (FIB)** resides in the router's **Data Plane** (hardware ASICs and TCAM). The route processor selects the single best route for each prefix from the RIB and programs it into the FIB. The FIB performs wire-speed, sub-nanosecond hardware packet lookups directly on incoming ports without interrupting the CPU.
+
+**Q5: How does Time-to-Live (TTL) prevent routing loops and how does `traceroute` leverage it?**
+
+The 8-bit TTL field in IPv4 (Hop Limit in IPv6) specifies the maximum number of router hops a packet can traverse before being discarded. Each router decrements the TTL by 1 before forwarding. If a routing loop exists, the TTL eventually reaches 0, preventing the packet from circulating infinitely; the router drops the packet and transmits an **ICMP Type 11 (Time Exceeded)** message to the sender. The `traceroute` utility leverages this by sending a sequence of packets with incremental TTL values ($\text{TTL}=1, 2, 3\dots$). Each successive router hop drops the packet and responds with an ICMP Time Exceeded message, revealing the IP address and latency of every intermediate router along the path.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the complete 20-byte IPv4 header vs 40-byte fixed IPv6 header
+- [ ] Know how TTL decrements prevent infinite routing loops and power `traceroute`
+- [ ] Know why intermediate routers in IPv6 never fragment packets
+- [ ] Know the Longest Prefix Match (LPM) routing algorithm
+- [ ] Know how Path MTU Discovery (PMTUD) and ICMP Type 3 Code 4 operate
+- [ ] Can query routes with `ip route get` and probe path MTU using `ping -M do`

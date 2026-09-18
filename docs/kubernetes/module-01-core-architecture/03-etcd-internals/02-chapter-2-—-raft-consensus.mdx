@@ -1,0 +1,1553 @@
+---
+title: "Chapter 2 — RAFT Consensus"
+sidebar_position: 2
+module: "Module 1.3 — etcd Internals"
+description: "> **Goal:** Understand the RAFT consensus algorithm that powers etcd. Learn why distributed consensus is required, how leaders are elected, how log replication ..."
+---
+
+# Module 1.3 — etcd Internals
+
+# Chapter 2 — RAFT Consensus
+
+> **Goal:** Understand the RAFT consensus algorithm that powers etcd. Learn why distributed consensus is required, how leaders are elected, how log replication works, how commits are agreed upon, how failures are handled, and how RAFT prevents split-brain situations.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why distributed consensus is needed
+> 2. RAFT node roles: Leader, Follower, Candidate
+> 3. Terms and Elections
+> 4. Heartbeats and timeout-based failure detection
+> 5. Log Replication from Leader to Followers
+> 6. Commit Index and majority acknowledgment
+> 7. Split-brain prevention
+> 8. Complete write lifecycle through Raft
+> ```
+
+---
+
+# Why Should You Learn RAFT?
+
+One of the most common Kubernetes interview questions is:
+
+> **How does etcd ensure every node has exactly the same data?**
+
+Or,
+
+> **Why doesn't Kubernetes lose data when one etcd node crashes?**
+
+Or,
+
+> **How does Kubernetes avoid split-brain?**
+
+The answer is:
+
+```text
+RAFT Consensus
+```
+
+Without RAFT:
+
+- Multiple nodes could accept conflicting writes.
+- Different etcd members could have different databases.
+- Kubernetes controllers would see inconsistent cluster state.
+- The entire Control Plane could become unreliable.
+
+RAFT is the reason Kubernetes trusts etcd.
+
+---
+
+# Real-Life Analogy
+
+Think of Raft like a committee that must vote before any decision is official.
+
+```text
+Committee Voting Analogy:
+
+One chairperson (Leader) proposes decisions
+Members (Followers) acknowledge the proposal
+Decision is official only after majority votes YES
+If chair disappears, members elect a new one
+No decision passes without strict majority
+```
+
+| Committee | Raft / etcd |
+| :--- | :--- |
+| Chairperson | Raft Leader |
+| Committee members | Raft Followers |
+| Candidate for chairperson | Raft Candidate |
+| Vote to approve | AppendEntries acknowledgment |
+| Majority vote (quorum) | Write commit threshold |
+| New chair elected | New Leader election after timeout |
+
+> **Important:** Raft requires a **strict majority quorum** to commit any write. In a 3-member cluster, 2 members must acknowledge before a write is committed. If only 1 member is reachable, writes are rejected entirely — availability is sacrificed to preserve correctness.
+
+---
+
+# The Problem Without Consensus
+
+Imagine three database servers.
+
+```text
+Server A
+
+Server B
+
+Server C
+```
+
+A client updates a Deployment.
+
+```yaml
+replicas: 5
+```
+
+But:
+
+```text
+Server A
+
+replicas = 5
+
+-------------
+
+Server B
+
+replicas = 3
+
+-------------
+
+Server C
+
+replicas = 7
+```
+
+Which one is correct?
+
+Nobody knows.
+
+The cluster becomes inconsistent.
+
+---
+
+# Why Distributed Systems Are Hard
+
+In a distributed system:
+
+Machines can:
+
+- Crash
+- Restart
+- Lose network connectivity
+- Respond slowly
+- Become partitioned
+- Receive messages out of order
+
+Example:
+
+```text
+Client
+
+v
+
+Server A
+
+×
+
+Network Failure
+
+v
+
+Server B
+```
+
+Both servers may think they are correct.
+
+Consensus solves this.
+
+---
+
+# What is Consensus?
+
+Consensus means:
+
+> **All healthy members agree on exactly the same sequence of operations.**
+
+Not merely:
+
+```text
+Same Final Data
+```
+
+But:
+
+```text
+Same Order
+
+v
+
+Same History
+
+v
+
+Same Database
+```
+
+Order matters.
+
+---
+
+# Example
+
+Suppose two writes happen.
+
+Write A:
+
+```text
+replicas = 5
+```
+
+Write B:
+
+```text
+replicas = 10
+```
+
+If servers apply:
+
+```text
+A
+
+v
+
+B
+```
+
+Final value:
+
+```text
+10
+```
+
+If another server applies:
+
+```text
+B
+
+v
+
+A
+```
+
+Final value:
+
+```text
+5
+```
+
+The database diverges.
+
+Consensus guarantees every server processes:
+
+```text
+Exactly
+
+The Same Order
+```
+
+---
+
+# What is RAFT?
+
+RAFT is a distributed consensus algorithm designed to:
+
+- Elect one leader
+- Replicate logs
+- Maintain consistency
+- Recover from failures
+- Prevent split-brain
+
+Unlike older algorithms such as Paxos,
+
+RAFT was intentionally designed to be easier to understand and implement.
+
+---
+
+# High-Level Architecture
+
+```text
+             RAFT Cluster
+
+        ┌────────┬────────┐
+
+        ▼        ▼        ▼
+
+     Member1  Member2  Member3
+
+          One Leader
+
+         Two Followers
+```
+
+At any moment:
+
+```text
+Exactly One Leader
+```
+
+All writes go through the leader.
+
+---
+
+# Why One Leader?
+
+Imagine:
+
+Three members all accepting writes independently.
+
+```text
+Write A
+
+v
+
+Member 1
+
+-----------------
+
+Write B
+
+v
+
+Member 2
+
+-----------------
+
+Write C
+
+v
+
+Member 3
+```
+
+Conflicts become unavoidable.
+
+RAFT solves this by saying:
+
+```text
+Only
+
+One Leader
+
+Can Accept Writes
+```
+
+Everyone else forwards requests.
+
+---
+
+# RAFT Node States
+
+Each member is always in exactly one state.
+
+```text
+Follower
+
+v
+
+Candidate
+
+v
+
+Leader
+```
+
+Transitions occur automatically.
+
+---
+
+# Followers
+
+Most members are Followers.
+
+Responsibilities:
+
+- Accept replicated logs
+- Respond to leader
+- Vote during elections
+- Reject client writes
+
+Followers are passive.
+
+They never initiate writes.
+
+---
+
+# Follower Workflow
+
+```text
+Leader
+
+v
+
+Heartbeat
+
+v
+
+Follower
+
+v
+
+Reset Election Timer
+```
+
+As long as heartbeats continue,
+
+the follower remains a follower.
+
+---
+
+# Leader
+
+The Leader is the only member allowed to:
+
+- Accept writes
+- Replicate logs
+- Send heartbeats
+- Coordinate consensus
+
+Every client write begins here.
+
+---
+
+# Leader Responsibilities
+
+```text
+Receive Write
+
+v
+
+Append Log
+
+v
+
+Replicate
+
+v
+
+Wait Majority
+
+v
+
+Commit
+
+v
+
+Reply Success
+```
+
+Everything flows through the leader.
+
+---
+
+# Candidates
+
+Suppose:
+
+Leader crashes.
+
+Followers stop receiving heartbeats.
+
+Eventually:
+
+```text
+Follower
+
+v
+
+Timeout
+
+v
+
+Candidate
+```
+
+Candidates start an election.
+
+---
+
+# Candidate Workflow
+
+```text
+Heartbeat Missing
+
+v
+
+Election Timeout
+
+v
+
+Become Candidate
+
+v
+
+Vote For Self
+
+v
+
+Request Votes
+
+v
+
+Majority?
+
+v
+
+Become Leader
+```
+
+Otherwise,
+
+the election is retried later.
+
+---
+
+# Complete State Diagram
+
+```text
+              Heartbeat Lost
+
+Follower -------------------------> Candidate
+
+   ▲                                 |
+
+   |                                 |
+
+   | Heartbeats                      | Majority
+
+   |                                 ▼
+
+Leader <------------------------- Candidate
+
+        Wins Election
+```
+
+---
+
+# Terms
+
+RAFT divides time into logical periods called:
+
+```text
+Terms
+```
+
+Every election creates a new term.
+
+Example:
+
+```text
+Term 1
+
+v
+
+Leader A
+
+----------------
+
+Term 2
+
+v
+
+Leader B
+
+----------------
+
+Term 3
+
+v
+
+Leader C
+```
+
+Terms never decrease.
+
+---
+
+# Why Terms Exist
+
+Imagine:
+
+An old leader reconnects after a network issue.
+
+Without terms:
+
+It may continue accepting writes.
+
+With terms:
+
+The old leader sees:
+
+```text
+Higher Term Exists
+
+v
+
+Step Down
+
+v
+
+Become Follower
+```
+
+Terms prevent stale leaders.
+
+---
+
+# Elections
+
+Suppose Leader crashes.
+
+Cluster:
+
+```text
+Leader
+
+×
+
+Dead
+```
+
+Followers wait.
+
+Each has an election timeout.
+
+Example:
+
+```text
+Follower A
+
+170 ms
+
+-------------
+
+Follower B
+
+240 ms
+
+-------------
+
+Follower C
+
+290 ms
+```
+
+The first timeout begins the election.
+
+---
+
+# Election Process
+
+Step 1
+
+```text
+Leader Dies
+```
+
+v
+
+Step 2
+
+```text
+Follower Timeout
+```
+
+v
+
+Step 3
+
+```text
+Become Candidate
+```
+
+v
+
+Step 4
+
+```text
+Increment Term
+```
+
+v
+
+Step 5
+
+```text
+Vote For Self
+```
+
+v
+
+Step 6
+
+```text
+Request Votes
+```
+
+v
+
+Step 7
+
+```text
+Receive Majority
+```
+
+v
+
+Step 8
+
+```text
+Become Leader
+```
+
+---
+
+# Random Election Timeout
+
+Why random?
+
+Suppose all followers timeout simultaneously.
+
+```text
+Candidate A
+
+Candidate B
+
+Candidate C
+```
+
+Nobody wins.
+
+Election repeats forever.
+
+Instead,
+
+timeouts are randomized.
+
+Example:
+
+```text
+160 ms
+
+221 ms
+
+295 ms
+```
+
+Only one node usually starts first.
+
+---
+
+# Heartbeats
+
+How do followers know the leader is alive?
+
+The leader periodically sends:
+
+```text
+Heartbeat
+```
+
+Even when there are no writes.
+
+---
+
+# Heartbeat Workflow
+
+```text
+Leader
+
+v
+
+Heartbeat
+
+v
+
+Follower
+
+v
+
+Reset Timer
+```
+
+No election occurs.
+
+---
+
+# Without Heartbeats
+
+Followers would assume:
+
+```text
+Leader Dead
+```
+
+Every few hundred milliseconds.
+
+Constant elections.
+
+Cluster instability.
+
+---
+
+# Log Replication
+
+Suppose a client writes:
+
+```yaml
+replicas: 5
+```
+
+Leader workflow:
+
+```text
+Receive Write
+
+v
+
+Append To Local Log
+
+v
+
+Send To Followers
+
+v
+
+Followers Append
+
+v
+
+Majority Acknowledge
+
+v
+
+Commit
+
+v
+
+Reply Success
+```
+
+The write is replicated before success is returned.
+
+---
+
+# Log Entries
+
+RAFT stores operations in a log.
+
+Example:
+
+```text
+Index   Command
+
+1       Create Pod
+
+2       Scale Deployment
+
+3       Delete Service
+
+4       Update Secret
+```
+
+Every member maintains the same ordered log.
+
+---
+
+# Replication Example
+
+```text
+Leader
+
+Log:
+
+1
+
+2
+
+3
+
+v
+
+Replicate
+
+v
+
+Follower A
+
+1
+
+2
+
+3
+
+v
+
+Follower B
+
+1
+
+2
+
+3
+```
+
+Eventually,
+
+every member has identical logs.
+
+---
+
+# Commit Index
+
+Appending to a log is not enough.
+
+The operation must also be:
+
+```text
+Committed
+```
+
+Commit means:
+
+```text
+Majority
+
+Stored
+
+The Entry
+```
+
+The leader tracks this using the:
+
+```text
+Commit Index
+```
+
+---
+
+# Commit Workflow
+
+```text
+Leader
+
+v
+
+Append Entry
+
+v
+
+Followers Replicate
+
+v
+
+Majority Success
+
+v
+
+Commit Index Advances
+
+v
+
+Apply To Database
+
+v
+
+Return Success
+```
+
+Only committed entries become visible.
+
+---
+
+# Majority Consensus
+
+Suppose:
+
+Three-member cluster.
+
+```text
+Member 1
+
+Member 2
+
+Member 3
+```
+
+Majority:
+
+```text
+2
+
+of
+
+3
+```
+
+Now:
+
+Leader receives:
+
+```text
+ACK
+
+Member 2
+
+ACK
+
+Member 3
+```
+
+Consensus reached.
+
+---
+
+# Majority Examples
+
+### Three Members
+
+```text
+Need:
+
+2 Votes
+```
+
+---
+
+### Five Members
+
+```text
+Need:
+
+3 Votes
+```
+
+---
+
+### Seven Members
+
+```text
+Need:
+
+4 Votes
+```
+
+Always:
+
+```text
+More Than Half
+```
+
+---
+
+# Why Majority?
+
+Imagine:
+
+```text
+Node A
+
+Node B
+
+Node C
+```
+
+Node C crashes.
+
+Remaining:
+
+```text
+A
+
+B
+```
+
+Still:
+
+```text
+2
+
+>
+
+1.5
+```
+
+Cluster continues.
+
+---
+
+# Failure Example
+
+Suppose:
+
+Leader crashes immediately after accepting a write.
+
+```text
+Leader
+
+v
+
+Log Entry
+
+v
+
+Replicated To Majority
+
+v
+
+Leader Dies
+```
+
+The next leader already has the committed log.
+
+No data loss.
+
+---
+
+# Split Brain
+
+One of the worst failures in distributed systems.
+
+Imagine:
+
+Network partition.
+
+```text
+Cluster
+
+v
+
+Split
+
+v
+
+A B
+
+|
+
+C D E
+```
+
+Both sides think:
+
+```text
+We Are Leader
+```
+
+Now:
+
+Different writes occur.
+
+Cluster diverges.
+
+---
+
+# How RAFT Prevents Split Brain
+
+RAFT requires:
+
+```text
+Majority
+
+To Elect
+
+Leader
+```
+
+Suppose:
+
+Five-member cluster.
+
+Partition:
+
+```text
+2 Members
+
+------------
+
+3 Members
+```
+
+The group with:
+
+```text
+3 Members
+```
+
+Can elect a leader.
+
+The group with:
+
+```text
+2 Members
+```
+
+Cannot.
+
+No split-brain occurs.
+
+---
+
+# Example
+
+Five-member cluster:
+
+```text
+A
+
+B
+
+C
+
+D
+
+E
+```
+
+Network partition:
+
+```text
+A
+
+B
+
+-------------------
+
+C
+
+D
+
+E
+```
+
+Majority:
+
+```text
+3
+```
+
+Only:
+
+```text
+C
+
+D
+
+E
+```
+
+Can continue.
+
+A and B stop accepting writes.
+
+---
+
+# Complete Write Lifecycle
+
+Suppose:
+
+```bash
+kubectl scale deployment web --replicas=10
+```
+
+Internal flow:
+
+```text
+kubectl
+
+v
+
+API Server
+
+v
+
+Leader
+
+v
+
+Append Log Entry
+
+v
+
+Replicate
+
+v
+
+Followers ACK
+
+v
+
+Majority Reached
+
+v
+
+Commit Index Advances
+
+v
+
+Apply Entry
+
+v
+
+Persist
+
+v
+
+Return Success
+
+v
+
+API Server
+
+v
+
+kubectl
+```
+
+Every Kubernetes write follows this path.
+
+---
+
+# Internal RAFT Architecture
+
+```text
+                 Client
+
+                   |
+
+                   ▼
+
+                Leader
+
+                   |
+
+      ┌────────────┼────────────┐
+
+      ▼            ▼            ▼
+
+Follower A    Follower B   Follower C
+
+      ▲            ▲            ▲
+
+      +--── Heartbeats ─────────┘
+
+      +-- Log Replication ───────┘
+```
+
+---
+
+# Relationship with Previous Chapter
+
+```text
+API Server
+
+v
+
+etcd
+
+v
+
+RAFT
+
+v
+
+Consensus
+
+v
+
+MVCC
+
+v
+
+BoltDB
+
+v
+
+Disk
+```
+
+RAFT sits between the client interface and the storage engine, ensuring every write is consistently agreed upon before it becomes durable state.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Every etcd member accepts writes.
+
+Wrong.
+
+Only the current leader accepts writes.
+
+---
+
+### ❌ Misconception 2
+
+Heartbeats transfer data.
+
+Wrong.
+
+Heartbeats primarily confirm the leader is still alive and help maintain leadership. Log replication may occur separately or piggyback on heartbeat messages.
+
+---
+
+### ❌ Misconception 3
+
+A write succeeds after reaching the leader.
+
+Wrong.
+
+The write succeeds only after it is replicated to a majority and committed.
+
+---
+
+### ❌ Misconception 4
+
+The oldest server automatically becomes leader.
+
+Wrong.
+
+Leadership is determined through elections and voting, not server age.
+
+---
+
+### ❌ Misconception 5
+
+Split-brain cannot happen because servers communicate.
+
+Wrong.
+
+Network partitions can happen. RAFT prevents split-brain by requiring a majority to elect and maintain a leader.
+
+---
+
+# Common Interview Questions
+
+### Q1. What problem does RAFT solve?
+
+RAFT provides distributed consensus, ensuring all healthy members agree on the same ordered sequence of operations.
+
+---
+
+### Q2. Why does RAFT use a leader?
+
+A single leader serializes writes, preventing conflicting updates and simplifying consistency.
+
+---
+
+### Q3. What are the three RAFT node states?
+
+- Follower
+- Candidate
+- Leader
+
+---
+
+### Q4. What is a Term?
+
+A logical election epoch. Each new election increments the term, allowing nodes to identify stale leaders.
+
+---
+
+### Q5. Why are election timeouts randomized?
+
+To reduce the chance that multiple followers become candidates simultaneously, which can lead to repeated split votes.
+
+---
+
+### Q6. What is the purpose of heartbeats?
+
+To let followers know the leader is still alive and prevent unnecessary elections.
+
+---
+
+### Q7. What is the Commit Index?
+
+The Commit Index identifies the highest log entry that has been safely replicated to a majority and can be applied.
+
+---
+
+### Q8. Why is majority consensus required?
+
+It guarantees that committed data survives failures and prevents conflicting leaders from existing simultaneously.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Frequent leader changes | Network instability, high latency, overloaded leader, or election timeout tuning issues |
+| Slow writes | Followers slow to acknowledge replication, disk latency, or network delays |
+| Cluster becomes read-only for writes | Majority of members unavailable; no leader can safely commit writes |
+| Continuous elections | Lost heartbeats, network partitions, or overloaded members |
+| Stale leader steps down | Node receives a message with a higher term and transitions back to follower |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why is distributed consensus necessary?
+2. Why does RAFT use exactly one leader?
+3. What are the responsibilities of Followers?
+4. What are the responsibilities of the Leader?
+5. When does a Follower become a Candidate?
+6. What is a Term, and why is it important?
+7. How does the election process work?
+8. Why are heartbeats necessary?
+9. How does log replication work?
+10. What is the Commit Index?
+11. Why is majority consensus required?
+12. How does RAFT prevent split-brain?
+13. Why can a minority partition not continue accepting writes?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned the core principles of the RAFT consensus algorithm:
+
+- Why distributed systems require consensus
+- The roles of Leader, Follower, and Candidate
+- How terms organize leadership over time
+- How leaders are elected
+- Why randomized election timeouts improve stability
+- How heartbeats maintain leadership
+- How log replication keeps members synchronized
+- How the Commit Index determines when writes become durable
+- Why majority consensus is essential
+- How RAFT prevents split-brain and preserves consistency
+
+These concepts are the foundation for understanding every write that flows through etcd.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — Quorum & Leader Election**
+
+In the next chapter, we'll build on RAFT by exploring:
+
+- What Quorum really means
+- Odd vs Even cluster sizes
+- Leader Election internals
+- Election timeouts
+- Failure scenarios
+- Network partitions
+- Read vs Write Quorums
+- High Availability design
+
+You'll learn why production etcd clusters almost always use **3 or 5 members**, and how quorum determines whether the cluster can continue serving requests after failures.
+```

@@ -1,0 +1,272 @@
+---
+title: "Chapter 2 — Helm Hooks, Dependencies & Subcharts"
+sidebar_position: 2
+module: "Module 8.5 — Helm Templating & Charts"
+description: "Master advanced Helm engineering — lifecycle hooks (pre-install, post-upgrade), hook-delete-policies, Chart.yaml dependencies, subchart value overrides, and library charts."
+---
+
+# Chapter 2 — Advanced Helm Templating: Hooks, Dependencies & Subcharts
+
+> **Goal:** Master advanced packaging workflows, lifecycle automation, and multi-tier composition in **Helm v3** — understanding how **Helm Chart Hooks** (`pre-install`, `post-upgrade`, `test`) execute database migrations and post-deployment validation jobs in strict sequence with `hook-weight`, managing **Chart Dependencies** and `Chart.lock` in parent-child topologies, overriding subchart variables, sharing **Global Values**, and building reusable enterprise **Library Charts**.
+>
+> By the end of this chapter, you will understand:
+> 1. The complete lifecycle execution order of Helm Hooks during install, upgrade, and rollback
+> 2. How `helm.sh/hook-weight` and `helm.sh/hook-delete-policy` manage hook Pod execution
+> 3. How to structure `dependencies` in `Chart.yaml` to bundle third-party charts (PostgreSQL, Redis)
+> 4. How parent charts override subchart values and inject `global` cross-chart variables
+> 5. How to build and consume reusable, manifest-free **Library Charts** (`type: library`)
+> 6. How to execute automated post-installation health verification with `helm test`
+
+---
+
+## Real-Life Analogy
+
+Think of Helm Hooks, Subcharts, and Library Charts as **the automated manufacturing, assembly, and quality-testing steps in a high-end automobile factory**:
+
+- **The Main Automobile Blueprint (The Parent Chart):** You are building a luxury electric car (**The Parent Application**).
+- **The Specialized Pre-Built Sub-Assemblies (The Subcharts):** You don't build the braking system or the stereo from scratch. You import pre-certified third-party components (**`dependencies` in `Chart.yaml`**):
+  - Subchart A: The Bosch Anti-Lock Braking System (**PostgreSQL Subchart**)
+  - Subchart B: The Sony Sound System (**Redis Cache Subchart**)
+- **The Master Dashboard Override (Parent-to-Subchart Value Overrides):** The car's main computer tells the stereo: *"Set the master volume limit to 80% (**`redis.master.persistence.size: 50Gi`**)."*
+- **The Universal Power Cable (Global Values - `global.env`):** The main battery voltage (**`global.environment: production`**) is wired directly into all sub-assemblies simultaneously.
+- **The Pre-Ignition Safety Check (The `pre-install` Hook):** Before the car's electric motor is allowed to turn on (**Starting Application Pods**), an automated test robot runs a battery pressure test (**Database Schema Migration Job**). If the test fails, the car refuses to start.
+- **The Standard Engineering Ruler (The Library Chart - `type: library`):** A standardized corporate blueprint containing common mathematical formulas and label standards (**Reusable `_helpers.tpl` partials**) that is shared across 50 different car models.
+
+---
+
+## Architecture Diagram
+
+```text
+               Helm Hook Lifecycle & Parent-Subchart Dependency Tree
+
+ 1. PARENT-SUBCHART COMPOSITION (Chart.yaml):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PARENT CHART: `ecommerce-platform`                                     │
+ │ ├── Subchart 1: `postgresql` (Bitnami v12.1.0)                         │
+ │ └── Subchart 2: `redis`      (Bitnami v18.0.0)                         │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Compiles and executes lifecycle hooks
+                    ▼
+ 2. THE HELM HOOK EXECUTION LIFECYCLE:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 1: PRE-INSTALL HOOK (Weight: -5)                                  │
+ │ Runs Job: `db-migration-job` ──► Executes SQL Schema Migrations        │
+ │ (Pauses installation until Job completes with Exit Code 0!)            │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Migration Successful!
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 2: MAIN MANIFEST INSTALLATION                                     │
+ │ Deploys: `ecommerce-api` Deployments, Services, and Ingress routes     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Workloads Healthy!
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 3: POST-INSTALL & TEST HOOKS                                      │
+ │ ├── Runs Job: `warm-cache-job` (`hook: post-install`)                  │
+ │ └── Runs Pod: `smoke-test-pod` (`hook: test`) via `helm test`          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Helm Hook Lifecycle Matrix
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Hook Annotation      │ Exact Execution Trigger & Typical Use Case                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`pre-install`**    │ Runs *after* templates are rendered, but *before* any Kubernetes resources  │
+ │                      │ are created in the cluster. Used for database migrations and provisioning.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`post-install`**   │ Runs *after* all resources in the chart are loaded into the cluster.        │
+ │                      │ Used for cache warming, registering external DNS, and firing Slack alerts.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`pre-upgrade`**    │ Runs on an upgrade request *before* any live resources are modified.       │
+ │                      │ Used for performing pre-upgrade database snapshots or backups.              │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`post-upgrade`**   │ Runs *after* all resources have been upgraded. Used for cleanup tasks.      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`pre-rollback`**   │ Runs *before* rolling back an existing release.                             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`test`**           │ Executed strictly when the user runs `helm test <release-name>`.            │
+ │                      │ Runs smoke test pods to verify endpoint health and API contracts.           │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Production Database Migration Job with Hook Policies
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "payment-service.fullname" . }}-db-migrate
+  labels:
+    {{- include "payment-service.labels" . | nindent 4 }}
+  annotations:
+    # 1. Declares this resource as a Pre-Install and Pre-Upgrade Hook
+    helm.sh/hook: pre-install,pre-upgrade
+    # 2. Execution Weight: Lower numbers run first!
+    helm.sh/hook-weight: "-5"
+    # 3. Garbage Collection: Deletes previous job before creating a new one!
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: db-migrate
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        command: ["/bin/sh", "-c", "python manage.py migrate --noinput"]
+        envFrom:
+        - secretRef:
+            name: db-credentials
+```
+
+---
+
+## Managing Chart Dependencies in `Chart.yaml`
+
+Define child subcharts inside `Chart.yaml`:
+
+```yaml
+apiVersion: v2
+name: ecommerce-platform
+version: 2.0.0
+appVersion: "1.0.0"
+type: application
+
+dependencies:
+  # 1. Managed PostgreSQL Dependency
+  - name: postgresql
+    version: "12.1.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: postgresql.enabled      # Dynamically toggle with a boolean flag!
+    tags:
+      - database
+
+  # 2. Managed Redis Cache Dependency
+  - name: redis
+    version: "18.0.0"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: redis.enabled
+
+  # 3. Enterprise Reusable Library Chart
+  - name: common-lib
+    version: "1.2.0"
+    repository: "oci://ghcr.io/enterprise-org/charts"
+```
+
+Update and lock dependencies:
+
+```bash
+# Downloads tarballs into charts/ and generates Chart.lock
+helm dependency update ./ecommerce-platform
+```
+
+---
+
+## Overriding Subchart Values & Global Variables
+
+In the parent chart's `values.yaml`, override subchart settings using the subchart's name as the top-level YAML key:
+
+```yaml
+# Parent values.yaml
+replicaCount: 3
+
+# 1. Global Values (Accessible by Parent AND all child subcharts!)
+global:
+  environment: production
+  imagePullSecrets:
+    - name: enterprise-registry-key
+
+# 2. Overriding PostgreSQL Subchart Values
+postgresql:
+  enabled: true
+  auth:
+    database: payment_db
+    username: payment_user
+  primary:
+    persistence:
+      size: 50Gi
+
+# 3. Overriding Redis Subchart Values
+redis:
+  enabled: true
+  architecture: standalone
+  master:
+    persistence:
+      enabled: false
+```
+
+---
+
+## Hands-On Lab: Managing Dependencies & Running `helm test`
+
+```bash
+# Step 1: Create a test chart with subcharts
+helm create parent-demo
+
+# Step 2: Add a mock test pod in templates/tests/test-connection.yaml
+cat <<EOF > parent-demo/templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include \"parent-demo.fullname\" . }}-test"
+  annotations:
+    helm.sh/hook: test
+spec:
+  containers:
+  - name: wget
+    image: busybox:1.28
+    command: ['wget', '--spider', 'http://{{ include "parent-demo.fullname" . }}:{{ .Values.service.port }}']
+  restartPolicy: Never
+EOF
+
+# Step 3: Lint the parent chart
+helm lint parent-demo
+
+# Step 4: Render templates verifying hook annotations
+helm template test-rel parent-demo -s templates/tests/test-connection.yaml
+
+# Step 5: Clean up lab
+rm -rf parent-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are Helm Hooks, and how does Helm handle resources defined with hook annotations during `helm uninstall`?**
+
+Helm Hooks are lifecycle annotations (such as `helm.sh/hook: pre-install` or `post-upgrade`) attached to Kubernetes manifests (typically Jobs or Pods). They allow executing automated tasks before or after the main chart resources are loaded into the cluster. Crucially, **Helm does NOT track hook resources as part of the official release inventory**: when you run `helm uninstall`, Helm will **not** delete hook resources unless they specify a `helm.sh/hook-delete-policy: hook-succeeded` annotation.
+
+**Q2: How does `helm.sh/hook-weight` determine execution order when multiple hooks exist?**
+
+`helm.sh/hook-weight` accepts positive or negative integer strings (e.g. `"-5"`, `"0"`, `"10"`). When an event occurs (e.g. `pre-install`), Helm sorts all matching hook resources in **ascending numerical order** (lowest numbers run first). Helm executes all hooks of weight -5, waits for them to complete successfully, and only then executes hooks of weight -4, enabling multi-stage prerequisite initialization.
+
+**Q3: What is the purpose of `Chart.lock` and `helm dependency update`?**
+
+When child charts are declared in `Chart.yaml`'s `dependencies` block, running `helm dependency update` downloads the exact `.tgz` chart packages from external repositories into the local `charts/` directory and generates a **`Chart.lock`** file containing exact semantic version hashes. Committing `Chart.lock` to Git guarantees reproducible, immutable builds across all CI/CD runners.
+
+**Q4: How do "Global Values" work across parent and subcharts in Helm?**
+
+Standard values declared in a parent `values.yaml` cannot be seen by child subcharts unless nested under the subchart's name key. However, values defined under the special **`global:`** key (e.g. `global.imageRegistry: "ghcr.io/enterprise"`) are automatically passed down and accessible inside the Go templates of the parent chart **and every single child subchart** via `{{ .Values.global.imageRegistry }}`.
+
+**Q5: What is a Helm "Library Chart" (`type: library`), and how does it differ from an "Application Chart"?**
+
+An **Application Chart** (`type: application`) contains deployable Kubernetes manifests (Deployments, Services) and can be directly installed via `helm install`. A **Library Chart** (`type: library`) contains zero deployable manifests; it consists purely of reusable Go template definitions, helper functions, and shared validation logic inside `templates/_helpers.tpl`. Library charts cannot be installed on their own—they are imported as dependencies by other application charts to eliminate code duplication across microservices.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the hook lifecycle: `pre-install`, `post-install`, `pre-upgrade`, `post-upgrade`, `test`
+- [ ] Know that `helm.sh/hook-weight` orders hook execution from lowest to highest
+- [ ] Know how `helm.sh/hook-delete-policy` cleans up completed migration Jobs
+- [ ] Know how to declare subcharts in `Chart.yaml` and lock them via `Chart.lock`
+- [ ] Know how parent charts override subchart values via top-level keys
+- [ ] Know that `global` values are shared across parent and all child subcharts
+- [ ] Know that Library Charts (`type: library`) provide reusable template partials without manifests

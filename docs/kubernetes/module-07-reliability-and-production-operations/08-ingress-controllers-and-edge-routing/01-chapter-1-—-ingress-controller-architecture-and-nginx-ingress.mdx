@@ -1,0 +1,275 @@
+---
+title: "Chapter 1 — Ingress Controllers & NGINX Ingress"
+sidebar_position: 1
+module: "Module 7.8 — Ingress & Edge Routing"
+description: "Master Kubernetes Ingress architecture and Ingress-NGINX — dynamic Lua configuration reloads, path matching (Exact vs Prefix), annotations, and ingressClassName routing."
+---
+
+# Chapter 1 — Ingress Controller Architecture & NGINX Ingress
+
+> **Goal:** Master edge traffic routing and Layer 7 reverse proxying in Kubernetes using the **Ingress API** and **Ingress-NGINX** — understanding the fundamental architectural separation between declarative Ingress resources and active Ingress Controllers, dissecting how OpenResty/Lua enables dynamic upstream updates without restarting NGINX worker processes, mastering path matching algorithms (`Exact`, `Prefix`), authoring advanced annotations for URL rewriting and rate limiting, and managing multi-controller clusters using **`ingressClassName`**.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural difference between an Ingress API resource and an Ingress Controller
+> 2. How Ingress-NGINX routes external internet traffic from Cloud NLBs to Pod Endpoints
+> 3. How Lua shared memory dynamically updates routing tables without dropping active TCP connections
+> 4. The precise matching rules for `Prefix`, `Exact`, and `ImplementationSpecific` path types
+> 5. How to configure production Ingress annotations (URL rewriting, SSL redirects, rate limits)
+> 6. How to co-locate multiple distinct Ingress controllers using `IngressClass`
+
+---
+
+## Real-Life Analogy
+
+Think of the Ingress API and Ingress-NGINX as **the receptionist and directory board at the entrance of a massive corporate skyscraper**:
+
+- **The Directory Board (`Ingress` Resource):** A printed sheet of paper on the wall listing the rules: *"Visitors for Billing go to Room 402; visitors for Engineering go to Floor 8 (**Declarative Routing Rules in `etcd`**)."* The piece of paper itself has no legs and cannot physically move or guide any visitors.
+- **The Active Human Security Team (The Ingress Controller - Ingress-NGINX):** An active team of guards stationed at the turnstiles (**NGINX Reverse Proxy Pods**). They read the directory board, greet incoming visitors at the front door (**Public Internet Traffic on Port 80/443**), inspect their security badges (**TLS Termination & Rate Limiting**), and guide them directly into the internal elevator corridors (**Routing directly to Pod Endpoints**).
+- **The Digital Name Tag Screen (Dynamic Lua Reloads):** When a new employee joins Room 402 (**A new Pod scales up**), the guards don't close the entire building lobby for 10 minutes to reprint the directory (**No NGINX process reload**). A digital LED screen flashes the new room number in **0.001 seconds** using shared memory (**Lua dynamic routing**), so active visitors walking through the lobby never drop their phone calls.
+- **The VIP Entrance vs Public Entrance (`ingressClassName`):** The building has a public front revolving door (**`ingressClassName: public-nginx`**) and a private high-security armored garage entrance (**`ingressClassName: internal-admin-nginx`**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Ingress-NGINX Edge Traffic Routing & IngressClass
+
+ PUBLIC INTERNET CLIENTS (`https://api.company.com/v1/orders`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HTTPS Request on Port 443                                              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ TCP Port 443
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ EXTERNAL CLOUD LOAD BALANCER (AWS NLB / GCP Cloud Load Balancing)      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Routes to Ingress-NGINX Pods
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ INGRESS-NGINX CONTROLLER (DaemonSet / Deployment)                      │
+ │                                                                        │
+ │ 1. Matches Host: `api.company.com`                                     │
+ │ 2. Matches Path: `Prefix: /v1/orders`                                  │
+ │ 3. Terminates TLS & Evaluates Rate Limits                              │
+ │ 4. OpenResty/Lua Balancer: Bypasses Service VIP! Direct to Pod IPs!    │
+ └──────┬───────────────────────────────────────────────────────┬─────────┘
+        │                                                       │
+        ▼ Direct Pod IP Routing                                 ▼ Direct Pod IP Routing
+ ┌────────────────────────┐                           ┌────────────────────────┐
+ │ Pod 01: payment-api    │                           │ Pod 02: payment-api    │
+ │ (IP: 10.244.2.14:8080) │                           │ (IP: 10.244.3.22:8080) │
+ └────────────────────────┘                           └────────────────────────┘
+```
+
+---
+
+## Ingress Resource vs Ingress Controller
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Ingress Resource (`kind: Ingress│ Ingress Controller              │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Nature**                │ **Declarative Data Object**     │ **Active Daemon / Software**    │
+ │                           │ Stored as JSON/YAML in `etcd`.  │ (Ingress-NGINX, Traefik, Kong). │
+ │ **Responsibility**        │ Defines routing rules, hostnames│ Watches Ingress objects, opens  │
+ │                           │ paths, and TLS secrets.         │ sockets, and proxies L7 traffic.│
+ │ **Behavior without Other**│ Does nothing on its own!        │ Waits idly for Ingress rules.   │
+ │ **Standard Spec**         │ `networking.k8s.io/v1`          │ Controller Deployment / Service │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Dynamic Upstream Updates: How Lua Prevents Connection Drops
+
+In raw NGINX, changing backend servers requires regenerating `nginx.conf` and executing `nginx -s reload`.
+
+```text
+ The Legacy NGINX Reload Problem:
+ In a dynamic Kubernetes cluster where pods scale up/down every 10 seconds:
+ - Executing `nginx -s reload` every 10s causes NGINX worker processes to pile up in memory.
+ - Long-lived persistent connections (WebSockets, gRPC, HTTP/2) are severed or leak memory!
+ 
+ The Ingress-NGINX Lua Solution:
+ Ingress-NGINX embeds OpenResty Lua shared memory dictionaries (`lua_shared_dict`).
+ - When Pod endpoints change, Lua updates the backend IP table IN MEMORY in microseconds!
+ - ZERO NGINX worker reloads are required for endpoint updates!
+ - NGINX reload is triggered ONLY when core server blocks or listen ports change.
+```
+
+---
+
+## Path Matching Rules: `Exact` vs `Prefix`
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ PathType             │ Path Rule Defined       │ Matches / Rejects Examples                        │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Exact`**          │ `/api/v1`               │ - `/api/v1` $\to$ **MATCH**                       │
+ │                      │                         │ - `/api/v1/` $\to$ **REJECT**                     │
+ │                      │                         │ - `/api/v1/users` $\to$ **REJECT**                │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Prefix`**         │ `/api`                  │ - `/api` $\to$ **MATCH**                          │
+ │                      │                         │ - `/api/` $\to$ **MATCH**                         │
+ │                      │                         │ - `/api/users` $\to$ **MATCH**                    │
+ │                      │                         │ - `/apidocs` $\to$ **REJECT** (Requires `/` split)│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Ingress Manifest with Advanced Annotations
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: enterprise-api-ingress
+  namespace: production
+  annotations:
+    # 1. Target Controller
+    kubernetes.io/ingress.class: "nginx"
+
+    # 2. SSL / TLS Hardening
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # 3. URL Rewriting (Strip prefix before passing to backend)
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+
+    # 4. Traffic & Performance Tuning
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+
+    # 5. Rate Limiting (100 Requests/sec per client IP)
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+spec:
+  ingressClassName: nginx-external     # Modern IngressClass binding!
+  tls:
+  - hosts:
+    - api.company.com
+    secretName: api-company-tls        # TLS Certificate Secret
+  rules:
+  - host: api.company.com
+    http:
+      paths:
+      # Matches: /v1/orders(/.*) and rewrites to /$2 on backend
+      - path: /v1/orders(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: order-service
+            port:
+              number: 8080
+      # Direct prefix routing to auth service
+      - path: /v1/auth
+        pathType: Prefix
+        backend:
+          service:
+            name: auth-service
+            port:
+              number: 8080
+```
+
+---
+
+## Managing Multi-Ingress Controllers with `IngressClass`
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx-external
+spec:
+  controller: k8s.io/ingress-nginx     # Identifies the controller implementation
+```
+
+---
+
+## Hands-On Lab: Deploying an Ingress Routing Path
+
+```bash
+# Step 1: Check Ingress Controller status in the cluster
+kubectl get pods,svc -n ingress-nginx 2>/dev/null || echo "Ingress-NGINX active / simulated"
+
+# Step 2: Create a lab namespace
+kubectl create namespace ingress-lab
+
+# Step 3: Deploy two backend services
+kubectl create deployment web-apple --image=hashicorp/http-echo --port=5678 -n ingress-lab -- -text="Apple Service"
+kubectl expose deployment web-apple --port=80 --target-port=5678 -n ingress-lab
+
+kubectl create deployment web-banana --image=hashicorp/http-echo --port=5678 -n ingress-lab -- -text="Banana Service"
+kubectl expose deployment web-banana --port=80 --target-port=5678 -n ingress-lab
+
+# Step 4: Deploy an Ingress routing traffic by path
+cat <<EOF | kubectl apply -f - -n ingress-lab
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fruits-ingress
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /apple
+        pathType: Prefix
+        backend:
+          service:
+            name: web-apple
+            port:
+              number: 80
+      - path: /banana
+        pathType: Prefix
+        backend:
+          service:
+            name: web-banana
+            port:
+              number: 80
+EOF
+
+# Step 5: Verify Ingress creation
+kubectl get ingress fruits-ingress -n ingress-lab
+
+# Step 6: Clean up lab
+kubectl delete namespace ingress-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between a Kubernetes `Ingress` resource and an `Ingress Controller`?**
+
+An `Ingress` resource (`networking.k8s.io/v1`) is a pure declarative data specification stored in `etcd` that defines desired Layer 7 HTTP routing rules, hostnames, and TLS secrets. It does not process network traffic. An `Ingress Controller` (such as Ingress-NGINX or Traefik) is the actual running reverse proxy software running in the cluster that continuously watches the API server for `Ingress` objects, dynamically compiles routing configurations, and accepts physical TCP traffic on ports 80/443.
+
+**Q2: How does Ingress-NGINX avoid reloading NGINX worker processes when Pod endpoints scale up or down?**
+
+Traditional NGINX requires executing `nginx -s reload` to update upstream server IP lists, which under high-churn Kubernetes environments causes worker processes to accumulate, leaking memory and breaking active WebSocket/gRPC streams. Ingress-NGINX embeds **OpenResty Lua shared memory dictionaries**. When the Endpoints controller updates pod IPs, Lua dynamically updates the routing table in shared memory in microseconds, bypassing process reloads completely.
+
+**Q3: What is the difference between `Exact` and `Prefix` path matching in the Kubernetes Ingress specification?**
+
+- **`Exact`**: Matches the exact string character-by-character. For example, `path: /api/v1` matches strictly `/api/v1`; it will reject `/api/v1/` and `/api/v1/orders`.
+- **`Prefix`**: Matches URL path segments separated by `/`. For example, `path: /api` will match `/api`, `/api/`, and `/api/users`, but will reject `/apidocs` because `docs` is not separated by a forward slash.
+
+**Q4: How does Ingress-NGINX route traffic to backend pods (ClusterIP vs Direct Pod IP)?**
+
+By default, Ingress-NGINX **bypasses the Kubernetes Service ClusterIP and Kube-Proxy iptables entirely**. Ingress-NGINX resolves the underlying `Endpoints` or `EndpointSlices` associated with the target Service and establishes a direct Layer 7 HTTP/2 connection from the NGINX worker straight to the Pod's private IP address, reducing network hops and enabling advanced client-side load-balancing algorithms (e.g. least connections, consistent hashing).
+
+**Q5: How do you run multiple distinct Ingress controllers (e.g. Public vs Internal) in the same cluster?**
+
+Administrators create separate **`IngressClass`** objects (e.g. `name: public-nginx` with `controller: k8s.io/ingress-nginx-public`, and `name: internal-nginx` with `controller: k8s.io/ingress-nginx-internal`). Each Ingress Controller deployment is configured with a unique `--ingress-class` controller flag. Developers bind their Ingress manifests to a specific controller by setting `spec.ingressClassName: internal-nginx`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between Ingress resources (data specs) and Ingress Controllers (running proxies)
+- [ ] Know how OpenResty/Lua enables dynamic upstream updates without NGINX worker reloads
+- [ ] Know the path matching rules: `Exact` (strict string) vs `Prefix` (slash-separated segments)
+- [ ] Know that Ingress-NGINX routes directly to Pod IPs, bypassing ClusterIP iptables
+- [ ] Know how `ingressClassName` allows multiple Ingress controllers to coexist
+- [ ] Can view active Ingress objects using `kubectl get ingress -A`

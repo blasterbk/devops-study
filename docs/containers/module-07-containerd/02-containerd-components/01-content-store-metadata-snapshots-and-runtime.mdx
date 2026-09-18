@@ -1,0 +1,185 @@
+---
+title: "Chapter 1 — containerd Components: Content, Metadata & Snapshots"
+sidebar_position: 1
+module: "Module 7.2 — containerd Components"
+description: "Master containerd core components — Content Store blob storage, BoltDB meta.db metadata, Snapshotter subsystems (OverlayFS), and Container vs Task service architecture."
+---
+
+# Chapter 1 — containerd Components: Content, Metadata & Snapshots
+
+> **Goal:** Master the internal data models, storage subsystems, and process management pipelines of **containerd core components** — dissecting the **Content Store** (`io.containerd.content.v1.content`), the **BoltDB Metadata Engine** (`meta.db`), the **Snapshotter Subsystem** (`Prepare()`, `Commit()`, `Mounts()`), and the fundamental architectural distinction between a static **Container Service** and an active **Task Service**.
+>
+> By the end of this chapter, you will understand:
+> 1. How the containerd Content Store stores immutable SHA-256 binary payload blobs
+> 2. How `meta.db` persists image tags, container specifications, and snapshot metadata in BoltDB
+> 3. The lifecycle of a Snapshotter: parent commits, active scratch spaces, and OverlayFS mounts
+> 4. Why containerd decouples a "Container" (static metadata) from a "Task" (live running process)
+> 5. How containerd Leases protect content blobs from automated garbage collection
+> 6. How to query and manage raw content, snapshots, containers, and tasks using `ctr`
+
+---
+
+## Real-Life Analogy
+
+Think of containerd's internal components as **the storage, cataloging, and exhibition wings of an international fine art museum**:
+
+- **1. The Secure Underground Vault (`The Content Store`):**
+  - Stacks of heavy wooden shipping crates holding raw canvas art and sculptures (**Raw SHA-256 compressed image layer tarballs**).
+  - Each crate is stamped with an immutable cryptographic barcode. The vault never modifies the crates; it only stores them securely (**Content-Addressable Storage**).
+- **2. The Curator's Master Catalog Ledger (`The Metadata Engine - meta.db`):**
+  - A digital ledger (**BoltDB**) indexing the museum collection:
+    - *"Crate #4A is the Mona Lisa base canvas"*.
+    - *"Exhibit #12 uses Crate #4A and Crate #7B"*.
+- **3. The Restoration Workshop (`The Snapshotter Subsystem`):**
+  - When an exhibit is prepared, the restorers unpack the wooden crates, assemble the frames, and mount them onto an exhibition wall (**Unpacks tarballs into OverlayFS directories via `Prepare()`**).
+- **4. The Museum Blueprint vs The Live Show (`Container` vs `Task`):**
+  - **The Container:** The laminated architectural blueprint for the gallery room (**Static metadata on disk**).
+  - **The Task:** The live gallery room with lights turned on, music playing, and visitors walking through the door (**The active running process executing on host CPU cores**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               containerd Component Data Flow: Pull ──► Store ──► Snapshot ──► Task
+
+ 1. IMAGE PULL INGESTION:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ REGISTRY DOWNLOAD ──► CONTENT STORE (`/var/lib/containerd/.../content`) │
+ │ Stores immutable SHA-256 blobs (Layer tarballs, Config JSON, Manifests)│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Registered into Metadata Catalog
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. METADATA DATABASE (`meta.db` - Embedded BoltDB Key-Value Store)     │
+ │    - Indexes Images, Tags, Container records, & Snapshot relationships │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Unpacks Layer Blobs into Filesystem Trees
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. SNAPSHOTTER SUBSYSTEM (`io.containerd.snapshotter.v1.overlayfs`)    │
+ │    - Calls `Prepare()` ──► Generates active container writable layer   │
+ │    - Emits Mount Spec: `mount -t overlay ...`                          │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Passed to Task Service for Execution
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 4. CONTAINER SERVICE (Metadata Spec) ──► TASK SERVICE (Live Process)   │
+ │    - Spawns `containerd-shim-v2` ──► Executes `runc` on CPU cores!     │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. The Content Store & Leases
+
+The containerd **Content Store** stores raw, immutable binary blobs indexed strictly by their SHA-256 content digest:
+- **Location**: `/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/`
+- **Immutability**: Once written, content blobs are never modified.
+- **Containerd Leases**: To prevent the automated background Garbage Collector (GC) from deleting a content blob while an image is being unpacked or built, a client acquires a **Lease (`io.containerd.lease`)**, pinning the blob in storage.
+
+---
+
+## 2. The Snapshotter Subsystem
+
+In containerd, storage drivers are called **Snapshotters**:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Snapshotter Method   │ Operational Action & Lifecycle Role                                         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Prepare()`**      │ Creates an **Active (Writable) Snapshot** based on an existing parent layer.│
+ │                      │ Returns the mount descriptors required by `mount -t overlay`.               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Commit()`**       │ Freezes an active snapshot into an **Immutable (Committed) Layer Snapshot** │
+ │                      │ when building a new container image layer.                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`View()`**         │ Creates a temporary **Read-Only Snapshot** to inspect layer contents.       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Mounts()`**       │ Queries the exact Linux VFS mount parameters for an existing snapshot.      │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Container Service vs Task Service
+
+One of containerd's most elegant architectural designs is the **strict separation between Containers and Tasks**:
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ Architecture Concept                 │ containerd Definition & Lifecycle Scope                     │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **The Container (`containerd.Container`)**│ **Static Metadata Entity on Disk.** Represents the container │
+ │                                      │ specification: rootfs snapshot, image ID, labels, mounts,   │
+ │                                      │ and OCI runtime options. It consumes **0% CPU and 0 RAM**.  │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **The Task (`containerd.Task`)**     │ **The Live Runtime Execution on CPU.** Represents the active│
+ │                                      │ running Linux process on the host. Has a real host PID,     │
+ │                                      │ stdio streaming pipes, and lifecycle state (`Running`).     │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# Workflow Example:
+# 1. Create static container metadata:
+ctr container create docker.io/library/alpine:latest my-alpine
+
+# 2. Start the live active runtime task:
+ctr task start -d my-alpine
+```
+
+---
+
+## Hands-On Lab: Querying containerd Components via `ctr`
+
+```bash
+# Step 1: Query content blobs stored in containerd's Content Store
+sudo ctr content ls 2>/dev/null || echo "ctr content ls ready"
+
+# Step 2: Query active filesystem snapshots managed by the OverlayFS snapshotter
+sudo ctr snapshot --snapshotter overlayfs ls 2>/dev/null || echo "ctr snapshot ls ready"
+
+# Step 3: Inspect static container definitions on disk
+sudo ctr containers list 2>/dev/null || echo "ctr containers list ready"
+
+# Step 4: Inspect active live running tasks (Notice real Host PIDs and status!)
+sudo ctr tasks list 2>/dev/null || echo "ctr tasks list ready"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the architectural difference between a "Container" and a "Task" in containerd?**
+
+- **Container (`containerd.Container`)**: A **static metadata object** stored in `meta.db`. It defines the container's declarative configuration: which OCI image to use, which snapshot is mounted, environment variables, and OCI runtime parameters. A container object can exist on disk with zero active processes and zero CPU consumption.
+- **Task (`containerd.Task`)**: The **active running process on the Linux host**. A Task represents the live execution instance of a Container. It has a real Host PID, active cgroup constraints, open stdio communication pipes, and a dynamic execution state (`Created`, `Running`, `Paused`, `Stopped`).
+
+**Q2: What is the role of the containerd Content Store, and how does it manage blob integrity?**
+
+The containerd Content Store (`io.containerd.content.v1.content`) is a local, content-addressable storage repository for immutable binary data (OCI Image Manifests, Config JSON blobs, and compressed Layer Tarballs). Every blob is stored in a directory named after its **SHA-256 cryptographic digest** (`sha256:<hash>`). During downloads or layer verification, containerd recalculates the SHA-256 checksum of incoming bytes against the stored digest; if a single bit is corrupted or tampered with, the blob is rejected.
+
+**Q3: How does containerd's Snapshotter architecture differ from Docker's legacy Graph Drivers?**
+
+- **Docker Graph Drivers**: Tightly coupled the unpacking of layer tarballs with filesystem mounting and image layer tracking into a monolithic interface (`overlay2`, `aufs`).
+- **containerd Snapshotters**: Completely decouple layer extraction from filesystem management. The Content Store holds raw tarballs, while the **Snapshotter manages only filesystem directory snapshots** (`Prepare`, `Commit`, `Mounts`). This modular design allows swapping OverlayFS for modern snapshotters like **eStargz (for sub-second lazy image pulling)** without changing the image ingestion engine.
+
+**Q4: What is a "Lease" in containerd, and why is it necessary?**
+
+containerd runs a continuous background **Garbage Collector (GC)** that deletes unreferenced content blobs and snapshots from disk. However, when an engine is downloading a multi-gigabyte image or building a new container, temporary layer blobs may temporarily exist in the Content Store without being linked to a registered image manifest. A **Lease (`io.containerd.lease`)** allows a client to lock a set of content blobs or snapshots, preventing the Garbage Collector from pruning them until the build or pull operation completes.
+
+**Q5: What data is stored in containerd's `meta.db` file?**
+
+`meta.db` is an embedded **BoltDB transactional key-value database** located at `/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db`. It stores: (1) Image references and tag-to-digest mappings; (2) Container metadata specifications; (3) Snapshot parent-child hierarchy trees; (4) Active leases and garbage collection roots; (5) containerd namespace records (`k8s.io`, `default`, `moby`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that the Content Store holds raw, immutable SHA-256 binary blobs
+- [ ] Know that `meta.db` (BoltDB) stores all containerd metadata and image tags
+- [ ] Know the Snapshotter methods: `Prepare()`, `Commit()`, `View()`, `Mounts()`
+- [ ] Know the distinction: Container (Static metadata) vs Task (Live running process)
+- [ ] Know that Leases prevent the Garbage Collector from deleting temporary blobs
+- [ ] Can query tasks and snapshots using `ctr tasks ls` and `ctr snapshot ls`

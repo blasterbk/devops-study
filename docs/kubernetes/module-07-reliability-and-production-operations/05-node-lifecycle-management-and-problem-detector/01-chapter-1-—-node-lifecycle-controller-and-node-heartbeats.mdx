@@ -1,0 +1,211 @@
+---
+title: "Chapter 1 — Node Lifecycle & Heartbeats"
+sidebar_position: 1
+module: "Module 7.5 — Node Lifecycle & NPD"
+description: "Master Kubernetes Node Lifecycle Controller internals — Node Lease heartbeats (kube-node-lease), failure detection timers, unreachable taints, and zone eviction rate-limiting."
+---
+
+# Chapter 1 — Node Lifecycle Controller & Node Heartbeats
+
+> **Goal:** Master the internal health monitoring and failure-handling mechanics of the Kubernetes **Node Lifecycle Controller** — understanding how Kubelets publish lightweight heartbeat renewals to the **`kube-node-lease`** namespace every 10 seconds, analyzing the exact timing sequence when a node goes down (`node-monitor-grace-period` $\to$ `Ready: Unknown` $\to$ automated taints $\to$ pod eviction), tuning toleration timers (`tolerationSeconds: 300s`), and investigating how zone-wide disruption rate limiters prevent cascading evictions during cloud datacenter outages.
+>
+> By the end of this chapter, you will understand:
+> 1. How Node Lease objects in `kube-node-lease` replaced heavy `NodeStatus` heartbeats
+> 2. The 5 standard Node Conditions: `Ready`, `MemoryPressure`, `DiskPressure`, `PIDPressure`, `NetworkUnavailable`
+> 3. The exact timeline from a missed heartbeat (10s) to node taint (40s) to pod eviction (300s)
+> 4. How the `node.kubernetes.io/unreachable` and `not-ready` taints trigger pod evictions
+> 5. How default pod tolerations (`tolerationSeconds: 300`) can be tuned for fast failover
+> 6. How the Node Controller rate-limits evictions during zone-wide datacenter network partitions
+
+---
+
+## Real-Life Analogy
+
+Think of Node Leases and the Node Lifecycle Controller as **an offshore oil rig worker check-in radio protocol and the emergency base station protocol**:
+
+- **The Legacy Check-In (The 50-Page Medical Exam - Legacy `NodeStatus`):** In the past, every worker had to radio in every 10 seconds and read a 50-page medical report (**Full Node Spec, Images, Capacity, and Conditions**), overloading the radio tower (**`etcd` write saturation**).
+- **The Modern Node Lease (The Quick Radio Button Tap - `kube-node-lease`):** Today, the worker simply presses a green button on their radio every 10 seconds (**`renewTime` on `Lease` object**). It takes 1 millisecond and consumes near-zero bandwidth.
+- **The Missing Worker Timer (`node-monitor-grace-period: 40s`):** If a worker fails to press their button for 40 seconds (**Lost radio contact / Kernel panic**), the base commander marks them as *"Contact Lost"* (**Node Condition: `Ready: "Unknown"`**) and posts a warning flag on their cabin door (**`node.kubernetes.io/unreachable:NoExecute`**).
+- **The Search & Evacuate Timer (`tolerationSeconds: 300s`):** The base waits 5 minutes (300 seconds) in case it was just a transient radio antenna flicker. If the worker is still silent after 5 minutes, the commander deploys an emergency helicopter to evacuate their assignments (**Evicts Pods to another healthy oil rig**).
+- **The Zone Earthquake Rule (Rate-Limiting Evictions):** If a massive tsunami hits an entire oil field and 40 out of 50 rigs go silent at once (**Zone-wide network split**), the commander does **not** panic and scramble 500 helicopters to crash into the remaining 10 rigs. The commander freezes all automated evictions to prevent destroying the entire fleet (**Eviction Rate Limiter**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubelet Node Lease Heartbeats & Failure Timeline
+
+ WORKER NODE (Kubelet Daemon)                          CONTROL PLANE (Node Lifecycle Controller)
+ ┌──────────────────────────────────────┐             ┌──────────────────────────────────────┐
+ │ Kubelet Heartbeat Loop (Every 10s)   │             │ Node Controller Heartbeat Monitor    │
+ │ Sends HTTP PATCH to API Server:      │────────────►│ Checks `kube-node-lease` namespace   │
+ │ `Lease: kube-node-lease/<node-name>` │             └──────────────────┬───────────────────┘
+ └──────────────────────────────────────┘                                │
+                                                                         ▼
+                                                      ┌──────────────────────────────────────┐
+                                                      │ FAILURE TIMELINE (Worker Node Dies!):│
+                                                      │                                      │
+                                                      │ T = 00s: Node power cord pulled      │
+                                                      │ T = 10s: First missed lease update   │
+                                                      │                                      │
+                                                      │ T = 40s: (node-monitor-grace-period) │
+                                                      │   ──► Sets `Ready: "Unknown"`        │
+                                                      │   ──► Taints: `unreachable:NoExecute`│
+                                                      │                                      │
+                                                      │ T = 340s: (tolerationSeconds: 300s)  │
+                                                      │   ──► Pods EVICTED from node!        │
+                                                      │   ──► Kube-Scheduler reschedules pods│
+                                                      └──────────────────────────────────────┘
+```
+
+---
+
+## The 5 Standard Kubernetes Node Conditions
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Node Condition       │ Trigger Cause & System Impact                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Ready`**          │ `True` if node is healthy and accepting pods; `False` if Kubelet is down;   │
+ │                      │ `Unknown` if node lease heartbeat stopped responding.                       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`MemoryPressure`** │ `True` if available memory dropped below `evictionHard: memory.available`.  │
+ │                      │ Blocks new pod scheduling; begins evicting BestEffort workloads.            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`DiskPressure`**   │ `True` if root filesystem or image storage dropped below `nodefs.available`.│
+ │                      │ Triggers container image garbage collection; blocks new pods.               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`PIDPressure`**    │ `True` if available process IDs dropped below `pids.available`. Prevents    │
+ │                      │ fork-bombs from crashing the host Linux operating system.                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Network-**        │ `True` if the CNI plugin (Cilium, Calico) is not initialized or configured. │
+ │ **Unavailable`**     │ Prevents pod scheduling until the container network route is functional.    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Tuning Fast Pod Eviction Tolerations
+
+By default, Kubernetes pods tolerate unreachable nodes for **300 seconds (5 minutes)**:
+
+```yaml
+# Default automatic toleration injected by API server:
+tolerations:
+- key: "node.kubernetes.io/not-ready"
+  operator: "Exists"
+  effect: "NoExecute"
+  tolerationSeconds: 300
+- key: "node.kubernetes.io/unreachable"
+  operator: "Exists"
+  effect: "NoExecute"
+  tolerationSeconds: 300
+```
+
+### Fast-Failover Tuning for Mission-Critical Microservices:
+To force Kubernetes to fail over and reschedule pods within **30 seconds** of a node failure:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fast-failover-api
+  namespace: production
+spec:
+  replicas: 3
+  template:
+    spec:
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30          # Fail over in 30 seconds!
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      containers:
+      - name: api
+        image: payment-api:v2.0
+```
+
+---
+
+## Zone-Wide Disruption Rate-Limiting
+
+If a network switch failure cuts off an entire cloud Availability Zone (e.g. 50 nodes disconnect simultaneously), standard evictions would overwhelm the remaining nodes.
+
+The Node Lifecycle Controller implements **3 Disruption States**:
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Disruption State     │ Trigger Condition       │ Eviction Rate Behavior                            │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Normal State**     │ $< 33\%$ nodes unready. │ Evicts pods at standard rate                      │
+ │                      │                         │ (`--node-eviction-rate=0.1` pods/sec per node).   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Partial**          │ $> 33\%$ nodes unready. │ Eviction rate is reduced to                       │
+ │ **Disruption**       │                         │ `--secondary-node-eviction-rate=0.01` (10x slower)│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Full Disruption**  │ $100\%$ nodes unready.  │ **All evictions completely HALTED.** Assumes a    │
+ │ (Total Network Split)│                         │ control plane or master network partition!        │
+ └──────────────────────┴─────────────────────────┴───────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Inspecting Node Leases & Conditions
+
+```bash
+# Step 1: Query all Node Lease objects in the kube-node-lease namespace
+kubectl get leases -n kube-node-lease
+
+# Step 2: Inspect a specific node lease renewal timestamp
+kubectl get lease $(kubectl get nodes -o jsonpath='{.items[0].metadata.name}') -n kube-node-lease -o yaml
+
+# Step 3: Inspect all active conditions on worker nodes
+kubectl get nodes -o custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type==\"Ready\")].status,MEM_PRESSURE:.status.conditions[?(@.type==\"MemoryPressure\")].status,DISK_PRESSURE:.status.conditions[?(@.type==\"DiskPressure\")].status
+
+# Step 4: Verify automated node taints on an unhealthy node (if any exist)
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\tTaints: "}{.spec.taints}{"\n"}{end}'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How did the introduction of the `kube-node-lease` API solve scalability bottlenecks in Kubernetes?**
+
+Prior to Kubernetes 1.13, Kubelets sent heartbeats by periodically updating the full `Node` API object in `etcd`. In a 5,000-node cluster, 5,000 nodes updating large 10KB `Node` objects every 10 seconds generated massive write amplification, fragmenting `etcd` and exhausting API server bandwidth. The **`kube-node-lease`** mechanism introduced tiny, lightweight `Lease` objects containing only a renewal timestamp. Kubelet updates the tiny Lease every 10 seconds, updating the heavy `Node` object only when hardware conditions or allocatable capacities actually change.
+
+**Q2: What is the exact sequence of events when a worker node crashes or loses network connectivity?**
+
+1. **T = 10s**: The node fails to renew its Lease in `kube-node-lease`.
+2. **T = 40s (`node-monitor-grace-period`)**: The Node Controller marks the node condition as `Ready: "Unknown"`.
+3. **T = 40s**: The Node Controller immediately applies the `node.kubernetes.io/unreachable:NoExecute` and `node.kubernetes.io/not-ready:NoExecute` taints to the Node object.
+4. **T = 340s (40s + 300s default `tolerationSeconds`)**: The API server's taint eviction manager evicts all pods from the node, and the `kube-scheduler` recreates them on healthy nodes.
+
+**Q3: How can you configure a stateless deployment to fail over faster when a node goes down?**
+
+By default, pods have a 300-second (5-minute) toleration for `unreachable` and `not-ready` taints. To achieve fast failover, add custom tolerations in the Deployment pod template with a lower `tolerationSeconds` value (e.g. `tolerationSeconds: 30` or `15`). When a node crashes, the pods will be evicted and rescheduled within 30 seconds of the node being declared `Unknown`.
+
+**Q4: How does the Node Lifecycle Controller prevent cascading outages during large-scale cloud datacenter failures?**
+
+If a major datacenter power cut or fiber optic cut disconnects 50% of a cluster's nodes, evicting thousands of pods simultaneously would overwhelm the remaining healthy nodes, triggering a catastrophic cascade of `MemoryPressure` and `DiskPressure` crashes. The Node Controller monitors cluster-wide disruption percentages: if more than 33% of nodes become unready, it throttles the eviction rate to `0.01` nodes/second, and if 100% of nodes disconnect, it halts all evictions completely until connectivity stabilizes.
+
+**Q5: What is the difference between `MemoryPressure` and `DiskPressure` node conditions?**
+
+- **`MemoryPressure`**: Triggers when physical host available RAM drops below `evictionHard: memory.available<100Mi`. Kubelet blocks new pod scheduling on that node and immediately terminates pods in order of QoS class (evicting `BestEffort` pods first, then `Burstable` pods exceeding requests).
+- **`DiskPressure`**: Triggers when available root filesystem storage drops below `evictionHard: nodefs.available<10%`. Kubelet blocks new pods and executes automated container and dead image garbage collection to reclaim disk space.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Kubelets update lightweight Node Leases in `kube-node-lease` every 10s
+- [ ] Know the 5 Node Conditions: `Ready`, `MemoryPressure`, `DiskPressure`, `PIDPressure`, `NetworkUnavailable`
+- [ ] Know the default node failure timeline: 40s grace period $\to$ 300s eviction toleration
+- [ ] Know how to tune `tolerationSeconds: 30` for fast stateless pod failover
+- [ ] Know how zone disruption rate-limiters prevent cascading eviction storms
+- [ ] Can view active node leases using `kubectl get leases -n kube-node-lease`

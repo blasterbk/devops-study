@@ -1,0 +1,155 @@
+---
+title: "Chapter 3 — OpenVPN Architecture: TLS Control Channel, TUN/TAP Devices & PKI"
+sidebar_position: 1
+module: "Module 11.3 — OpenVPN Architecture"
+description: "Master OpenVPN architecture — TLS control channel + HMAC data channel multiplexing, TUN (Layer 3) vs TAP (Layer 2) virtual devices, Public Key Infrastructure (PKI) X.509 certificates, and tls-auth HMAC firewalls."
+---
+
+# Chapter 3 — OpenVPN Architecture: TLS Control Channel, TUN/TAP Devices & PKI
+
+> **Goal:** Master OpenVPN (RFC draft & open-source standard), the historically dominant enterprise client-to-site SSL/TLS VPN solution. Understand its dual-channel architecture (TLS Control Channel + Data Channel), TUN (Layer 3 IP routed) vs TAP (Layer 2 Ethernet bridged) virtual network devices in Linux, X.509 PKI certificate authentication, and security hardening with `tls-auth` / `tls-crypt` HMAC signatures.
+>
+> By the end of this chapter, you will understand:
+> 1. The Dual-Channel OpenVPN architecture: Reliable TLS Control Channel multiplexed with Data Channel
+> 2. Virtual network devices: `/dev/net/tun` (Layer 3 IP) vs `/dev/net/tap` (Layer 2 Ethernet frames)
+> 3. User-space context switching overhead (Kernel $\leftrightarrow$ User-space $\leftrightarrow$ TUN/TAP device)
+> 4. PKI Certificate Authority (CA) setup: Root CA, Server Certificate, Client Certificate, and CRL revocation
+> 5. Defense-in-depth security: `tls-auth` and `tls-crypt` pre-shared HMAC firewall packets preventing buffer overflow zero-days
+> 6. CLI configuration and diagnostics with `openvpn` and Linux `ip`
+
+---
+
+## Real-Life Analogy
+
+Think of OpenVPN as **a secure international conference booth with a private badge validator desk**:
+
+- **The TLS Control Channel (The Security Checkpoint Desk):**
+  - Before you are allowed inside the booth, you approach the front desk. You show your passport and photo badge (**Client X.509 Certificate signed by Root CA**).
+  - The security officer validates your signature against their master registry and issues you an ephemeral color-coded wristband with cryptographic keys (**TLS Handshake over Port 1194**).
+- **The Data Channel (The Private Briefcase Exchange):**
+  - Once verified, you and the officer exchange confidential documents stamped with the wristband key at high speed (**Data Channel payload**).
+- **`tls-auth` (The Secret Door Knock):**
+  - Before the guard even opens the sliding inspection window, you must tap a secret rhythm on the door (**HMAC pre-shared key**). If you don't know the secret knock, the guard ignores you completely, protecting the booth from unauthorized probing.
+
+---
+
+## Architecture Diagram
+
+```text
+                  OpenVPN Dual-Channel Multiplexing Architecture
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT APPLICATION (e.g., Browser / SSH)                                    │
+ │    │                                                                        │
+ │    ▼ (User-space OS Socket)                                                 │
+ │ ┌─────────────────────────────────────────────────────────────────────────┐ │
+ │ │ LINUX KERNEL                                                            │ │
+ │ │                                                                         │ │
+ │ │   [Virtual TUN Device: tun0 (10.8.0.2)]                                 │ │
+ │ └────────────────────────────┬────────────────────────────────────────────┘ │
+ │                              │ (Packet copied to User-space)                │
+ │                              ▼                                              │
+ │ ┌─────────────────────────────────────────────────────────────────────────┐ │
+ │ │ OPENVPN USER-SPACE DAEMON                                               │ │
+ │ │                                                                         │ │
+ │ │   1. TLS CONTROL CHANNEL: Key exchange & Auth (X.509 CA + DH/ECDH)      │ │
+ │ │   2. DATA CHANNEL: Payload encryption (AES-256-GCM / ChaCha20)          │ │
+ │ │   3. HMAC FIREWALL: Signs packet with `tls-auth` / `tls-crypt`          │ │
+ │ └────────────────────────────┬────────────────────────────────────────────┘ │
+ │                              │ (Encapsulated into UDP Port 1194)            │
+ │                              ▼                                              │
+ │ [Physical NIC: eth0] ────────┼──────── (Internet Transit) ──────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. TUN vs TAP Virtual Network Devices
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Device               │ Virtual Interface Layer                  │ Supported Protocols & Tradeoffs          │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **TUN (`/dev/net/tun`)**│ **Layer 3 (Network Layer / IP Packets)**  │ Pure IPv4 and IPv6 routing. Lower        │
+ │                      │ (Default for 99% of VPNs)                │ overhead; does NOT forward L2 broadcast. │
+ │ **TAP (`/dev/net/tap`)**│ **Layer 2 (Data Link / Ethernet Frames)**│ Transports full Ethernet frames, MACs,   │
+ │                      │                                          │ NetBIOS, IPX, and non-IP protocols.      │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 2. The User-Space Context Switching Bottleneck
+
+Unlike WireGuard and IPsec which operate 100% inside the Linux kernel, OpenVPN runs as a **user-space daemon**:
+1. Application writes packet to socket (User $\to$ Kernel).
+2. Kernel routes packet to `tun0` interface (Kernel $\to$ User-space OpenVPN process).
+3. OpenVPN encrypts payload and writes to physical socket (User $\to$ Kernel).
+4. Kernel transmits out physical NIC `eth0` (Kernel $\to$ Hardware).
+
+*(This quadruple context switch consumes CPU cycles and limits OpenVPN single-thread throughput to ~1–2 Gbps compared to WireGuard's 10–40 Gbps line rate)*.
+
+---
+
+### 3. `tls-auth` vs `tls-crypt` Security Hardening
+
+- **`tls-auth` (HMAC Firewall):** Appends a SHA-256 HMAC signature to all control channel packets using a shared static key (`ta.key`). Unauthenticated packets are discarded **before** triggering the OpenSSL TLS parser, mitigating remote code execution zero-days in TLS libraries.
+- **`tls-crypt`:** Encrypts the entire TLS control channel itself (hiding certificate common names and metadata from deep packet inspection).
+
+---
+
+## Hands-On Lab: Inspecting TUN Devices & OpenVPN Configuration
+
+```bash
+# Step 1: Verify Linux kernel support for the universal TUN/TAP driver
+ls -la /dev/net/tun
+
+# Step 2: Create a standalone persistent TUN interface using ip tuntap
+sudo ip tuntap add dev tun99 mode tun
+sudo ip addr add 10.99.0.1/24 dev tun99
+sudo ip link set tun99 up
+
+# Step 3: Inspect the virtual TUN interface
+ip -d link show tun99
+
+# Step 4: Clean up test TUN device
+sudo ip link del dev tun99
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does OpenVPN operate over UDP by default, and why is running "TCP-over-TCP" dangerous?**
+
+OpenVPN defaults to **UDP Port 1194**. If OpenVPN is configured over TCP (e.g. TCP port 443 to bypass firewalls), and a client runs TCP applications (e.g. web browsing) over the VPN, a phenomenon called **TCP-over-TCP Meltdown** occurs. If packet loss happens, both the inner TCP stream and the outer OpenVPN TCP tunnel trigger retransmission and exponential backoff timers simultaneously, causing total throughput to collapse to zero.
+
+**Q2: What is the difference between a TUN device and a TAP device in OpenVPN?**
+
+- **TUN (Layer 3 Tunnel):** Operates on raw IP packets. It acts like a point-to-point IP link. It cannot transport Layer 2 protocols (like ARP, DHCP broadcasts, or non-IP packets) but has lower overhead and is supported on mobile devices (iOS/Android).
+- **TAP (Layer 2 Adapter):** Operates on full Ethernet frames with MAC addresses. It allows bridging remote computers into a local physical switch broadcast domain, but adds Ethernet header overhead and is blocked on mobile OS platforms.
+
+**Q3: How does Certificate Revocation List (CRL) work in an OpenVPN PKI infrastructure?**
+
+When an employee leaves the company or their laptop is stolen, their private client certificate must be invalidated. The Certificate Authority (CA) generates a signed **Certificate Revocation List (`crl.pem`)** containing the revoked certificate's serial number. The OpenVPN server loads the CRL (`crl-verify crl.pem`) and rejects the TLS handshake immediately during connection attempts.
+
+**Q4: What is the purpose of the `redirect-gateway def1` directive in an OpenVPN client profile?**
+
+In OpenVPN, `redirect-gateway def1` forces all client internet traffic to route through the VPN tunnel. Instead of overwriting the existing default gateway (`0.0.0.0/0`), the `def1` flag installs two `/1` routes (`0.0.0.0/1` and `128.0.0.0/1`). Because `/1` has a longer prefix match than `/0`, all client traffic routes into `tun0` without deleting the underlying physical ISP gateway.
+
+**Q5: Why is WireGuard replacing OpenVPN in high-throughput enterprise deployments?**
+
+1. **Kernel Datapath:** WireGuard runs entirely in the kernel, eliminating OpenVPN's expensive user-space/kernel context switches and memory copies.
+2. **Codebase Footprint:** WireGuard has ~4,000 lines of code vs OpenVPN's 100,000+ lines, drastically reducing the CVE attack surface.
+3. **Connection Handshake:** WireGuard connects in **1 RTT (<10ms)** vs OpenVPN's multi-step TLS handshake (often taking 2–5 seconds).
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Dual-Channel OpenVPN (TLS Control Channel + Data Channel)
+- [ ] Differentiate TUN (Layer 3 IP) from TAP (Layer 2 Ethernet)
+- [ ] Understand user-space context switching performance trade-offs
+- [ ] Understand `tls-auth` and `tls-crypt` HMAC pre-shared key security
+- [ ] Explain TCP-over-TCP Meltdown and why UDP is preferred

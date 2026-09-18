@@ -1,0 +1,296 @@
+---
+title: "Chapter 2 — AppArmor, SELinux & Capabilities"
+sidebar_position: 2
+module: "Module 5.7 — Runtime Security"
+description: "Master Linux Mandatory Access Control (MAC) and capability hardening in Kubernetes — AppArmor profiles (GA 1.30), SELinux MCS labels, dropping ALL capabilities, and allowPrivilegeEscalation: false."
+---
+
+# Chapter 2 — AppArmor, SELinux & Capabilities Hardening
+
+> **Goal:** Master multi-layered Linux kernel runtime defense in Kubernetes — understanding the distinction between Discretionary Access Control (DAC) and Mandatory Access Control (MAC), configuring native AppArmor profiles (GA in Kubernetes 1.30 via `securityContext.appArmorProfile`), managing SELinux Multi-Category Security (MCS) labels via `seLinuxOptions`, stripping unnecessary Linux kernel capabilities (`capabilities.drop: ["ALL"]`), and blocking privilege escalation vectors.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4-layer Linux kernel defense model: Namespaces $\to$ Cgroups $\to$ Capabilities $\to$ MAC (AppArmor/SELinux)
+> 2. How the native AppArmor API in Kubernetes 1.30 replaces legacy beta annotations
+> 3. How AppArmor profile rules restrict file path reads/writes, network sockets, and raw execution
+> 4. How SELinux Multi-Category Security (MCS) labels isolate multi-tenant volume mounts on host nodes
+> 5. Why dropping `ALL` Linux capabilities and disabling `allowPrivilegeEscalation` neutralizes root exploits
+> 6. How to author a production-grade `securityContext` incorporating all runtime security primitives
+
+---
+
+## Real-Life Analogy
+
+Think of Linux kernel runtime hardening as **the multi-layered security infrastructure of a maximum-security chemical laboratory**:
+
+- **Namespaces & Cgroups (The Building Room Walls & Air Conditioning Limits):** Ensures Room A cannot see Room B, and limits how much oxygen/power Room A can consume.
+- **Linux Capabilities (The Master Tool Chest):** A standard root user has a master toolbox with 38 special keys (**Capabilities**). Instead of giving a technician the entire toolbox, you give them a single wrench to screw in a pipe (**`CAP_NET_BIND_SERVICE`**) and lock the rest of the 37 keys in the safe (**`capabilities.drop: ["ALL"]`**).
+- **`allowPrivilegeEscalation: false` (The Welded Suit Lock):** Prevents a junior assistant from putting on a Hazmat Director uniform they found lying on the floor (Neutralizes `setuid` binaries like `sudo`).
+- **Seccomp (The Voice Filter):** Ensures the worker cannot shout dangerous commands into the building intercom (**Syscall filtering**).
+- **AppArmor & SELinux (The Armed Bodyguard with a Path Tracker - Mandatory Access Control):** Even if a worker somehow steals root clearance, the armed guard (MAC) checks their security clearance badge on **every single file touch**: *"Your badge says you may ONLY read `/data/orders.txt`. If you try to touch `/etc/shadow` or `/etc/kubernetes`, you will be shot immediately with a kernel permission error!"*
+
+---
+
+## Architecture Diagram
+
+```text
+               Multi-Layered Linux Kernel Container Security Model
+
+ Incoming Attack Vector: Remote Code Execution (RCE) in Container Process
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LAYER 1: Linux Namespaces & Cgroups (PID, Mount, Net, IPC, Memory/CPU) │
+ │          Restricts visibility and enforces resource quotas.            │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Attempts to switch user to root via setuid
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LAYER 2: `allowPrivilegeEscalation: false` (PR_SET_NO_NEW_PRIVS)       │
+ │          BLOCKS all setuid/setgid binary privilege escalations!        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Attempts to use kernel superpowers (Raw sockets)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LAYER 3: Linux Capabilities (`capabilities.drop: ["ALL"]`)             │
+ │          Strips all 38+ kernel capabilities (CAP_SYS_ADMIN, CAP_NET_..)│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Attempts to issue kernel syscalls
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LAYER 4: Seccomp Syscall Filtering (`RuntimeDefault` BPF Filter)       │
+ │          BLOCKS dangerous syscalls (ptrace, kexec_load, reboot).       │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Attempts to read /etc/shadow or /var/log
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LAYER 5: Mandatory Access Control: AppArmor / SELinux                  │
+ │          Enforces file path & inode access controls at kernel VFS.     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ Attack completely neutralized!
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Result: Host OS & Other Tenant Containers are 100% Protected!          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## AppArmor in Kubernetes (GA in 1.30)
+
+Historically, AppArmor was configured via awkward pod metadata annotations. In Kubernetes 1.30, AppArmor is a **first-class native API field** under `securityContext.appArmorProfile`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-apparmor-pod
+spec:
+  securityContext:
+    # 1. Native AppArmor Profile (Kubernetes 1.30+ GA)
+    appArmorProfile:
+      type: RuntimeDefault            # Options: RuntimeDefault, Localhost, Unconfined
+  containers:
+  - name: web
+    image: nginx:1.25-alpine
+```
+
+### Writing a Custom AppArmor Profile (`/etc/apparmor.d/k8s-custom-web`):
+```text
+#include <tunables/global>
+
+profile k8s-custom-web flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Allow network access
+  network inet tcp,
+  network inet udp,
+
+  # Allow reading web assets
+  /usr/share/nginx/html/** r,
+  /etc/nginx/** r,
+
+  # Allow writing logs
+  /var/log/nginx/** w,
+
+  # DENY access to sensitive host and system directories!
+  deny /etc/shadow r,
+  deny /etc/kubernetes/** rwklx,
+  deny /proc/sysrq-trigger rwklx,
+}
+```
+
+---
+
+## SELinux Multi-Category Security (MCS)
+
+On Red Hat Enterprise Linux (RHEL), CentOS, and Fedora, **SELinux** provides Mandatory Access Control using Multi-Category Security (MCS) categories:
+
+```yaml
+spec:
+  securityContext:
+    seLinuxOptions:
+      level: "s0:c123,c456"           # Unique category label per tenant!
+      type: "container_t"
+      user: "system_u"
+      role: "system_r"
+```
+
+```text
+ How SELinux MCS Prevents Multi-Tenant Cross-Contamination:
+ - Container A runs under category label: `s0:c10,c20`
+ - Container B runs under category label: `s0:c30,c40`
+ - Even if both containers mount the same shared host directory, or share identical UID 10001, 
+   the Linux kernel VFS blocks Container A from accessing any file created by Container B!
+```
+
+---
+
+## Linux Capabilities Hardening Matrix
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Linux Capability     │ Risk & What It Allows If Not Dropped                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_SYS_ADMIN`**  │ **The "God Mode" Capability.** Allows mounting filesystems, setting cgroups,│
+ │                      │ loading kernel modules, and escaping container boundaries. Must DROP!       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_NET_ADMIN`**  │ Allows modifying host routing tables, iptables, and interface configs.      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_NET_RAW`**    │ Allows crafting arbitrary raw IP packets (ARP poisoning, DNS spoofing).     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_SETUID`**     │ Allows arbitrary process UID switching (Switching to root).                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`CAP_NET_BIND_**   │ Permitted exception: Allows binding unprivileged containers to low-numbered │
+ │      **SERVICE`**    │ privileged system ports (< 1024, such as port 80 and port 443).             │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Hardened `securityContext`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fully-hardened-workload
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hardened-api
+  template:
+    metadata:
+      labels:
+        app: hardened-api
+    spec:
+      # 1. Pod-Level Security Context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+        appArmorProfile:
+          type: RuntimeDefault
+
+      containers:
+      - name: api
+        image: payment-api:v3.0.0
+        # 2. Container-Level Security Context
+        securityContext:
+          allowPrivilegeEscalation: false    # PR_SET_NO_NEW_PRIVS
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL                          # Drop all 38 capabilities!
+            add:
+              - NET_BIND_SERVICE             # Minimal privilege for port 80/443
+
+        volumeMounts:
+        - name: tmp-scratch
+          mountPath: /tmp
+
+      volumes:
+      - name: tmp-scratch
+        emptyDir: {}
+```
+
+---
+
+## Hands-On Lab: Verifying Capabilities & Privilege Escalation Blocking
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace mac-lab
+
+# Step 2: Deploy a Pod with capabilities.drop: ["ALL"] and allowPrivilegeEscalation: false
+cat <<EOF | kubectl apply -f - -n mac-lab
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cap-test-pod
+spec:
+  containers:
+  - name: test-runner
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+EOF
+
+# Step 3: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/cap-test-pod -n mac-lab --timeout=30s
+
+# Step 4: Verify dropped capabilities by inspecting /proc/1/status inside container
+kubectl exec -n mac-lab cap-test-pod -- grep -i "Cap" /proc/1/status
+# Observe: CapInh, CapPrm, CapEff, CapBnd are all 0000000000000000 (Zero capabilities!)
+
+# Step 5: Verify that ping fails because CAP_NET_RAW was dropped!
+kubectl exec -n mac-lab cap-test-pod -- ping -c 1 127.0.0.1 2>&1 || echo "SUCCESS: Raw packet ping blocked due to dropped capabilities!"
+
+# Step 6: Clean up lab
+kubectl delete namespace mac-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between Discretionary Access Control (DAC) and Mandatory Access Control (MAC) in Linux?**
+
+- **Discretionary Access Control (DAC)**: Traditional file permissions based on User IDs and Group IDs (`chmod 755`, `chown`). In DAC, the file owner has full discretion to set permissions; if a process runs as root (UID 0), it bypasses all DAC restrictions.
+- **Mandatory Access Control (MAC)**: Enforced by the Linux kernel via **AppArmor** or **SELinux**. Security policies are defined centrally by the system administrator and apply system-wide. Even if a process runs as root (UID 0), the kernel MAC engine strictly denies access if the security profile does not explicitly permit the target file path or operation.
+
+**Q2: How was AppArmor configured in Kubernetes 1.30 compared to earlier versions?**
+
+Prior to Kubernetes 1.30, AppArmor was in beta and could only be configured through custom Pod metadata annotations (e.g. `container.apparmor.security.beta.kubernetes.io/<container-name>: localhost/<profile>`). In Kubernetes 1.30, AppArmor was promoted to **General Availability (GA)**, introducing a native, first-class field inside `securityContext.appArmorProfile` (with `type: RuntimeDefault`, `Localhost`, or `Unconfined`), standardizing it alongside Seccomp.
+
+**Q3: How do SELinux Multi-Category Security (MCS) labels prevent cross-tenant container attacks?**
+
+SELinux MCS assigns a unique pair of category categories (e.g. `s0:c123,c456`) to each container and its mounted storage volumes. The Linux kernel VFS layer enforces that a process running under category `c123,c456` can **only open and write to files labeled with the exact same category pair**. Even if two tenant containers run on the same worker node with identical UIDs (e.g. UID 1000), SELinux blocks either container from touching the other's data.
+
+**Q4: Why is `capabilities.drop: ["ALL"]` an industry best practice for all container deployments?**
+
+By default, container runtimes grant ~14 default Linux capabilities (such as `CAP_CHOWN`, `CAP_SETUID`, `CAP_NET_RAW`). These capabilities give container processes the ability to craft raw network spoofing packets, alter file ownerships, and change process credentials. Dropping `ALL` capabilities strips away all 38+ kernel superpowers. If the application specifically requires a single privilege (such as binding port 80), administrators can selectively re-add only that individual capability (`NET_BIND_SERVICE`).
+
+**Q5: What does the Linux kernel flag `PR_SET_NO_NEW_PRIVS` do when `allowPrivilegeEscalation: false` is configured?**
+
+When `allowPrivilegeEscalation: false` is set in the container's `securityContext`, the container runtime executes the `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` system call before launching the container process. This kernel flag guarantees that neither the process nor any of its child processes can ever gain elevated privileges, effectively preventing malicious users from executing `setuid` or `setgid` binaries (like `sudo` or `/usr/bin/passwd`) to gain root clearance.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 5-layer kernel defense: Namespaces $\to$ Cgroups $\to$ Escalation $\to$ Capabilities $\to$ MAC
+- [ ] Know how native AppArmor is configured in K8s 1.30+ (`securityContext.appArmorProfile`)
+- [ ] Know how SELinux MCS labels (`seLinuxOptions.level`) isolate multi-tenant filesystems
+- [ ] Know why dropping `ALL` Linux capabilities neutralizes container escape vectors
+- [ ] Know that `allowPrivilegeEscalation: false` disables setuid/setgid binary escalation
+- [ ] Can inspect container capabilities via `/proc/1/status`

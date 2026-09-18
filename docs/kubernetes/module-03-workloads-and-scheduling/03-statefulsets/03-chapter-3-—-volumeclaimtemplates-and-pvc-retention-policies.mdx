@@ -1,0 +1,327 @@
+---
+title: "Chapter 3 — VolumeClaimTemplates & PVC Retention"
+sidebar_position: 3
+module: "Module 3.3 — StatefulSets"
+description: "Master StatefulSet storage — volumeClaimTemplates dynamic PVC provisioning, persistentVolumeClaimRetentionPolicy (whenDeleted, whenScaled), volumeBindingMode WaitForFirstConsumer, and orphaned volume management."
+---
+
+# Chapter 3 — VolumeClaimTemplates & PVC Retention Policies
+
+> **Goal:** Master persistent storage architecture in Kubernetes StatefulSets — understanding how `volumeClaimTemplates` dynamically provision dedicated storage per ordinal, how the modern `persistentVolumeClaimRetentionPolicy` controls automated PVC cleanup, how `volumeBindingMode: WaitForFirstConsumer` prevents multi-zone placement deadlocks, and how to safely resize stateful volumes in production.
+>
+> By the end of this chapter, you will understand:
+> 1. The deterministic PVC naming convention: `<claim-name>-<statefulset-name>-<ordinal>`
+> 2. Why standard StatefulSets retain PVCs indefinitely and how that prevents catastrophic data loss
+> 3. How `persistentVolumeClaimRetentionPolicy` (`whenDeleted` and `whenScaled`) operates in Kubernetes 1.27+
+> 4. Why `volumeBindingMode: WaitForFirstConsumer` is mandatory for multi-AZ clusters
+> 5. How to execute zero-downtime online volume expansions on StatefulSets
+> 6. Best practices for identifying and pruning orphaned PVCs
+
+---
+
+## Real-Life Analogy
+
+Think of StatefulSet storage as **numbered safety deposit boxes in a bank vault**:
+
+- **Dynamic Box Creation (`volumeClaimTemplates`):** When Member #0, Member #1, and Member #2 join the club, the bank manager automatically allocates Safety Deposit Box `box-club-0`, `box-club-1`, and `box-club-2`.
+- **The Default Retention Guarantee (`Retain`):** If Member #1 leaves town or goes to sleep (Pod restarted or scaled down), their safety deposit box is **never thrown in the trash**. It remains locked and intact in the vault. When Member #1 returns (Pod rescheduled), the bank gives them back their exact key to `box-club-0`.
+- **Automated Shredding (`persistentVolumeClaimRetentionPolicy: Delete`):** If the club permanently dissolves (StatefulSet deleted) or permanently downsizes membership from 5 to 3 (`whenScaled: Delete`), the bank automatically shreds the unneeded deposit boxes (`box-club-3` and `box-club-4`) to stop paying monthly vault storage fees.
+
+---
+
+## Architecture Diagram
+
+```text
+       volumeClaimTemplates Dynamic Provisioning & Ordinal Binding
+
+ StatefulSet: postgres (replicas: 3)
+ volumeClaimTemplates: [ name: data, size: 50Gi, storageClass: gp3 ]
+  │
+  ├─► Creates Pod: postgres-0  ──► Binds PVC: data-postgres-0 ──► Provisions PV-0 (EBS/Disk)
+  │
+  ├─► Creates Pod: postgres-1  ──► Binds PVC: data-postgres-1 ──► Provisions PV-1 (EBS/Disk)
+  │
+  └─► Creates Pod: postgres-2  ──► Binds PVC: data-postgres-2 ──► Provisions PV-2 (EBS/Disk)
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ Failure & Recovery Scenario:
+ 
+ 1. Worker Node A crashes ──► Pod postgres-1 is destroyed.
+ 2. Control Plane reschedules postgres-1 onto Worker Node B.
+ 3. Controller sees PVC `data-postgres-1` ALREADY EXISTS in namespace.
+ 4. Reattaches existing PVC `data-postgres-1` to the newly scheduled Pod!
+ 5. Zero data loss!
+```
+
+---
+
+## `volumeClaimTemplates` Mechanics
+
+In a stateless `Deployment`, if you declare a PVC inside `spec.template.spec.volumes`, **every single Pod replica mounts the exact same PVC**. For block storage (like AWS EBS), this causes multi-attach errors because EBS disks cannot attach to multiple nodes simultaneously.
+
+A `StatefulSet` solves this via `.spec.volumeClaimTemplates[]`:
+1. It defines an array of PVC templates rather than static volume mounts.
+2. When Pod ordinal $K$ is spawned, the StatefulSet controller automatically generates a dedicated PVC:
+   $$\text{<template-name>}-\text{<statefulset-name>}-K$$
+3. The cluster's StorageClass dynamically provisions an independent cloud volume (PV) for each replica.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+spec:
+  serviceName: "mongo"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      containers:
+      - name: mongo
+        image: mongo:6.0
+        volumeMounts:
+        - name: db-storage
+          mountPath: /data/db
+
+  # Generates: db-storage-mongo-0, db-storage-mongo-1, db-storage-mongo-2
+  volumeClaimTemplates:
+  - metadata:
+      name: db-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "fast-ebs"
+      resources:
+        requests:
+          storage: 100Gi
+```
+
+---
+
+## PVC Retention Policies (Kubernetes 1.27+ GA)
+
+Historically, Kubernetes **never** deleted PVCs created by a StatefulSet. While this guaranteed data safety, it caused cloud storage bills to explode in dynamic environments where StatefulSets scaled up and down frequently.
+
+The `persistentVolumeClaimRetentionPolicy` provides granular lifecycle management:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Policy Trigger       │ Options & Behavioral Semantics                                              │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`whenDeleted`**    │ Governs what happens to PVCs when the entire StatefulSet object is deleted. │
+ │                      │ - `Retain` (Default): PVCs remain intact.                                   │
+ │                      │ - `Delete`: All PVCs created by this StatefulSet are deleted automatically. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`whenScaled`**     │ Governs what happens to PVCs when the StatefulSet replica count is reduced. │
+ │                      │ - `Retain` (Default): PVCs for scaled-down ordinals are preserved.          │
+ │                      │ - `Delete`: Excess PVCs (e.g. ordinals 3 and 4 if scaled from 5 to 3) are    │
+ │                      │   deleted immediately upon Pod termination.                                 │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+```yaml
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain    # Keep storage if StatefulSet is deleted
+    whenScaled: Delete     # Automatically delete PVCs when scaling down replicas!
+```
+
+---
+
+## Multi-AZ Scheduling & `WaitForFirstConsumer`
+
+In cloud environments (AWS, GCP, Azure), block storage volumes are locked to a specific **Availability Zone (AZ)** (e.g. `us-east-1a`).
+
+```text
+ The Immediate Volume Binding Deadlock:
+
+ 1. StorageClass has `volumeBindingMode: Immediate`.
+ 2. StatefulSet is created. StorageClass immediately provisions PV-0 in `us-east-1a`.
+ 3. Kube-Scheduler runs: Node in `us-east-1a` is full (out of CPU/Memory)!
+ 4. Scheduler wants to place Pod 0 on a free node in `us-east-1b`.
+ 5. Pod FAILS to start! Reason: Cloud disk in us-east-1a CANNOT attach to node in us-east-1b!
+```
+
+### The Solution: `WaitForFirstConsumer`
+Always ensure your stateful StorageClasses use `volumeBindingMode: WaitForFirstConsumer`:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: dynamic-ebs-gp3
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer    # <--- DELAYS PROVISIONING UNTIL POD IS SCHEDULED!
+allowVolumeExpansion: true
+```
+
+With `WaitForFirstConsumer`, the CSI driver waits until `kube-scheduler` assigns the Pod to a node in a specific zone. Only then does it provision the cloud volume in that exact zone, guaranteeing 100% placement compatibility.
+
+---
+
+## Online Volume Expansion for StatefulSets
+
+StatefulSet `volumeClaimTemplates` are **immutable** after creation. To expand volume size from `50Gi` to `100Gi`:
+
+1. Verify StorageClass has `allowVolumeExpansion: true`.
+2. Edit each PVC individually (or via a script):
+   ```bash
+   kubectl patch pvc db-storage-mongo-0 -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+   kubectl patch pvc db-storage-mongo-1 -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+   kubectl patch pvc db-storage-mongo-2 -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+   ```
+3. The underlying CSI driver expands the cloud disk online. If the filesystem requires a restart (e.g., ext4 without online resize), delete the Pods one by one (`kubectl delete pod mongo-0`); the StatefulSet controller recreates them and mounts the expanded volume.
+
+---
+
+## Complete Production Stateful Storage Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql-ha
+  namespace: database
+spec:
+  serviceName: "postgresql-ha-headless"
+  replicas: 3
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app: postgresql-ha
+  template:
+    metadata:
+      labels:
+        app: postgresql-ha
+    spec:
+      containers:
+      - name: postgresql
+        image: bitnami/postgresql:15.4.0
+        ports:
+        - name: tcp-pg
+          containerPort: 5432
+        volumeMounts:
+        - name: pg-data
+          mountPath: /bitnami/postgresql
+
+  volumeClaimTemplates:
+  - metadata:
+      name: pg-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "dynamic-ebs-gp3"
+      resources:
+        requests:
+          storage: 50Gi
+```
+
+---
+
+## Hands-On Lab: Testing Dynamic PVCs & Retention Policies
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace pvc-lab
+
+# Step 2: Deploy StatefulSet with whenScaled: Delete retention policy
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: storage-demo
+  namespace: pvc-lab
+spec:
+  serviceName: storage-demo
+  replicas: 3
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
+  selector:
+    matchLabels:
+      app: storage-demo
+  template:
+    metadata:
+      labels:
+        app: storage-demo
+    spec:
+      containers:
+      - name: writer
+        image: alpine:latest
+        command: ["sh", "-c", "echo 'Node initialized' > /data/info.txt; sleep 3600"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 500Mi
+EOF
+
+# Step 3: Wait for all 3 Pods and PVCs to be created
+kubectl get pods -n pvc-lab
+kubectl get pvc -n pvc-lab
+# Observe 3 PVCs: data-storage-demo-0, data-storage-demo-1, data-storage-demo-2
+
+# Step 4: Scale down from 3 to 1
+kubectl scale statefulset storage-demo -n pvc-lab --replicas=1
+
+# Step 5: Verify that PVCs 1 and 2 were AUTOMATICALLY DELETED due to whenScaled: Delete!
+kubectl get pvc -n pvc-lab
+# Only data-storage-demo-0 remains!
+
+# Step 6: Delete the entire StatefulSet
+kubectl delete statefulset storage-demo -n pvc-lab
+
+# Step 7: Verify data-storage-demo-0 is STILL RETAINED due to whenDeleted: Retain!
+kubectl get pvc -n pvc-lab
+
+# Step 8: Clean up lab
+kubectl delete namespace pvc-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does `volumeClaimTemplates` differ from declaring a PVC in a Deployment?**
+
+In a Deployment, a volume declared in `spec.template.spec.volumes` references a single, pre-existing PVC name that is shared across all Pod replicas, making it unsuitable for multi-replica stateful databases requiring independent storage. In contrast, `volumeClaimTemplates` inside a StatefulSet acts as a factory: for every ordinal Pod created ($K$), the controller dynamically provisions a unique, dedicated PVC named `<claim-name>-<statefulset-name>-<K>`. Each Pod receives its own isolated persistent disk.
+
+**Q2: What is `persistentVolumeClaimRetentionPolicy`, and how do `whenDeleted` and `whenScaled` behave?**
+
+Introduced as stable in Kubernetes 1.27, `persistentVolumeClaimRetentionPolicy` defines automated lifecycle rules for StatefulSet PVCs. `whenDeleted` specifies whether PVCs are preserved (`Retain`) or deleted (`Delete`) when the parent StatefulSet object is deleted. `whenScaled` specifies whether PVCs for excess ordinals are preserved (`Retain`) or immediately deleted (`Delete`) when the replica count is reduced. Setting `whenScaled: Delete` prevents orphaned cloud disks from accumulating during auto-scaling operations.
+
+**Q3: Why is `volumeBindingMode: WaitForFirstConsumer` critical for StatefulSets deployed across multiple Availability Zones?**
+
+With `volumeBindingMode: Immediate`, the storage provisioner creates the persistent volume disk in an arbitrary Availability Zone as soon as the PVC is created, before the Pod is scheduled. If the node in that zone lacks CPU/RAM capacity, the scheduler attempts to place the Pod in a different zone. However, cloud block storage (like AWS EBS) cannot attach across AZ boundaries, resulting in scheduling deadlock. `WaitForFirstConsumer` delays volume creation until the Pod is placed on a node, ensuring the storage is provisioned in the exact same AZ.
+
+**Q4: How do you increase the disk size of a StatefulSet in production?**
+
+Because `volumeClaimTemplates` is immutable in the StatefulSet manifest: (1) Ensure the underlying `StorageClass` has `allowVolumeExpansion: true`. (2) Patch or edit each existing PVC (`data-db-0`, `data-db-1`) directly by modifying `.spec.resources.requests.storage` to the new size. (3) The CSI driver expands the volume storage online. (4) To ensure future replicas created during scale-up receive the larger size, update the StatefulSet manifest using `kubectl apply` with an updated `volumeClaimTemplates` (supported in modern Kubernetes) or recreate the StatefulSet with `--cascade=orphan`.
+
+**Q5: What happens to a StatefulSet Pod's storage if the worker node hosting it is permanently terminated?**
+
+When a worker node is terminated, the Pod is rescheduled onto a healthy worker node in the same zone. Because the PVC (`data-app-1`) is decoupled from the node and tied to the cluster namespace, the cloud storage driver detaches the volume from the dead node and reattaches it to the new node. The new Pod mounts the exact same PVC and accesses all previously committed database files with zero data loss.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the PVC naming formula: `<claim-name>-<statefulset-name>-<ordinal>`
+- [ ] Know that PVCs are retained by default on scale-down to prevent data loss
+- [ ] Know how `persistentVolumeClaimRetentionPolicy` configures `whenDeleted` and `whenScaled`
+- [ ] Know why `volumeBindingMode: WaitForFirstConsumer` is mandatory for multi-AZ clusters
+- [ ] Know how to expand StatefulSet storage by patching individual PVC objects
+- [ ] Know that Pods automatically rebind to their identical PVC upon rescheduling
+- [ ] Can inspect PVC bindings with `kubectl get pvc -o wide`

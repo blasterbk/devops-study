@@ -1,0 +1,178 @@
+---
+title: "Chapter 1 — OCI Distribution Spec: Registry V2 API"
+sidebar_position: 1
+module: "Module 2.4 — OCI Distribution Spec"
+description: "Master the OCI Distribution Specification — Registry HTTP V2 API protocols, push/pull handshakes, chunked blob uploads, Bearer authentication, and digest pinning."
+---
+
+# Chapter 1 — OCI Distribution Spec: Registry V2 API
+
+> **Goal:** Master the network protocols, REST API endpoints, and cryptographic verification workflows defined by the **OCI Distribution Specification (`distribution-spec`)** — dissecting the **Registry HTTP V2 API**, tracing the **3-Step Image Pull Dance**, executing the **4-Stage Chunked Blob Push Handshake**, configuring **OAuth2 Bearer Token Authentication**, and enforcing immutable security via **SHA-256 Digest Pinning**.
+>
+> By the end of this chapter, you will understand:
+> 1. The HTTP REST API endpoints powering all modern container registries
+> 2. How container clients authenticate via the `Www-Authenticate: Bearer` challenge flow
+> 3. The exact sequence of network calls during `docker pull` and `docker push`
+> 4. How Monolithic and Chunked Blob uploads stream gigabyte layers over HTTP
+> 5. How Content-Addressable Digests guarantee tamper-proof supply chain immutability
+> 6. How to interact directly with an OCI registry using raw `curl` commands without Docker
+
+---
+
+## Real-Life Analogy
+
+Think of the OCI Distribution Specification as **an automated robotic parcel fulfillment warehouse with laser barcode verification and partitioned freight shipping**:
+
+- **1. The Security Gate & Badge Reader (`Bearer Token Authentication`):**
+  - A truck driver arrives at the warehouse gate (**`GET /v2/`**).
+  - The security gate stops the truck and presents an access requirement challenge (**`401 Unauthorized` with `Www-Authenticate: Bearer realm=...`**).
+  - The driver walks to the token booth (**Auth Server**), shows their credentials, receives a temporary RFID badge (**JWT Bearer Token**), and enters the warehouse.
+- **2. The 3-Step Pickup Protocol (`Image Pull Dance`):**
+  - **Step 1:** The driver presents an order receipt (**`GET /v2/library/nginx/manifests/latest`**).
+  - **Step 2:** The warehouse computer prints the bill of materials containing 3 barcode numbers (**Layer Digests: `sha256:4a...`, `sha256:7b...`, `sha256:9c...`**).
+  - **Step 3:** Three robotic forklifts fetch all 3 packages from different warehouse shelves simultaneously and load them into the truck (**Parallel Blob Downloads via `GET /v2/library/nginx/blobs/<digest>`**).
+- **3. The Atomic Contract Signing (`Manifest Commit`):**
+  - When uploading a new product (**`docker push`**), the driver uploads all heavy boxes first.
+  - The warehouse refuses to list the product in the public catalog until the final master contract is signed (**`PUT /v2/.../manifests/v1.0`**). If network connection drops halfway through, the catalog is untouched (**Atomic Commit**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               OCI Distribution HTTP V2 Protocol Handshake Sequence
+
+ CLIENT (Docker CLI / containerd / CRI-O)             OCI REGISTRY (Harbor / ECR / GHCR)
+ ┌──────────────────────────────────────┐            ┌───────────────────────────────────┐
+ │                                      │            │                                   │
+ │ 1. Auth Handshake: `GET /v2/`        │ ─────────► │ Returns `401 Unauthorized`        │
+ │                                      │ ◄───────── │ Header: `Www-Authenticate: Bearer`│
+ │                                      │            │                                   │
+ │ 2. Fetches JWT Token from Auth Svc   │            │                                   │
+ │                                      │            │                                   │
+ │ 3. Fetch Manifest:                   │            │                                   │
+ │    `GET /v2/app/manifests/v1.0`      │ ─────────► │ Returns OCI Manifest JSON         │
+ │    (Header: `Authorization: Bearer`) │ ◄───────── │ (Lists Config & Layer Digests)    │
+ │                                      │            │                                   │
+ │ 4. Parallel Blob Downloads:          │            │                                   │
+ │    `GET /v2/app/blobs/sha256:111...` │ ─────────► │ Streams Layer 0 Tarball (Binary)  │
+ │    `GET /v2/app/blobs/sha256:222...` │ ─────────► │ Streams Layer 1 Tarball (Binary)  │
+ │    `GET /v2/app/blobs/sha256:cfg...` │ ─────────► │ Streams Config JSON Blob          │
+ │                                      │ ◄───────── │                                   │
+ └──────────────────────────────────────┘            └───────────────────────────────────┘
+```
+
+---
+
+## The Registry HTTP V2 API Endpoint Directory
+
+```text
+ ┌──────────────────────────────────────────────┬────────┬────────────────────────────────────────────┐
+ │ HTTP REST Endpoint URI                       │ Method │ Operational Function                       │
+ │──────────────────────────────────────────────┼────────┼────────────────────────────────────────────┤
+ │ `/v2/`                                       │ `GET`  │ Base check; confirms V2 API support & auth.│
+ │ `/v2/<name>/manifests/<reference>`           │ `GET`  │ Fetch manifest by tag or SHA-256 digest.   │
+ │ `/v2/<name>/manifests/<reference>`           │ `PUT`  │ Upload/commit manifest atomically by tag.  │
+ │ `/v2/<name>/manifests/<reference>`           │ `DELETE│ Delete manifest reference from registry.  │
+ │ `/v2/<name>/blobs/<digest>`                  │ `GET`  │ Download layer tarball or config JSON blob.│
+ │ `/v2/<name>/blobs/<digest>`                  │ `HEAD` │ Check if layer blob already exists (skip). │
+ │ `/v2/<name>/blobs/uploads/`                  │ `POST` │ Initiate a new blob upload session.        │
+ │ `/v2/<name>/blobs/uploads/<uuid>`            │ `PATCH`│ Stream chunked binary layer data.          │
+ │ `/v2/<name>/blobs/uploads/<uuid>?digest=...` │ `PUT`  │ Finalize blob upload and verify hash.      │
+ │ `/v2/<name>/tags/list`                       │ `GET`  │ List all published tags for repository.    │
+ └──────────────────────────────────────────────┴────────┴────────────────────────────────────────────┘
+```
+
+---
+
+## Pushing an Image: The 4-Stage Upload Protocol
+
+```text
+ Step 1: Check Existence
+ - Client sends: `HEAD /v2/my-app/blobs/sha256:4abcf206...`
+ - Registry returns `200 OK` (Layer exists, upload skipped!) OR `404 Not Found` (Proceed to Step 2).
+
+ Step 2: Initiate Upload Session
+ - Client sends: `POST /v2/my-app/blobs/uploads/`
+ - Registry returns `202 Accepted` with header: `Location: /v2/my-app/blobs/uploads/9b1deb4d-...`
+
+ Step 3: Stream Layer Data & Finalize
+ - Client sends binary bytes: `PUT /v2/my-app/blobs/uploads/9b1deb4d-...?digest=sha256:4abcf206...`
+ - Registry computes SHA-256; if matched, returns `201 Created`!
+
+ Step 4: Commit Manifest Atomically
+ - Client sends: `PUT /v2/my-app/manifests/v1.0.0` (with Manifest JSON payload)
+ - Registry registers tag `v1.0.0` in catalog; returns `201 Created`!
+```
+
+---
+
+## Supply Chain Security: Mutable Tags vs Immutable Digests
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ Image Reference Format               │ Security & Reproducibility Behavior                         │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **Mutable Tag:**                     │ **High Risk.** An attacker can overwrite `v1.0` with malware│
+ │ `ghcr.io/org/app:v1.0`               │ in the registry; pods pulling later get different code!     │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **Immutable Digest Pin:**            │ **Zero Trust Standard.** Cryptographically locked to exact  │
+ │ `ghcr.io/org/app@sha256:7a4f9b...`   │ bit-for-bit layer contents; impossible to tamper with!      │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Pulling an Image Manifest via Raw `curl`
+
+```bash
+# Step 1: Obtain an anonymous Bearer Token from Docker Hub Auth Service
+TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull" | jq -r .token)
+
+# Step 2: Fetch the OCI Image Manifest using raw curl
+curl -s -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+  https://registry-1.docker.io/v2/library/alpine/manifests/latest | jq .
+
+# Step 3: Query the list of published tags for a repository
+curl -s -H "Authorization: Bearer $TOKEN" \
+  https://registry-1.docker.io/v2/library/alpine/tags/list | jq .
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the OCI Distribution Specification, and why is it essential for container interoperability?**
+
+The OCI Distribution Specification standardizes the **HTTP REST API protocols used by container clients (Docker, containerd, Podman) to communicate with container registries (Docker Hub, Harbor, AWS ECR, Quay)**. Prior to standardization, registry protocols were vendor-specific. The specification standardizes Bearer authentication, blob streaming, chunked uploads, manifest discovery, and pagination, ensuring that any compliant container client can push or pull artifacts to any compliant registry worldwide.
+
+**Q2: How does the 3-step "Image Pull Dance" work under the hood in the Registry V2 API?**
+
+1. **Authentication**: The client sends `GET /v2/`, receives a `401 Unauthorized` with a `Www-Authenticate` header, and fetches an OAuth2 JWT Bearer token from the authentication realm.
+2. **Manifest Resolution**: The client sends `GET /v2/<name>/manifests/<tag>` (with `Accept: application/vnd.oci.image.manifest.v1+json`). The registry returns the Manifest JSON listing all layer digests (`sha256:...`) and the config digest.
+3. **Parallel Blob Downloads**: The client issues concurrent requests (`GET /v2/<name>/blobs/<digest>`) to download the binary layer tarballs and config JSON blob, unpacking them into the local snapshotter.
+
+**Q3: How do registries prevent duplicate uploads of layers that already exist?**
+
+Before uploading a layer, the container client sends a **`HEAD /v2/<name>/blobs/<digest>`** request containing the computed SHA-256 hash of the local layer tarball. If the registry already possesses that blob (e.g. an Ubuntu base layer uploaded by another project), it immediately responds with **`200 OK`**. The client skips the upload entirely and moves to the next layer, saving bandwidth and upload time.
+
+**Q4: What is the difference between a Monolithic Blob Upload and a Chunked Blob Upload?**
+
+- **Monolithic Upload**: The client opens a single upload session and streams the entire layer tarball in one continuous HTTP `PUT` request (`PUT /v2/<name>/blobs/uploads/<uuid>?digest=sha256:...`). If the network connection drops at 99%, the entire upload fails and must restart from byte 0.
+- **Chunked Upload**: The client splits large layers (e.g. 5GB model weights) into smaller chunks (e.g. 100MB pieces) sent via sequential HTTP `PATCH` requests with `Content-Range: bytes 0-104857599/*`. If connection drops, the client resumes uploading only the missing chunks.
+
+**Q5: Why should production Kubernetes manifests reference images by SHA-256 Digest rather than Tag?**
+
+Tags (such as `:latest` or `:v1.2.0`) are **mutable pointers**: a registry administrator or compromised CI account can overwrite a tag with a different binary payload. If a node restarts and pulls the tag, it runs different code than existing nodes, causing silent regressions. Referencing an image by its immutable cryptographic digest (`image@sha256:4abcf...`) guarantees that **every node across the cluster downloads the exact identical, bit-for-bit verified binary artifact**, completely immune to tag manipulation.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that the OCI Distribution Spec standardizes the Registry HTTP V2 API
+- [ ] Know the 3 pull steps: Auth Handshake $\to$ Manifest Fetch $\to$ Parallel Blob Downloads
+- [ ] Know that `HEAD /v2/.../blobs/<digest>` skips uploading layers that already exist
+- [ ] Know how Chunked `PATCH` uploads allow resilient resumable layer uploads
+- [ ] Know why Digest Pinning (`image@sha256:...`) is mandatory for zero-trust security
+- [ ] Can query registry tags and manifests using raw `curl` with Bearer tokens

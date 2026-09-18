@@ -1,0 +1,381 @@
+---
+title: "Chapter 2 — Gateway"
+sidebar_position: 2
+module: "Module 2.6 — Gateway API"
+description: "Deep dive into the Gateway resource — how it defines listeners (port, protocol, TLS), how Route attachment policies control which namespaces can attach routes, infrastructure annotations for cloud load balancer provisioning, and Gateway status conditions."
+---
+
+# Chapter 2 — Gateway
+
+> **Goal:** Understand the Gateway resource as the infrastructure tier of Gateway API — how listeners define the entry points, how allowedRoutes controls cross-namespace access, how the controller provisions real infrastructure, and how to troubleshoot Gateway provisioning.
+>
+> By the end of this chapter, you will understand:
+> 1. Gateway's role as the infrastructure provisioning resource
+> 2. Listener configuration: protocol, port, TLS, hostname wildcards
+> 3. `allowedRoutes` — the namespace policy for Route attachment
+> 4. TLS configuration at the Gateway level (Terminate vs Passthrough)
+> 5. Infrastructure annotations for cloud LB customization
+> 6. Gateway status conditions and how to debug provisioning failures
+
+---
+
+## Real-Life Analogy
+
+If GatewayClass is a **franchise brand**, then a Gateway is a **specific restaurant location** at a specific address with specific features:
+
+- It has specific entrance doors (listeners): "Main door opens at 80 (HTTP), side door at 443 (HTTPS)"
+- It has a policy about who can use the space: "Only our own team's menu items (Same namespace only)" or "Any team in the building can add their items (All namespaces)"
+- Infrastructure team decides where to build it (cloud LoadBalancer, on-prem, etc.)
+- App teams attach their menu items (HTTPRoutes) to specific doors
+
+The Gateway is the **junction point** between infrastructure (what IP/port we're listening on, what TLS cert we use) and routing (which paths go to which backend).
+
+---
+
+## Architecture Diagram
+
+```text
+              Gateway — Listener and Route Attachment
+
+  Gateway: "main-gateway"
+  Namespace: gateway-infra
+
+  Listener: http
+  ┌────────────────────────────────────────────────────────────┐
+  │  port: 80, protocol: HTTP                                  │
+  │  allowedRoutes:                                            │
+  │    namespaces:                                             │
+  │      from: All  ← Any namespace can attach HTTPRoutes     │
+  └────────────────────────────────────────────────────────────┘
+
+  Listener: https
+  ┌────────────────────────────────────────────────────────────┐
+  │  port: 443, protocol: HTTPS                                │
+  │  tls:                                                      │
+  │    mode: Terminate                                         │
+  │    certificateRefs:                                        │
+  │    - name: wildcard-cert                                   │
+  │  allowedRoutes:                                            │
+  │    namespaces:                                             │
+  │      from: Selector                                        │
+  │      selector:                                             │
+  │        matchLabels:                                        │
+  │          gateway-access: "allowed"  ← Restricted          │
+  └────────────────────────────────────────────────────────────┘
+
+  HTTPRoutes that attach to this Gateway:
+  ─ production/api-route  → listener: https  → api-service
+  ─ staging/test-route    → listener: http   → test-service
+```
+
+---
+
+## Gateway Resource Definition
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main-gateway
+  namespace: gateway-infra
+  annotations:
+    # Cloud-specific infrastructure annotations
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  gatewayClassName: nginx     # Reference to GatewayClass
+
+  listeners:
+  # HTTP listener (with redirect to HTTPS)
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All              # Any namespace can attach
+
+  # HTTPS listener with TLS termination
+  - name: https
+    protocol: HTTPS
+    port: 443
+    hostname: "*.example.com"  # Only serve this hostname pattern
+    tls:
+      mode: Terminate          # Decrypt TLS at Gateway
+      certificateRefs:
+      - name: wildcard-cert    # kubernetes.io/tls Secret
+        namespace: gateway-infra  # Secret can be in any namespace
+    allowedRoutes:
+      namespaces:
+        from: Selector
+        selector:
+          matchLabels:
+            gateway-access: "allowed"
+
+  # Additional listener for a specific hostname
+  - name: admin-https
+    protocol: HTTPS
+    port: 443
+    hostname: "admin.example.com"
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: admin-cert
+    allowedRoutes:
+      namespaces:
+        from: Same             # Only gateway-infra namespace
+```
+
+---
+
+## Listener Protocol Options
+
+| Protocol | Port Behavior | TLS | Use Case |
+|----------|--------------|-----|---------|
+| `HTTP` | Plain HTTP | None | Redirect to HTTPS or internal traffic |
+| `HTTPS` | TLS-terminated HTTPS | Required (`Terminate` or `Passthrough`) | Standard web traffic |
+| `TLS` | TLS passthrough or terminate | Required | Non-HTTP TLS (gRPC, databases) |
+| `TCP` | Raw TCP | Optional | Database proxying (experimental) |
+| `UDP` | Raw UDP | None | DNS, QUIC (experimental) |
+
+---
+
+## `allowedRoutes`: Namespace Access Policy
+
+`allowedRoutes.namespaces.from` controls which namespaces can attach Routes to this listener:
+
+```yaml
+# Option 1: Same — only routes in the same namespace as Gateway
+allowedRoutes:
+  namespaces:
+    from: Same
+
+# Option 2: All — any namespace can attach
+allowedRoutes:
+  namespaces:
+    from: All
+
+# Option 3: Selector — namespaces matching label selector
+allowedRoutes:
+  namespaces:
+    from: Selector
+    selector:
+      matchLabels:
+        environment: production
+        gateway-access: "allowed"
+
+# Also restrict by Route type:
+allowedRoutes:
+  kinds:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+  namespaces:
+    from: All
+```
+
+```bash
+# Label a namespace to grant Gateway access
+kubectl label namespace production gateway-access=allowed environment=production
+```
+
+---
+
+## TLS Configuration
+
+### Terminate Mode (Default for HTTPS)
+
+```yaml
+tls:
+  mode: Terminate
+  certificateRefs:
+  - group: ""              # core API group (Kubernetes Secrets)
+    kind: Secret
+    name: my-tls-cert
+    namespace: gateway-infra  # Must be in same ns or ReferenceGrant
+```
+
+### Passthrough Mode
+
+```yaml
+listeners:
+- name: tls-passthrough
+  protocol: TLS
+  port: 443
+  tls:
+    mode: Passthrough      # Don't decrypt — route by SNI
+  allowedRoutes:
+    kinds:
+    - kind: TLSRoute
+```
+
+With Passthrough, the Route must use `TLSRoute` (not `HTTPRoute`), since HTTPS headers aren't visible.
+
+### ReferenceGrant: Cross-Namespace Certificate Access
+
+By default, a Gateway can only reference Secrets in its own namespace. `ReferenceGrant` allows cross-namespace Secret references:
+
+```yaml
+# In the namespace that owns the Secret:
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-cert-access
+  namespace: cert-storage          # Namespace with the Secret
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    namespace: gateway-infra       # Allow Gateways in this namespace
+  to:
+  - group: ""
+    kind: Secret                   # To access Secrets here
+```
+
+---
+
+## Gateway Status
+
+The controller updates the Gateway's status with conditions and the provisioned address:
+
+```bash
+kubectl describe gateway main-gateway -n gateway-infra
+
+# Status section:
+# Addresses:
+#   Type: IPAddress
+#   Value: 203.0.113.100    ← Cloud LB IP assigned by controller
+# Conditions:
+#   Type:   Accepted
+#   Status: True
+#   Reason: Accepted
+#   Message: Gateway has been accepted
+#
+#   Type:   Programmed
+#   Status: True
+#   Reason: Programmed
+#   Message: Address assigned to the Gateway
+```
+
+```yaml
+# Gateway conditions:
+# Accepted: Is the GatewayClass found and controller running?
+# Programmed: Has the controller finished provisioning? (address assigned)
+
+# Listener conditions (per listener):
+# Accepted: Is the listener configuration valid?
+# ResolvedRefs: Are all referenced Secrets/Params found?
+# Conflicted: Are there conflicting listeners?
+```
+
+---
+
+## Infrastructure Annotations (Cloud LBs)
+
+Gateways can have cloud-specific annotations that the controller passes to the provisioned LB:
+
+```yaml
+# AWS Network Load Balancer
+metadata:
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+# GCP Internal Load Balancer
+metadata:
+  annotations:
+    networking.gke.io/load-balancer-type: "Internal"
+
+# Static IP (GCP)
+metadata:
+  annotations:
+    networking.gke.io/address-type: "Internal"
+    networking.gke.io/internal-load-balancer-subnet: "my-subnet"
+```
+
+---
+
+## Hands-On: Gateway Setup and Debugging
+
+```bash
+# 1. Install Gateway API CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/standard-install.yaml
+
+# 2. Create a Gateway
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: default
+spec:
+  gatewayClassName: nginx
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All
+EOF
+
+# 3. Check Gateway status
+kubectl get gateway my-gateway
+# NAME         CLASS   ADDRESS          PROGRAMMED  AGE
+# my-gateway   nginx   203.0.113.100    True        2m
+
+# 4. Check listener conditions
+kubectl get gateway my-gateway -o jsonpath='{.status.listeners}' | python3 -m json.tool
+
+# 5. See which Routes are attached
+kubectl get httproute -A -o json | \
+  jq '.items[] | select(.spec.parentRefs[].name == "my-gateway") | .metadata.name'
+
+# 6. Debug: Gateway not programmed?
+kubectl describe gateway my-gateway
+# Check: Conditions[Accepted].Reason, Conditions[Programmed].Reason
+
+# 7. Debug: Listener ResolvedRefs False?
+# Usually: Secret not found, or namespace not permitted by ReferenceGrant
+kubectl get secret -n gateway-infra
+kubectl get referencegrant -A
+
+# 8. Gateway address (use for DNS)
+kubectl get gateway my-gateway \
+  -o jsonpath='{.status.addresses[0].value}'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a Gateway in the Gateway API hierarchy and what does it provision?**
+
+A Gateway is a namespace-scoped resource that defines the network entry point: one or more listeners with port, protocol, and TLS configuration. When a controller reconciles a Gateway, it provisions real infrastructure: a LoadBalancer Service (and cloud LB), configures the proxy (NGINX, Envoy, etc.) to listen on the specified ports, and sets up TLS if configured. The Gateway then becomes the attachment point for HTTPRoutes from application teams.
+
+**Q2: How does `allowedRoutes.namespaces` provide security in multi-tenant clusters?**
+
+`allowedRoutes.namespaces.from` controls which namespaces can attach routes to a Gateway listener. With `Same`, only routes in the same namespace as the Gateway can attach — the platform team has full control. With `Selector`, only namespaces with specific labels can attach — the platform team grants access via namespace labels. With `All`, any namespace can attach. This prevents tenant A's HTTPRoute from accidentally (or maliciously) attaching to a Gateway owned by tenant B.
+
+**Q3: What is the difference between `Terminate` and `Passthrough` TLS modes in a Gateway?**
+
+`Terminate`: The Gateway controller decrypts the TLS connection using the provided certificate. HTTPRoutes can inspect and route based on HTTP headers, paths, and query parameters. The backend receives plain HTTP. `Passthrough`: The Gateway routes the TLS connection by SNI (hostname in the TLS ClientHello) without decrypting. TLSRoutes are used (not HTTPRoutes). The backend handles TLS decryption. Use passthrough when end-to-end encryption is required or the backend must authenticate the client via mTLS.
+
+**Q4: What is a `ReferenceGrant` and when is it needed?**
+
+A `ReferenceGrant` is a namespace-scoped resource that grants cross-namespace reference permissions. It's needed when a Gateway in one namespace (e.g., `gateway-infra`) wants to reference a Secret (TLS certificate) in another namespace (e.g., `cert-storage`). By default, cross-namespace references are denied. The `ReferenceGrant` in `cert-storage` explicitly allows Gateways from `gateway-infra` to reference Secrets there. Same applies for HTTPRoutes referencing Services in other namespaces.
+
+**Q5: What are the `Accepted` and `Programmed` Gateway conditions and what does each indicate?**
+
+`Accepted: True` means the controller found and accepted the GatewayClass this Gateway references. If `Accepted: False`, the GatewayClass doesn't exist or no controller handles it. `Programmed: True` means the controller has fully provisioned the infrastructure — the address has been assigned and the proxy is configured. Between `Accepted: True` and `Programmed: True`, the controller is working (provisioning cloud LB, etc.). If `Programmed: False` persists, check the controller logs and the condition's `reason` and `message` fields.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know Gateway defines listeners (port, protocol, TLS) — the infrastructure entry point
+- [ ] Understand `allowedRoutes.namespaces`: Same / All / Selector — controls Route attachment security
+- [ ] Know TLS `Terminate` (Gateway decrypts) vs `Passthrough` (SNI-only routing, backend decrypts)
+- [ ] Know `ReferenceGrant` enables cross-namespace Secret/Service references
+- [ ] Understand Gateway status: `Accepted` (controller found) and `Programmed` (infrastructure provisioned)
+- [ ] Know Gateway annotations pass through to cloud LB provisioning
+- [ ] Can debug with `kubectl get/describe gateway`, check conditions and addresses

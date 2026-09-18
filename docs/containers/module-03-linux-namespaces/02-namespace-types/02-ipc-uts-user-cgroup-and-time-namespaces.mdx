@@ -1,0 +1,182 @@
+---
+title: "Chapter 2 — IPC, UTS, User, Cgroup & Time Namespaces"
+sidebar_position: 2
+module: "Module 3.2 — Namespace Types"
+description: "Master advanced Linux namespaces — IPC shared memory isolation, UTS hostnames, User namespaces (UID/GID mapping for rootless containers), Cgroup namespaces, and Time namespaces."
+---
+
+# Chapter 2 — IPC, UTS, User, Cgroup & Time Namespaces
+
+> **Goal:** Master the security, identity, and virtualization mechanics of advanced Linux namespaces — analyzing **IPC Namespaces** (System V / POSIX shared memory), **UTS Namespaces** (hostname isolation), **User Namespaces (`CLONE_NEWUSER`)** and `/proc/[pid]/uid_map` for **Rootless Containers**, **Cgroup Namespaces** (cgroup path virtualization), and **Time Namespaces (`CLONE_NEWTIME`)** for virtualized monotonic clock offsets.
+>
+> By the end of this chapter, you will understand:
+> 1. How IPC namespaces prevent cross-container shared memory sniffing and semaphore hijacking
+> 2. How UTS namespaces allow each container to possess a unique hostname
+> 3. How User namespaces map container root (UID 0) to an unprivileged host UID (UID 100000)
+> 4. Why User namespaces eliminate container breakout root exploits on the host
+> 5. How Cgroup namespaces virtualize the view in `/proc/self/cgroup`
+> 6. How Time namespaces offset `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` per container
+
+---
+
+## Real-Life Analogy
+
+Think of IPC, UTS, User, Cgroup, and Time Namespaces as **the specialized identity and environment controls for different film sets inside a Hollywood production studio**:
+
+- **1. The UTS Namespace (The Stage Front Door Nameplate):**
+  - Stage A hangs a sign on the door saying *"Paris Café"* (**Hostname `paris-cafe`**), while Stage B hangs a sign saying *"Tokyo Subway"* (**Hostname `tokyo-subway`**). Neither interferes with the studio's true physical street address (**Host Hostname**).
+- **2. The IPC Namespace (The Private Walkie-Talkie Channel):**
+  - Actors on Stage A speak over Walkie-Talkie Channel 1 (**POSIX Shared Memory & Message Queues**).
+  - Stage B cannot overhear or tamper with Stage A's communication, preventing eavesdropping.
+- **3. The User Namespace (The Costume Identity Badge - UID Mapping):**
+  - An actor puts on a King's crown and costume (**Inside the container, they are Root - UID 0**).
+  - Inside the set, everyone bows to the King. But as soon as the actor walks outside into the city street, the security guard treats them as a regular citizen with zero legal authority (**Host OS sees UID 100000 - Unprivileged User**)!
+- **4. The Time Namespace (The Film Set Clocks):**
+  - Stage A is filming a historical movie set 100 days in the past (**Offsetting `CLOCK_BOOTTIME`**). Stage B is in the present day. The physical clock on the wall remains unchanged.
+
+---
+
+## Architecture Diagram
+
+```text
+               User Namespace UID Mapping & Time Namespace Offsets
+
+ 1. USER NAMESPACE UID MAPPING ARCHITECTURE:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER USER NAMESPACE (Virtual User Space):                         │
+ │ ├── Process runs as `root` (UID: 0, GID: 0)                            │
+ │ └── Inside container: Full root privileges to bind ports & manage files│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Mapped via `/proc/[pid]/uid_map`: `0 100000 65536`
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HOST ROOT USER NAMESPACE (True Physical Kernel):                       │
+ │ ├── Kernel views process as: `UID 100000` (Unprivileged Nobody User!)  │
+ │ └── If process breaks out: Mathematically CANNOT touch `/etc/shadow`!  │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. TIME NAMESPACE ARCHITECTURE (Linux 5.6+):
+ ┌──────────────────────────────────┐         ┌───────────────────────────┐
+ │ CONTAINER TIME NAMESPACE         │         │ HOST TIME NAMESPACE       │
+ │ - `CLOCK_MONOTONIC`: +10,000s    │ ◄─────► │ - `CLOCK_MONOTONIC`: Real │
+ │ - `CLOCK_BOOTTIME`:  -5,000s     │ Offset  │ - `CLOCK_BOOTTIME`:  Real │
+ └──────────────────────────────────┘         └───────────────────────────┘
+```
+
+---
+
+## Master Matrix of All 8 Linux Namespaces
+
+```text
+ ┌──────────────────────┬──────────────────────┬────────────┬─────────────────────────────────────────┐
+ │ Namespace Name       │ `clone()` Flag       │ Kernel Ver │ System Resource Virtualized             │
+ │──────────────────────┼──────────────────────┼────────────┼─────────────────────────────────────────┤
+ │ **1. Mount (MNT)**   │ `CLONE_NEWNS`        │ 2.4.19     │ Filesystem mount points and rootfs.     │
+ │ **2. UTS**           │ `CLONE_NEWUTS`       │ 2.6.19     │ Hostname and NIS domain name.           │
+ │ **3. IPC**           │ `CLONE_NEWIPC`       │ 2.6.19     │ System V IPC & POSIX message queues.    │
+ │ **4. PID**           │ `CLONE_NEWPID`       │ 2.6.24     │ Process IDs and process hierarchy tree. │
+ │ **5. Network (NET)** │ `CLONE_NEWNET`       │ 2.6.29     │ Network devices, IPs, routes, sockets.  │
+ │ **6. User (USER)**   │ `CLONE_NEWUSER`      │ 3.8        │ User IDs (UID), Group IDs (GID), & Caps.│
+ │ **7. Cgroup**        │ `CLONE_NEWCGROUP`    │ 4.6        │ Virtualized view of `/proc/self/cgroup`.│
+ │ **8. Time**          │ `CLONE_NEWTIME`      │ 5.6        │ Monotonic and Boottime clock offsets.   │
+ └──────────────────────┴──────────────────────┴────────────┴─────────────────────────────────────────┘
+```
+
+---
+
+## 1. IPC Namespaces (`CLONE_NEWIPC`)
+
+Isolates Inter-Process Communication mechanisms:
+- **System V IPC**: Shared memory segments (`shmget`), semaphores (`semget`), message queues (`msgget`).
+- **POSIX Message Queues**: `mq_open`.
+- **Security Impact**: Without IPC namespaces, Container A can attach to Container B's shared memory segments in RAM, reading database passwords or intercepting raw application data buffers.
+
+---
+
+## 2. User Namespaces (`CLONE_NEWUSER`) & Rootless Execution
+
+User namespaces allow a process to have **root privileges inside the container while remaining an unprivileged user on the host**:
+
+### How UID Mapping Works (`/proc/[pid]/uid_map`):
+The mapping file takes 3 values: `[Container UID] [Host UID] [Range Length]`.
+
+```text
+ Example mapping line: 0 100000 65536
+ - Container UID 0 (root) maps to Host UID 100000.
+ - Container UID 1 (daemon) maps to Host UID 100001.
+ - Container UID 1000 (app) maps to Host UID 101000.
+```
+
+If an attacker executes a container breakout, the Linux kernel sees `UID 100000`. The attacker has **zero access to host root files (`/etc/shadow`, `/dev/sda`)**, rendering the exploit completely harmless!
+
+---
+
+## 3. Time Namespaces (`CLONE_NEWTIME`)
+
+Introduced in Linux 5.6 to support:
+- **Container Checkpoint & Restore (CRIU)**: When a container is frozen, saved to disk, and migrated across servers, its monotonic clock can be adjusted to prevent application time jumps.
+- **Testing Time-Dependent Code**: Emulating clock drift or date advances without modifying the host hardware clock.
+
+---
+
+## Hands-On Lab: Experimenting with User Namespaces
+
+```bash
+# Step 1: Create an isolated User namespace where you are ROOT (No sudo required!)
+unshare -U -r /bin/sh
+
+# -------------------------------------------------------------
+# INSIDE THE USER NAMESPACE:
+# -------------------------------------------------------------
+
+# Step 2: Check your user ID inside the namespace
+id
+# Output: uid=0(root) gid=0(root) — You are ROOT inside this namespace!
+
+# Step 3: Inspect the UID mapping file from inside the namespace
+cat /proc/self/uid_map
+# Output: 0  1000  1 (Maps container root UID 0 to your real host UID 1000!)
+
+# Step 4: Try to write to a protected host system directory
+touch /etc/hacked_file 2>/dev/null || echo "Permission Denied! Host is 100% protected!"
+# (Even though you are 'root', the kernel enforces your true unprivileged host UID!)
+
+exit
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How do User Namespaces (`CLONE_NEWUSER`) revolutionize container security?**
+
+User Namespaces decouple a process's user and group IDs inside a container from its credentials on the host operating system. A process can execute as **`root (UID 0)` inside the container's user namespace**, allowing it to install packages, configure internal network interfaces, and manage files. However, the kernel maps UID 0 to an **unprivileged user (e.g. UID 100000) on the host**. If the process breaks out of the container or accesses host filesystems, the Linux kernel strictly enforces the unprivileged UID 100000 permissions, preventing host takeover.
+
+**Q2: What is an IPC Namespace, and what happens if two containers share an IPC namespace?**
+
+An IPC (Inter-Process Communication) Namespace isolates System V IPC objects (shared memory segments, semaphore arrays, message queues) and POSIX message queues. If two containers are placed into the **same IPC namespace** (e.g. using `docker run --ipc=container:<target>` or containers in the same Kubernetes Pod), they can share raw memory arrays in RAM using `shmget` / `shmat`, enabling ultra-high-speed, zero-copy inter-process communication for databases or scientific workloads.
+
+**Q3: How does the `/proc/[pid]/uid_map` file function?**
+
+`/proc/[pid]/uid_map` defines the translation table between container UIDs and host UIDs using 3 integer fields: `ID-inside-ns`, `ID-outside-ns`, and `length`. For example, `0 100000 65536` maps 65,536 sequential UIDs: container UID 0 becomes host UID 100000, container UID 1 becomes host UID 100001, etc. Whenever the process makes a system call accessing files or sockets, the kernel dynamically translates the credentials according to this mapping.
+
+**Q4: What is the purpose of a Cgroup Namespace (`CLONE_NEWCGROUP`)?**
+
+When a process inspects its cgroup allocation (e.g. reading `/proc/self/cgroup`), it normally sees the full host cgroup path (e.g. `/system.slice/docker-1a2b3c...`). A **Cgroup Namespace virtualizes this view**: it makes the container's cgroup directory appear as the root directory (`/`). This prevents information leakage (hiding host directory hierarchies from tenants) and enables nested container runtimes to manage sub-cgroups safely.
+
+**Q5: What problem does the Linux Time Namespace (`CLONE_NEWTIME`) solve for container migration?**
+
+When a container is checkpointed using CRIU (Checkpoint/Restore in Userspace) on Host A and restored on Host B, the physical hardware clocks (`CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`) on Host B will not match Host A's uptime. Without Time Namespaces, application timers, timers in Java/Go runtimes, and time-sensitive cryptographic tokens would experience sudden time warps and crash. Time Namespaces allow setting **per-namespace clock offsets**, ensuring monotonic time progresses seamlessly after container migration.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 8 Linux Namespaces: MNT, UTS, IPC, PID, NET, USER, Cgroup, Time
+- [ ] Know that IPC namespaces isolate shared memory (`shmget`) and semaphores
+- [ ] Know that User namespaces map container root (UID 0) to unprivileged host UIDs
+- [ ] Know how `/proc/[pid]/uid_map` configures UID ranges
+- [ ] Know that Cgroup namespaces virtualize the view of `/proc/self/cgroup`
+- [ ] Can spawn an unprivileged root User namespace using `unshare -U -r`

@@ -1,0 +1,333 @@
+---
+title: "Chapter 2 — Calico"
+sidebar_position: 2
+module: "Module 2.2 — CNI Plugins"
+description: "Deep dive into Calico — its architecture (Felix, BIRD, confd, Typha), BGP and eBPF dataplanes, IPAM block allocation, network policy enforcement, and how it achieves high-performance Kubernetes networking."
+---
+
+# Chapter 2 — Calico
+
+> **Goal:** Understand Calico's complete architecture — the Felix policy agent, BIRD BGP daemon, datastore integration, IPAM block model, and how Calico enforces NetworkPolicies via iptables or eBPF.
+>
+> By the end of this chapter, you will understand:
+> 1. Calico's four key components: Felix, BIRD, confd, Typha
+> 2. How Calico programs routes and iptables rules on each node
+> 3. Calico's IPAM block model and how it allocates Pod IPs
+> 4. The difference between Calico's iptables, IPVS, and eBPF dataplanes
+> 5. How Calico enforces Kubernetes NetworkPolicy at the kernel level
+> 6. How to inspect Calico's state and debug connectivity issues
+
+---
+
+## Real-Life Analogy
+
+Calico is like a **city's traffic management system**:
+
+- **Felix** is the traffic warden on each street corner (node) — it knows all the local rules (NetworkPolicies) and enforces them for every vehicle (packet) passing through.
+- **BIRD** is the city's radio network — each warden broadcasts to all others: "Street 10.244.1.x is in my district." All wardens update their local maps.
+- **Typha** is the city's central dispatch — in large cities (clusters), instead of every warden listening to every broadcast, they all listen through a small team of dispatchers who aggregate and relay updates.
+- **confd** is the warden's instruction printer — it watches for new rules and generates the warden's enforcement manual (BIRD config) automatically.
+
+---
+
+## Architecture Diagram
+
+```text
+                      Calico Architecture
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │  Kubernetes API Server                                        │
+    │  - NetworkPolicy objects                                      │
+    │  - Node specs (podCIDR)                                      │
+    └────────────────────────┬─────────────────────────────────────┘
+                             │ Watch
+    ┌────────────────────────▼─────────────────────────────────────┐
+    │  Typha (optional, for >50 nodes)                             │
+    │  - Fans out API watch events to many Felix instances          │
+    │  - Reduces API server load                                    │
+    └────────────────────────┬─────────────────────────────────────┘
+                             │ Push
+    ┌────────────────────────▼─────────────────────────────────────┐
+    │  calico-node DaemonSet Pod (on every node)                   │
+    │                                                              │
+    │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐  │
+    │  │    Felix     │  │     BIRD     │  │       confd        │  │
+    │  │ Policy agent │  │ BGP speaker  │  │  Config generator  │  │
+    │  │              │  │              │  │                    │  │
+    │  │ - Programs   │  │ - Advertises │  │ - Watches datastore │  │
+    │  │   iptables   │  │   Pod CIDR   │  │ - Writes BIRD conf │  │
+    │  │ - Programs   │  │ - Learns     │  │   from templates   │  │
+    │  │   routes     │  │   peer CIDRs │  │                    │  │
+    │  │ - Enforces   │  │ - Installs   │  │                    │  │
+    │  │   NetPol     │  │   kernel     │  │                    │  │
+    │  │              │  │   routes     │  │                    │  │
+    │  └─────────────┘  └──────────────┘  └────────────────────┘  │
+    └──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Component Deep Dives
+
+### Felix: The Policy Agent
+
+Felix is the most critical Calico component. It runs on every node and is responsible for:
+
+1. **Route programming** — installs kernel routes for Pod subnets
+2. **iptables programming** — creates chains for NetworkPolicy enforcement
+3. **Interface management** — creates/removes `calico_` prefixed interfaces
+4. **Endpoint management** — tracks all Pods on the local node
+
+```bash
+# Felix logs (most useful for debugging)
+kubectl logs -n kube-system -l k8s-app=calico-node -c calico-node | grep felix
+
+# Check Felix health endpoint
+kubectl exec -n kube-system calico-node-<id> -- calico-node -felix-live
+
+# Felix metrics (Prometheus)
+curl http://<node-ip>:9091/metrics | grep felix_
+```
+
+Felix's iptables chains:
+```bash
+# View Calico's iptables rules on a node
+iptables -L -n --line-numbers | grep -A5 "cali-"
+
+# Key chains:
+# cali-FORWARD     → enforces NetworkPolicy for forwarded traffic
+# cali-INPUT       → enforces policy for traffic TO the node
+# cali-OUTPUT      → enforces policy for traffic FROM the node
+# cali-tw-<iface>  → per-endpoint "to workload" rules
+# cali-fw-<iface>  → per-endpoint "from workload" rules
+```
+
+### BIRD: The BGP Daemon
+
+BIRD (BIRD Internet Routing Daemon) handles all BGP functionality:
+
+```bash
+# Check BGP session status
+kubectl exec -n kube-system calico-node-<id> -- birdcl show protocols
+
+# View all BGP routes
+kubectl exec -n kube-system calico-node-<id> -- birdcl show route
+
+# Check BIRD configuration (generated by confd)
+kubectl exec -n kube-system calico-node-<id> -- cat /etc/calico/confd/config/bird.cfg
+```
+
+### Typha: The Fan-Out Proxy
+
+For large clusters (>50 nodes), the cost of every Felix instance maintaining a watch connection to the API server becomes significant. Typha acts as a proxy:
+
+```text
+Without Typha (100 nodes):
+  100 Felix instances × 1 watch connection = 100 API server connections
+
+With Typha (100 nodes, 3 Typha instances):
+  3 Typha instances × 1 watch connection = 3 API server connections
+  100 Felix instances → connect to nearest Typha
+```
+
+```yaml
+# Typha deployment (part of Calico manifest)
+# Calico auto-scales Typha replicas based on node count
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: calico-typha
+  namespace: kube-system
+spec:
+  replicas: 3  # Recommended: 1 per 100 nodes
+```
+
+---
+
+## Calico IPAM: Block Allocation
+
+Calico uses a **block-based IPAM** model that's more efficient than simple per-node subnets:
+
+```text
+Cluster CIDR: 10.244.0.0/16
+
+Calico divides it into /26 blocks (64 IPs each) by default:
+  Block 1: 10.244.0.0/26  (IPs .0 to .63)
+  Block 2: 10.244.0.64/26 (IPs .64 to .127)
+  Block 3: 10.244.0.128/26 (IPs .128 to .191)
+  ...
+
+Blocks are assigned to nodes:
+  Node A: [10.244.0.0/26, 10.244.1.0/26]   ← gets more blocks as Pods fill up
+  Node B: [10.244.0.64/26]
+  Node C: [10.244.0.128/26, 10.244.2.0/26]
+
+Block affinity: blocks prefer to stay with the same node for IPAM efficiency
+```
+
+```bash
+# View all IP pools
+calicoctl get ippool -o wide
+
+# View block allocations (which node owns which block)
+calicoctl get ipamblock -o wide
+
+# View individual IP allocations
+calicoctl ipam show --show-blocks
+```
+
+### BlockSize Configuration
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: default-ipv4-ippool
+spec:
+  cidr: 10.244.0.0/16
+  blockSize: 26        # Default: /26 (64 IPs per block)
+  ipipMode: CrossSubnet
+  natOutgoing: true
+  nodeSelector: all()
+```
+
+Smaller blockSize = more granular allocation. Larger blockSize = fewer route entries but less flexibility.
+
+---
+
+## Network Policy Enforcement
+
+Calico enforces Kubernetes NetworkPolicy by translating policy rules into iptables rules (or eBPF programs in eBPF mode).
+
+### Example NetworkPolicy
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+### How Felix translates this to iptables
+
+```text
+For each Pod with label app=backend:
+  Felix creates interface chain: cali-tw-<veth-ifname>
+  
+  Rule 1: Allow src IP = any Pod with label app=frontend, dst port 8080
+  Rule 2: Drop everything else
+  
+  iptables rules:
+  -A cali-tw-calic12345 -m comment --comment "cali:frontend-to-backend" \
+     -m set --match-set cali40s:frontend-pods src \
+     -p tcp --dport 8080 -j ACCEPT
+  -A cali-tw-calic12345 -j DROP
+```
+
+Calico uses **ipsets** to track Pod IPs by label — when a Pod with `app=frontend` starts or stops, its IP is added/removed from the ipset, automatically updating all policy enforcement without modifying individual iptables rules.
+
+---
+
+## Calico eBPF Dataplane
+
+Calico supports an alternative eBPF dataplane that bypasses iptables entirely:
+
+```bash
+# Enable eBPF mode (replaces iptables-based dataplane)
+kubectl patch installation.operator.tigera.io default \
+  --type merge \
+  -p '{"spec":{"calicoNetwork":{"linuxDataplane":"BPF"}}}'
+
+# Verify eBPF mode
+kubectl exec -n kube-system calico-node-<id> -- calico-node -bpf-log-level debug
+
+# View eBPF programs attached to interfaces
+bpftool prog list | grep calico
+```
+
+eBPF mode benefits:
+- **No iptables** — packets never go through Netfilter
+- **Direct socket routing** — connects client socket directly to server socket
+- **~2x throughput** for Service traffic
+- **DSR (Direct Server Return)** — bypasses kube-proxy entirely
+
+---
+
+## Hands-On: Calico Debugging
+
+```bash
+# 1. Check overall Calico status
+calicoctl node status
+
+# 2. Check specific node's BGP peers
+calicoctl node status -n <node-name>
+
+# 3. Verify Felix is enforcing policy
+kubectl exec -n kube-system calico-node-<id> -- calico-node -felix-live
+
+# 4. Check endpoint programming
+calicoctl get workloadendpoint -A -o wide
+
+# 5. Inspect IP allocation for a specific Pod
+POD_IP=$(kubectl get pod nginx -o jsonpath='{.status.podIP}')
+calicoctl ipam show --ip=$POD_IP
+
+# 6. Test network policy (from another Pod)
+kubectl exec -it frontend-pod -- wget -qO- http://<backend-pod-ip>:8080
+kubectl exec -it other-pod -- wget -qO- http://<backend-pod-ip>:8080  # Should fail
+
+# 7. Check iptables chains for a specific Pod
+ip link show | grep cali  # Find veth interface name
+iptables -L cali-tw-<interface> -n --line-numbers
+
+# 8. Debug BGP routing
+ip route show | grep bird  # Routes installed by BGP
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are Calico's four main components and what does each do?**
+
+**Felix** is the policy agent on each node — it programs iptables rules (or eBPF maps) to enforce NetworkPolicy and installs kernel routes. **BIRD** is the BGP daemon that advertises the node's Pod CIDR to peers and installs remote Pod CIDR routes in the kernel. **confd** watches the Calico datastore and generates BIRD configuration files from templates. **Typha** (optional) is a fan-out proxy that reduces API server load in large clusters by acting as a relay between the API server and multiple Felix instances.
+
+**Q2: How does Calico enforce NetworkPolicy without a userspace proxy?**
+
+Felix translates NetworkPolicy specs into iptables chains (or eBPF programs). Each Pod's veth interface gets dedicated iptables chains (`cali-tw-*` for inbound, `cali-fw-*` for outbound). Felix uses **ipsets** to track Pod IPs by label — policy allows/denies are matched against these ipsets. When Pod labels change, ipsets are updated atomically, with no need to rewrite individual iptables rules.
+
+**Q3: What is Calico's block IPAM model and how does it differ from Flannel's per-node CIDR approach?**
+
+Calico divides the cluster CIDR into small blocks (default `/26`, 64 IPs). Blocks are allocated to nodes on-demand — a node gets its first block when a Pod is scheduled, and gets additional blocks as they fill up. This is more flexible than a fixed per-node `/24` — small nodes waste fewer IPs, and IP space rebalances naturally. Block affinity tracks which node prefers which blocks to minimize route fragmentation.
+
+**Q4: What is Typha and when should you deploy it?**
+
+Typha is a fan-out proxy for Calico's datastore watch connections. Without Typha, each Felix instance on every node maintains its own API server watch connection — at 200 nodes, that's 200+ persistent connections. Typha consolidates these: 3 Typha instances maintain 3 connections, and all Felix instances connect to Typha instead. Calico recommends deploying Typha for clusters with more than 50 nodes.
+
+**Q5: How does Calico's eBPF dataplane improve performance over iptables?**
+
+eBPF bypasses the Netfilter/iptables framework entirely. Instead of packets traversing multiple iptables chains (each with O(N) rules), eBPF programs attached to network interfaces perform packet processing directly in kernel context with O(1) hash map lookups. For Service traffic, eBPF implements Direct Socket Return (DSR) — the return path from the backend Pod goes directly to the client without routing through the original node. Result: ~2x throughput, lower latency, and near-zero kube-proxy overhead.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know Calico's four components: Felix (policy), BIRD (BGP), confd (config gen), Typha (fan-out)
+- [ ] Understand Felix programs iptables chains per-endpoint using ipsets for label matching
+- [ ] Know Calico's block IPAM model (`/26` blocks, assigned to nodes on-demand)
+- [ ] Understand when Typha is needed (>50 nodes) and why (API server connection scaling)
+- [ ] Know the three Calico dataplanes: iptables, IPVS, eBPF
+- [ ] Can use `calicoctl node status`, `birdcl show route`, and `iptables -L cali-*` to debug

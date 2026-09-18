@@ -1,0 +1,292 @@
+---
+title: "Chapter 2 — RoleBindings & ClusterRoleBindings"
+sidebar_position: 2
+module: "Module 5.2 — Authorization & RBAC"
+description: "Master Kubernetes RoleBindings and ClusterRoleBindings — binding Subjects (Users, Groups, ServiceAccounts), reusing ClusterRoles in namespaces, default cluster roles, and privilege escalation prevention."
+---
+
+# Chapter 2 — RoleBindings & ClusterRoleBindings
+
+> **Goal:** Master the binding mechanisms that attach RBAC permissions to identities in Kubernetes — understanding the difference between `RoleBinding` and `ClusterRoleBinding`, leveraging the enterprise pattern of binding global `ClusterRoles` within specific namespaces using `RoleBindings`, defining the three subject types (`User`, `Group`, `ServiceAccount`), analyzing default built-in roles (`admin`, `edit`, `view`, `cluster-admin`), and understanding how Kubernetes prevents RBAC privilege escalation.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural difference between `RoleBinding` and `ClusterRoleBinding`
+> 2. How to reuse a single global `ClusterRole` across hundreds of namespaces using `RoleBindings`
+> 3. How to correctly format `subjects` for Users, Groups, and cross-namespace ServiceAccounts
+> 4. The 4 default built-in Kubernetes roles: `cluster-admin`, `admin`, `edit`, and `view`
+> 5. How the API server blocks privilege escalation using `escalate` and `bind` verb checks
+> 6. How to audit and visualize RBAC bindings with `kubectl auth can-i` and `rakkess`
+
+---
+
+## Real-Life Analogy
+
+Think of RoleBindings as **assigning security access keys to employees in a high-rise commercial office building**:
+
+- **The Role Specification Document (`Role` or `ClusterRole`):** The written definition of what a key opens (e.g. *"Floor 4 Office Suite Key"*).
+- **The Global Master Blueprint (`ClusterRole: view`):** An architectural standard blueprint for *"Guest Visitor Pass"*. It describes what a visitor is allowed to see.
+- **The Namespace-Scoped Assignment (`RoleBinding`):** The building manager hands Alice a Visitor Pass, but stamps it: **"Valid ONLY on Floor 3 (Namespace: `marketing`)"**. Alice can walk around Floor 3, but the second she steps out of the elevator on Floor 5 (`finance`), her badge does not open the door.
+- **The Master Keycard (`ClusterRoleBinding`):** The building manager hands Bob the Head of Facilities master keycard (`ClusterRoleBinding: cluster-admin`). Bob's badge unlocks every single office, elevator, server room, and electrical breaker on every floor in the entire building.
+- **Privilege Escalation Prevention (The Keymaker Rule):** A junior employee holding a key to the janitor's closet cannot walk to the key machine and cut a duplicate master keycard for their friend. You can **only make keys for rooms you already have permission to enter**.
+
+---
+
+## Architecture Diagram
+
+```text
+               RoleBinding vs ClusterRoleBinding Scoping
+
+ 1. ClusterRoleBinding (Global Scope - All Namespaces & Cluster-Scoped Assets):
+ ┌──────────────────────┐
+ │ Subject: Alice       │
+ └──────────┬───────────┘
+            │ ClusterRoleBinding: cluster-admin-binding
+            ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ClusterRole: cluster-admin (Unrestricted access to entire cluster!)    │
+ │   ├── Namespace: default    ├── Namespace: kube-system                 │
+ │   ├── Namespace: prod       └── Cluster Nodes & PersistentVolumes      │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. RoleBinding with ClusterRole (Namespace-Restricted Reusable Pattern):
+ ┌──────────────────────┐
+ │ Subject: Bob         │
+ └──────────┬───────────┘
+            │ RoleBinding: dev-view-binding (Namespace: "analytics")
+            ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ClusterRole: view (Reusable Global Template)                           │
+ │                                                                        │
+ │ Evaluated STRICTLY within Namespace "analytics":                      │
+ │ - Can read Pods/Services in "analytics" ──► GRANTED!                   │
+ │ - Attempts to read Pods in "production" ──► ACCESS DENIED (403)!       │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `RoleBinding` vs `ClusterRoleBinding`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ `RoleBinding`                   │ `ClusterRoleBinding`            │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Scope**                 │ **Namespace-Scoped**            │ **Cluster-Scoped**              │
+ │ **Referenced `roleRef`**  │ Can reference `Role` OR         │ Can **ONLY** reference a        │
+ │                           │ `ClusterRole`                   │ `ClusterRole`                   │
+ │ **Effective Scope**       │ Grants permissions ONLY within  │ Grants permissions across       │
+ │                           │ the binding's namespace         │ **ALL namespaces** + cluster res│
+ │ **API Object**            │ `kind: RoleBinding`             │ `kind: ClusterRoleBinding`      │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Reusing ClusterRoles with Namespace RoleBindings
+
+In enterprise clusters with hundreds of namespaces, writing duplicate `Role` definitions in every single namespace creates unmaintainable YAML bloat.
+
+### The Enterprise Pattern:
+1. Define a global `ClusterRole` once (e.g. `developer-workload-editor`).
+2. Bind that `ClusterRole` using a **`RoleBinding`** inside each developer's private namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alice-workload-access
+  namespace: team-payments          # Scope is locked strictly to team-payments!
+subjects:
+- kind: User
+  name: alice@company.com
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole                 # Reuses global template!
+  name: edit
+  apiGroup: rbac.authorization.k8s.io
+```
+
+---
+
+## The 3 RBAC Subject Types
+
+Every binding maps one or more `subjects` to a single `roleRef`:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Subject `kind`       │ Syntax & Operational Rules                                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`User`**           │ Represents a human user identified via X.509 `CN` or OIDC username claim.   │
+ │                      │ `apiGroup: rbac.authorization.k8s.io`, `name: "alice@corp.com"`             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Group`**          │ Represents an identity group (X.509 `O`, OIDC groups array, or system group)│
+ │                      │ `apiGroup: rbac.authorization.k8s.io`, `name: "oidc:devops-engineers"`      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`ServiceAccount`** │ In-cluster service account. **Must include `namespace`!**                   │
+ │                      │ `kind: ServiceAccount`, `name: "deployer"`, `namespace: "ci-cd"`            │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Default Built-in Kubernetes ClusterRoles
+
+Kubernetes provisions four standard built-in ClusterRoles:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Built-in Role        │ Scope of Permissions & Operational Guardrails                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`cluster-admin`**  │ **Superuser.** Complete control over every resource in the cluster.          │
+ │                      │ Bypasses all restrictions. Should be strictly reserved for break-glass SREs.│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`admin`**          │ Namespace-level administrative control. Can read/write workloads, manage    │
+ │                      │ Roles and RoleBindings inside the namespace. Cannot modify ResourceQuotas.  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`edit`**           │ Full read/write access to application workloads (Pods, Deployments, PVCs,   │
+ │                      │ Secrets, ConfigMaps). **Cannot create/modify Roles or RoleBindings.**       │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`view`**           │ Read-only visibility across workloads, ConfigMaps, Services, and Events.    │
+ │                      │ **CANNOT read Secrets** or Roles/RoleBindings to prevent token theft.       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## RBAC Privilege Escalation Prevention
+
+To prevent malicious users from granting themselves elevated permissions:
+
+```text
+ The RBAC Escalation Prevention Rule:
+ A user can ONLY create, update, or bind a Role if:
+ 1. The user ALREADY possesses ALL the permissions declared in that target Role; OR
+ 2. The user has been explicitly granted the `escalate` verb on `roles` / `clusterroles` in 
+    the `rbac.authorization.k8s.io` API group.
+```
+
+If a user with only Pod-reading permissions tries to create a Role granting Secret-deletion permissions, the API server rejects the request with HTTP `403 Forbidden: user cannot escalate permissions`.
+
+---
+
+## Complete Production Manifest: Multi-Tenant RoleBindings
+
+```yaml
+# 1. CI/CD ServiceAccount Binding (Scoped to Namespace)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-runner-binding
+  namespace: staging
+subjects:
+- kind: ServiceAccount
+  name: github-actions-runner
+  namespace: ci-infrastructure       # Cross-namespace ServiceAccount reference!
+roleRef:
+  kind: ClusterRole
+  name: edit
+  apiGroup: rbac.authorization.k8s.io
+---
+# 2. Engineering Team Group Binding (Global Read-Only)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: global-engineering-view
+subjects:
+- kind: Group
+  name: oidc:all-engineers           # Bound via OIDC groups claim!
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+```
+
+---
+
+## Hands-On Lab: Testing RoleBindings vs ClusterRoleBindings
+
+```bash
+# Step 1: Create two test namespaces
+kubectl create namespace tenant-a
+kubectl create namespace tenant-b
+
+# Step 2: Create a ServiceAccount in tenant-a
+kubectl create serviceaccount test-bot -n tenant-a
+
+# Step 3: Bind the 'view' ClusterRole to test-bot ONLY within tenant-a
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-bot-view
+  namespace: tenant-a
+subjects:
+- kind: ServiceAccount
+  name: test-bot
+  namespace: tenant-a
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# Step 4: Verify test-bot CAN view pods in tenant-a
+kubectl auth can-i get pods --as=system:serviceaccount:tenant-a:test-bot -n tenant-a
+# Output: 'yes'
+
+# Step 5: Verify test-bot CANNOT view pods in tenant-b (Namespace isolation verified!)
+kubectl auth can-i get pods --as=system:serviceaccount:tenant-a:test-bot -n tenant-b
+# Output: 'no'
+
+# Step 6: Verify test-bot CANNOT view secrets in tenant-a (view role excludes secrets!)
+kubectl auth can-i get secrets --as=system:serviceaccount:tenant-a:test-bot -n tenant-a
+# Output: 'no'
+
+# Step 7: Clean up lab
+kubectl delete namespace tenant-a tenant-b
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What happens when you bind a `ClusterRole` using a `RoleBinding` instead of a `ClusterRoleBinding`?**
+
+When a `ClusterRole` is bound via a `RoleBinding`, the permissions defined in the `ClusterRole` apply **only within the specific namespace** where the `RoleBinding` is deployed. This is a core Kubernetes best practice: it allows cluster administrators to define standardized global permission templates (like `view` or `edit`) once and reuse them across hundreds of tenant namespaces without granting cluster-wide access.
+
+**Q2: What are the three subject types supported in Kubernetes RBAC bindings, and how do they differ?**
+
+The three subject types are:
+1. `User`: An individual human identity (e.g. `alice@company.com`) identified by X.509 CN or OIDC token.
+2. `Group`: A collection of users (e.g. `system:authenticated` or `oidc:developers`).
+3. `ServiceAccount`: An in-cluster software identity. Crucially, ServiceAccount subjects **must always specify their containing `namespace`**, allowing cross-namespace permission delegations.
+
+**Q3: What is the difference between the built-in `admin`, `edit`, and `view` ClusterRoles?**
+
+- `admin`: Full administrative control over a namespace; can read/write all workloads, manage Secrets, and create/modify Roles and RoleBindings within that namespace.
+- `edit`: Read and write access to all standard workload objects (Pods, Deployments, Secrets, ConfigMaps) in the namespace, but **cannot create or modify Roles or RoleBindings**.
+- `view`: Read-only access to workload manifests, ConfigMaps, and Services; **cannot read Secrets** or Roles/RoleBindings to prevent credential exfiltration.
+
+**Q4: How does Kubernetes prevent RBAC privilege escalation?**
+
+The API server enforces that an authenticated user cannot create or update a `Role` or `RoleBinding` that grants permissions exceeding what the user currently possesses. For example, a user who only has read access to Pods cannot create a Role that grants write access to Secrets. To bypass this restriction, the user must explicitly hold the `escalate` verb on `roles`/`clusterroles` or `bind` verb on the target role.
+
+**Q5: Can you change the `roleRef` of an existing RoleBinding or ClusterRoleBinding?**
+
+No. The `.roleRef` field of a `RoleBinding` or `ClusterRoleBinding` is **strictly immutable** after creation. To point a binding to a different Role or ClusterRole, the existing binding object must be deleted and recreated.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the difference between `RoleBinding` (namespace) and `ClusterRoleBinding` (cluster-wide)
+- [ ] Know how to reuse global `ClusterRoles` within namespaces using `RoleBindings`
+- [ ] Know the 3 subject types: `User`, `Group`, and `ServiceAccount`
+- [ ] Know that ServiceAccount subjects strictly require the `namespace` field
+- [ ] Know the 4 default roles: `cluster-admin`, `admin`, `edit`, and `view`
+- [ ] Know that the built-in `view` role explicitly excludes reading `Secrets`
+- [ ] Know how RBAC prevents privilege escalation via `escalate`/`bind` verb checks
+- [ ] Can test cross-namespace ServiceAccount permissions with `kubectl auth can-i`

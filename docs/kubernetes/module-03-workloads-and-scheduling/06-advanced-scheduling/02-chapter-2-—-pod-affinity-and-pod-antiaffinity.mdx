@@ -1,0 +1,351 @@
+---
+title: "Chapter 2 — Pod Affinity & Pod Anti-Affinity"
+sidebar_position: 2
+module: "Module 3.6 — Advanced Scheduling"
+description: "Master inter-Pod affinity and anti-affinity — topologyKey domains (hostname, zone, region), co-locating low-latency services, spreading HA replicas, namespace selectors, and scheduler performance implications."
+---
+
+# Chapter 2 — Pod Affinity & Pod Anti-Affinity
+
+> **Goal:** Master inter-Pod affinity and anti-affinity in Kubernetes — understanding how `topologyKey` defines failure domains (nodes, racks, availability zones), co-locating latency-sensitive microservices with local caches via Pod Affinity, eliminating single points of failure via Pod Anti-Affinity, and optimizing scheduler performance in high-scale clusters.
+>
+> By the end of this chapter, you will understand:
+> 1. The fundamental difference between Node Affinity (Pod-to-Node) and Pod Affinity (Pod-to-Pod)
+> 2. How `topologyKey` creates dynamic placement domains (hostname, zone, region)
+> 3. How to co-locate microservices and Redis caches on the same node using Pod Affinity
+> 4. How to guarantee zero multi-replica colocation across Availability Zones using Pod Anti-Affinity
+> 5. How cross-namespace matching operates with `namespaces` and `namespaceSelector`
+> 6. The $O(N \times M)$ computational complexity of Pod Affinity and how to prevent scheduler latency spikes
+
+---
+
+## Real-Life Analogy
+
+Think of Pod Affinity and Anti-Affinity as **seating arrangements at a corporate conference**:
+
+- **Pod Affinity (Co-Locating Best Friends):** The Lead Architect (`app: web-api`) and the Database Admin (`app: redis-cache`) work together constantly. They want to sit at the **exact same table** (`topologyKey: table-number`) so they can talk instantly without shouting across the banquet hall (microsecond `localhost` latency).
+- **Pod Anti-Affinity (Separating Rival Competitors / HA Safety):** Three rival security executives (`app: web-frontend`, 3 replicas) attend the conference. Corporate policy mandates: *"Never put two security executives on the same airplane or at the same table (`topologyKey: kubernetes.io/hostname`). In fact, don't even put them in the same hotel building (`topologyKey: topology.kubernetes.io/zone`)!"* If one building catches fire (an entire AWS Availability Zone goes dark), the other two executives survive in separate buildings and keep the company running.
+
+---
+
+## Architecture Diagram
+
+```text
+       Pod Affinity (Co-location) vs Pod Anti-Affinity (Zone Spread)
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Availability Zone: us-east-1a (topologyKey: topology.kubernetes.io/zone│
+ │                                                                        │
+ │ ┌────────────────────────────────────────────────────────────────────┐ │
+ │ │ Worker Node 1 (topologyKey: kubernetes.io/hostname)                │ │
+ │ │                                                                    │ │
+ │ │ ┌────────────────────────────┐    ┌──────────────────────────────┐ │ │
+ │ │ │ Pod: web-api-replica-1     │◄──►│ Pod: redis-cache-instance    │ │ │
+ │ │ └────────────────────────────┘    └──────────────────────────────┘ │ │
+ │ │   ▲ Pod Affinity (Co-located on SAME hostname for fast cache I/O)    │ │
+ │ └────────────────────────────────────────────────────────────────────┘ │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    │ Pod Anti-Affinity
+                                    │ (app: web-api cannot share zone!)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Availability Zone: us-east-1b (topologyKey: topology.kubernetes.io/zone│
+ │                                                                        │
+ │ ┌────────────────────────────────────────────────────────────────────┐ │
+ │ │ Worker Node 2                                                      │ │
+ │ │ ┌────────────────────────────┐                                     │ │
+ │ │ │ Pod: web-api-replica-2     │                                     │ │
+ │ │ └────────────────────────────┘                                     │ │
+ │ └────────────────────────────────────────────────────────────────────┘ │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Understanding `topologyKey`
+
+The `topologyKey` is the **node label** that defines the boundary of the domain within which Kubernetes evaluates the presence of matching Pods:
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ `topologyKey` Label                  │ Scope / Domain Boundary                                     │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `kubernetes.io/hostname`             │ **Individual Node Level.**                                  │
+ │                                      │ Pods must run on the exact same physical/virtual node.      │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `topology.kubernetes.io/zone`        │ **Availability Zone Level.**                                │
+ │                                      │ Pods must run within the same cloud data center / AZ.       │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `topology.kubernetes.io/region`      │ **Geographic Region Level.**                                │
+ │                                      │ Pods must run in the same regional boundary.                │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ `topology.custom/rack`               │ **Custom On-Premise Rack Level.**                           │
+ │                                      │ Pods must run inside the same physical server rack.         │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Pattern 1: Co-Locating Services with Pod Affinity
+
+When your Web API makes thousands of cache requests per second, routing over the node network adds latency. By using **Pod Affinity**, you schedule the Web API on the **exact same node** as the Redis cache:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-api
+spec:
+  replicas: 3
+  template:
+    spec:
+      affinity:
+        podAffinity:
+          # Co-locate this web-api pod onto any node already running redis
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["redis-cache"]
+            topologyKey: "kubernetes.io/hostname"    # Same physical node!
+      containers:
+      - name: api
+        image: api:v1.0
+```
+
+---
+
+## Pattern 2: High Availability Zone Spread with Pod Anti-Affinity
+
+To guarantee high availability, no two replicas of the same Deployment should ever land in the same Availability Zone:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-processor
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: payment-processor
+    spec:
+      affinity:
+        podAntiAffinity:
+          # HARD ANTI-AFFINITY: Reject any zone that already hosts a payment-processor Pod!
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["payment-processor"]
+            topologyKey: "topology.kubernetes.io/zone"
+      containers:
+      - name: processor
+        image: payment:v2.0
+```
+
+> [!WARNING]
+> **Hard Anti-Affinity Deadlock:** If you specify `requiredDuringScheduling...` with `topologyKey: topology.kubernetes.io/zone` on a cluster with only **3 Availability Zones**, setting `replicas: 4` will result in the 4th Pod being stuck in `Pending` forever! For scalable workloads, use `preferredDuringScheduling...` (soft anti-affinity) or **Topology Spread Constraints**.
+
+---
+
+## Cross-Namespace Matching: `namespaces` vs `namespaceSelector`
+
+By default, Pod affinity only inspects Pods in the **same namespace** as the Pod being scheduled.
+
+To match Pods across other namespaces:
+
+```yaml
+podAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+  - labelSelector:
+      matchLabels:
+        app: shared-vault-agent
+    # Option 1: Explicit namespace list
+    namespaces: ["security", "infra"]
+    # Option 2: Match namespaces by label (K8s 1.24+)
+    namespaceSelector:
+      matchLabels:
+        environment: production
+    topologyKey: "kubernetes.io/hostname"
+```
+
+---
+
+## Performance Implications & Scheduler Complexity
+
+While Node Affinity is inexpensive ($O(\text{Nodes})$), Pod Affinity and Anti-Affinity require the scheduler to iterate through every existing Pod on every node in every topology domain:
+
+$$\text{Complexity} = O(\text{Pods to Schedule} \times \text{Cluster Pods} \times \text{Nodes})$$
+
+```text
+ Scheduler Scalability Guidelines:
+ - In clusters with > 1,000 nodes or > 10,000 Pods, heavy use of hard Pod Anti-Affinity 
+   can degrade scheduling throughput from 100 pods/sec down to < 5 pods/sec.
+ - Prefer `preferredDuringScheduling` over `requiredDuringScheduling`.
+ - Prefer `topologySpreadConstraints` for even zone distribution.
+```
+
+---
+
+## Complete Production High-Availability Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: critical-checkout-service
+  namespace: ecommerce
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      affinity:
+        # 1. HARD ANTI-AFFINITY: Never place two checkouts on the same node
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["checkout"]
+            topologyKey: "kubernetes.io/hostname"
+
+          # 2. SOFT ANTI-AFFINITY: Prefer spreading checkouts across different AZs
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["checkout"]
+              topologyKey: "topology.kubernetes.io/zone"
+
+        # 3. SOFT AFFINITY: Prefer co-locating near local cache in same zone
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["redis-cluster"]
+              topologyKey: "topology.kubernetes.io/zone"
+
+      containers:
+      - name: app
+        image: checkout:3.1.0
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+```
+
+---
+
+## Hands-On Lab: Testing Node Separation & Co-Location
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace pod-affinity-lab
+
+# Step 2: Deploy an in-memory database anchor pod
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-anchor
+  namespace: pod-affinity-lab
+  labels:
+    role: cache
+spec:
+  containers:
+  - name: redis
+    image: redis:alpine
+EOF
+
+# Wait for redis anchor to be scheduled
+kubectl wait --for=condition=Ready pod/redis-anchor -n pod-affinity-lab --timeout=30s
+REDIS_NODE=$(kubectl get pod redis-anchor -n pod-affinity-lab -o jsonpath='{.spec.nodeName}')
+echo "Redis anchor is running on node: $REDIS_NODE"
+
+# Step 3: Deploy Web App with Pod Affinity to co-locate with redis-anchor on SAME node
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-client
+  namespace: pod-affinity-lab
+spec:
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: role
+            operator: In
+            values: ["cache"]
+        topologyKey: "kubernetes.io/hostname"
+  containers:
+  - name: client
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 4: Verify web-client landed on the EXACT same node as Redis!
+sleep 3
+CLIENT_NODE=$(kubectl get pod web-client -n pod-affinity-lab -o jsonpath='{.spec.nodeName}')
+echo "Web client scheduled on: $CLIENT_NODE"
+if [ "$REDIS_NODE" = "$CLIENT_NODE" ]; then echo "SUCCESS: Pods are co-located!"; fi
+
+# Step 5: Clean up lab
+kubectl delete namespace pod-affinity-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the core difference between Node Affinity and Pod Affinity?**
+
+Node Affinity constrains which nodes a Pod can schedule on based on labels attached to the **Node objects** themselves (e.g. `topology.kubernetes.io/zone: us-east-1a` or `instance-type: gpu`). Pod Affinity constrains which nodes a Pod can schedule on based on labels attached to **other Pods** already running on those nodes within a specified topology domain (`topologyKey`), enabling co-location or geographical separation of related services.
+
+**Q2: What is `topologyKey`, and how does it alter the scope of Pod Anti-Affinity?**
+
+`topologyKey` specifies the node label key that defines the boundaries of the failure domain. If `topologyKey: kubernetes.io/hostname`, anti-affinity ensures no two matching Pods run on the same physical/virtual node. If `topologyKey: topology.kubernetes.io/zone`, anti-affinity prevents two matching Pods from running anywhere in the same Availability Zone (even across different nodes in that zone).
+
+**Q3: What risk is associated with using hard Pod Anti-Affinity (`requiredDuringScheduling...`) on large replica sets?**
+
+If a Deployment declares hard anti-affinity with `topologyKey: kubernetes.io/hostname` and has `replicas: 10` on a cluster with only **8 worker nodes**, the 9th and 10th Pods will become permanently stuck in the `Pending` phase because no vacant nodes exist. Similarly, with zone anti-affinity, you cannot scale replicas higher than the total number of cloud Availability Zones.
+
+**Q4: Why does Pod Affinity and Anti-Affinity impact scheduler performance in large clusters?**
+
+Evaluating Pod Affinity requires the `kube-scheduler` to inspect every node in the cluster and examine the label selectors of every active Pod running on those nodes across matching namespaces. In large clusters (e.g. 5,000 nodes and 50,000 pods), this $O(\text{Pods} \times \text{Nodes})$ computation introduces severe CPU overhead in `kube-scheduler`, drastically reducing scheduling throughput (pods scheduled per second).
+
+**Q5: How can a Pod define affinity rules against Pods in a different Kubernetes namespace?**
+
+By default, Pod affinity only checks Pods running within the same namespace. To match Pods across other namespaces, you configure either: (1) `namespaces: ["namespace-a", "namespace-b"]` with an explicit list of target namespace strings, or (2) `namespaceSelector: { matchLabels: { env: prod } }` to dynamically match any namespace bearing specified labels.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Pod Affinity co-locates Pods; Pod Anti-Affinity spreads Pods apart
+- [ ] Know how `topologyKey` defines the failure domain (`hostname`, `zone`, `region`)
+- [ ] Know that `topologyKey: kubernetes.io/hostname` prevents sharing the same node
+- [ ] Know that `topologyKey: topology.kubernetes.io/zone` prevents sharing the same AZ
+- [ ] Know that hard anti-affinity will cause Pods to hang `Pending` if replicas > topology domains
+- [ ] Know how `namespaces` and `namespaceSelector` enable cross-namespace matching
+- [ ] Can verify Pod co-location using `kubectl get pods -o wide`

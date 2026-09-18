@@ -1,0 +1,224 @@
+---
+title: "Chapter 2 — AnalysisTemplate & Auto-Rollbacks"
+sidebar_position: 2
+module: "Module 8.4 — Progressive Delivery"
+description: "Master automated metric-driven rollbacks in Argo Rollouts — AnalysisTemplate CRDs, Prometheus/Datadog SLI queries, background vs step analysis, and self-healing aborts."
+---
+
+# Chapter 2 — Argo Rollouts AnalysisTemplate & Automated Rollbacks
+
+> **Goal:** Master fully automated, closed-loop metric verification and self-healing rollbacks in Kubernetes using **Argo Rollouts `AnalysisTemplate`** — understanding how to query live observability backends (Prometheus, Datadog, New Relic) during progressive rollouts, evaluating Service Level Indicators (SLIs) against statistical success conditions (`result[0] < 0.01`), configuring **Background Analysis** vs **Step-Based Analysis**, and triggering instant automated rollbacks when error budgets are breached.
+>
+> By the end of this chapter, you will understand:
+> 1. The architecture and lifecycle of `AnalysisTemplate` and `AnalysisRun` CRDs
+> 2. How to author Prometheus PromQL metrics with success conditions and failure limits
+> 3. The operational difference between Background Analysis and Inline Step-Based Analysis
+> 4. How Argo Rollouts detects HTTP 5xx error spikes and aborts canaries automatically
+> 5. How to pass dynamic parameters (e.g. service name, canary hash) into analysis queries
+> 6. How to troubleshoot failing analysis runs using `kubectl describe analysisrun`
+
+---
+
+## Real-Life Analogy
+
+Think of an `AnalysisTemplate` as **an automated medical vital-signs monitor and emergency parachute during an experimental aviation test flight**:
+
+- **The Blind Pilot (Standard Deployments):** A pilot turns on a new experimental jet engine. As long as the engine is spinning (**Passing Kubernetes HTTP 200 Readiness Probes**), the pilot assumes everything is fine, even if the engine oil temperature is reaching 900 degrees (**Hidden Production Memory Leaks or 500 Error Spikes**).
+- **The Automated Vital-Signs Monitor (`AnalysisTemplate` CRD):** A digital sensor continuously reads the engine's core telemetry from the cockpit computer (**Prometheus TSDB**). Every 30 seconds (**`interval: 30s`**), it asks: *"Is the engine vibration below 0.05 mm (**`successCondition: result[0] <= 0.01`**)?"*
+- **The Step-Based Milestone (The Inline Analysis Step):** Before allowing the plane to climb from 10,000 feet to 20,000 feet (**Advancing traffic from 20% to 50%**), the plane must hover and pass 5 consecutive health tests (**`count: 5`**).
+- **The Emergency Auto-Eject Parachute (Automated Rollback):** If the vibration sensor detects 3 consecutive abnormal spikes (**`failureLimit: 3`**), the automated computer doesn't wait for the human pilot to wake up. It **instantly pulls the emergency parachute lever (**Aborts the rollout, cuts canary traffic to 0%, and returns full control to the stable engine**) in under 1 second!
+
+---
+
+## Architecture Diagram
+
+```text
+               Argo Rollouts Automated Metric Analysis & Rollback Loop
+
+ CANARY TRAFFIC ACTIVE (20% Traffic routed to Canary ReplicaSet)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Users generate live HTTP traffic ──► Ingress-NGINX / Gateway API       │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Emits HTTP metrics to Prometheus
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PROMETHEUS TSDB (Metrics Server)                                       │
+ │ Metric: `rate(http_requests_total{status=~"5.*"}[2m])`                 │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Queries PromQL every 30s
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ARGO ROLLOUTS CONTROLLER (Spawns `AnalysisRun` Pod/Job)                │
+ │                                                                        │
+ │ Evaluates `AnalysisTemplate`:                                          │
+ │ ├── Query: PromQL Error Rate Percentage                                │
+ │ ├── Success Condition: `result[0] <= 0.005` (Error Rate < 0.5%)        │
+ │ └── Actual Prometheus Result: `0.042` (Error Rate = 4.2%! FAILURE!)    │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Breaches `failureLimit: 2`! AUTOMATED ABORT TRIGGERED!
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ SELF-HEALING AUTOMATED ROLLBACK:                                       │
+ │ 1. Ingress Router: Instantly shifts Canary Weight: 20% ──► 0%!         │
+ │ 2. Stable Service: Absorbs 100% of customer traffic!                   │
+ │ 3. Canary ReplicaSet: Scaled down to 0 replicas!                       │
+ │ 4. Slack / PagerDuty: Dispatches `CanaryAbortedDueToMetricFailure`     │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `AnalysisTemplate` Manifest
+
+This template queries Prometheus for the HTTP 5xx error rate percentage over a rolling 2-minute window:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: http-success-rate-check
+  namespace: production
+spec:
+  # 1. Dynamic Parameter Injection
+  args:
+  - name: service-name
+  metrics:
+  # 2. Prometheus Error Rate SLI Metric
+  - name: error-rate
+    interval: 30s                      # Query Prometheus every 30 seconds
+    count: 10                          # Execute 10 evaluations total
+    successCondition: result[0] <= 0.01 # Pass if 5xx errors <= 1%
+    failureLimit: 2                    # Abort rollout if 2 queries fail!
+    provider:
+      prometheus:
+        address: http://prometheus-k8s.monitoring.svc:9090
+        query: |
+          sum(rate(http_requests_total{status=~"5.*", service="{{args.service-name}}"}[2m]))
+          /
+          sum(rate(http_requests_total{service="{{args.service-name}}"}[2m]))
+```
+
+---
+
+## Integrating Analysis into Rollout Strategies
+
+You can attach an `AnalysisTemplate` as a **Continuous Background Analysis** or as an **Inline Step-Based Gate**:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payment-api-rollout
+  namespace: production
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      # 1. Background Analysis (Runs continuously during the entire rollout!)
+      analysis:
+        templates:
+        - templateName: http-success-rate-check
+        args:
+        - name: service-name
+          value: payment-api
+
+      # 2. Step-by-Step Traffic Progression with Inline Analysis
+      steps:
+      - setWeight: 10
+      - pause: { duration: 5m }
+      - setWeight: 25
+      # Inline Gate: Runs analysis specifically at the 25% traffic milestone!
+      - analysis:
+          templates:
+          - templateName: http-success-rate-check
+          args:
+          - name: service-name
+            value: payment-api
+      - setWeight: 50
+      - pause: { duration: 10m }
+      - setWeight: 100
+  template:
+    metadata:
+      labels:
+        app: payment-api
+    spec:
+      containers:
+      - name: payment
+        image: ghcr.io/enterprise/payment-api:v2.2.0
+```
+
+---
+
+## Background Analysis vs Step-Based Analysis
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Background Analysis             │ Inline Step-Based Analysis      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Execution Window**      │ Runs across the **entire**      │ Runs strictly at a **specific** │
+ │                           │ duration of the rollout.        │ step before advancing weights.  │
+ │ **Behavior on Failure**   │ Aborts rollout immediately at   │ Halts promotion and aborts the  │
+ │                           │ any stage if error limits fire. │ rollout at that specific step.  │
+ │ **Typical Use Case**      │ High-level Golden Signals       │ In-depth smoke test suites or   │
+ │                           │ (Global error rate, p99 latency)│ intensive database queries.     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying Active AnalysisRuns
+
+```bash
+# Step 1: Query active AnalysisTemplates in the cluster
+kubectl get analysistemplates -A 2>/dev/null || echo "AnalysisTemplates active / simulated"
+
+# Step 2: Query running and historical AnalysisRuns
+kubectl get analysisruns -A -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,SUCCESS:.status.metricResults[0].successful,FAILED:.status.metricResults[0].failed
+
+# Step 3: Inspect detailed metric evaluation history of an AnalysisRun
+# kubectl describe analysisrun <analysisrun-name> -n production
+
+# Step 4: Check if any Rollout was aborted by automated analysis
+# kubectl argo rollouts list rollouts -A
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the purpose of an `AnalysisTemplate` in Argo Rollouts?**
+
+An `AnalysisTemplate` defines declarative metric evaluation rules against external monitoring systems (such as Prometheus, Datadog, New Relic, or custom HTTP webhooks). It queries live application performance metrics (such as HTTP 5xx error rates, p99 latency percentiles, or business checkout success rates) and verifies whether the canary deployment satisfies mathematical success conditions (e.g. `result[0] <= 0.01`), enabling fully autonomous metric-driven verification without human intervention.
+
+**Q2: What is the difference between an `AnalysisTemplate` and an `AnalysisRun`?**
+
+- **`AnalysisTemplate`**: The reusable declarative blueprint stored in Kubernetes that defines the query syntax, metric provider, interval, success condition, and failure thresholds.
+- **`AnalysisRun`**: The live, running instantiation of an `AnalysisTemplate` spawned by the Argo Rollouts controller during an active deployment. It executes the queries, tracks the historical result values, and transitions through phases (`Running`, `Successful`, `Failed`, `Inconclusive`).
+
+**Q3: What happens when an `AnalysisRun` exceeds its `failureLimit`?**
+
+When the number of failed metric evaluations reaches the `failureLimit` (e.g. 2 failed queries):
+1. The `AnalysisRun` immediately transitions to the `Failed` phase.
+2. The Argo Rollouts controller marks the Rollout as `Degraded`.
+3. The controller instructs the Ingress/Service Mesh router to immediately drop Canary traffic weight to `0%`.
+4. The Canary ReplicaSet is scaled down to zero, ensuring that customer traffic is 100% protected on the stable version.
+
+**Q4: How do you prevent transient metric blips or cold-start spikes from aborting a rollout?**
+
+Cold-start cache misses and JVM warmups often cause temporary 1-second latency spikes. To prevent premature aborts: (1) Set a reasonable `failureLimit` (e.g. `failureLimit: 3`), requiring multiple consecutive failures before aborting; (2) Configure `consecutiveSuccessLimit` to require sustained stability; and (3) Use Prometheus PromQL functions with rolling windows (e.g. `[2m]` or `[5m]`) to smooth out microscopic noise.
+
+**Q5: What is the difference between Background Analysis and Inline Step Analysis?**
+
+- **Background Analysis** (`spec.strategy.canary.analysis`): Starts as soon as the rollout begins and runs continuously in parallel across all canary steps. If a critical metric breaches thresholds at any time, it aborts the deployment immediately.
+- **Inline Step Analysis** (`spec.strategy.canary.steps[].analysis`): Acts as a blocking quality gate at a specific traffic weight (e.g. soak test at 20% for 10 minutes and verify 10 successful checks before opening traffic to 50%).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `AnalysisTemplate` defines metric queries and success conditions
+- [ ] Know that `AnalysisRun` is the active live instantiation of an analysis
+- [ ] Know how `successCondition` evaluates PromQL results mathematically
+- [ ] Know that breaching `failureLimit` triggers an instant automated rollback
+- [ ] Know the difference between Continuous Background and Inline Step analysis
+- [ ] Can view active analysis runs using `kubectl get analysisruns -A`

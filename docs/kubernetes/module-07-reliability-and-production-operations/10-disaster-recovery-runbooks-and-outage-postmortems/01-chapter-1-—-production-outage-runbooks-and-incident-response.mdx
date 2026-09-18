@@ -1,0 +1,248 @@
+---
+title: "Chapter 1 — Outage Runbooks & Incident Response"
+sidebar_position: 1
+module: "Module 7.10 — Disaster Recovery & Post-Mortems"
+description: "Master Kubernetes production outage runbooks and SRE incident response — Incident Command hierarchies, Sev-1 escalation workflows, and CoreDNS / Control-Plane disaster runbooks."
+---
+
+# Chapter 1 — Production Outage Runbooks & Incident Response
+
+> **Goal:** Master enterprise site reliability engineering (SRE) incident response and emergency disaster remediation in Kubernetes — understanding the **Incident Command System (ICS)** roles, classifying outage severity levels (**Sev-1** to **Sev-4**), authoring and executing battle-tested production runbooks for catastrophic failure scenarios (Control Plane quorum collapse, **CoreDNS cluster-wide resolution blackouts**, Ingress 502 cascading loops, and CNI node panics), and implementing rapid mitigation protocols.
+>
+> By the end of this chapter, you will understand:
+> 1. The Incident Command Structure: Incident Commander (IC), Operations Lead (OL), and Comms Lead (CL)
+> 2. The Sev-1 to Sev-4 Severity Classification Matrix and escalation triggers
+> 3. Production Runbook 1: Total Control Plane & etcd Quorum Loss Recovery
+> 4. Production Runbook 2: Cluster-Wide CoreDNS Resolution Failure Triage
+> 5. Production Runbook 3: Ingress-NGINX 502/504 Cascading Failure Remediation
+> 6. Fast mitigation techniques: Rollbacks (`kubectl rollout undo`), Traffic Draining, and Emergency Scaling
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes incident response and production runbooks as **the emergency protocols of a major hospital trauma center and municipal fire department**:
+
+- **The Fire Alarm (The Automated Alert):** An alarm sounds: *"CoreDNS failure in Production East (**Sev-1 Incident**)"*.
+- **The Incident Commander (The Fire Chief / Trauma Surgeon - IC):** The Incident Commander does **not** grab a wrench or write code. The IC stands in the center of the room with a whiteboard, coordinates the team, prevents panicky engineers from shouting over each other, and makes final executive decisions (**Maintains Order & Focus**).
+- **The Operations Lead (The Active Firefighter - OL):** The senior engineer with hands on the keyboard who executes the runbook commands.
+- **The Communications Lead (The Public Information Officer - CL):** Writes updates to the corporate status page every 15 minutes: *"We are actively mitigating a DNS latency event. Next update at 12:30 PM."* This shields the engineers from 50 executive emails.
+- **The Battle-Tested Runbook (The Aircraft Emergency Checklist):** When an engine catches fire at 30,000 feet, the pilot does **not** guess or search Google. The pilot opens Page 12 of the flight manual (**The Production Runbook**) and executes 4 verified, memorized steps in 10 seconds.
+
+---
+
+## Architecture Diagram
+
+```text
+               SRE Incident Command & Emergency Runbook Pipeline
+
+ MONITORING ALERT: `Sev-1: CoreDNS Cluster Resolution Failure (100% Errors)`
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ INCIDENT COMMAND SYSTEM (ICS) BRIDGE ACTIVATED:                        │
+ │ ├── Incident Commander (IC): Leads the call & delegates tasks         │
+ │ ├── Operations Lead (OL):    Executes terminal runbook commands        │
+ │ └── Comms Lead (CL):         Updates status page & executive stakeholders
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Selects Emergency Production Runbook:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ RUNBOOK: CRITICAL COREDNS OUTAGE TRIAGE PROTOCOL                       │
+ │                                                                        │
+ │ [Step 1: Check Pod Health]  ──► `kubectl get pods -n kube-system -l k8s-app=kube-dns`
+ │ [Step 2: Check Endpoints]   ──► `kubectl get endpoints kube-dns -n kube-system`
+ │ [Step 3: Check UDP Port 53] ──► Verify CNI iptables & CoreDNS logs     │
+ │ [Step 4: Emergency Mitigation] ──► Scale CoreDNS Replicas: 2 ──► 10!   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ CoreDNS Recovers! DNS Latency drops to 1ms!
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ INCIDENT MITIGATED ──► Declare All-Clear ──► Schedule Post-Mortem RCA │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The SRE Severity Classification Matrix
+
+```text
+ ┌──────────────┬─────────────────────────┬─────────────────────────┬────────────────────────────────┐
+ │ Severity     │ Definition & Impact     │ Response SLA            │ Escalation Protocol            │
+ │──────────────┼─────────────────────────┼─────────────────────────┼────────────────────────────────┤
+ │ **Sev-1**    │ **Critical Outage.**    │ **Immediate**           │ PagerDuty on-call, Incident    │
+ │ (Critical)   │ Revenue-generating or   │ ($< 5\text{ mins}$)     │ Commander, VP Eng bridge,      │
+ │              │ customer-facing down.   │                         │ Status page update every 15m.  │
+ │──────────────┼─────────────────────────┼─────────────────────────┼────────────────────────────────┤
+ │ **Sev-2**    │ **Major Degradation.**  │ **$< 15\text{ mins}$**  │ Primary on-call, Slack bridge, │
+ │ (Major)      │ Core service impaired;  │                         │ hourly stakeholder updates.    │
+ │              │ redundancy lost.        │                         │                                │
+ │──────────────┼─────────────────────────┼─────────────────────────┼────────────────────────────────┤
+ │ **Sev-3**    │ **Minor Issue.**        │ $< 2\text{ hours}$      │ On-call ticket; addressed      │
+ │ (Moderate)   │ Non-critical internal   │ (Business hours)        │ during normal workday.         │
+ │──────────────┼─────────────────────────┼─────────────────────────┼────────────────────────────────┤
+ │ **Sev-4**    │ **Cosmetic / Minor.**   │ Next sprint             │ Standard Jira backlog item.    │
+ └──────────────┴─────────────────────────┴─────────────────────────┴────────────────────────────────┘
+```
+
+---
+
+## Production Runbook 1: Total CoreDNS Cluster-Wide Failure
+
+**Symptoms:** All microservices report `dial tcp: lookup api.internal: no such host` or connection timeouts.
+
+```bash
+# 1. Check CoreDNS Pod status and restart counts
+kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide
+
+# 2. Check CoreDNS Service and Endpoint readiness
+kubectl get endpoints kube-dns -n kube-system
+
+# 3. Stream CoreDNS error logs
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50
+
+# 4. EMERGENCY MITIGATION: Scale CoreDNS horizontally to absorb query storms
+kubectl scale deployment coredns -n kube-system --replicas=10
+
+# 5. Verify local DNS resolution from a test pod
+kubectl run dns-test --image=busybox:1.28 --rm -it --restart=Never -- nslookup kubernetes.default
+```
+
+---
+
+## Production Runbook 2: Ingress-NGINX 502/504 Cascading Loop
+
+**Symptoms:** External clients receive `HTTP 502 Bad Gateway` or `504 Gateway Timeout` across all routes.
+
+```bash
+# 1. Check Ingress-NGINX controller resource utilization and throttling
+kubectl top pods -n ingress-nginx
+
+# 2. Inspect Ingress-NGINX controller logs for upstream connection errors
+kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=50 | grep -E "502|504|upstream"
+
+# 3. Check if backend target service endpoints exist
+kubectl get endpoints -A | grep "<none>"
+
+# 4. EMERGENCY MITIGATION: Roll back recent bad deployment
+kubectl rollout undo deployment/payment-api -n production
+
+# 5. If controller is memory-exhausted, scale Ingress-NGINX replicas
+kubectl scale deployment ingress-nginx-controller -n ingress-nginx --replicas=8
+```
+
+---
+
+## Production Runbook 3: Control Plane Quorum Collapse
+
+**Symptoms:** `kubectl` commands fail with `The connection to the server was refused - did you specify the right host or port?`.
+
+```bash
+# 1. SSH into primary master node and check etcd container status
+crictl ps -a | grep etcd
+
+# 2. Inspect etcd static pod log output directly from host disk
+tail -n 100 /var/log/pods/kube-system_etcd-*/etcd/*.log
+
+# 3. Check physical master node disk space (Inspect for 100% full root partition!)
+df -h /var/lib/etcd
+
+# 4. Check active alarms (NOSPACE / Corrupt)
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  alarm list
+
+# 5. If unrecoverable corruption: Execute Snapshot Disaster Recovery Restore!
+```
+
+---
+
+## Rapid Mitigation Playbook
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Mitigation Technique │ Command & Operational Context                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Fast Rollback** │ `kubectl rollout undo deployment/<name> -n <ns>`                            │
+ │                      │ Instantly rolls back to previous ReplicaSet generation ($< 10\text{s}$).    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Emergency**     │ `kubectl scale deployment/<name> --replicas=<N> -n <ns>`                    │
+ │ **Scale-Up**         │ Rapidly increases capacity to absorb traffic surges or CPU starvation.      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Pod Restart**   │ `kubectl rollout restart deployment/<name> -n <ns>`                         │
+ │                      │ Triggers clean rolling restart of hung or memory-leaking containers.        │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Simulating a Fast Deployment Rollback
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace incident-lab
+
+# Step 2: Deploy a working v1 application
+kubectl create deployment web-app --image=nginx:1.24-alpine -n incident-lab
+kubectl rollout status deployment/web-app -n incident-lab
+
+# Step 3: Trigger a broken update (Simulated bad release)
+kubectl set image deployment/web-app nginx=nginx:non-existent-tag-v99 -n incident-lab
+
+# Step 4: Observe the broken rollout in progress
+kubectl rollout status deployment/web-app -n incident-lab --timeout=15s 2>&1 || echo "Rollout hung as expected!"
+
+# Step 5: Execute Emergency SRE Rollback command!
+kubectl rollout undo deployment/web-app -n incident-lab
+
+# Step 6: Verify deployment returned to 100% healthy status
+kubectl rollout status deployment/web-app -n incident-lab
+
+# Step 7: Clean up lab
+kubectl delete namespace incident-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the three primary roles in the Incident Command System (ICS), and why are they separated?**
+
+1. **Incident Commander (IC)**: Owns the overall response strategy, delegates diagnostic tasks, enforces focus, and makes final decisions. The IC does not execute technical fixes.
+2. **Operations Lead (OL)**: The technical specialist who executes commands, inspects logs, and applies runbook mitigations.
+3. **Communications Lead (CL)**: Drafts updates for internal stakeholders and public status pages.
+Separating these roles prevents the technical leads from being distracted by executive emails and ensures clear, authoritative leadership during high-stress outages.
+
+**Q2: What is the difference between "Mitigation" and "Root Cause Resolution" during an active outage?**
+
+- **Mitigation (During the Outage)**: The immediate priority is to **restore customer service health as fast as possible**, even if the underlying bug is not understood. Examples: rolling back to the previous version, scaling replicas up 5x, or draining traffic to a secondary region.
+- **Root Cause Resolution (Post-Outage)**: Deep investigative debugging conducted *after* the system is stable, resulting in long-term code fixes, architectural enhancements, and preventative testing.
+
+**Q3: How do you troubleshoot a cluster-wide CoreDNS failure in Kubernetes?**
+
+1. Check CoreDNS pod status (`kubectl get pods -n kube-system -l k8s-app=kube-dns`) and restart counts.
+2. Verify the `kube-dns` `Endpoints` object has ready pod IPs.
+3. Scale CoreDNS horizontally (`kubectl scale deployment coredns --replicas=10`) to absorb CPU starvation from query loops.
+4. Check CNI health (ensure UDP port 53 traffic is not blocked by a rogue `NetworkPolicy`).
+5. Deploy **NodeLocal DNSCache** as a DaemonSet to cache DNS queries locally on every worker node.
+
+**Q4: How does `kubectl rollout undo` work under the hood?**
+
+Kubernetes Deployments maintain historical `ReplicaSet` objects. When `kubectl rollout undo deployment/<name>` is executed, the Deployment controller looks up the Pod template spec from the previous ReplicaSet generation (`kubernetes.io/change-cause`), updates the Deployment's active pod template to match that previous state, and triggers a standard rolling update, spinning up healthy old pods while terminating the failing new pods.
+
+**Q5: What are the primary indicators of a Sev-1 incident in Kubernetes?**
+
+A Sev-1 incident is triggered when: (1) Core business transactions (checkout, payments, user authentication) are completely down or experiencing $> 5\%$ error rates; (2) Critical cluster infrastructure (Control plane, CoreDNS, or Ingress edge) is completely unavailable; or (3) There is an active security breach or catastrophic data loss event affecting production data.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the ICS roles: Incident Commander (Strategy), Ops Lead (Execution), Comms Lead (Updates)
+- [ ] Know the severity matrix: Sev-1 (Critical Down), Sev-2 (Degraded), Sev-3 (Minor), Sev-4 (Cosmetic)
+- [ ] Know the CoreDNS emergency triage protocol (Scale replicas, check endpoints, inspect CNI)
+- [ ] Know the Ingress 502 triage protocol (Roll back deployment, check backend endpoints)
+- [ ] Know that Mitigation (restoring service) always takes priority over deep Root Cause Analysis
+- [ ] Can execute an emergency rollback using `kubectl rollout undo deployment/<name>`

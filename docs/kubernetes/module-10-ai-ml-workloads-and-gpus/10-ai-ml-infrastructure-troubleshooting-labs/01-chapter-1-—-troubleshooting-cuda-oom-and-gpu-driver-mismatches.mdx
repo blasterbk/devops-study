@@ -1,0 +1,208 @@
+---
+title: "Chapter 1 — Debugging CUDA OOM & Driver Mismatches"
+sidebar_position: 1
+module: "Module 10.10 — AI/ML Troubleshooting Labs"
+description: "Master AI/ML GPU troubleshooting on Kubernetes — diagnosing CUDA Out of Memory (OOM), PyTorch memory fragmentation, driver/toolkit mismatches, and DCGM throttling."
+---
+
+# Chapter 1 — Troubleshooting CUDA OOM & GPU Driver Mismatches
+
+> **Goal:** Master systematic SRE root-cause analysis, memory profiling, and hardware recovery runbooks for AI/ML workloads on Kubernetes — diagnosing fatal **`CUDA Out of Memory (OOM)`** errors, eliminating **PyTorch Caching Allocator memory fragmentation** using `expandable_segments:True`, resolving **CUDA Driver vs Toolkit version mismatches**, and detecting hardware performance degradation via **DCGM thermal and power throttling** metrics.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4 distinct memory consumers in GPU VRAM (Model Weights, Activations, KV Cache, Workspace)
+> 2. Why PyTorch triggers `CUDA out of memory` even when free VRAM appears available in `nvidia-smi`
+> 3. How to configure `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to eliminate memory fragmentation
+> 4. How to diagnose and resolve `CUDA driver version is insufficient for CUDA runtime version` errors
+> 5. How to identify hardware thermal throttling, power capping, and PCIe bus bottlenecks using DCGM
+> 6. How to author systematic SRE diagnostic runbooks for crashing AI training and inference pods
+
+---
+
+## Real-Life Analogy
+
+Think of troubleshooting CUDA OOM errors and GPU driver mismatches as **diagnosing why a multi-million-dollar Formula 1 racing engine keeps stalling on the racetrack**:
+
+- **The Phantom Fuel Shortage (PyTorch Caching Allocator Fragmentation):** The fuel gauge (**`nvidia-smi`**) shows that the car has 20 gallons of fuel left in the tank. Yet, the engine suddenly sputters and dies (**`CUDA Out of Memory`**).
+  - Why? The fuel tank is divided into dozens of tiny, mismatched, disconnected 1-liter plastic bottles (**Memory Fragmentation**).
+  - The engine needs a single contiguous 5-liter stream of fuel for a high-speed straightaway (**A large tensor allocation**).
+  - Because no single bottle can hold 5 liters, the engine panics and crashes (**CUDA OOM**)!
+  - **The Fix (`expandable_segments:True`):** You remove the plastic bottles and install a flexible, seamless virtual fuel bladder that dynamically expands to fit any size stream.
+- **The Wrong Octane Fuel (CUDA Driver vs Toolkit Mismatch):** You built a modern high-compression racing engine (**A Docker container compiled with CUDA 12.4**), but the racetrack gas pump only supplies low-octane regular gasoline (**An old host Linux driver from 2021**). The engine refuses to start (**`CUDA driver version is insufficient`**).
+- **The Overheated Radiator (DCGM Thermal Throttling):** The car is driving at half speed. You check the telemetry gauge (**DCGM Exporter**): the radiator is blocked with mud, the GPU reached 92°C, and the hardware safety circuit cut clock speeds by 50% to prevent the silicon chip from melting!
+
+---
+
+## Architecture Diagram
+
+```text
+               GPU VRAM Memory Anatomy & CUDA OOM Triage Flow
+
+ PHYSICAL GPU VRAM ALLOCATION BREAKDOWN (Total: 80GB VRAM on NVIDIA A100/H100)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. MODEL PARAMETER WEIGHTS: ~35GB (LLaMA-3 70B FP16 with 2-way TP)    │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 2. ACTIVATION MEMORY & GRADIENTS: ~20GB (Forward pass intermediate)    │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 3. KV CACHE (PagedAttention): ~20GB (User sequence context tokens)     │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 4. PYTORCH CACHE FRAGMENTATION: ~5GB (Fragmented un-mergeable blocks!) │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Allocates new tensor: `tensor = torch.zeros([8, 4096, 4096])`
+                    ▼ Exceeds remaining 80GB VRAM limit!
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 💥 CRASH: `RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB`│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ├───────────────────────┬───────────────────────┐
+                    ▼ STEP 1                ▼ STEP 2                ▼ STEP 3
+ ┌──────────────────────────┐ ┌───────────────────────────┐ ┌──────────────────────────┐
+ │ EXPANDABLE SEGMENTS      │ │ ACTIVATION CHECKPOINTING  │ │ REDUCE BATCH SIZE / KV   │
+ │ `PYTORCH_CUDA_ALLOC_CONF`│ │ Recomputes activations    │ │ Enable vLLM FP8 KV Cache │
+ │ `=expandable_segments:T` │ │ during backward pass!     │ │ or reduce micro-batch.   │
+ └──────────────────────────┘ └───────────────────────────┘ └──────────────────────────┘
+```
+
+---
+
+## The 4 Main GPU VRAM Memory Consumers
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Memory Consumer      │ Percentage of VRAM      │ SRE Mitigation / Optimization Technique           │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Model Weights** │ 30% – 50% of VRAM       │ Apply **Model Quantization** (FP16 $\to$ INT8/FP8)│
+ │                      │                         │ or increase Tensor Parallelism (`tp_size: 4`).    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. Activations**   │ 20% – 40% of VRAM       │ Enable **Activation Checkpointing** (trades small│
+ │                      │ (Scales with batch size)│ compute time to discard activations in memory).   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. KV Cache**      │ 20% – 40% of VRAM       │ Use **PagedAttention** (vLLM) and restrict        │
+ │                      │ (Inference only)        │ `--max-model-len` or enable FP8 KV caching.       │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. Cache Fragment**│ 5% – 15% of VRAM        │ Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:T`│
+ │                      │ (Wasted empty buffers)  │ to eliminate virtual memory address fragmentation.│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Root Cause 1: Eliminating PyTorch Memory Fragmentation
+
+Starting in PyTorch 2.1+, virtual memory fragmentation can be permanently resolved by setting the **`expandable_segments`** allocator flag:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: llm-fine-tuner
+  namespace: ai-workloads
+spec:
+  containers:
+  - name: trainer
+    image: nvcr.io/nvidia/pytorch:24.04-py3
+    env:
+      # 1. Critical PyTorch Allocator Flag: Prevents VRAM fragmentation OOMs!
+      - name: PYTORCH_CUDA_ALLOC_CONF
+        value: "expandable_segments:True,max_split_size_mb:128"
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+```
+
+---
+
+## Root Cause 2: Diagnosing Driver vs Toolkit Version Mismatches
+
+```text
+ ┌──────────────────────────────────┬─────────────────────────────┬───────────────────────────────────┐
+ │ Error Message in Container Logs  │ Underlying Root Cause       │ Exact SRE Resolution              │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `CUDA driver version is          │ The host Linux node runs an │ (1) Upgrade host driver via GPU   │
+ │ insufficient for CUDA runtime`   │ older driver (e.g. 470) than│ Operator `ClusterPolicy` (550+),  │
+ │                                  │ container CUDA toolkit (12).│ OR (2) install `cuda-compat`.     │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `CUDA error: no kernel image is  │ The application was compiled│ Set `TORCH_CUDA_ARCH_LIST="8.0;   │
+ │ available for execution on the   │ for a different GPU compute │ 9.0"` to match physical GPU       │
+ │ device`                          │ architecture (e.g. Hopper). │ architecture (Ampere vs Hopper).  │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────┤
+ │ `device-side assert triggered`   │ Tensor index out of bounds  │ Run with `CUDA_LAUNCH_BLOCKING=1` │
+ │                                  │ or invalid embedding ID.    │ to locate exact failing line.     │
+ └──────────────────────────────────┴─────────────────────────────┴───────────────────────────────────┘
+```
+
+---
+
+## Root Cause 3: Detecting Hardware Thermal & Power Throttling via DCGM
+
+If AI training speed drops by 50% without software changes, the GPU is suffering from **Hardware Throttling**:
+
+```bash
+# 1. Inspect real-time GPU performance and throttling reasons
+nvidia-smi -q -d PERFORMANCE
+
+# Output to look for:
+# Performance State: P0 (Maximum Performance)
+# Clocks Throttle Reasons:
+#     Idle: Not Active
+#     Thermal Slowdown: ACTIVE (GPU overheating > 89C!)
+#     Power Brake Slowdown: ACTIVE (Power supply throttled!)
+
+# 2. Check DCGM Prometheus metrics for hardware throttling:
+# curl -s http://<dcgm-exporter>:9400/metrics | grep "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS"
+```
+
+---
+
+## Hands-On Lab: Simulating and Debugging a CUDA OOM Incident
+
+```bash
+# Step 1: Query all pods terminated with OOMKilled or CrashLoopBackOff in AI namespaces
+kubectl get pods -n ai-workloads -o json 2>/dev/null | jq '.items[] | select(.status.containerStatuses[0].lastState.terminated.reason=="OOMKilled" or .status.containerStatuses[0].state.waiting.reason=="CrashLoopBackOff") | {name: .metadata.name, reason: .status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "AI Pods active"
+
+# Step 2: Extract the exact CUDA memory allocation trace from pod logs
+# kubectl logs -n ai-workloads <failing-pod-name> --tail=100 | grep -A 10 "CUDA out of memory"
+
+# Step 3: Run interactive GPU memory monitoring inside a worker node
+# kubectl exec -it <gpu-pod> -- nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.free,temperature.gpu,power.draw --format=csv -l 1
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What causes a `CUDA out of memory (OOM)` error, and why is it distinct from a standard Linux container OOMKill?**
+
+- **Linux Container OOMKill (Exit Code 137)**: Occurs when a container exceeds its **host system RAM** limit (`resources.limits.memory: 32Gi`). The Linux kernel's cgroup OOM-killer immediately terminates the entire container process.
+- **CUDA Out of Memory (PyTorch RuntimeError)**: Occurs when an application requests more **GPU VRAM** (e.g. 82GB on an 80GB A100) than physically available. The container process does not immediately die from the OS kernel; instead, the CUDA driver throws an in-process exception (`RuntimeError: CUDA out of memory`). If uncaught in Python, the script crashes.
+
+**Q2: How does `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` eliminate virtual memory fragmentation?**
+
+By default, the PyTorch Caching Allocator reserves contiguous memory blocks from the CUDA driver and maintains its own sub-allocator in user space. Over time, allocating and freeing tensors of varying sizes fragments the address space into small, non-contiguous gaps. Setting `expandable_segments:True` leverages virtual memory address manipulation (using `cuMemMap`). It allows PyTorch to allocate **non-contiguous physical memory pages and map them into a single contiguous virtual address space**, eliminating fragmentation-induced OOM crashes.
+
+**Q3: How do you fix the error `CUDA driver version is insufficient for CUDA runtime version` in a Kubernetes cluster?**
+
+This error indicates that the container image was compiled with a newer CUDA toolkit (e.g. CUDA 12.2 requiring driver 535+) than the driver currently loaded in the host Linux kernel (e.g. Driver 515 supporting CUDA 11.7). To fix:
+1. **Recommended**: Upgrade the host driver version in the NVIDIA GPU Operator's `ClusterPolicy` manifest (`spec.driver.version: "550.54.14"`).
+2. **Alternative**: If the host driver cannot be updated, install the **`cuda-compat`** user-space forward compatibility package inside the container image.
+
+**Q4: How does Activation Checkpointing (Gradient Checkpointing) trade compute time for VRAM savings?**
+
+During the forward pass of a deep neural network, intermediate activation tensors are stored in VRAM so they can be used to calculate gradients during the backward pass. For long sequence lengths, activations consume massive memory. **Activation Checkpointing** discards intermediate activations during the forward pass and **recomputes them on-the-fly during the backward pass**. This reduces activation memory consumption by **60% to 80%**, allowing training of 2x larger models on the same GPU at the cost of ~20% additional compute time.
+
+**Q5: What are the three primary DCGM hardware throttle indicators an SRE should monitor in Prometheus?**
+
+1. **`DCGM_FI_DEV_THERMAL_VIOLATION`**: Indicates the GPU core or HBM3 memory exceeded temperature limits ($> 90^\circ\text{C}$), causing hardware clock frequency drops.
+2. **`DCGM_FI_DEV_POWER_VIOLATION`**: Indicates the GPU hit its maximum wattage limit (e.g. 700W on H100 SXM5), throttling compute clocks.
+3. **`DCGM_FI_DEV_XID_ERRORS`**: Critical hardware fault codes (e.g. Xid 31: GPU memory page fault, Xid 79: GPU fallen off the PCIe bus), indicating physical hardware failure requiring node replacement.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 VRAM consumers: Model Weights, Activations, KV Cache, Workspace
+- [ ] Know that `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` stops fragmentation OOMs
+- [ ] Know the difference: Linux Host OOMKill (Exit 137) vs GPU CUDA OOM (RuntimeError)
+- [ ] Know how to fix driver/toolkit mismatches via GPU Operator `ClusterPolicy` upgrades
+- [ ] Know that Activation Checkpointing slashes activation VRAM by 60%–80%
+- [ ] Can inspect hardware throttling using `nvidia-smi -q -d PERFORMANCE`

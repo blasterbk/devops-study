@@ -1,0 +1,231 @@
+---
+title: "Chapter 1 — Progressive Delivery: Blue-Green & Canary"
+sidebar_position: 1
+module: "Module 8.4 — Progressive Delivery"
+description: "Master Progressive Delivery with Argo Rollouts — Blue-Green and Canary deployment strategies, active vs preview services, and Ingress/Mesh traffic shifting."
+---
+
+# Chapter 1 — Progressive Delivery: Blue-Green & Canary Deployments
+
+> **Goal:** Master advanced release engineering and blast-radius mitigation in Kubernetes using **Progressive Delivery** and **Argo Rollouts** — understanding why standard Kubernetes `Deployment` rolling updates fail to protect production workloads, dissecting the architectural mechanics of **Blue-Green** (Active vs Preview Services) and **Canary** (step-weighted traffic shifting) strategies, and configuring dynamic traffic routing integrations with Ingress-NGINX, Istio, and the Gateway API.
+>
+> By the end of this chapter, you will understand:
+> 1. The fundamental limitations of native Kubernetes `Deployment` rolling updates
+> 2. How the `Rollout` CRD acts as a drop-in replacement for standard Deployments
+> 3. The exact workflow of Blue-Green deployments with automated preview verification
+> 4. How Canary deployments shift traffic in granular steps (10% $\to$ 25% $\to$ 50% $\to$ 100%)
+> 5. How Argo Rollouts manipulates Ingress and Service Mesh controllers for weight shifting
+> 6. How to manage and promote live rollouts using the `kubectl argo rollouts` CLI
+
+---
+
+## Real-Life Analogy
+
+Think of Progressive Delivery as **the grand opening of a newly renovated international airport terminal**:
+
+- **The Standard Rolling Update (The Uncontrolled Passenger Rush):** The airport replaces all 20 ticket check-in desks simultaneously one by one (**Standard Kubernetes Rolling Update**). If the new computer system has a catastrophic hidden software bug, 100% of incoming passengers are immediately exposed to the failure, the entire airport gridlocks, and flights are canceled (**High Blast Radius Outage**).
+- **The Blue-Green Strategy (The Secret VIP Dry Run):** The airport leaves the old Terminal Blue running for all 10,000 public passengers (**Active Service**). Meanwhile, in Terminal Green (**Preview Service**), airport executives and secret beta testers test the baggage belts and computers with real luggage. Once Terminal Green proves 100% stable, the airport flips a master directional sign at the highway entrance (**Instant Cutover**). If an issue occurs, they flip the sign back to Terminal Blue in 1 second.
+- **The Canary Strategy (The 10% Gate Funnel):** The airport directs **90% of flights to the stable old gates** and **10% of flights to the new gates (**`setWeight: 10`**)**. The operations team monitors the luggage belts for 1 hour. If error rates remain at 0%, they expand traffic to 25%, then 50%, and finally 100% (**Controlled Blast Radius**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Argo Rollouts: Canary Traffic Shifting Architecture
+
+ CLIENT TRAFFIC: `https://api.company.com/v1/checkout`
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Inbound HTTPS Traffic on Port 443                                      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ INGRESS-NGINX / GATEWAY API / ISTIO (Traffic Router)                   │
+ │ Managed dynamically by Argo Rollouts Controller:                       │
+ │ ├── 80% Traffic Weight ──► Stable Service (`payment-stable`)           │
+ │ └── 20% Traffic Weight ──► Canary Service (`payment-canary`)           │
+ └──────┬───────────────────────────────────────────────────────┬─────────┘
+        │ 80% Live Traffic                                      │ 20% Canary Traffic
+        ▼                                                       ▼
+ ┌──────────────────────────────────────┐             ┌───────────────────┐
+ │ STABLE SERVICE (`payment-stable`)    │             │ CANARY SERVICE    │
+ └──────────────────┬───────────────────┘             └─────────┬─────────┘
+                    │                                           │
+                    ▼                                           ▼
+ ┌──────────────────────────────────────┐             ┌───────────────────┐
+ │ STABLE REPLICASET (v1.0.0)           │             │ CANARY REPLICASET │
+ │ Pods: [ Pod 1 ] [ Pod 2 ] [ Pod 3 ]  │             │ Pods: [ Pod 4 ]   │
+ └──────────────────────────────────────┘             └───────────────────┘
+```
+
+---
+
+## Standard Deployment vs Argo Rollouts
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Capability      │ Standard Kubernetes Deployment  │ CNCF Argo Rollouts              │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Traffic Shifting**      │ **Crude Pod Ratios only.**      │ **Dynamic Weight Shifting**     │
+ │                           │ (5% traffic requires 20 pods!)  │ (e.g. 2% traffic on 1 pod via L7│
+ │                           │                                 │ Ingress / Service Mesh router). │
+ │ **Blue-Green Support**    │ **None.** Requires manual       │ **Native First-Class.** Manages │
+ │                           │ Service selector hacking.       │ Active/Preview Services & tests.│
+ │ **Automated Rollback**    │ **None.** Fails to roll back    │ **Native.** Automatically aborts│
+ │                           │ on application-level 500 errors.│ if Prometheus SLIs breach limits│
+ │ **Metric Validation**     │ None (Liveness/Readiness only). │ **Continuous Analysis Runs**    │
+ │                           │                                 │ (Prometheus, Datadog, New Relic)│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## 1. Blue-Green Strategy Manifest
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payment-bluegreen-rollout
+  namespace: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: payment-api
+  strategy:
+    blueGreen:
+      # 1. Active Service (Receives live customer traffic)
+      activeService: payment-active-svc
+      # 2. Preview Service (Used for pre-promotion smoke testing)
+      previewService: payment-preview-svc
+      autoPromotionEnabled: false      # Requires explicit approval before cutting over!
+      scaleDownDelaySeconds: 30        # Keeps old version alive for 30s after cutover for instant rollback!
+  template:
+    metadata:
+      labels:
+        app: payment-api
+    spec:
+      containers:
+      - name: payment
+        image: ghcr.io/enterprise/payment-api:v2.0.0
+        ports:
+        - containerPort: 8080
+```
+
+---
+
+## 2. Canary Strategy with Ingress-NGINX Traffic Shifting
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payment-canary-rollout
+  namespace: production
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: payment-api
+  strategy:
+    canary:
+      # 1. Ingress & Service Traffic Routing Configuration
+      trafficRouting:
+        nginx:
+          stableIngress: payment-stable-ingress
+      canaryService: payment-canary-svc
+      stableService: payment-stable-svc
+
+      # 2. Step-by-Step Phased Rollout Schedule
+      steps:
+      - setWeight: 10                  # Shift 10% traffic to Canary
+      - pause: { duration: 10m }       # Soak test for 10 minutes
+      - setWeight: 25                  # Shift 25% traffic to Canary
+      - pause: { duration: 30m }       # Soak test for 30 minutes
+      - setWeight: 50
+      - pause: { duration: 15m }
+      - setWeight: 100                 # Complete promotion!
+  template:
+    metadata:
+      labels:
+        app: payment-api
+    spec:
+      containers:
+      - name: payment
+        image: ghcr.io/enterprise/payment-api:v2.1.0
+        ports:
+        - containerPort: 8080
+```
+
+---
+
+## Managing Rollouts with the CLI
+
+```bash
+# 1. Watch rollout progression in real time
+kubectl argo rollouts get rollout payment-canary-rollout -n production --watch
+
+# 2. Manually promote a paused rollout to the next step
+kubectl argo rollouts promote payment-canary-rollout -n production
+
+# 3. Emergency Abort: Instantly cancel canary and revert 100% traffic to stable!
+kubectl argo rollouts abort payment-canary-rollout -n production
+
+# 4. Retry an aborted rollout
+kubectl argo rollouts retry rollout payment-canary-rollout -n production
+```
+
+---
+
+## Hands-On Lab: Observing Canary Traffic Shifting
+
+```bash
+# Step 1: Query active Rollouts in the cluster
+kubectl get rollouts.argoproj.io -A 2>/dev/null || echo "Argo Rollouts CRDs active / simulated"
+
+# Step 2: Query replica sets managed by Argo Rollouts
+kubectl get replicasets -l rollouts-pod-template-hash
+
+# Step 3: Inspect active Canary NGINX annotations (if deployed)
+# kubectl get ingress -n production -o yaml | grep "nginx.ingress.kubernetes.io/canary"
+
+# Step 4: Check Rollout status summary
+# kubectl argo rollouts list rollouts -A
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is the standard Kubernetes `Deployment` rolling update inadequate for mission-critical production systems?**
+
+Standard Kubernetes Deployments execute **blind, all-or-nothing rolling updates**. If a new container image passes its basic HTTP readiness probes but has a deep logical bug (e.g. throwing 500 errors on 3% of checkout transactions or leaking database connections under load), the Deployment controller will continue replacing old pods until 100% of the fleet is infected. Standard Deployments cannot: (1) Route small percentages of traffic (e.g. 2%) independently of pod count; (2) Integrate with Prometheus for metric-driven validation; or (3) Automatically abort and roll back upon error rate spikes.
+
+**Q2: How does a Blue-Green deployment work in Argo Rollouts?**
+
+In Blue-Green: (1) The controller maintains an **Active Service** (routing live customer traffic to the stable Blue ReplicaSet) and a **Preview Service** (routing internal test traffic to the newly created Green ReplicaSet); (2) Automated tests or QA engineers validate the Green release via the Preview Service; (3) Upon approval, the controller updates the Active Service's label selector to point to the Green ReplicaSet, achieving an **instant, zero-downtime cutover**; (4) The old Blue ReplicaSet is kept warm for a configured `scaleDownDelaySeconds` duration to allow instant zero-downtime rollback if issues appear.
+
+**Q3: How does Argo Rollouts achieve precise percentage-based traffic shifting (e.g. 5% traffic) with only 2 pods?**
+
+Argo Rollouts integrates with Layer 7 **Traffic Routers** (such as Ingress-NGINX, AWS ALB, Istio, Linkerd, and the Gateway API). Rather than relying on simple pod-count ratios in Kube-Proxy iptables, Argo Rollouts dynamically updates the routing rules in the Ingress or Service Mesh (e.g. injecting `nginx.ingress.kubernetes.io/canary-weight: "5"`). The Ingress proxy splits incoming HTTP requests mathematically at the network edge, sending exactly 5% of requests to the canary pod and 95% to the stable pods.
+
+**Q4: What is the purpose of `scaleDownDelaySeconds` in Blue-Green deployments?**
+
+When traffic is cut over to the new Green version, `scaleDownDelaySeconds: 30` instructs the controller to **keep the old Blue pods running and healthy for 30 seconds** before terminating them. If the SRE team notices an immediate spike in errors, they can execute `kubectl argo rollouts abort`, and the controller flips the Active Service back to the still-running Blue pods in **under 1 second** with zero container startup latency.
+
+**Q5: What happens when an engineer runs `kubectl argo rollouts abort` on a Canary rollout?**
+
+The controller instantly: (1) Reconfigures the Ingress/Service Mesh traffic router to set Canary weight to `0%`, returning 100% of customer traffic to the Stable ReplicaSet; (2) Marks the Rollout condition as `Degraded`; and (3) Scales down the failing Canary ReplicaSet pods, completely stopping the blast radius within milliseconds.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why standard Deployments fail at blast-radius mitigation and automated rollbacks
+- [ ] Know the difference between Blue-Green (Instant Active/Preview flip) and Canary (Step weights)
+- [ ] Know how Argo Rollouts integrates with Ingress-NGINX and Gateway API for traffic shifting
+- [ ] Know how `autoPromotionEnabled: false` enforces human approval gates
+- [ ] Know how `scaleDownDelaySeconds` enables sub-second Blue-Green rollbacks
+- [ ] Can inspect and manage rollouts using `kubectl argo rollouts get rollout <name>`

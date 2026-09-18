@@ -1,0 +1,249 @@
+---
+title: "Chapter 2 — API Server LB & Leader Election"
+sidebar_position: 2
+module: "Module 7.1 — Cluster High Availability"
+description: "Master Kubernetes API server load balancing and controller leader election — Layer 4 TCP load balancing, health endpoints (/livez, /readyz), and coordination.k8s.io Lease locks."
+---
+
+# Chapter 2 — API Server Load Balancing & Leader Election
+
+> **Goal:** Master the concurrency, load balancing, and high-availability coordination mechanisms of the Kubernetes control plane — understanding why **`kube-apiserver`** runs in an **Active-Active** stateless load-balanced pool while **`kube-controller-manager`** and **`kube-scheduler`** require **Active-Passive** leader election, configuring Layer 4 TCP load balancers with `/livez` and `/readyz` health probes, and dissecting the **`coordination.k8s.io/v1` `Lease`** API.
+>
+> By the end of this chapter, you will understand:
+> 1. The operational concurrency difference: Active-Active (API Server) vs Active-Passive (Controllers)
+> 2. How Layer 4 TCP Load Balancers (HAProxy, Keepalived, Cloud NLBs) distribute traffic to port 6443
+> 3. How API Server `/livez` and `/readyz` health endpoints validate control plane subsystems
+> 4. How the Kubernetes `Leases` API (`coordination.k8s.io/v1`) prevents split-brain race conditions
+> 5. The exact timing sequence of leader failover (`leaseDuration`, `renewDeadline`, `retryPeriod`)
+> 6. How to inspect and troubleshoot active leader locks using `kubectl get leases`
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes control plane concurrency as **a corporate bank branch with multiple customer service teller windows but only one head vault manager**:
+
+- **The Active-Active Tellers (`kube-apiserver`):** The bank lobby has 3 teller windows open at the front desk (**3 API Server Replicas**). Any customer (**`kubectl` client, Kubelet, or Controller**) can walk up to Window 1, Window 2, or Window 3. Because all tellers read and write from the exact same central computer database (**`etcd`**), it doesn't matter which teller you talk to (**Stateless Active-Active Load Balancing**).
+- **The Customer Line Organizer (The Layer 4 Load Balancer - HAProxy / Cloud NLB):** A stanchion queue at the entrance directs incoming customers to whichever teller is currently free.
+- **The Active-Passive Vault Manager (`kube-controller-manager` & `kube-scheduler`):** There are 3 certified accountants in the back office, but **only ONE person is allowed to hold the physical golden vault key at a time (**Active-Passive Leader Election**). If two accountants tried to dispense cash or approve loans simultaneously without talking, the bank's books would experience catastrophic race conditions (**Split-Brain Disasters**).
+- **The Digital Stopwatch Lease (`coordination.k8s.io` `Lease`):** The active accountant holds a digital timer badge (**The Leader Lease**). Every 10 seconds, they press the button to extend their shift by 15 seconds (**`renewDeadlineSeconds: 10s`**). If the active accountant faints (**Process Crash**), the timer counts down to zero (**`leaseDurationSeconds: 15s`**), and a standby accountant instantly picks up the badge and assumes command (**Leader Failover**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Control Plane Concurrency & Leader Election Architecture
+
+ CLIENTS (`kubectl`, Kubelets, Prometheus)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HTTPS Requests: `https://k8s-api.internal:6443`                        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ TCP Port 6443
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LAYER 4 TCP LOAD BALANCER (Cloud NLB / HAProxy + Keepalived VIP)       │
+ │ Health Probes: `GET https://<node_ip>:6443/readyz`                     │
+ └──────┬───────────────────────────┬───────────────────────────┬─────────┘
+        │ (Active-Active Round Robin)│                           │
+        ▼                           ▼                           ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ kube-apiserver #1      │  │ kube-apiserver #2      │  │ kube-apiserver #3      │
+ │ (Stateless Front-Proxy)│  │ (Stateless Front-Proxy)│  │ (Stateless Front-Proxy)│
+ └──────────┬─────────────┘  └───────────┬────────────┘  └───────────┬────────────┘
+            │                            │                           │
+            └────────────────────────────┼───────────────────────────┘
+                                         ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ETCD DATABASE CLUSTER (Persistent State & Coordination Storage)        │
+ │ Key: `/registry/leases/kube-system/kube-controller-manager`            │
+ └──────────────────────────────────▲─────────────────────────────────────┘
+                                    │
+                                    │ Contends for Leader Lease Lock
+                                    │
+ ┌────────────────────────┐  ┌──────┴─────────────────┐  ┌────────────────────────┐
+ │ Controller Manager #1  │  │ Controller Manager #2  │  │ Controller Manager #3  │
+ │ (STANDBY / FOLLOWER)   │  │ (ACTIVE LEADER HOLDER) │  │ (STANDBY / FOLLOWER)   │
+ │ Sleep / Polling Lease  │  │ Executes Control Loops │  │ Sleep / Polling Lease  │
+ └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
+```
+
+---
+
+## Active-Active vs Active-Passive Concurrency Matrix
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Component                 │ Concurrency Architecture        │ Why This Model is Required      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kube-apiserver`**      │ **Active-Active (Stateless)**   │ The API server holds no in-memory│
+ │                           │ All instances serve live traffic│ state; it validates, serializes,│
+ │                           │ concurrently behind a TCP LB.   │ and writes directly to `etcd`.  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kube-controller-**     │ **Active-Passive (Leader)**     │ Manages control loops (Node,    │
+ │ **manager`**              │ 1 Active Leader runs loops;     │ ReplicaSet, Endpoints). Multiple│
+ │                           │ 2 Standbys wait for failover.   │ leaders would fight each other! │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`kube-scheduler`**      │ **Active-Passive (Leader)**     │ Evaluates cluster node capacity.│
+ │                           │ 1 Active Leader assigns pods;   │ Multiple schedulers would double│
+ │                           │ 2 Standbys wait for failover.   │ assign the same node resources! │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## API Server Health Check Endpoints: `/livez` vs `/readyz`
+
+Kubernetes 1.16+ replaced `/healthz` with specialized fine-grained health endpoints:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Endpoint             │ Internal Checks & Load Balancer Action                                      │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`/livez`**         │ Verifies that the `kube-apiserver` process is alive and not deadlocked.     │
+ │                      │ Used by Kubelet static pod liveness probes to trigger process restarts.     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`/readyz`**        │ Verifies that **all backend dependencies are healthy** (etcd connection,    │
+ │                      │ post-start hooks, admission plugins). **Used by the External Load Balancer** │
+ │                      │ to remove unready API server nodes from active routing tables!              │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# Query individual subsystem health via readyz query parameters:
+curl -k -s "https://127.0.0.1:6443/readyz?verbose"
+# Returns:
+# [+]ping ok
+# [+]log ok
+# [+]etcd ok
+# [+]poststarthook/start-kube-apiserver-admission-initializer ok
+# readyz check passed
+```
+
+---
+
+## The Kubernetes `Leases` API (`coordination.k8s.io/v1`)
+
+Modern Kubernetes clusters manage leader locks using the lightweight `coordination.k8s.io` `Lease` object:
+
+```yaml
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: kube-controller-manager
+  namespace: kube-system
+spec:
+  holderIdentity: "k8s-master-02_a1b2c3d4-5678" # Current Active Leader ID
+  leaseDurationSeconds: 15                     # Total lease validity duration
+  acquireTime: "2026-08-18T10:00:00.000000Z"
+  renewTime: "2026-08-18T12:00:10.000000Z"   # Refreshed every 10 seconds!
+  leaseTransitions: 3                          # Total times leadership transferred
+```
+
+---
+
+## Leader Election Timing & Failover Sequence
+
+Configured in `kube-controller-manager` and `kube-scheduler` flags:
+
+```text
+ ┌──────────────────────────────────┬─────────┬───────────────────────────────────────────────────────┐
+ │ Parameter Flag                   │ Default │ Operational Meaning                                   │
+ │──────────────────────────────────┼─────────┼───────────────────────────────────────────────────────┤
+ │ `--leader-elect-lease-duration`  │ `15s`   │ Duration the leader holds the lock before expiration. │
+ │ `--leader-elect-renew-deadline`  │ `10s`   │ Maximum time the active leader has to refresh lease.  │
+ │ `--leader-elect-retry-period`    │ `2s`    │ Sleep interval between renewal attempts by standbys.  │
+ └──────────────────────────────────┴─────────┴───────────────────────────────────────────────────────┘
+```
+
+```text
+ Leader Failover Timeline (Worst-Case ~15-20 Seconds):
+ T = 00s: Master 02 (Active Leader) crashes due to kernel panic.
+ T = 10s: Master 02 fails to send its scheduled renew heartbeat.
+ T = 15s: The `Lease` object expires in etcd (Current Time > renewTime + 15s).
+ T = 17s: Master 01 (Standby) executes its 2-second retry check, detects the expired lease, 
+          updates `holderIdentity` to itself, and immediately starts all controller loops!
+```
+
+---
+
+## Complete HAProxy Configuration for API Server Load Balancing
+
+`/etc/haproxy/haproxy.cfg`:
+
+```haproxy
+frontend k8s-api-frontend
+    bind *:6443
+    mode tcp
+    option tcplog
+    default_backend k8s-api-backend
+
+backend k8s-api-backend
+    mode tcp
+    option tcp-check
+    balance roundrobin
+    # Health checks over HTTPS using the /readyz endpoint!
+    server master01 192.168.1.11:6443 check check-ssl verify none inter 3s fall 2 rise 2
+    server master02 192.168.1.12:6443 check check-ssl verify none inter 3s fall 2 rise 2
+    server master03 192.168.1.13:6443 check check-ssl verify none inter 3s fall 2 rise 2
+```
+
+---
+
+## Hands-On Lab: Inspecting Active Leader Leases
+
+```bash
+# Step 1: Query all leader election Leases in the kube-system namespace
+kubectl get leases -n kube-system
+
+# Step 2: Identify the current active leader for kube-controller-manager
+kubectl get lease kube-controller-manager -n kube-system -o jsonpath='{.spec.holderIdentity}'
+echo ""
+
+# Step 3: Identify the current active leader for kube-scheduler
+kubectl get lease kube-scheduler -n kube-system -o jsonpath='{.spec.holderIdentity}'
+echo ""
+
+# Step 4: Test the live /readyz endpoint on the API server
+kubectl get --raw "/readyz?verbose"
+
+# Step 5: Track lease transition count for the controller manager
+kubectl get lease kube-controller-manager -n kube-system -o jsonpath='{.spec.leaseTransitions}'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is `kube-apiserver` deployed in an Active-Active model while `kube-controller-manager` requires an Active-Passive model?**
+
+- `kube-apiserver` is completely **stateless**. It acts as a transactional reverse-proxy that authenticates, authorizes, and persists data into `etcd`. Any number of API servers can execute read and write transactions in parallel without conflict because `etcd` enforces atomic serializability.
+- `kube-controller-manager` executes **stateful asynchronous reconciliation loops** (e.g. creating pods for ReplicaSets, assigning IPs for Services). If two controller managers ran concurrently, both would observe the same state delta and execute duplicate actions (such as spinning up twice as many pods), causing severe split-brain race conditions.
+
+**Q2: What is the difference between `/livez` and `/readyz` health endpoints on the API server?**
+
+- **`/livez` (Liveness)**: Verifies strictly that the `kube-apiserver` process is alive, running, and has not deadlocked. It is used by Kubelet to restart a hung container.
+- **`/readyz` (Readiness)**: Performs comprehensive health evaluations across all critical backend dependencies (verifying etcd quorum connectivity, authorization webhooks, and post-start hooks). If etcd connectivity drops on a specific master node, `/readyz` returns `500 Internal Server Error`, prompting the external load balancer to immediately stop routing client traffic to that node.
+
+**Q3: How does the Kubernetes `Leases` API (`coordination.k8s.io/v1`) work for leader election?**
+
+The active controller acquires leadership by writing its identity (e.g. `k8s-master-01`) into a `Lease` object in `kube-system`. It maintains leadership by continuously updating the `renewTime` timestamp before the `renewDeadlineSeconds` (default: 10s) expires. Standby controllers periodically poll the Lease every `retryPeriodSeconds` (default: 2s). If the active leader crashes and the lease exceeds `leaseDurationSeconds` (default: 15s), the standby controller overwrites `holderIdentity` with its own name and assumes active execution.
+
+**Q4: Why should Kubernetes API Server load balancers operate at Layer 4 (TCP) rather than Layer 7 (HTTP)?**
+
+The Kubernetes API uses long-lived persistent HTTPS connections, HTTP/2 multiplexing, and bidirectional WebSockets / SPDY streaming (for `kubectl exec`, `kubectl port-forward`, and `watch` API streams). Terminating TLS at a Layer 7 proxy requires complex mTLS certificate re-encryption, breaks client certificate authentication (`X.509` user certs), and adds latency. Layer 4 TCP pass-through load balancing preserves raw TLS streams directly from client to API server.
+
+**Q5: What happens if an active Controller Manager experiences a network partition and cannot renew its Lease?**
+
+If an active Controller Manager is cut off from the network, it cannot send its renewal heartbeat to `etcd`. Once `renewDeadlineSeconds` (10s) passes without a successful heartbeat, the partitioned controller **must step down and immediately stop executing all control loops** to prevent split-brain. Meanwhile, standby controllers observe the expired lease after 15s and elect a new leader.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `kube-apiserver` runs Active-Active while controllers run Active-Passive
+- [ ] Know why controllers require Leader Election to prevent split-brain race conditions
+- [ ] Know that Layer 4 TCP load balancers route port 6443 with `/readyz` health checks
+- [ ] Know the difference between `/livez` (process alive) and `/readyz` (etcd ready)
+- [ ] Know the `Lease` timing parameters: `leaseDuration` (15s), `renewDeadline` (10s), `retryPeriod` (2s)
+- [ ] Can view active control plane leaders using `kubectl get leases -n kube-system`

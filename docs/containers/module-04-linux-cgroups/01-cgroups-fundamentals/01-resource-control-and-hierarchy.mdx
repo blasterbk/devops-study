@@ -1,0 +1,174 @@
+---
+title: "Chapter 1 — Linux cgroups Fundamentals & Hierarchy"
+sidebar_position: 1
+module: "Module 4.1 — cgroups Fundamentals"
+description: "Master Linux cgroups fundamentals — resource limiting, accounting, parent-child directory hierarchy in /sys/fs/cgroup/, and core subsystem controllers."
+---
+
+# Chapter 1 — Linux cgroups Fundamentals & Hierarchy
+
+> **Goal:** Master the kernel mechanics, directory hierarchies, and resource accounting architectures of **Linux Control Groups (cgroups)** — understanding how cgroups regulate **CPU, Memory, I/O, and PID allocations**, navigating the pseudo-filesystem interface in **`/sys/fs/cgroup/`**, analyzing **parent-child inheritance rules**, and moving processes between control groups via **`cgroup.procs`**.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4 core responsibilities of cgroups: Limiting, Prioritizing, Accounting, and Control
+> 2. How the `/sys/fs/cgroup/` filesystem maps directory trees to kernel resource controllers
+> 3. How parent cgroup limits strictly constrain child cgroups
+> 4. How writing a PID into `cgroup.procs` instantly applies resource boundaries
+> 5. The roles of the primary kernel controllers: `cpu`, `memory`, `io`, `pids`, and `cpuset`
+> 6. How to create and enforce a manual cgroup from scratch using bash commands
+
+---
+
+## Real-Life Analogy
+
+Think of Linux cgroups as **the smart utility metering and automated circuit breaker system in a multi-tenant commercial office skyscraper**:
+
+- **1. The Noisy Neighbor Threat (Without cgroups):**
+  - Tenant A in Suite 300 decides to install 50 heavy cryptocurrency mining computers (**A runaway infinite CPU loop or memory leak**).
+  - Without circuit breakers, Tenant A pulls 100% of the skyscraper's electrical grid (**CPU exhaustion**) and drains all municipal water (**RAM exhaustion**).
+  - The elevators stop working, the air conditioning dies, and the entire skyscraper collapses into an outage (**The entire Linux host node crashes**)!
+- **2. The Smart Sub-Meter & Circuit Breaker (With cgroups):**
+  - The building manager creates a sub-meter panel for Suite 300 (**A cgroup in `/sys/fs/cgroup/suite300/`**).
+  - The manager sets strict limits:
+    - *"Maximum Electricity: 50 Amps (**`cpu.max`**)"*
+    - *"Maximum Water: 500 Gallons (**`memory.max`**)"*
+    - *"Maximum Door Access Badges: 20 People (**`pids.max`**)"*.
+  - When Tenant A exceeds 500 gallons of water, the automated valve trips and terminates Tenant A's leak (**The OOM-Killer**), while the other 99 tenants in the building never experience a single flicker of light!
+
+---
+
+## Architecture Diagram
+
+```text
+               Linux cgroups Virtual Filesystem Hierarchy in `/sys/fs/cgroup/`
+
+ ROOT CGROUP DIRECTORY (`/sys/fs/cgroup/` - Total Host Hardware: 128GB RAM / 32 CPUs)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Root Controllers Enabled: `cpu memory io pids cpuset`                  │
+ └──────┬───────────────────────────────────────────────────────────┬─────┘
+        │ Subtree Control Delegation                                │
+        ▼                                                           ▼
+ SYSTEM SLICE (`system.slice/`)                              DOCKER SLICE (`docker.slice/`)
+ ┌──────────────────────────┐                                ┌────────────────────────────┐
+ │ Limit: 16GB RAM / 4 CPUs │                                │ Limit: 96GB RAM / 24 CPUs  │
+ ├──────────────────────────┤                                ├────────────────────────────┤
+ │ ├── `systemd-journald`   │                                │ ├── `container-web-app/`   │
+ │ ├── `sshd.service`       │                                │ │   ├── `memory.max: 2Gi`  │
+ │ └── `kubelet.service`    │                                │ │   └── `cgroup.procs`     │
+ └──────────────────────────┘                                │ └── `container-db-app/`    │
+                                                             │     └── `memory.max: 16Gi` │
+                                                             └────────────────────────────┘
+```
+
+---
+
+## The 4 Core Responsibilities of cgroups
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+ │ cgroup Responsibility     │ Linux Kernel Implementation & Behavioral Outcome                        │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **1. Resource Limiting**  │ Enforces hard ceilings (e.g. `memory.max: 4Gi`) and throttles CPU       │
+ │                           │ bandwidth via Completely Fair Scheduler (CFS) quotas (`cpu.max`).       │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **2. Prioritization**     │ Allocates proportional shares and weights (e.g. `cpu.weight: 100` vs    │
+ │                           │ `cpu.weight: 500`) during periods of high hardware contention.          │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **3. Accounting & Stats** │ Meters byte-level resource consumption (`memory.current`, `cpu.stat`,   │
+ │                           │ `io.stat`) and tracks Pressure Stall Information (PSI).                 │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **4. Process Control**    │ Freezes, suspends, checkpoints, or terminates an entire tree of         │
+ │                           │ processes simultaneously via the `cgroup.freeze` interface.             │
+ └───────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Core Subsystem Controllers
+
+```text
+ ┌──────────────────┬─────────────────────────────────────────────────────────────────────────────────┐
+ │ Controller Name  │ Kernel Subsystem & Management Scope                                             │
+ │──────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+ │ **`cpu`**        │ CPU time bandwidth quotas (CFS), proportional shares, and burst capacity.       │
+ │ **`memory`**     │ User memory, page cache, swap limits, and Out-of-Memory (OOM) killer triggers.  │
+ │ **`io`**         │ Block I/O read/write throttling (IOPS and byte bandwidth) and proportional I/O. │
+ │ **`pids`**       │ Maximum number of processes/threads allowed to prevent fork bombs.              │
+ │ **`cpuset`**     │ Pinning processes to specific physical CPU cores and NUMA memory nodes.        │
+ │ **`hugetlb`**    │ Managing allocations of HugeTLB memory pages (2MB / 1GB pages).                 │
+ │ **`rdma`**       │ Limiting Remote Direct Memory Access (InfiniBand/RoCE) resources.               │
+ └──────────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Parent-Child Inheritance & Delegation Rules
+
+1. **Strict Ceiling Rule**: A child cgroup can **never** exceed the resource limits of its parent cgroup. If `/sys/fs/cgroup/parent` has `memory.max: 10Gi`, a child `/sys/fs/cgroup/parent/child` with `memory.max: 20Gi` will still be OOM-killed at 10GB.
+2. **Subtree Control**: In cgroups v2, a parent must explicitly delegate controllers to child directories by writing to **`cgroup.subtree_control`** (e.g. `echo "+cpu +memory" > cgroup.subtree_control`).
+3. **No Internal Processes Rule (cgroups v2)**: A parent cgroup cannot contain processes if it has child cgroups with enabled controllers. Processes must reside in leaf nodes!
+
+---
+
+## Hands-On Lab: Creating and Testing a Manual cgroup
+
+```bash
+# Step 1: Create a new cgroup directory under /sys/fs/cgroup/
+sudo mkdir -p /sys/fs/cgroup/demo-sandbox
+
+# Step 2: Set a memory limit of 50 Megabytes
+echo "52428800" | sudo tee /sys/fs/cgroup/demo-sandbox/memory.max > /dev/null
+
+# Step 3: Disable swap for this test
+echo "0" | sudo tee /sys/fs/cgroup/demo-sandbox/memory.swap.max > /dev/null
+
+# Step 4: Set a maximum process limit of 5 PIDs (Fork-bomb protection)
+echo "5" | sudo tee /sys/fs/cgroup/demo-sandbox/pids.max > /dev/null
+
+# Step 5: Add our current subshell process to the cgroup!
+echo $$ | sudo tee /sys/fs/cgroup/demo-sandbox/cgroup.procs > /dev/null
+
+# Step 6: Verify current memory consumption tracked by kernel
+cat /sys/fs/cgroup/demo-sandbox/memory.current
+
+# Cleanup (Remove directory after processes exit)
+# sudo rmdir /sys/fs/cgroup/demo-sandbox
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are Linux Control Groups (cgroups), and what problem do they solve in containerization?**
+
+Linux Control Groups (cgroups) are a kernel feature that meters, limits, prioritizes, and isolates the physical hardware resource consumption (CPU cores, RAM memory, disk I/O bandwidth, network priority, and PID counts) of a collection of processes. Without cgroups, any single container process could trigger an infinite memory allocation or consume 100% of host CPU time, starving all other co-located containers and crashing the physical host node (the "Noisy Neighbor" problem).
+
+**Q2: How does the `/sys/fs/cgroup/` filesystem interface work?**
+
+cgroups are exposed to user space as a **pseudo-filesystem (VFS)** mounted at `/sys/fs/cgroup/`. Managing cgroups requires no special binaries or APIs; it is manipulated using standard filesystem operations:
+- Creating a new directory (`mkdir /sys/fs/cgroup/my-group`) instructs the kernel to create a new control group.
+- Writing values to control files (`echo "500M" > memory.max`) sets resource boundaries.
+- Writing a Process ID to `cgroup.procs` (`echo 48921 > cgroup.procs`) instantly moves that process and all its threads into the control group.
+
+**Q3: How does the `pids` controller protect a Linux host from "Fork Bombs"?**
+
+A "Fork Bomb" (`:(){ :|:& };:`) is a malicious script that recursively spawns endless child processes, rapidly consuming all available entries in the Linux kernel PID table and locking up the host operating system. The **`pids` cgroup controller** limits the maximum number of processes/threads that can exist within a cgroup (`pids.max: 100`). If a process in the container attempts to spawn the 101st process, the `fork()` or `clone()` system call immediately fails with **`EAGAIN` (Resource temporarily unavailable)**, preventing host exhaustion.
+
+**Q4: What is the "No Internal Processes" rule in cgroups v2?**
+
+In cgroups v2, a non-root cgroup directory **cannot contain running processes if it has child cgroups that have controllers enabled in `cgroup.subtree_control`**. In other words, processes can only reside in **leaf cgroups**. This rule eliminates the ambiguity present in cgroups v1 where parent and child processes competed for resources under unclear accounting rules, ensuring clean hierarchical resource budgeting.
+
+**Q5: What happens when a parent cgroup and a child cgroup have conflicting resource limits?**
+
+The **most restrictive limit in the hierarchy is always enforced**. If a parent cgroup has `memory.max: 4Gi` and its child cgroup has `memory.max: 8Gi`, the child is physically restricted to 4GB by the parent. Conversely, if the parent has `memory.max: 8Gi` and the child has `memory.max: 2Gi`, the child is restricted to 2GB. A child can never consume resources beyond the capacity of any ancestor along its hierarchy path.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that cgroups limit, prioritize, account, and control hardware resources
+- [ ] Know that cgroups are managed as a virtual filesystem in `/sys/fs/cgroup/`
+- [ ] Know that writing a PID to `cgroup.procs` moves the process into the group
+- [ ] Know that child cgroups can never exceed parent cgroup boundaries
+- [ ] Know that the `pids` controller stops fork bombs via `pids.max`
+- [ ] Can create a custom cgroup using `mkdir /sys/fs/cgroup/<name>`

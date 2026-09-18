@@ -1,0 +1,171 @@
+---
+title: "Chapter 1 — CNI & Pod Networking: Network Namespaces, veth Pairs, IPAM & Linux Bridge"
+sidebar_position: 1
+module: "Module 18.1 — CNI & Pod Networking"
+description: "Master the low-level Linux networking plumbing powering Kubernetes Pods — Linux Network Namespaces (`netns`), virtual ethernet (`veth`) pairs, CNI plugin specification (ADD/DEL/CHECK), and IPAM plugins."
+---
+
+# Chapter 1 — CNI & Pod Networking: Network Namespaces, veth Pairs, IPAM & Linux Bridge
+
+> **Goal:** Master the low-level Linux kernel plumbing that gives every Kubernetes Pod its own dedicated IP address and network stack. Understand the **Container Network Interface (CNI)** specification (RFC-style API verbs: `ADD`, `DEL`, `CHECK`, `VERSION`), how container runtimes (`containerd` / CRI-O) invoke CNI plugins via JSON stdin, virtual ethernet (`veth`) pair creation, network namespace isolation (`ip netns`), and IP Address Management (IPAM: `host-local` vs `dhcp`).
+>
+> By the end of this chapter, you will understand:
+> 1. The 4 Fundamental Kubernetes Networking Invariants:
+>    - Every Pod gets its own unique IP address
+>    - Pods on a node can communicate with all Pods on all nodes without NAT
+>    - Agents on a node (kubelet) can communicate with all Pods on that node
+>    - Pods in the host network of a node can communicate with all Pods on all nodes
+> 2. The CNI Plugin Lifecycle: JSON configuration files (`/etc/cni/net.d/`), CNI environment variables (`CNI_COMMAND`, `CNI_CONTAINERID`, `CNI_NETNS`), and binary execution (`/opt/cni/bin/`)
+> 3. Linux Kernel plumbing: `veth` pair creation, moving one end into the container namespace, and attaching the other end to a bridge or eBPF hook
+> 4. CNI IPAM Plugins: `host-local` (allocating from a local `/24` subnet file) vs cloud-native IPAM
+> 5. CNI Plugin Chaining (e.g. `bridge` + `portmap` + `firewall` + `tuning`)
+> 6. CLI diagnostic walkthrough using `ip netns`, `bridge link`, and manual CNI invocation scripts
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes Pod networking plumbing as **plumbing a private telephone extension into a newly constructed hotel room**:
+
+- **The Linux Network Namespace (`netns` - The Private Hotel Room):**
+  - An isolated soundproof room with its own private walls, socket outlets, and routing table.
+- **The `veth` Pair (The Dual-Ended Telephone Cable):**
+  - A specialized physical cable with two ends:
+    - **End A (`eth0`):** Plugged directly into the phone on the hotel room desk.
+    - **End B (`vethxxxx`):** Pulled through the wall into the building's central utility closet (**Host Network Namespace**).
+- **The CNI Plugin (The Certified Electrician):**
+  - When a guest checks in (**Pod is scheduled**), the manager (**kubelet / containerd**) calls the electrician (**CNI Plugin**).
+  - The electrician runs the cable (**`veth` pair**), assigns an extension number from their clipboard ledger (**IPAM**), tests the dial tone (**`CNI_COMMAND=ADD`**), and hands the working phone to the guest.
+
+---
+
+## Architecture Diagram
+
+```text
+                  Low-Level Linux Kernel Pod Network Plumbing
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES WORKER NODE (Host Network Namespace: `eth0` IP: 192.168.1.10)    │
+ │                                                                             │
+ │ ┌─────────────────────────────────────────────────────────────────────────┐ │
+ │ │ POD NETWORK NAMESPACE (`netns: /var/run/netns/cni-xxxx`)                │ │
+ │ │ - IP: 10.244.1.15/24, Default Route: 10.244.1.1                         │ │
+ │ │ - Interface: `eth0` (MAC: 52:54:00:11:22:33)                            │ │
+ │ └────────────────────────────────────▲────────────────────────────────────┘ │
+ │                                      │                                      │
+ │                                      │ Virtual Ethernet Pair (`veth`)       │
+ │                                      │ (Kernel Pipe)                        │
+ │                                      ▼                                      │
+ │ ┌─────────────────────────────────────────────────────────────────────────┐ │
+ │ │ HOST NETWORK INTERFACES & FORWARDING:                                   │ │
+ │ │                                                                         │ │
+ │ │   [veth4892bc] ──┐                                                      │ │
+ │ │   [veth1904aa] ──┼──► [Linux Bridge: cbr0 / cni0] ──► [Physical eth0]   │ │
+ │ │                  │    (IP: 10.244.1.1/24)                               │ │
+ │ └──────────────────┴──────────────────────────────────────────────────────┘ │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The CNI Plugin Specification Interface
+
+When `kubelet` and `containerd` create a Pod sandbox:
+1. They create a network namespace (`/var/run/netns/...`).
+2. They execute the CNI binary (e.g. `/opt/cni/bin/bridge` or `/opt/cni/bin/calico`) with environment variables:
+
+```bash
+CNI_COMMAND=ADD \
+CNI_CONTAINERID=d9482104bf \
+CNI_NETNS=/proc/12450/ns/net \
+CNI_IFNAME=eth0 \
+CNI_PATH=/opt/cni/bin \
+/opt/cni/bin/calico < /etc/cni/net.d/10-calico.conflist
+```
+
+---
+
+### 2. Manual Step-by-Step Linux Kernel Plumbing (What CNI Does)
+
+```bash
+# Step 1: Create a network namespace for the container
+ip netns add container_ns1
+
+# Step 2: Create a virtual ethernet pair (veth-host and veth-guest)
+ip link add veth-host type veth peer name veth-guest
+
+# Step 3: Move veth-guest into the container's network namespace as eth0
+ip link set veth-guest netns container_ns1 name eth0
+
+# Step 4: Configure IP and default route inside the container namespace
+ip netns exec container_ns1 ip addr add 10.244.1.15/24 dev eth0
+ip netns exec container_ns1 ip link set eth0 up
+ip netns exec container_ns1 ip link set lo up
+ip netns exec container_ns1 ip route add default via 10.244.1.1
+
+# Step 5: Attach veth-host to the Linux bridge on the host
+ip link set veth-host master cni0
+ip link set veth-host up
+```
+
+---
+
+## Hands-On Lab: Inspecting CNI Configurations & Pod Namespaces
+
+```bash
+# Step 1: Inspect CNI configuration files on the Kubernetes node
+cat /etc/cni/net.d/*.conf* 2>/dev/null || cat /etc/cni/net.d/*.json 2>/dev/null
+
+# Step 2: List all installed CNI plugin binaries in /opt/cni/bin
+ls -la /opt/cni/bin/
+
+# Step 3: Inspect active veth interfaces on the host attached to container bridges
+ip -d link show type veth 2>/dev/null | head -n 15
+
+# Step 4: Inspect local CNI IPAM allocation records (host-local plugin)
+ls -la /var/lib/cni/networks/ 2>/dev/null || true
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the 4 fundamental networking invariants required by the Kubernetes specification?**
+
+1. All Pods can communicate with all other Pods on any node **without Network Address Translation (NAT)**.
+2. All agents on a node (e.g. `kubelet`) can communicate with all Pods on that same node.
+3. Pods in the host network of a node can communicate with all Pods on all nodes without NAT.
+4. Every Pod receives its own **unique, routable IP address** that other Pods can see and communicate with directly.
+
+**Q2: What happens when a CNI plugin returns an error during the `CNI_COMMAND=ADD` invocation?**
+
+If the CNI binary fails (e.g., local IPAM pool exhausted or veth interface creation failed), the container runtime (`containerd` / CRI-O) aborts Pod sandbox creation. The Pod remains stuck in the **`ContainerCreating`** or **`Pending`** state, and `kubectl describe pod` displays an event: `FailedCreatePodSandBox: Failed to allocate IP address / NetworkPlugin cni failed`.
+
+**Q3: How does CNI Plugin Chaining work in a `.conflist` file?**
+
+A CNI configuration list (`.conflist`) allows executing multiple CNI binaries sequentially in a pipeline. For example:
+1. **Main Plugin (`bridge` / `calico`):** Creates the `veth` pair and plumbs the IP.
+2. **`portmap` Plugin:** Configures `iptables` rules on the host to handle `hostPort` mappings.
+3. **`tuning` Plugin:** Adjusts MTU and sysctl parameters inside the Pod namespace.
+4. **`firewall` Plugin:** Injects ingress/egress firewall rules.
+
+**Q4: What is the difference between `host-local` IPAM and cloud-native VPC IPAM (like AWS VPC CNI)?**
+
+- **`host-local`:** The cluster allocates a static `/24` subnet slice to each node. The node manages Pod IPs locally via flat files in `/var/lib/cni/networks/`. Pod IPs are overlay IPs and not directly routable from outside the cluster VPC.
+- **AWS VPC CNI:** Calls the AWS EC2 API to attach real Elastic Network Interfaces (ENIs) and real VPC private IPs directly to Pods, making Pods natively routable across the entire corporate AWS VPC and Direct Connect.
+
+**Q5: Why do two containers inside the SAME Pod share the exact same IP address and `localhost`?**
+
+During Pod startup, the container runtime creates an initial lightweight pause container (**Pod Sandbox**) with its own dedicated Linux Network Namespace (`netns`). All subsequent application containers in that Pod join the **exact same network namespace** (using `setns()` / `--net=container:sandbox_id`). They share the same `eth0` IP, loopback adapter (`127.0.0.1`), and port space, allowing inter-container IPC via `localhost`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Memorize the 4 Kubernetes networking invariants
+- [ ] Understand CNI environment variables (`CNI_COMMAND=ADD/DEL`, `CNI_NETNS`)
+- [ ] Master manual `veth` pair plumbing into network namespaces
+- [ ] Understand `host-local` vs cloud-native VPC IPAM
+- [ ] Explain why containers in the same Pod share `localhost` and `eth0`

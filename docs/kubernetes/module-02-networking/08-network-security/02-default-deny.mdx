@@ -1,0 +1,383 @@
+---
+title: "Chapter 2 — Default Deny"
+sidebar_position: 2
+module: "Module 2.8 — Network Security"
+description: "Deep dive into default-deny NetworkPolicy patterns — implementing cluster-wide zero-trust networking with default deny-all policies, the namespace isolation pattern, and how to progressively open traffic without creating security holes."
+---
+
+# Chapter 2 — Default Deny
+
+> **Goal:** Understand how to implement zero-trust networking in Kubernetes using default-deny NetworkPolicies, how to structure namespace-level isolation, and how to progressively open only necessary traffic paths while maintaining a strong security baseline.
+>
+> By the end of this chapter, you will understand:
+> 1. Why default-allow is a security risk in shared clusters
+> 2. The default-deny-all ingress pattern and how to apply it
+> 3. The default-deny-all egress pattern with mandatory DNS exception
+> 4. Namespace-level isolation — no cross-namespace traffic by default
+> 5. Allowlist patterns — opening specific traffic paths explicitly
+> 6. How to audit existing network policies for security gaps
+
+---
+
+## Real-Life Analogy
+
+Default-allow networking is like a **hospital with open ward access**: anyone can walk into any room, read any chart, and talk to any patient. Convenient — but a serious privacy and security violation.
+
+Default-deny networking is like a **hospital with badge-access**: every door is locked. Staff are given specific badge permissions for only the rooms they need. A nurse for Ward A has no access to Ward B unless explicitly granted.
+
+Implementing default-deny in Kubernetes is like **installing the badge system**: first, lock all doors (default-deny policy). Then, explicitly grant access for each legitimate path (allow policies). If you forget a legitimate path — a Pod can't communicate, which is visible and fixable. If you forget to deny a malicious path — you may never know until breached.
+
+---
+
+## Architecture Diagram
+
+```text
+              Default Deny — Layered Security Model
+
+  Without default-deny:         With default-deny:
+  ┌────────────────────┐        ┌────────────────────┐
+  │ Namespace: prod    │        │ Namespace: prod    │
+  │                    │        │  [deny-all-ingress]│
+  │ Pod A ←──────── Pod C │   │ Pod A  ← BLOCKED ← Pod C│
+  │ Pod B ←──────── Pod D │   │ Pod B  ← BLOCKED ← Pod D│
+  │  (all cross-pod    │        │                    │
+  │   traffic allowed) │        │ [allow-api-to-db]  │
+  └────────────────────┘        │ Pod-api ──→ Pod-db │
+                                │ (only this is open)│
+                                └────────────────────┘
+```
+
+---
+
+## Default Deny Ingress
+
+The simplest default-deny policy — denies ALL incoming traffic to all Pods in the namespace:
+
+```yaml
+# Apply to every namespace that needs isolation
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {}       # Empty selector = matches ALL Pods in namespace
+  policyTypes:
+  - Ingress
+  # No ingress rules = deny all ingress
+```
+
+After applying this:
+- All Pods in `production` have ingress blocked by default
+- Still need to add explicit allow policies for legitimate traffic
+
+---
+
+## Default Deny Egress
+
+Denies ALL outgoing traffic from all Pods in the namespace:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  # No egress rules = deny all egress
+```
+
+> [!WARNING]
+> Applying default-deny egress **immediately breaks DNS** for all Pods. Before applying egress deny, you must have DNS allow policies ready, or apply them simultaneously.
+
+---
+
+## Combined Default Deny (Ingress + Egress)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  # Both policyTypes with no rules = deny everything
+```
+
+---
+
+## The Mandatory DNS Exception
+
+**Always** add a DNS allow policy when applying egress deny:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: production
+spec:
+  podSelector: {}      # All Pods in namespace
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS to CoreDNS in kube-system
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Also allow DNS to NodeLocal DNSCache (if deployed)
+  - to:
+    - ipBlock:
+        cidr: 169.254.20.10/32  # Link-local NodeLocal DNSCache IP
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+```
+
+---
+
+## Namespace Isolation Pattern
+
+Prevent all cross-namespace traffic while allowing intra-namespace traffic:
+
+```yaml
+# Step 1: Block all ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+---
+# Step 2: Allow intra-namespace traffic (within production only)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector: {}     # Empty podSelector = all Pods in THIS namespace
+    # (Note: no namespaceSelector means "current namespace only")
+```
+
+This creates isolated namespace "islands" — Pods within `production` can talk to each other, but no cross-namespace traffic is allowed.
+
+---
+
+## Allowlist Pattern: Progressive Opening
+
+Once default-deny is in place, explicitly allow specific traffic paths:
+
+```yaml
+# Allow monitoring namespace to scrape metrics from all Pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scraping
+  namespace: production
+spec:
+  podSelector: {}          # All production Pods can be scraped
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090     # Prometheus metrics port
+    - protocol: TCP
+      port: 8080     # Some apps expose metrics here
+---
+# Allow specific app-to-db traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-to-postgres
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: api
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+# Allow Ingress Controller to reach backend Pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+---
+
+## Applying Default Deny Across All Namespaces
+
+Use a script to apply default-deny to every namespace (except system namespaces):
+
+```bash
+#!/bin/bash
+EXCLUDE_NAMESPACES="kube-system kube-public kube-node-lease"
+
+for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
+  # Skip system namespaces
+  if echo "$EXCLUDE_NAMESPACES" | grep -qw "$ns"; then
+    echo "Skipping $ns"
+    continue
+  fi
+  
+  echo "Applying default-deny to namespace: $ns"
+  kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: $ns
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: $ns
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+EOF
+done
+```
+
+---
+
+## Auditing Network Policy Coverage
+
+```bash
+# 1. Find Pods NOT covered by any NetworkPolicy (default-allow = security risk)
+# List all Pods, then check which ones match no NetworkPolicy podSelector
+kubectl get networkpolicies -n production -o json | \
+  jq '.items[].spec.podSelector.matchLabels'
+
+# 2. Check if default-deny exists for a namespace
+kubectl get networkpolicy default-deny-all -n production
+
+# 3. Use network policy visualization tools
+# Install netpol-vis:
+kubectl apply -f https://raw.githubusercontent.com/ahmetb/kubernetes-network-policy-recipes/master/...
+
+# Or use Cilium's policy map:
+kubectl exec -n kube-system cilium-<id> -- cilium policy get
+
+# 4. Test isolation manually
+kubectl run attacker --image=curlimages/curl -n production \
+  --labels="app=attacker" --command -- sleep 3600
+
+# Try to reach db from attacker (should fail with default-deny):
+kubectl exec attacker -n production -- curl -s --max-time 3 http://postgres:5432
+# Should timeout
+
+# 5. Verify DNS is still working (essential after adding egress deny)
+kubectl exec attacker -n production -- nslookup kubernetes.default
+# Should succeed (if allow-dns policy is applied)
+
+# 6. List all effective policies for a Pod
+kubectl get networkpolicies -n production -o yaml | \
+  grep -A5 "podSelector" | head -50
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Kubernetes implement a default-deny policy?**
+
+By creating a NetworkPolicy with `spec.podSelector: {}` (empty, matching all Pods) and listing the desired `policyTypes` (`Ingress`, `Egress`, or both) with **no rules**. The presence of a policyType with no matching rules is the "deny all" — the policy applies to all Pods, creating default deny for the listed directions. Any traffic not explicitly permitted by another policy for that Pod in that direction is dropped.
+
+**Q2: What happens if you apply a default-deny egress policy without a DNS exception?**
+
+All egress traffic is blocked, including UDP/TCP port 53 queries to CoreDNS. DNS lookups fail immediately. Since most application code resolves Service names via DNS, the application effectively cannot communicate with any Service — even if ingress policies allowing traffic to target Services exist. The DNS failure happens at name resolution before a TCP connection is even attempted. This is why DNS egress allow policies must be applied **simultaneously** with egress deny policies.
+
+**Q3: How do you allow Pods within the same namespace to communicate while blocking cross-namespace traffic?**
+
+Apply two policies to the namespace: (1) `default-deny-ingress` with empty `podSelector` and no ingress rules — this blocks all incoming traffic. (2) `allow-same-namespace` with empty `podSelector` and an ingress rule with `from: [{podSelector: {}}]` — empty podSelector in a `from` clause means "all Pods in the policy's namespace." No `namespaceSelector` means the scope is the current namespace only. Together: all intra-namespace Pod traffic is allowed, all cross-namespace traffic is blocked.
+
+**Q4: Why shouldn't you apply default-deny NetworkPolicy to `kube-system` namespace?**
+
+`kube-system` contains critical cluster components: CoreDNS, kube-proxy, metrics-server, CNI DaemonSets, etc. These need specific cross-component communication that is complex to enumerate. If you accidentally block CoreDNS→etcd or CNI DaemonSet→node communication, the entire cluster can become dysfunctional. Start with application namespaces, not system namespaces. If you must apply policies to kube-system, do so carefully with full understanding of required traffic patterns.
+
+**Q5: How do you check if a specific Pod is effectively isolated (covered by default-deny)?**
+
+First check if any NetworkPolicy in the Pod's namespace has a `podSelector` that matches the Pod's labels: `kubectl get networkpolicies -n <ns> -o json | jq '.items[] | select(.spec.podSelector.matchLabels | to_entries | all(.key as $k | input.labels[$k] == .value)) | .metadata.name'`. Second, if using Cilium: `cilium policy trace --src-k8s-pod ns:pod --dst-k8s-pod ns:pod2 --dport 80` shows whether traffic is allowed or denied and which policy matched. If no NetworkPolicy selects the Pod, it's effectively default-allow — a security risk.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know default-deny is created with empty `podSelector: {}` and policyTypes but no rules
+- [ ] Know combined deny: include both Ingress and Egress in policyTypes with no rules
+- [ ] Know DNS must always be explicitly allowed in egress policies (port 53 UDP+TCP to kube-system)
+- [ ] Know namespace isolation: deny-all ingress + allow from same namespace (podSelector: {})
+- [ ] Know to never apply default-deny to kube-system without deep understanding of required traffic
+- [ ] Know policies are additive (OR logic) — multiple policies can grant access to the same Pod
+- [ ] Can audit with `kubectl get networkpolicies` and test with `curl --max-time 3` from test Pods

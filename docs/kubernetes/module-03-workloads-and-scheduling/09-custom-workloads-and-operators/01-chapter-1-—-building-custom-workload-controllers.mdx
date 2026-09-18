@@ -1,0 +1,380 @@
+---
+title: "Chapter 1 — Building Custom Workload Controllers"
+sidebar_position: 1
+module: "Module 3.9 — Custom Workloads & Operators"
+description: "Master the Kubernetes Operator pattern — CustomResourceDefinitions (CRDs), controller-runtime architecture, Kubebuilder scaffolding, CEL validation rules, and status subresources."
+---
+
+# Chapter 1 — Building Custom Workload Controllers
+
+> **Goal:** Master the Kubernetes Operator pattern and custom workload development — understanding how CustomResourceDefinitions (CRDs) extend the Kubernetes API, scaffolding production controllers using `controller-runtime` and Kubebuilder, enforcing schema integrity with Common Expression Language (CEL) validation, and isolating the `/status` subresource.
+>
+> By the end of this chapter, you will understand:
+> 1. The Operator Pattern: Automating human operational knowledge in code
+> 2. How to author structural OpenAPI v3 schemas and declarative CRDs
+> 3. The architecture of `controller-runtime`: Manager, Client, Cache, and Scheme
+> 4. How to use Kubebuilder markers for automated RBAC and CRD generation
+> 5. How CEL (Common Expression Language) replaces complex validating webhooks
+> 6. The difference between CustomResourceDefinitions (CRDs) and Aggregated API Servers
+
+---
+
+## Real-Life Analogy
+
+Think of a Kubernetes Operator as a **human Site Reliability Engineer (SRE) cloned into software**:
+
+- **The Custom Resource (The High-Level SRE Request Ticket):** Instead of manually creating 3 StatefulSet pods, 2 ConfigMaps, 4 Secrets, a headless service, and backup cronjobs for a database, a developer submits a clean high-level ticket:
+  ```yaml
+  kind: PostgresCluster
+  spec:
+    replicas: 3
+    storage: 100Gi
+    enableAutomatedBackups: true
+  ```
+- **The Human SRE (The Old Way):** The SRE reads the ticket, manually configures replication streams, tests failover, provisions cloud disks, and sets up cronjobs. If primary fails at 3:00 AM, the SRE's pager beeps to execute manual failover.
+- **The Operator (The Software SRE):** A custom controller running in the cluster watches for `PostgresCluster` objects. It automatically provisions the child StatefulSets, configures streaming replication, watches health 24/7, and automatically promotes a follower to primary in 200ms if the leader crashes.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Operator Architecture & Control Loop
+
+ 1. Developer submits Custom Resource (CR):
+    kubectl apply -f postgres-prod.yaml
+     │
+     ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes API Server & etcd                                           │
+ │ CustomResourceDefinition (CRD): postgresclusters.db.example.com        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Watches CR events via Informer Cache
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Custom Controller (controller-runtime / Manager)                       │
+ │                                                                        │
+ │  Reconcile(ctx, req) Loop:                                             │
+ │  1. Fetch PostgresCluster object from Client Cache                     │
+ │  2. Observe desired state (.spec) vs current child resources           │
+ │  3. Reconcile Child Resources:                                         │
+ └──────────────┬───────────────────┬───────────────────┬─────────────────┘
+                │ Creates/Updates   │ Creates/Updates   │ Creates/Updates
+                ▼                   ▼                   ▼
+        ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+        │ StatefulSet  │    │ Headless Svc │    │ CronJob      │
+        │ (Postgres)   │    │ (Discovery)  │    │ (S3 Backup)  │
+        └──────────────┘    └──────────────┘    └──────────────┘
+                │
+                ▼ Status Reporting
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Updates Status Subresource: `r.Status().Update(ctx, &postgresCluster)` │
+ │ .status.phase = "Running", .status.readyReplicas = 3                   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CustomResourceDefinitions (CRDs) & OpenAPI v3 Schemas
+
+A **CustomResourceDefinition (CRD)** teaches the Kubernetes API server how to parse, validate, and store a brand-new API type:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: redisclusters.cache.example.com
+spec:
+  group: cache.example.com
+  names:
+    kind: RedisCluster
+    listKind: RedisClusterList
+    plural: redisclusters
+    singular: rediscluster
+    shortNames: ["rc"]
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}          # <--- Isolates /status subresource!
+    schema:
+      openAPIV3Schema:
+        type: object
+        required: ["spec"]
+        properties:
+          spec:
+            type: object
+            required: ["replicas", "memoryLimit"]
+            properties:
+              replicas:
+                type: integer
+                minimum: 1
+                maximum: 9
+              memoryLimit:
+                type: string
+                pattern: "^[0-9]+(Mi|Gi)$"
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+              activeNodes:
+                type: integer
+```
+
+---
+
+## The `controller-runtime` Framework
+
+The official CNCF standard for building Kubernetes controllers in Go is `sigs.k8s.io/controller-runtime`:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Core Primitive       │ Responsibility in Go Operator                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Manager`**        │ Initializes shared dependencies, leader election, and runs informers.       │
+ │ **`Client`**         │ Reads from high-speed in-memory cache and writes directly to API server.    │
+ │ **`Reconciler`**     │ The business logic loop (`Reconcile(ctx, Request) (Result, error)`).        │
+ │ **`Scheme`**         │ Go type registry mapping API Group/Version/Kind to Go structs.              │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Go Reconciler Implementation Skeleton:
+
+```go
+package controllers
+
+import (
+	"context"
+	cachev1alpha1 "example.com/api/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type RedisClusterReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+// +kubebuilder:rbac:groups=cache.example.com,resources=redisclusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cache.example.com,resources=redisclusters/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+
+func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// 1. Fetch the Custom Resource from cache
+	var redisCluster cachev1alpha1.RedisCluster
+	if err := r.Get(ctx, req.NamespacedName, &redisCluster); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// 2. Reconcile Child StatefulSet
+	// (Check if StatefulSet exists; if not, create it. If changed, update it).
+
+	// 3. Update Status Subresource
+	redisCluster.Status.Phase = "Running"
+	redisCluster.Status.ActiveNodes = redisCluster.Spec.Replicas
+	if err := r.Status().Update(ctx, &redisCluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *RedisClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&cachev1alpha1.RedisCluster{}).
+		Owns(&appsv1.StatefulSet{}).    // Re-trigger Reconcile if child StatefulSet changes!
+		Complete(r)
+}
+```
+
+---
+
+## Declarative Validation with CEL (Kubernetes 1.29+ GA)
+
+Historically, complex validation required writing and running a separate **Validating Admission Webhook**.
+
+**CEL (Common Expression Language)** embeds validation rules directly inside the CRD YAML without writing webhook code:
+
+```yaml
+properties:
+  spec:
+    type: object
+    properties:
+      minReplicas:
+        type: integer
+      maxReplicas:
+        type: integer
+    # Inlined CEL Validation Rule
+    x-kubernetes-validations:
+    - rule: "self.minReplicas <= self.maxReplicas"
+      message: "minReplicas cannot be greater than maxReplicas."
+    - rule: "self.minReplicas > 0"
+      message: "minReplicas must be strictly positive."
+```
+
+---
+
+## The `/status` Subresource Isolation
+
+Enabling `subresources: { status: {} }` in your CRD is an essential best practice:
+
+1. **RBAC Isolation:** Allows operators to grant regular users permissions to edit `.spec`, while restricting `.status` updates exclusively to the controller's ServiceAccount.
+2. **Preventing Infinite Loops:** Updating `.status` via `r.Status().Update()` modifies `.metadata.generation` independently of `.spec`, ensuring the controller does not trigger unnecessary spec-reconciliation loops upon recording metrics!
+
+---
+
+## CRDs vs Aggregated API Servers
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ CustomResourceDefinition (CRD)  │ Aggregated API Server (AA)      │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Implementation**        │ Pure declarative YAML schema    │ Full standalone Go HTTP server  │
+ │ **Storage**               │ Main cluster `etcd`             │ Custom database (e.g. Timescale)│
+ │ **Throughput**            │ Standard API limits (etcd bound)│ Ultra-high throughput streaming │
+ │ **Complexity**            │ Low (Managed by Kubernetes)     │ High (Requires certs & routing) │
+ │ **When to Use**           │ 99% of all Kubernetes Operators │ `metrics-server`, custom DBs    │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Complete Custom Resource Instance Manifest
+
+```yaml
+apiVersion: cache.example.com/v1alpha1
+kind: RedisCluster
+metadata:
+  name: prod-redis-cluster
+  namespace: default
+spec:
+  replicas: 3
+  memoryLimit: "2Gi"
+```
+
+---
+
+## Hands-On Lab: Authoring, Installing & Querying a CRD
+
+```bash
+# Step 1: Create a raw CRD with OpenAPI validation and status subresource
+cat <<EOF | kubectl apply -f -
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.infra.example.com
+spec:
+  group: infra.example.com
+  names:
+    kind: Database
+    listKind: DatabaseList
+    plural: databases
+    singular: database
+    shortNames: ["db"]
+  scope: Namespaced
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        type: object
+        required: ["spec"]
+        properties:
+          spec:
+            type: object
+            required: ["engine", "storageGb"]
+            properties:
+              engine:
+                type: string
+                enum: ["postgres", "mysql", "redis"]
+              storageGb:
+                type: integer
+                minimum: 10
+                maximum: 1000
+          status:
+            type: object
+            properties:
+              state:
+                type: string
+EOF
+
+# Step 2: Verify the CRD is registered and recognized by kubectl
+kubectl get crd databases.infra.example.com
+kubectl api-resources | grep -i database
+
+# Step 3: Instantiate a Custom Resource instance
+cat <<EOF | kubectl apply -f -
+apiVersion: infra.example.com/v1
+kind: Database
+metadata:
+  name: orders-db
+  namespace: default
+spec:
+  engine: postgres
+  storageGb: 100
+EOF
+
+# Step 4: Query the custom resource using custom shortNames
+kubectl get db
+
+# Step 5: Test OpenAPI Schema Validation Failure (Invalid Engine & Too small storage)
+cat <<EOF | kubectl apply -f -
+apiVersion: infra.example.com/v1
+kind: Database
+metadata:
+  name: broken-db
+  namespace: default
+spec:
+  engine: oracle     # Not in enum list!
+  storageGb: 2       # Below minimum 10!
+EOF
+# Observe: API server immediately rejects the request with validation errors!
+
+# Step 6: Clean up lab
+kubectl delete database orders-db
+kubectl delete crd databases.infra.example.com
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Kubernetes Operator Pattern, and what makes it distinct from a simple controller?**
+
+A standard Kubernetes controller (like the ReplicaSet controller) reconciles core generic resources. The Operator Pattern combines CustomResourceDefinitions (CRDs) with custom controller loops that encode **deep domain-specific operational knowledge** for managing complex, stateful applications (such as Kafka, PostgreSQL, or Elasticsearch). An Operator automates lifecycle operations previously executed by human administrators, including automated provisioning, cluster topology discovery, version upgrades, backup scheduling, failover promotions, and auto-tuning.
+
+**Q2: What is the purpose of `controller-runtime` in Go-based Operator development?**
+
+`controller-runtime` is the foundational Go framework maintained by Kubernetes SIGs that abstracts low-level client-go boilerplate. It provides: (1) `Manager` to manage shared controller lifecycles and leader election; (2) `Client` with automated local informer caching; (3) `Reconciler` interface for business logic; (4) Predicate filtering and event handlers; and (5) Built-in metric and webhook servers, allowing developers to focus solely on their reconciliation logic.
+
+**Q3: How does Common Expression Language (CEL) validation simplify CRD development?**
+
+Prior to CEL, enforcing complex business rules across multiple fields (e.g. ensuring `minReplicas <= maxReplicas`) required authoring, building, deploying, securing with TLS certificates, and hosting a standalone validating admission webhook. CEL allows developers to write declarative validation rules directly inside the CRD YAML schema (`x-kubernetes-validations`), evaluated in-process by the `kube-apiserver` with zero external infrastructure overhead.
+
+**Q4: Why is the `/status` subresource enabled separately in CRDs?**
+
+Enabling `subresources: { status: {} }` provides two critical benefits: (1) **RBAC Security**: It allows fine-grained authorization policies where standard users can mutate `.spec`, but only the controller's ServiceAccount is permitted to patch `.status`. (2) **Generation Isolation**: Modifying `.status` via the subresource endpoint does not increment `.metadata.generation`, preventing the controller from accidentally triggering an infinite reconciliation feedback loop when writing telemetry data.
+
+**Q5: When would you build an Aggregated API Server instead of a CRD?**
+
+You should use a CRD for 99% of all custom workloads because Kubernetes natively manages schema validation, conversion, and `etcd` persistence. An Aggregated API Server is required only when: (1) You need an alternative, ultra-high-throughput storage backend other than `etcd` (e.g. time-series metrics in `metrics-server`); (2) You require custom REST endpoint logic that deviates from standard Kubernetes CRUD semantics; or (3) You need real-time data streaming capabilities.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that the Operator Pattern encodes human operational expertise into code
+- [ ] Know how CRDs define custom OpenAPI v3 schemas in the API server
+- [ ] Know the role of `controller-runtime`: Manager, Reconciler, Client, and Informer Cache
+- [ ] Know how CEL validation rules (`x-kubernetes-validations`) replace validating webhooks
+- [ ] Know why the `/status` subresource prevents infinite reconciliation loops
+- [ ] Know when to choose CRDs (standard) vs Aggregated API Servers (high throughput)
+- [ ] Can scaffold operators using `kubebuilder init` and `kubebuilder create api`

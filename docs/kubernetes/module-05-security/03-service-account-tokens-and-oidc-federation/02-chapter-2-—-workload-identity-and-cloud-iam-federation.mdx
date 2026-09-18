@@ -1,0 +1,296 @@
+---
+title: "Chapter 2 — Workload Identity & Cloud IAM Federation"
+sidebar_position: 2
+module: "Module 5.3 — ServiceAccount & Federation"
+description: "Master Kubernetes Workload Identity — passwordless cloud IAM authentication, AWS IRSA (IAM Roles for Service Accounts), GKE Workload Identity, Azure AD Federation, and OIDC discovery endpoints."
+---
+
+# Chapter 2 — Workload Identity & Cloud IAM Federation
+
+> **Goal:** Master passwordless cloud authentication for Kubernetes workloads — understanding how Workload Identity and Cloud IAM Federation eliminate static, long-lived cloud credentials (`AKIA...` access keys and GCP JSON service account keys), configuring the Kubernetes OIDC discovery endpoint (`/.well-known/openid-configuration`), analyzing the trust relationship between Kubernetes ServiceAccounts and Cloud IAM Roles across AWS (IRSA), Google Cloud (GKE Workload Identity), and Azure (Azure AD Workload Identity).
+>
+> By the end of this chapter, you will understand:
+> 1. The critical security risks of hardcoding static cloud API keys inside Kubernetes Secrets
+> 2. How the Kubernetes API Server acts as an OpenID Connect (OIDC) Identity Provider
+> 3. How AWS IAM Roles for Service Accounts (IRSA) exchanges projected JWT tokens via `sts:AssumeRoleWithWebIdentity`
+> 4. How Google Cloud GKE Workload Identity maps Kubernetes ServiceAccounts to Google Service Accounts (GSA)
+> 5. How Azure AD Workload Identity uses federated identity credentials
+> 6. How to troubleshoot trust policy mismatches, audience errors, and STS token exchange failures
+
+---
+
+## Real-Life Analogy
+
+Think of Workload Identity as **an automated diplomatic courier exchange between a foreign embassy and the local city hall**:
+
+- **The Static Key Anti-Pattern (A Physical Master Skeleton Key Hidden in a Flowerpot):** You store a permanent AWS IAM Access Key (`AKIA...`) in a Kubernetes Secret. If a container suffers a remote code execution vulnerability or a developer pushes the key to GitHub, the attacker owns your entire cloud account forever until someone notices.
+- **The Kubernetes Embassy (The OIDC Issuer Endpoint):** The Kubernetes cluster acts as a recognized sovereign embassy with a public notary seal (`/.well-known/openid-configuration` and public JWKS keys).
+- **The Diplomatic Letter of Credence (Bound ServiceAccount JWT):** When a Pod starts, the cluster notary stamps a short-lived, 1-hour digital diplomatic passport bearing the Pod's identity (`system:serviceaccount:prod:billing-app`).
+- **The Cloud Federal Bureau (AWS STS / Google Cloud IAM / Azure AD):** The Pod presents its diplomatic passport to AWS STS. AWS does **not** need a static password; it verifies the Kubernetes notary seal against the cluster's public JWKS keys.
+- **Temporary 1-Hour Cloud Badges:** AWS STS hands the Pod a temporary, auto-rotating 1-hour cloud credential. If stolen, the badge expires in minutes and is mathematically useless outside the cloud context.
+
+---
+
+## Architecture Diagram
+
+```text
+               Workload Identity Federation (AWS IRSA / GCP / Azure)
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes Cluster: OIDC Issuer (`https://oidc.eks.us-east-1...`)     │
+ │ Exposes Public JWKS endpoint: `/openid/v1/jwks`                        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ 1. Cloud IAM establishes OIDC Trust
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Cloud Provider IAM (AWS IAM Role / GCP Service Account / Azure AD)     │
+ │ Trust Policy: "Trust tokens issued by OIDC Issuer WHERE                │
+ │                sub == system:serviceaccount:production:payment-app"    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    │ 3. Pod calls STS:
+                                    │    `AssumeRoleWithWebIdentity(JWT)`
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod: payment-app (Namespace: production)                               │
+ │ Injected via Projected Volume:                                         │
+ │   - JWT Token: /var/run/secrets/eks.amazonaws.com/serviceaccount/token │
+ │   - Env: AWS_ROLE_ARN = arn:aws:iam::123456789:role/PaymentRole       │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ 4. Cloud STS validates JWT against JWKS
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Temporary Cloud API Credentials Returned (1-Hour Short-Lived Keys!)    │
+ │ (Pod reads/writes S3 Buckets, DynamoDB, CloudSQL with ZERO static keys!)│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Static Key Vulnerability vs Workload Identity
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Static Cloud API Keys           │ Workload Identity Federation    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Credential Type**       │ Long-lived AWS Secret Key / GCP │ **Temporary 1-hour STS tokens** │
+ │                           │ JSON key file.                  │ exchanged dynamically via JWT.  │
+ │ **Storage in Cluster**    │ Base64 Secret in `etcd`.        │ **ZERO static secrets in etcd!**│
+ │ **Rotation Lifecycle**    │ Manual / rarely rotated         │ **Automated continuous rotation**│
+ │                           │ (Major security vulnerability). │ by cloud SDKs in memory.        │
+ │ **Leak Impact**           │ Permanent cloud takeover.       │ Token expires within minutes;   │
+ │                           │                                 │ invalid outside cluster context.│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The Kubernetes OIDC Discovery Endpoint
+
+Every modern Kubernetes cluster exposes two public or internal OIDC discovery endpoints:
+
+1. **`https://<cluster-oidc-issuer>/.well-known/openid-configuration`**: Returns identity provider metadata, supported signing algorithms, and the URL to the public JWKS keys.
+2. **`https://<cluster-oidc-issuer>/openid/v1/jwks`**: Exposes the public cryptographic keys used to verify the digital signatures of all ServiceAccount tokens issued by the cluster.
+
+---
+
+## AWS IAM Roles for Service Accounts (IRSA)
+
+On AWS EKS, the **EKS Pod Identity Webhook** injects environment variables and projected tokens automatically:
+
+```yaml
+# 1. Kubernetes ServiceAccount Annotated with AWS IAM Role
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: s3-reader-sa
+  namespace: production
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ProductionS3ReaderRole
+    eks.amazonaws.com/token-expiration: "3600"
+```
+
+### The AWS IAM Trust Policy:
+The AWS IAM Role must define a trust relationship restricting access strictly to that specific ServiceAccount:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE123"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE123:sub": "system:serviceaccount:production:s3-reader-sa",
+          "oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE123:aud": "sts.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Google Cloud GKE Workload Identity
+
+On Google Cloud, Kubernetes ServiceAccounts (KSA) bind directly to Google Service Accounts (GSA):
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bigquery-processor-sa
+  namespace: analytics
+  annotations:
+    iam.gke.io/gcp-service-account: bigquery-writer@my-project.iam.gserviceaccount.com
+```
+
+### Google Cloud IAM Binding:
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  bigquery-writer@my-project.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:my-project.svc.id.goog[analytics/bigquery-processor-sa]"
+```
+
+---
+
+## Azure AD Workload Identity
+
+Azure uses **Federated Identity Credentials** linking the Kubernetes ServiceAccount to an Azure Managed Identity:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: azure-blob-sa
+  namespace: default
+  annotations:
+    azure.workload.identity/client-id: "33333333-3333-3333-3333-333333333333"
+```
+
+---
+
+## Complete Production Workload Manifest (Zero Cloud Keys!)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-storage-writer
+  namespace: production
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: storage-writer
+  template:
+    metadata:
+      labels:
+        app: storage-writer
+    spec:
+      # Binds Pod to IAM-Federated ServiceAccount
+      serviceAccountName: s3-reader-sa
+      containers:
+      - name: writer
+        image: amazon/aws-cli:latest
+        # Uses AWS SDK / CLI without any AWS_ACCESS_KEY_ID environment variables!
+        command: ["sh", "-c", "aws s3 ls s3://my-enterprise-data-bucket; sleep 3600"]
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+```
+
+---
+
+## Hands-On Lab: Simulating Workload Identity Injections
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace wi-lab
+
+# Step 2: Create a ServiceAccount with AWS IRSA annotation
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mock-irsa-sa
+  namespace: wi-lab
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/MockS3Role
+EOF
+
+# Step 3: Deploy a Pod referencing the ServiceAccount
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wi-demo-pod
+  namespace: wi-lab
+spec:
+  serviceAccountName: mock-irsa-sa
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 4: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/wi-demo-pod -n wi-lab --timeout=30s
+
+# Step 5: Verify environment variables injected by Pod Identity Webhook (if running on EKS/GKE)
+kubectl exec -n wi-lab wi-demo-pod -- env | grep -E "(AWS_ROLE_ARN|AWS_WEB_IDENTITY_TOKEN_FILE|GOOGLE)" || echo "Simulated environment verified!"
+
+# Step 6: Clean up lab
+kubectl delete namespace wi-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Workload Identity in Kubernetes, and why is it considered an essential security standard?**
+
+Workload Identity is a federated authentication pattern that allows Kubernetes workloads to authenticate directly against cloud provider APIs (AWS, Google Cloud, Azure) using Kubernetes-native ServiceAccount tokens instead of static cloud access keys. It is considered an essential security standard because: (1) It eliminates long-lived, high-privilege credentials (`AKIA...` keys or JSON service account keys) from cluster `etcd` and GitHub repositories; (2) Tokens are short-lived (1 hour) and rotated automatically; and (3) Access is cryptographically bound to specific namespaces and ServiceAccounts.
+
+**Q2: How does AWS IAM Roles for Service Accounts (IRSA) work under the hood?**
+
+IRSA operates via four coordinated steps:
+1. The EKS cluster exposes an OIDC discovery endpoint (`/openid/v1/jwks`) containing the cluster's public signing keys.
+2. The EKS Pod Identity Webhook mutates Pods whose ServiceAccount has `eks.amazonaws.com/role-arn`, injecting a projected Bound ServiceAccount Token and setting `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`.
+3. The AWS SDK inside the container reads the token and calls the AWS Security Token Service (`sts:AssumeRoleWithWebIdentity`).
+4. AWS STS validates the token's digital signature against the EKS OIDC discovery keys and returns temporary 1-hour AWS credentials.
+
+**Q3: What is the purpose of the `sub` claim check in a Cloud IAM Trust Policy?**
+
+The `sub` (Subject) claim in the JWT is formatted as `system:serviceaccount:<namespace>:<serviceaccount-name>`. In the cloud IAM trust policy, checking the `sub` condition is critical: it guarantees that **only that specific ServiceAccount in that exact namespace** can assume the cloud IAM role. Without the `sub` condition, any Pod in any namespace in the cluster could assume the high-privilege cloud role.
+
+**Q4: How does GKE Workload Identity differ architecturally from AWS IRSA?**
+
+While AWS IRSA relies on an admission mutating webhook to inject projected files and SDK environment variables, GKE Workload Identity intercepts metadata API calls at the network level. GKE runs an in-cluster **GKE Metadata Server** (a DaemonSet proxying `169.254.169.254`). When an application makes standard Google Cloud client library calls, the GKE Metadata Server intercepts the request, validates the Pod's local ServiceAccount, and returns temporary Google OAuth2 access tokens seamlessly.
+
+**Q5: What are common causes of `AccessDenied` errors during Workload Identity token exchanges?**
+
+Common root causes include:
+1. **Trust Policy Mismatch**: The IAM Role's trust policy has a typo in the OIDC provider ARN, the namespace, or the ServiceAccount name in the `sub` condition.
+2. **Audience Mismatch**: The token's `aud` claim (e.g. `sts.amazonaws.com`) does not match the audience expected by the cloud IAM provider.
+3. **Missing ServiceAccount Annotation**: The Kubernetes ServiceAccount is missing the required annotation (`eks.amazonaws.com/role-arn` or `iam.gke.io/gcp-service-account`).
+4. **IAM Role Permissions**: The cloud IAM Role was assumed successfully, but the IAM Role lacks permissions (policies) to access the target cloud resource (e.g. S3 bucket or KMS key).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Workload Identity eliminates static cloud credentials (`AKIA...` keys)
+- [ ] Know how the cluster OIDC discovery endpoint (`/openid/v1/jwks`) provides public keys
+- [ ] Know how AWS IRSA uses `sts:AssumeRoleWithWebIdentity` to exchange JWTs
+- [ ] Know how the `sub` claim (`system:serviceaccount:<ns>:<name>`) enforces least privilege
+- [ ] Know that GKE Workload Identity proxies metadata calls via the GKE Metadata Server
+- [ ] Know that Azure AD Workload Identity uses Federated Identity Credentials
+- [ ] Can inspect ServiceAccount IAM annotations using `kubectl get sa <name> -o yaml`

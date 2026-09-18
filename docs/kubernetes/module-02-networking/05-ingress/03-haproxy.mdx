@@ -1,0 +1,351 @@
+---
+title: "Chapter 3 — HAProxy Ingress"
+sidebar_position: 3
+module: "Module 2.5 — Ingress"
+description: "Deep dive into HAProxy Ingress Controller — its configuration model, the HAProxy stats socket for zero-reload dynamic updates, ACL-based routing, TCP mode for non-HTTP Services, and HAProxy's exceptional performance characteristics."
+---
+
+# Chapter 3 — HAProxy Ingress Controller
+
+> **Goal:** Understand HAProxy Ingress Controller's configuration model, how it achieves zero-downtime updates via the runtime API, and why HAProxy is the preferred choice for high-throughput TCP/HTTP applications requiring fine-grained traffic control.
+>
+> By the end of this chapter, you will understand:
+> 1. HAProxy Ingress Controller's architecture and how it differs from NGINX
+> 2. The HAProxy runtime API — dynamic server add/remove without reload
+> 3. ACL-based routing — more powerful than NGINX location matching
+> 4. TCP mode for non-HTTP Services (databases, MQTT, Redis)
+> 5. HAProxy's stats page and Prometheus metrics
+> 6. When to choose HAProxy over NGINX or Traefik
+
+---
+
+## Real-Life Analogy
+
+HAProxy is the **high-frequency trading engine of load balancers**:
+
+Imagine a stock exchange routing millions of orders per second. The routing rules must be extremely precise (ACLs), execution must be lightning-fast (event-driven, single-threaded efficiency), and the system cannot pause even for milliseconds to reload rules (runtime API). HAProxy was built for exactly this — financial institutions and CDNs use it for sub-millisecond routing decisions at wire speed.
+
+In Kubernetes, HAProxy Ingress Controller brings this financial-grade performance and routing precision to your cluster — at the cost of more configuration complexity compared to NGINX or Traefik.
+
+---
+
+## Architecture Diagram
+
+```text
+                HAProxy Ingress Controller Architecture
+
+  Kubernetes API
+  ┌────────────────────────────────────────────────────────┐
+  │  Ingress objects, Services, EndpointSlices, ConfigMaps │
+  └───────────────────────────┬────────────────────────────┘
+                              │ Watch
+  ┌───────────────────────────▼────────────────────────────┐
+  │  haproxy-ingress controller (Go binary)                │
+  │                                                        │
+  │  ┌──────────────────────────────────────────────────┐  │
+  │  │  Configuration renderer                          │  │
+  │  │  Ingress rules → haproxy.cfg template            │  │
+  │  └───────────────────────┬──────────────────────────┘  │
+  │                          │                             │
+  │  ┌───────────────────────▼──────────────────────────┐  │
+  │  │  Change detector                                 │  │
+  │  │  - Endpoint-only change? → Runtime API update    │  │
+  │  │  - Structural change?    → Reload haproxy.cfg    │  │
+  │  └───────────────────────┬──────────────────────────┘  │
+  │                          │                             │
+  │  ┌───────────────────────▼──────────────────────────┐  │
+  │  │  HAProxy (data plane)                            │  │
+  │  │  - haproxy.cfg (generated)                       │  │
+  │  │  - Runtime API socket: /var/run/haproxy.sock     │  │
+  │  │  - Stats page: :1936                             │  │
+  │  └──────────────────────────────────────────────────┘  │
+  └────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Installing HAProxy Ingress Controller
+
+```bash
+# Install via Helm
+helm repo add haproxy-ingress https://haproxy-ingress.github.io/charts
+helm repo update
+
+helm install haproxy-ingress haproxy-ingress/haproxy-ingress \
+  --namespace ingress-controller \
+  --create-namespace \
+  --set controller.replicaCount=2 \
+  --set controller.stats.enabled=true \
+  --set controller.metrics.enabled=true
+
+# Verify
+kubectl get pods -n ingress-controller
+kubectl get svc haproxy-ingress -n ingress-controller
+```
+
+---
+
+## Basic Ingress Configuration
+
+HAProxy Ingress Controller fully supports the standard Kubernetes Ingress resource:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: haproxy
+    # HAProxy-specific annotations
+    haproxy-ingress.github.io/balance-algorithm: roundrobin
+    haproxy-ingress.github.io/timeout-connect: "5s"
+    haproxy-ingress.github.io/timeout-server: "60s"
+    haproxy-ingress.github.io/max-connections: "200"
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls-secret
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+---
+
+## The HAProxy Runtime API: Zero-Reload Updates
+
+HAProxy's most distinctive production feature is its **Runtime API** (stats socket). When only endpoints change (Pods scale), the controller sends commands directly to the running HAProxy process via the socket — without generating or reloading `haproxy.cfg`:
+
+```bash
+# The controller internally sends commands like these:
+# Add a new server to a backend:
+echo "add server production/api-service/10.244.3.5:8080" | \
+  socat stdio /var/run/haproxy.sock
+
+# Enable a server (mark as ready):
+echo "set server production/api-service/10.244.3.5:8080 state ready" | \
+  socat stdio /var/run/haproxy.sock
+
+# Gracefully drain a server before removal:
+echo "set server production/api-service/10.244.1.5:8080 state drain" | \
+  socat stdio /var/run/haproxy.sock
+
+# Wait for connections to drain, then remove:
+echo "del server production/api-service/10.244.1.5:8080" | \
+  socat stdio /var/run/haproxy.sock
+```
+
+This achieves **true zero-downtime endpoint changes** — running connections are not interrupted, new servers start receiving traffic immediately. The `drain` state allows existing connections to finish before the server is removed.
+
+---
+
+## ACL-Based Routing
+
+HAProxy uses **ACL (Access Control List)** rules — more expressive than NGINX's `location` blocks:
+
+```haproxy
+# Generated haproxy.cfg (simplified):
+
+frontend https-in
+  bind :443 ssl crt /etc/ssl/certs/
+  mode http
+
+  # Define ACLs (conditions)
+  acl is_api_host hdr(host) -i api.example.com
+  acl is_web_host hdr(host) -i web.example.com
+  acl is_admin_path path_beg /admin
+  acl is_api_v2 path_beg /v2
+  acl is_internal src 10.0.0.0/8
+
+  # Combine ACLs with boolean logic
+  acl is_admin_access is_api_host is_admin_path is_internal
+
+  # Route based on combined conditions
+  use_backend admin-svc   if is_admin_access
+  use_backend api-v2-svc  if is_api_host is_api_v2
+  use_backend api-svc     if is_api_host
+  use_backend web-svc     if is_web_host
+  default_backend default-backend
+```
+
+Supported ACL criteria:
+- `hdr()` — any HTTP header
+- `path_beg`, `path_end`, `path_reg` — URL path matching
+- `src` — source IP/CIDR
+- `ssl_fc_has_sni` — TLS SNI
+- `url_param()` — query parameters
+- `req.cook()` — cookie values
+- `method` — HTTP method (GET, POST, etc.)
+
+---
+
+## TCP Mode: Routing Non-HTTP Traffic
+
+HAProxy Ingress can route raw TCP traffic (not just HTTP), making it useful for:
+- Database proxying (PostgreSQL, MySQL, Redis)
+- MQTT brokers
+- Custom binary protocols
+
+```yaml
+# TCP routing via ConfigMap annotation
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haproxy-ingress
+  namespace: ingress-controller
+data:
+  # TCP service: external port 5432 → postgres-service:5432
+  "5432": "production/postgres-service:5432:PROXY"
+```
+
+Or via TCP IngressRoute (community CRD):
+
+```yaml
+apiVersion: haproxy-ingress.github.io/v1
+kind: TCPIngress
+metadata:
+  name: postgres-tcp
+  namespace: production
+spec:
+  rules:
+  - port: 5432
+    backend:
+      serviceName: postgres-service
+      servicePort: 5432
+```
+
+---
+
+## Stats Page and Prometheus Metrics
+
+HAProxy's built-in stats page is a powerful operational tool:
+
+```bash
+# Port-forward to stats page
+kubectl port-forward -n ingress-controller \
+  haproxy-ingress-<id> 1936:1936
+
+# Access: http://localhost:1936/stats
+# Shows: all frontends, backends, server states, connection counts, latency
+
+# Prometheus metrics endpoint
+curl http://localhost:1936/metrics
+# haproxy_backend_current_sessions{backend="production_api-service"} 42
+# haproxy_backend_response_errors_total{backend="production_api-service"} 0
+# haproxy_server_status{...server="10.244.1.5:8080"} 1  ← 1=UP, 0=DOWN
+```
+
+Key metrics to monitor:
+```text
+haproxy_backend_response_time_average_seconds  - Upstream response time
+haproxy_backend_current_queue                  - Queued connections (overload signal)
+haproxy_backend_connection_errors_total        - Backend errors
+haproxy_frontend_bytes_in_total                - Ingress throughput
+haproxy_server_check_status                    - Health check result per server
+```
+
+---
+
+## Health Checks
+
+HAProxy performs active health checks on backends:
+
+```yaml
+metadata:
+  annotations:
+    # HTTP health check
+    haproxy-ingress.github.io/health-check-uri: "/health"
+    haproxy-ingress.github.io/health-check-interval: "5s"
+    haproxy-ingress.github.io/health-check-rise: "2"   # passes before UP
+    haproxy-ingress.github.io/health-check-fall: "3"   # fails before DOWN
+```
+
+Generated haproxy.cfg:
+```haproxy
+backend production_api-service
+  balance roundrobin
+  option httpchk GET /health
+  http-check expect status 200
+  server 10.244.1.5:8080 check inter 5s rise 2 fall 3
+  server 10.244.2.3:8080 check inter 5s rise 2 fall 3
+```
+
+---
+
+## Hands-On: HAProxy Ingress Debugging
+
+```bash
+# 1. View generated HAProxy configuration
+kubectl exec -n ingress-controller haproxy-ingress-<id> \
+  -- cat /etc/haproxy/haproxy.cfg
+
+# 2. Check HAProxy process status via runtime API
+kubectl exec -n ingress-controller haproxy-ingress-<id> \
+  -- sh -c 'echo "show stat" | socat stdio /var/run/haproxy.sock | tr "," "\n" | head -30'
+
+# 3. List all backend servers and their status
+kubectl exec -n ingress-controller haproxy-ingress-<id> \
+  -- sh -c 'echo "show servers state" | socat stdio /var/run/haproxy.sock'
+
+# 4. Check recent configuration events
+kubectl logs -n ingress-controller haproxy-ingress-<id> | \
+  grep -E "reload|error|warn" | tail -20
+
+# 5. Manually drain a server (simulate graceful shutdown)
+kubectl exec -n ingress-controller haproxy-ingress-<id> \
+  -- sh -c 'echo "set server production/api-svc/10.244.1.5:8080 state drain" | socat stdio /var/run/haproxy.sock'
+
+# 6. View connection counts per backend
+kubectl exec -n ingress-controller haproxy-ingress-<id> \
+  -- sh -c 'echo "show info" | socat stdio /var/run/haproxy.sock' | grep -i cur
+
+# 7. Test HAProxy config validity without reload
+kubectl exec -n ingress-controller haproxy-ingress-<id> \
+  -- haproxy -c -f /etc/haproxy/haproxy.cfg
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does HAProxy Ingress avoid service disruption when backend Pods scale?**
+
+HAProxy Ingress uses the HAProxy Runtime API (stats socket). When endpoints change (Pods scale up/down), the controller sends socket commands (`add server`, `del server`, `set server state`) directly to the running HAProxy process. These commands update the active backend pool without rewriting or reloading `haproxy.cfg`. For Pod removal, the controller first sets the server to `drain` state (allowing existing connections to finish), then removes it. This achieves true zero-downtime scaling with connection draining.
+
+**Q2: What are HAProxy ACLs and how are they more powerful than NGINX location blocks?**
+
+HAProxy ACLs are named boolean conditions that can be combined with AND/OR/NOT logic. Each ACL tests one criterion: HTTP header value, URL path prefix/suffix/regex, source IP, TLS SNI, cookie, query parameter, etc. Multiple ACLs can be combined in a `use_backend` directive: `use_backend admin-svc if is_api_host is_admin_path is_internal`. NGINX location blocks only support URI path matching without native multi-condition logic (requiring multiple nested blocks or regex). HAProxy ACLs are more flexible for complex routing scenarios.
+
+**Q3: What is HAProxy's TCP mode and what does it enable?**
+
+HAProxy in TCP mode (`mode tcp`) proxies raw TCP connections without HTTP parsing. This enables routing of non-HTTP protocols: database connections (PostgreSQL on port 5432, MySQL on port 3306), message brokers (MQTT, AMQP), Redis, and custom binary protocols. The HAProxy Ingress Controller exposes TCP routing via ConfigMap annotations or TCPIngress CRDs. TCP mode is ideal when you want a single Ingress point for both HTTP and database traffic without running a separate load balancer.
+
+**Q4: What is the PROXY protocol and when would you use it with HAProxy?**
+
+The PROXY protocol is a header prepended to TCP connections that carries the original client's IP and port. When HAProxy routes a TCP connection to a backend, it can prepend this header (`option send-proxy`). The backend server (configured to accept PROXY protocol) reads it and sees the real client IP — even though the connection arrives from HAProxy's IP. This is important for backends that need to know the real client IP for logging, rate limiting, or geographic routing (databases, custom TCP services).
+
+**Q5: Why would you choose HAProxy Ingress over NGINX or Traefik?**
+
+HAProxy is preferred when: (1) you need the highest possible throughput at the L7 proxy layer (HAProxy is widely used in financial services and CDNs for sub-millisecond routing), (2) you need complex ACL-based routing with multi-condition AND/OR logic, (3) you need TCP-mode proxying for databases alongside HTTP routing, (4) you need precise connection draining with the Runtime API's `drain` state, or (5) you need detailed per-connection statistics via the stats socket. Choose NGINX for familiar configuration and community support; choose Traefik for dynamic environments and built-in Let's Encrypt.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know HAProxy Ingress uses the Runtime API socket for zero-reload endpoint updates
+- [ ] Understand ACL-based routing — named boolean conditions combinable with AND/OR logic
+- [ ] Know HAProxy supports TCP mode for database and non-HTTP protocol proxying
+- [ ] Know the server states: ready, drain, maint — and how drain enables connection draining
+- [ ] Understand the stats page (`:1936`) and Prometheus metrics endpoint
+- [ ] Know when to choose HAProxy: high throughput, complex ACLs, TCP routing, precise draining
+- [ ] Can debug with `show stat`, `show servers state` via the socat runtime API

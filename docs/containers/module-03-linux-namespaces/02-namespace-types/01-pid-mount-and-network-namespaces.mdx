@@ -1,0 +1,181 @@
+---
+title: "Chapter 1 — PID, Mount & Network Namespaces"
+sidebar_position: 1
+module: "Module 3.2 — Namespace Types"
+description: "Master the 3 core Linux namespaces — nested PID trees and zombie adoption, Mount namespaces and propagation flags (SHARED/PRIVATE/SLAVE), and Network namespaces with veth pairs."
+---
+
+# Chapter 1 — PID, Mount & Network Namespaces
+
+> **Goal:** Master the architecture, systems mechanics, and kernel interfaces of the 3 foundational container namespaces — analyzing nested **PID Namespace Trees** and PID 1 zombie process adoption, configuring **Mount Namespaces** and mount propagation flags (**`MS_SHARED`**, **`MS_PRIVATE`**, and **`MS_SLAVE`**), and constructing **Network Namespaces** using **Virtual Ethernet (`veth`) Pairs** and Linux bridge networking.
+>
+> By the end of this chapter, you will understand:
+> 1. How the Linux kernel maps a single process to multiple PIDs across nested PID namespaces
+> 2. The critical role of PID 1 in reaping orphaned zombie child processes (`waitpid`)
+> 3. How Mount Namespaces isolate filesystem trees and how mount propagation rules function
+> 4. Why Kubernetes CSI volume plugins require `MS_SHARED` mount propagation
+> 5. How Network Namespaces isolate IP addresses, routing tables, and socket ports
+> 6. How to manually connect two network namespaces using a `veth` pair and ping between them
+
+---
+
+## Real-Life Analogy
+
+Think of PID, Mount, and Network Namespaces as **the 3 core isolation systems inside an international embassy building**:
+
+- **1. The PID Namespace (The Diplomatic Identity Roster):**
+  - Inside the French Embassy in Washington D.C. (**A Container**), the ambassador is ranked **Employee #1 (PID 1)**.
+  - However, in the master United States national security registry (**The Host Linux OS**), the ambassador is citizen **#48,921**.
+  - Both numbers refer to the **exact same physical human being**, but their identity number depends on which registry is being queried!
+- **2. The Mount Namespace (The Embassy Private Vault & Diplomatic Pouch):**
+  - The embassy has private file cabinets (**Mount Namespace**) that local city police cannot inspect.
+  - If the embassy wants to receive mail from the host city (**Mount Propagation: `MS_SLAVE`**), the city drops letters into the diplomatic pouch, and the embassy sees the mail. But if the embassy adds a private document, it never leaks back to the city!
+- **3. The Network Namespace (The Encrypted Satellite Fiber Line - `veth` Pair):**
+  - The embassy does not use the city's public telephone switchboard.
+  - A private subterranean fiber cable (**A `veth` pair**) runs from the embassy desk (**`eth0`**) directly into the central telecommunications bridge (**`docker0`**), giving the embassy a private IP address and dedicated encrypted phone line.
+
+---
+
+## Architecture Diagram
+
+```text
+               PID Hierarchy, Mount Propagation & Network veth Plumbing
+
+ 1. NESTED PID NAMESPACE TREE:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ROOT PID NAMESPACE (Host Operating System):                            │
+ │ ├── PID 1: `systemd` (Host Init)                                       │
+ │ └── PID 48921: `nginx master` ◄──────────────────────────────────┐     │
+ └──────────────────────────────────────────────────────────────────┼─────┘
+                                                                    │ Maps to
+ ┌──────────────────────────────────────────────────────────────────┼─────┐
+ │ CONTAINER PID NAMESPACE (Child Namespace):                       │     │
+ │ └── PID 1: `nginx master` (Believes it is the root of the world!)│◄────┘
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. NETWORK NAMESPACE & VIRTUAL ETHERNET (veth) BRIDGE PLUMBING:
+ ┌──────────────────────────────────────┐  Virtual Cable  ┌───────────────┐
+ │ CONTAINER NETWORK NAMESPACE          │  (`veth` Pair)  │ HOST NAMESPACE│
+ │ - Interface: `eth0`                  │ ◄─────────────► │ Interface:    │
+ │ - IP: `172.17.0.2/16`                │                 │ `veth1a2b3c`  │
+ │ - Private Routing Table & iptables   │                 └───────┬───────┘
+ └──────────────────────────────────────┘                         │ Attached
+                                                                  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX BRIDGE (`docker0` / `cbr0`): Bridges traffic to physical NIC!    │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. PID Namespaces (`CLONE_NEWPID`) & Zombie Reaping
+
+PID namespaces isolate the process ID number space:
+- **Nested Trees**: PID namespaces are hierarchical. A parent namespace can see all processes in child namespaces (with host PIDs), but child namespaces **cannot see any processes in parent or sibling namespaces**.
+- **The Zombie Adoption Rule**: When a process dies in Linux, it becomes a **Zombie (`<defunct>`)** until its parent calls `wait()` or `waitpid()`. If the parent dies first, the Linux kernel automatically re-parents the orphaned children to **PID 1 in that PID namespace**. If PID 1 does not reap them, the kernel process table fills up with zombies and exhausts host PIDs!
+
+---
+
+## 2. Mount Namespaces (`CLONE_NEWNS`) & Mount Propagation
+
+The Mount namespace was the very first Linux namespace introduced in 2002 (hence its generic flag name `CLONE_NEWNS`).
+
+### The 4 Mount Propagation Flags:
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Mount Flag           │ Propagation Behavior Across Mount Namespaces                                │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`MS_SHARED`**      │ **Bi-Directional.** Mount events in host propagate to container, AND mount  │
+ │                      │ events in container propagate back to host! (Required for CSI plugins).     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`MS_PRIVATE`**     │ **Isolated.** Mount events never propagate in either direction. (Default).  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`MS_SLAVE`**       │ **One-Way.** Mount events on the host propagate into the container, but     │
+ │                      │ mounts created inside the container NEVER leak back to the host.            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`MS_UNBINDABLE`**  │ **Uncloneable.** Disallows recursive bind mounts (prevents loops).          │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Network Namespaces (`CLONE_NEWNET`)
+
+A Network namespace virtualizes all network-related system resources:
+1. **Network Device Interfaces**: `lo`, `eth0`, `veth*`, `tun/tap`.
+2. **IP Routing Tables**: Independent routing policies (`ip route`).
+3. **Socket Port Tables**: Multiple containers can all bind to port `0.0.0.0:80` on the same host without port collisions!
+4. **Firewall Rules**: Independent `iptables` / `nftables` chains.
+
+---
+
+## Hands-On Lab: Building Network Namespace `veth` Plumbing
+
+We will manually connect two isolated network namespaces using a virtual ethernet cable:
+
+```bash
+# Step 1: Create two independent network namespaces
+sudo ip netns add net-red
+sudo ip netns add net-blue
+
+# Step 2: Create a virtual ethernet (veth) cable with two ends
+sudo ip link add veth-red type veth peer name veth-blue
+
+# Step 3: Plug one end into net-red and the other end into net-blue!
+sudo ip link set veth-red netns net-red
+sudo ip link set veth-blue netns net-blue
+
+# Step 4: Configure IP addresses and bring interfaces UP in net-red
+sudo ip netns exec net-red ip addr add 192.168.100.1/24 dev veth-red
+sudo ip netns exec net-red ip link set veth-red up
+sudo ip netns exec net-red ip link set lo up
+
+# Step 5: Configure IP addresses and bring interfaces UP in net-blue
+sudo ip netns exec net-blue ip addr add 192.168.100.2/24 dev veth-blue
+sudo ip netns exec net-blue ip link set veth-blue up
+sudo ip netns exec net-blue ip link set lo up
+
+# Step 6: PING from net-red to net-blue across the virtual cable!
+sudo ip netns exec net-red ping -c 3 192.168.100.2
+
+# Cleanup
+sudo ip netns del net-red
+sudo ip netns del net-blue
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the Linux kernel handle a process that exists in multiple nested PID namespaces?**
+
+In the Linux kernel, every process is represented by a single `struct task_struct`. However, `task_struct` does not store a single integer PID; instead, it contains an array of `struct upid` structs (one for each level of the PID namespace hierarchy in which it resides). A process created in a container might have `PID 1` in the container's local namespace, `PID 48921` in the host root namespace, and `PID 340` in an intermediate cgroup namespace. When a syscall (e.g. `getpid()`) is invoked, the kernel translates the PID relative to the caller's active PID namespace.
+
+**Q2: What is the "Zombie Process Problem" inside containers, and why does PID 1 have a special duty?**
+
+When a Linux child process terminates, it enters the **Zombie (`defunct`)** state, holding an entry in the kernel's process table until its parent reads its exit status via `waitpid()`. If the parent process crashes or terminates prematurely, the orphaned child processes are automatically **adopted by PID 1 of that PID namespace**. If PID 1 in the container is a naive application that does not run an active `waitpid()` event loop, dead child processes accumulate indefinitely as zombies, eventually exhausting the Linux host's available PID table capacity (`/proc/sys/kernel/pid_max`).
+
+**Q3: Why is `Mount Propagation: HostToContainer` (`MS_SLAVE` / `MS_SHARED`) required for Kubernetes CSI Storage Plugins?**
+
+Kubernetes CSI (Container Storage Interface) driver pods run inside containers, but their job is to format and mount physical block storage devices (e.g. AWS EBS or Ceph) into host directories (e.g. `/var/lib/kubelet/pods/.../volumes`). If the CSI container ran in an isolated `MS_PRIVATE` mount namespace, any mount operations executed by the CSI plugin would remain invisible to the host and application pods. Setting **`mountPropagation: Bidirectional` (`MS_SHARED`)** ensures that filesystem mounts created inside the CSI container automatically propagate back to the host operating system.
+
+**Q4: How do multiple containers listen on port 80 on the same physical server without port conflicts?**
+
+Port numbers (TCP/UDP) are bound to a specific **Network Namespace's socket table**. Because each container runs in its own dedicated Network Namespace (`CLONE_NEWNET`), each container possesses its own private loopback interface, private IP address (e.g. `172.17.0.2` and `172.17.0.3`), and private socket table. Container A binds port 80 to `172.17.0.2:80`, and Container B binds port 80 to `172.17.0.3:80`. The host uses `iptables` Network Address Translation (NAT) or bridge routing to forward traffic to the appropriate namespace IP.
+
+**Q5: What is a `veth` pair in Linux, and how does it function like a physical patch cable?**
+
+A **Virtual Ethernet (`veth`) Pair** is a pair of interconnected virtual network interfaces created in the Linux kernel (`ip link add veth0 type veth peer name veth1`). It acts like a **bidirectional virtual network cable**: any packet transmitted into `veth0` instantly emerges as an incoming packet on `veth1`. By moving one end into a container's Network Namespace (renaming it `eth0`) and attaching the other end to a Linux Bridge on the host (`docker0` or `cbr0`), the kernel establishes a high-speed L2 network connection between the container and host.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that PID namespaces are nested and processes have different PIDs at each level
+- [ ] Know that PID 1 is responsible for reaping orphaned zombie processes
+- [ ] Know the mount propagation modes: `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE`
+- [ ] Know why Kubernetes CSI drivers require `Bidirectional` (`MS_SHARED`) propagation
+- [ ] Know that Network namespaces isolate IP addresses, routing tables, and ports
+- [ ] Can connect two network namespaces using a `veth` pair and verify with `ping`

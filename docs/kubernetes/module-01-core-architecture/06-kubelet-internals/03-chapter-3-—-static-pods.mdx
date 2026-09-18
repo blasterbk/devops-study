@@ -1,0 +1,1196 @@
+---
+title: "Chapter 3 — Static Pods"
+sidebar_position: 3
+module: "Module 1.6 — kubelet Internals"
+description: "> **Goal:** Understand how Kubernetes uses **Static Pods** to bootstrap and manage critical Node-local workloads. Learn how kubelet discovers Static Pod manifes..."
+---
+
+# Module 1.6 — kubelet Internals
+
+# Chapter 3 — Static Pods
+
+> **Goal:** Understand how Kubernetes uses **Static Pods** to bootstrap and manage critical Node-local workloads. Learn how kubelet discovers Static Pod manifests, creates Mirror Pods, manages the Static Pod lifecycle, and how Static Pods differ from normal Kubernetes-managed Pods.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What Static Pods are: manifests read directly by kubelet from disk
+> 2. staticPodPath: the directory kubelet watches for manifest files
+> 3. How kubelet creates and manages Static Pods without the API Server
+> 4. Mirror Pods: read-only API Server representation of a Static Pod
+> 5. Why control plane components run as Static Pods (kubeadm clusters)
+> 6. Static Pod lifecycle: kubelet restarts them if they crash or are deleted
+> 7. Limitations: no DaemonSets, no Deployments, no scheduler involvement
+> 8. Static Pod vs normal Pod: ownership, deletion, scheduling differences
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Static Pods like an emergency generator that runs without central power.
+
+```text
+Emergency Generator Analogy:
+
+Building (Node) has a generator (Static Pod) wired directly to critical systems
+Generator starts automatically when the building powers on
+Central power company (API Server) didn't install it and can't control it
+Building manager (kubelet) is responsible for keeping it running
+If generator stops: building manager immediately restarts it
+Central office can see a status light (Mirror Pod) but can't flip the switch
+Only removing the generator from the wiring room (deleting the manifest) stops it
+```
+
+| Emergency Generator | Static Pod |
+| :--- | :--- |
+| Emergency generator | Static Pod (e.g., `kube-apiserver`, `etcd`) |
+| Building manager | kubelet |
+| Wiring room manifest | `/etc/kubernetes/manifests/` directory |
+| Generator status light in central office | Mirror Pod (read-only in API Server) |
+| Central office cannot stop generator | `kubectl delete pod` has no permanent effect |
+| Removing from wiring room | Deleting the manifest file from disk |
+
+> **Important:** If you run `kubectl delete pod` on a Static Pod, **kubelet immediately recreates it** from the manifest file on disk. The API Server's Mirror Pod deletion triggers kubelet to notice the mismatch and recreate the Pod. To permanently stop a Static Pod, you must **remove or rename the manifest file** from `staticPodPath` on the Node.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- kubelet Architecture
+- Node Registration
+- Pod Lifecycle
+- Pod Sync Loop
+- API Server
+- Scheduler
+
+---
+
+# Why Do Static Pods Exist?
+
+Normally, Kubernetes workloads begin with the API Server.
+
+Example:
+
+```text
+kubectl apply
+  |
+  v
+API Server
+  |
+  v
+Scheduler
+  |
+  v
+kubelet
+  |
+  v
+Running Pod
+```
+
+But a fundamental question arises:
+
+> **How does the API Server itself start?**
+
+The API Server cannot schedule itself because it is not running yet.
+
+This creates a classic bootstrap problem.
+
+---
+
+# The Bootstrap Problem
+
+Suppose a new Kubernetes cluster is starting.
+
+Initially:
+
+```text
+API Server
+
+❌ Not Running
+
+Scheduler
+
+❌ Not Running
+
+Controller Manager
+
+❌ Not Running
+```
+
+Without the API Server:
+
+- No Pod objects exist.
+- No Scheduler exists.
+- No Controller Manager exists.
+
+So who starts these components?
+
+The answer is:
+
+```text
+kubelet
+  |
+  v
+Static Pods
+```
+
+---
+
+# What is a Static Pod?
+
+A **Static Pod** is a Pod whose manifest is stored as a local file on a Node.
+
+Instead of being created through the Kubernetes API, it is created directly by the kubelet.
+
+Conceptually:
+
+```text
+Local YAML File
+  |
+  v
+kubelet
+  |
+  v
+Container Runtime
+  |
+  v
+Running Pod
+```
+
+No Scheduler is involved.
+
+---
+
+# Definition
+
+Unlike a normal Pod:
+
+```text
+API Server
+  |
+  v
+Pod Object
+  |
+  v
+Scheduler
+  |
+  v
+kubelet
+```
+
+A Static Pod follows:
+
+```text
+Manifest File
+  |
+  v
+kubelet
+  |
+  v
+Container Runtime
+```
+
+The kubelet becomes both:
+
+- Resource watcher
+- Resource creator
+
+---
+
+# Static Pod Manifest Directory
+
+The kubelet continuously watches one or more directories configured at startup.
+
+A common default location is:
+
+```text
+/etc/kubernetes/manifests/
+```
+
+Example:
+
+```text
+/etc/kubernetes/manifests/
+
++-- kube-apiserver.yaml
+
++-- kube-controller-manager.yaml
+
++-- kube-scheduler.yaml
+
++-- etcd.yaml
+```
+
+Every file represents one Static Pod.
+
+---
+
+# How kubelet Finds Static Pods
+
+During startup:
+
+```text
+kubelet
+  |
+  v
+Read Static Pod Directory
+  |
+  v
+Parse YAML
+  |
+  v
+Validate Manifest
+  |
+  v
+Create Pod
+```
+
+The kubelet also watches the directory for changes.
+
+---
+
+# Static Pod Discovery Workflow
+
+```text
+Manifest Directory
+  |
+  v
+File Added
+  |
+  v
+kubelet Detects Change
+  |
+  v
+Parse Manifest
+  |
+  v
+Create Pod
+  |
+  v
+Container Runtime
+```
+
+This happens without contacting the Scheduler.
+
+---
+
+# Static Pod Architecture
+
+```text
+               Local File
+
+                    |
+
+                    ▼
+
+              kubelet Watcher
+
+                    |
+
+                    ▼
+
+               Static Pod
+
+                    |
+
+                    ▼
+
+          Container Runtime
+
+                    |
+
+                    ▼
+
+             Running Containers
+```
+
+---
+
+# Static Pod Manifest
+
+A Static Pod manifest looks almost identical to a normal Pod manifest.
+
+Example:
+
+```yaml
+apiVersion: v1
+
+kind: Pod
+
+metadata:
+
+  name: kube-apiserver
+
+spec:
+
+  containers:
+
+  - name: kube-apiserver
+
+    image: registry.k8s.io/kube-apiserver:v1.xx
+```
+
+The difference is **how it is created**, not its structure.
+
+---
+
+# Who Creates Static Pods?
+
+Normal Pods:
+
+```text
+User
+  |
+  v
+API Server
+  |
+  v
+Stored in etcd
+  |
+  v
+Scheduler
+  |
+  v
+kubelet
+```
+
+Static Pods:
+
+```text
+Administrator
+  |
+  v
+Manifest File
+  |
+  v
+kubelet
+  |
+  v
+Container Runtime
+```
+
+---
+
+# Static Pod Lifecycle
+
+The kubelet continuously manages Static Pods using the same reconciliation principles discussed earlier.
+
+Lifecycle:
+
+```text
+Manifest Created
+  |
+  v
+kubelet Detects File
+  |
+  v
+Create Pod
+  |
+  v
+Monitor Pod
+  |
+  v
+Restart If Needed
+  |
+  v
+Delete When Manifest Removed
+```
+
+---
+
+# Lifecycle States
+
+A Static Pod can still move through normal Pod phases:
+
+```text
+Pending
+  |
+  v
+Running
+  |
+  v
+Succeeded
+  |
+  v
+Failed
+```
+
+The lifecycle phases remain the same.
+
+Only the **source of the Pod** is different.
+
+---
+
+# Continuous Reconciliation
+
+Suppose:
+
+```text
+Container Crashes
+```
+
+The kubelet detects:
+
+```text
+Desired State
+  |
+  v
+Manifest Exists
+  |
+  v
+Container Missing
+```
+
+Result:
+
+```text
+Restart Container
+```
+
+The same Pod Sync Loop applies.
+
+---
+
+# Manifest Modification
+
+Suppose the administrator edits:
+
+```text
+kube-apiserver.yaml
+```
+
+Example:
+
+```text
+Image Changed
+  |
+  v
+Save File
+```
+
+The kubelet detects:
+
+```text
+Manifest Updated
+  |
+  v
+Reconcile
+  |
+  v
+Restart Pod
+  |
+  v
+Run Updated Version
+```
+
+The update is driven by the local file.
+
+---
+
+# Manifest Deletion
+
+Suppose:
+
+```text
+Delete
+
+kube-apiserver.yaml
+```
+
+Workflow:
+
+```text
+Manifest Removed
+  |
+  v
+kubelet Detects Change
+  |
+  v
+Terminate Pod
+  |
+  v
+Delete Containers
+```
+
+Since the desired state no longer exists, the kubelet removes the Pod.
+
+---
+
+# Static Pod Sync Loop
+
+Static Pods participate in the same kubelet reconciliation process.
+
+```text
+Manifest Exists
+  |
+  v
+Pod Sync Loop
+  |
+  v
+Desired == Actual?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Wait
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+SyncPod()
+```
+
+The only difference is where the desired state originates.
+
+---
+
+# Mirror Pods
+
+Although Static Pods exist only on the local Node,
+
+administrators still need visibility through Kubernetes APIs.
+
+To solve this,
+
+the kubelet creates:
+
+```text
+Mirror Pods
+```
+
+---
+
+# What is a Mirror Pod?
+
+A Mirror Pod is a read-only representation of a Static Pod stored in the API Server.
+
+It allows:
+
+```text
+kubectl get pods
+```
+
+to display Static Pods.
+
+---
+
+# Mirror Pod Architecture
+
+```text
+Static Pod
+  |
+  v
+kubelet
+  |
+  v
+Mirror Pod
+  |
+  v
+API Server
+  |
+  v
+kubectl get pods
+```
+
+Important:
+
+The Mirror Pod is **not** the running workload.
+
+It is only metadata representing the Static Pod.
+
+---
+
+# Why Mirror Pods?
+
+Without Mirror Pods:
+
+```text
+Static Pod Running
+  |
+  v
+API Server Knows Nothing
+  |
+  v
+kubectl Shows Nothing
+```
+
+Mirror Pods provide cluster visibility.
+
+---
+
+# Mirror Pod Creation Workflow
+
+```text
+Static Pod Created
+  |
+  v
+kubelet
+  |
+  v
+Create Mirror Pod
+  |
+  v
+API Server
+  |
+  v
+Visible To Users
+```
+
+---
+
+# Mirror Pod Synchronization
+
+Whenever the Static Pod changes:
+
+```text
+Static Pod
+  |
+  v
+kubelet
+  |
+  v
+Update Mirror Pod
+```
+
+The API representation reflects the current state.
+
+---
+
+# Can Users Modify Mirror Pods?
+
+No.
+
+Suppose someone runs:
+
+```bash
+kubectl delete pod kube-apiserver-worker01
+```
+
+The API Server deletes the Mirror Pod object.
+
+However:
+
+```text
+Static Manifest
+
+Still Exists
+  |
+  v
+kubelet
+  |
+  v
+Recreate Mirror Pod
+```
+
+The running Static Pod is unaffected.
+
+---
+
+# Important Concept
+
+Mirror Pods are:
+
+```text
+Representation
+
+NOT
+
+Source Of Truth
+```
+
+The source of truth is always:
+
+```text
+Local Manifest File
+```
+
+---
+
+# Static Pods vs Normal Pods
+
+| Static Pod | Normal Pod |
+|------------|------------|
+| Created by kubelet | Created through API Server |
+| Defined in local manifest | Defined through Kubernetes API |
+| No Scheduler involvement | Scheduler assigns a Node |
+| Stored as local files | Stored in etcd |
+| Managed directly by kubelet | Managed by controllers and kubelet |
+| Represented by Mirror Pods | Native API objects |
+| Best suited for Node-local infrastructure | Used for normal workloads |
+
+---
+
+# Scheduler Interaction
+
+Static Pods bypass scheduling.
+
+Normal Pod:
+
+```text
+Pod
+  |
+  v
+Scheduler
+  |
+  v
+Node Selected
+  |
+  v
+kubelet
+```
+
+Static Pod:
+
+```text
+Manifest
+  |
+  v
+kubelet
+  |
+  v
+Run On Local Node
+```
+
+They always run on the Node where the manifest exists.
+
+---
+
+# Controller Interaction
+
+Static Pods are **not** managed by:
+
+- Deployment Controller
+- ReplicaSet Controller
+- StatefulSet Controller
+- DaemonSet Controller
+
+Instead:
+
+```text
+Manifest
+  |
+  v
+kubelet
+  |
+  v
+Pod
+```
+
+The kubelet alone is responsible.
+
+---
+
+# Storage of Desired State
+
+Normal Pods:
+
+```text
+etcd
+  |
+  v
+API Server
+  |
+  v
+Desired State
+```
+
+Static Pods:
+
+```text
+Local Disk
+  |
+  v
+Manifest
+  |
+  v
+Desired State
+```
+
+This distinction is extremely important.
+
+---
+
+# Failure Recovery
+
+Suppose:
+
+```text
+Container Crash
+```
+
+Recovery:
+
+```text
+Manifest Exists
+  |
+  v
+kubelet
+  |
+  v
+Restart Container
+```
+
+Suppose:
+
+```text
+Node Reboots
+```
+
+Recovery:
+
+```text
+kubelet Starts
+  |
+  v
+Read Manifest Directory
+  |
+  v
+Recreate Static Pods
+```
+
+The manifest survives the reboot.
+
+---
+
+# Control Plane Bootstrapping
+
+A kubeadm-based control plane commonly uses Static Pods.
+
+Example:
+
+```text
+/etc/kubernetes/manifests/
+  |
+  v
+kube-apiserver.yaml
+  |
+  v
+kube-controller-manager.yaml
+  |
+  v
+kube-scheduler.yaml
+  |
+  v
+etcd.yaml
+```
+
+The kubelet starts these automatically.
+
+Once the API Server is running,
+
+the rest of the cluster becomes operational.
+
+---
+
+# Bootstrapping Workflow
+
+```text
+Node Boots
+  |
+  v
+kubelet Starts
+  |
+  v
+Read Manifest Directory
+  |
+  v
+Start etcd
+  |
+  v
+Start API Server
+  |
+  v
+Start Controller Manager
+  |
+  v
+Start Scheduler
+  |
+  v
+Control Plane Ready
+```
+
+Without Static Pods,
+
+this bootstrap sequence would not be possible.
+
+---
+
+# Production Example 1
+
+API Server Startup
+
+```text
+Node Restart
+  |
+  v
+kubelet
+  |
+  v
+Read kube-apiserver.yaml
+  |
+  v
+API Server Running
+```
+
+---
+
+# Production Example 2
+
+Scheduler Upgrade
+
+```text
+Replace
+
+kube-scheduler.yaml
+  |
+  v
+kubelet Detects Change
+  |
+  v
+Restart Scheduler
+  |
+  v
+New Version Running
+```
+
+---
+
+# Production Example 3
+
+Manifest Removed
+
+```text
+Delete
+
+etcd.yaml
+  |
+  v
+kubelet
+  |
+  v
+Stop etcd
+  |
+  v
+Remove Containers
+```
+
+---
+
+# Production Example 4
+
+Mirror Pod Deleted
+
+```text
+kubectl delete pod
+  |
+  v
+Mirror Pod Deleted
+  |
+  v
+Manifest Still Exists
+  |
+  v
+kubelet Recreates Mirror Pod
+```
+
+The Static Pod never stopped.
+
+---
+
+# Production Best Practices
+
+✔ Use Static Pods only for Node-local infrastructure.
+
+✔ Keep Static Pod manifests under version control.
+
+✔ Protect the manifest directory with strict filesystem permissions.
+
+✔ Avoid manually editing manifests directly on production Nodes whenever possible; use controlled automation.
+
+✔ Monitor kubelet logs for manifest parsing errors.
+
+✔ Do not use Static Pods for application workloads.
+
+✔ Validate manifest syntax before deployment.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Static Pods are scheduled by the Scheduler.
+
+**Correct:** Static Pods bypass the Scheduler entirely and are created directly by the kubelet.
+
+---
+
+### ❌ Misconception 2
+
+Mirror Pods are the real running Pods.
+
+**Correct:** Mirror Pods are API representations. The running workload is the locally managed Static Pod.
+
+---
+
+### ❌ Misconception 3
+
+Deleting a Mirror Pod stops the application.
+
+**Correct:** If the local manifest still exists, the kubelet recreates the Mirror Pod and keeps the Static Pod running.
+
+---
+
+### ❌ Misconception 4
+
+Static Pods are stored in etcd.
+
+**Correct:** Their desired state comes from local manifest files. Mirror Pods exist in the API Server only for visibility.
+
+---
+
+### ❌ Misconception 5
+
+Deployments can manage Static Pods.
+
+**Correct:** Static Pods are managed directly by the kubelet, not by Kubernetes workload controllers.
+
+---
+
+### ❌ Misconception 6
+
+Static Pods cannot restart.
+
+**Correct:** They participate in the same kubelet reconciliation process and are restarted when required.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is a Static Pod?
+
+A Pod created directly by the kubelet from a local manifest file instead of through the Kubernetes API.
+
+---
+
+### Q2. Why do Static Pods exist?
+
+They solve the bootstrap problem by allowing critical components, such as the API Server and etcd, to start before the control plane is fully operational.
+
+---
+
+### Q3. What is a Mirror Pod?
+
+A read-only API representation of a Static Pod created by the kubelet for visibility through Kubernetes APIs.
+
+---
+
+### Q4. Are Static Pods scheduled?
+
+No. They always run on the Node where their manifest exists.
+
+---
+
+### Q5. What happens if a Static Pod manifest is deleted?
+
+The kubelet stops the running Pod because the desired state no longer exists.
+
+---
+
+### Q6. What happens if someone deletes a Mirror Pod?
+
+The kubelet recreates it as long as the Static Pod manifest remains present.
+
+---
+
+### Q7. Are Static Pods stored in etcd?
+
+No. Only their Mirror Pods are visible through the API Server. The source of truth is the local manifest file.
+
+---
+
+### Q8. What is the most common production use of Static Pods?
+
+Running Kubernetes control plane components such as the API Server, Scheduler, Controller Manager, and etcd.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Static Pod never starts | Invalid manifest, incorrect file location, or kubelet cannot read the manifest |
+| Mirror Pod missing | API Server unavailable or kubelet unable to create/update the Mirror Pod |
+| Manifest changes have no effect | kubelet not monitoring the configured manifest directory or invalid YAML |
+| Static Pod restarts repeatedly | Application crash, image issues, or configuration errors |
+| Deleting the Mirror Pod has no effect | Expected behavior—the kubelet recreates it from the local manifest |
+| Control plane fails after reboot | Missing or corrupted Static Pod manifests for control plane components |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why were Static Pods introduced?
+2. How does a Static Pod differ from a normal Pod?
+3. Where are Static Pod manifests stored?
+4. How does the kubelet discover Static Pods?
+5. What is the source of truth for a Static Pod?
+6. What is a Mirror Pod?
+7. Why are Mirror Pods needed?
+8. What happens when a Static Pod manifest changes?
+9. What happens when a Static Pod manifest is deleted?
+10. Why are Static Pods commonly used for Kubernetes control plane components?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how **Static Pods** allow the kubelet to run critical workloads without relying on the Kubernetes API.
+
+You learned:
+
+- Why Static Pods solve the control plane bootstrap problem
+- How kubelet discovers Static Pod manifests from the local filesystem
+- How Static Pods move through the normal Pod lifecycle under kubelet management
+- How the Pod Sync Loop continuously reconciles Static Pods
+- Why Mirror Pods exist and how they provide API visibility
+- The key differences between Static Pods and normal Kubernetes-managed Pods
+- Why Static Pods are primarily used for control plane components in production clusters
+
+Static Pods are one of the few Kubernetes mechanisms that operate **outside the normal API-driven workflow**. Their local-file-based design enables Kubernetes to start itself, making them a foundational part of cluster bootstrapping while remaining fully managed by the kubelet through the same reconciliation principles used for all other Pods.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — Health Probes**
+
+In the next chapter, we'll explore how the kubelet determines whether applications are healthy and ready to receive traffic.
+
+Topics include:
+
+- Readiness Probes
+- Liveness Probes
+- Startup Probes
+- Probe Types (HTTP, TCP, Exec, gRPC)
+- Probe Execution Flow
+- Common Misconfigurations
+- Production Best Practices
+
+You'll learn how kubelet continuously evaluates application health and how probe results influence traffic routing, container restarts, and workload reliability.
+```

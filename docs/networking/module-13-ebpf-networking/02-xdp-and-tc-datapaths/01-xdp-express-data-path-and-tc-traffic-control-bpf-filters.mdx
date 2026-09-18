@@ -1,0 +1,167 @@
+---
+title: "Chapter 2 — eBPF Fast Datapaths: XDP (eXpress Data Path), TC & Socket Filters"
+sidebar_position: 1
+module: "Module 13.2 — XDP & TC Datapaths"
+description: "Master high-speed eBPF packet processing — eXpress Data Path (XDP) driver/offloaded line-rate processing, XDP action verdicts (DROP, PASS, TX, REDIRECT), Traffic Control (TC) ingress/egress BPF filters, and AF_XDP zero-copy."
+---
+
+# Chapter 2 — eBPF Fast Datapaths: XDP (eXpress Data Path), TC & Socket Filters
+
+> **Goal:** Master the highest-performance packet processing architecture in modern operating systems: **eXpress Data Path (XDP)** and **Traffic Control (TC) with eBPF**. Understand how XDP executes eBPF programs directly inside the NIC driver ring buffer at 40M+ packets per second (line rate) *before* the Linux kernel allocates an `sk_buff` socket buffer, XDP action verdicts, and how Cloudflare, Meta, and Cilium use XDP for hyper-scale L4 DDoS mitigation and load balancing.
+>
+> By the end of this chapter, you will understand:
+> 1. The Linux networking datapath bottleneck: `sk_buff` allocation, DMA ring buffers, and cache misses
+> 2. The 3 XDP Execution Modes: **Offloaded** (runs on SmartNIC ASIC), **Native / Driver** (runs in NIC driver), and **Generic** (runs in core kernel stack)
+> 3. The 5 XDP Action Verdicts: `XDP_DROP`, `XDP_PASS`, `XDP_TX`, `XDP_REDIRECT`, `XDP_ABORTED`
+> 4. Traffic Control (TC cls_bpf) hooks: full access to `__sk_buff`, ingress & egress packet manipulation
+> 5. `AF_XDP` (XSK): Zero-copy raw packet streaming from NIC hardware directly to user-space memory
+> 6. CLI commands to attach, inspect, and detach XDP and TC programs using `ip link` and `tc`
+
+---
+
+## Real-Life Analogy
+
+Think of XDP vs standard Linux networking as **a high-speed security guard stationed directly at the airport airplane door vs at the main terminal customs hall**:
+
+- **Standard Linux Network Stack (`sk_buff`):**
+  - When a package arrives at the airport gate, a worker builds a 50-page formal paperwork binder for it (**Allocates a 240-byte `sk_buff` in RAM**), pushes it through 10 conveyor belts, checks 5 different ledgers (**Netfilter / Conntrack**), and finally delivers it to the customer.
+  - If an attacker sends 10 million junk letters per second, the workers run out of paper and the entire airport freezes (**DDoS Crash**).
+- **XDP (eXpress Data Path):**
+  - An automated robotic scanner sits directly inside the airplane cargo door (**NIC Driver DMA Buffer**).
+  - The scanner inspects the first 64 bytes in 5 nanoseconds. If it sees a DDoS attack, it incinerates the box on the spot (**`XDP_DROP`**) *before* any paperwork is printed or RAM is allocated!
+
+---
+
+## Architecture Diagram
+
+```text
+                  Linux Kernel Networking Datapath: XDP vs TC vs Netfilter
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ PHYSICAL NETWORK INTERFACE CARD (NIC Hardware / SmartNIC)                   │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ DMA Transfer
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. XDP HOOK (eXpress Data Path - Runs in Driver Ring Buffer):               │
+ │    - Operates on raw `xdp_md` frame (NO `sk_buff` allocated yet!)           │
+ │    - Processing Speed: 40+ Million Packets/Second (Line Rate)               │
+ │                                                                             │
+ │    Actions: [ XDP_DROP ] [ XDP_TX (Hairpin) ] [ XDP_REDIRECT ] [ XDP_PASS ] │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ (If XDP_PASS: Kernel allocates `sk_buff`)
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 2. TC INGRESS HOOK (Traffic Control cls_bpf):                               │
+ │    - Operates on full `__sk_buff` struct                                    │
+ │    - Ingress packet rewriting, redirecting, L4 load balancing               │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 3. STANDARD LINUX NETWORK STACK:                                            │
+ │    [Netfilter / iptables PREROUTING] ──► [Routing] ──► [TCP/UDP Sockets]    │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The 5 XDP Action Verdicts
+
+```text
+ ┌──────────────────┬──────┬───────────────────────────────────────────────────────────────────────────┐
+ │ Verdict          │ Code │ Operational Action & Use Case                                             │
+ │──────────────────┼──────┼───────────────────────────────────────────────────────────────────────────┤
+ │ **`XDP_DROP`**   │ 1    │ Drops packet instantly in driver. Zero memory allocated (DDoS Defense).   │
+ │ **`XDP_PASS`**   │ 2    │ Allocates `sk_buff` and passes packet up into standard Linux IP stack.    │
+ │ **`XDP_TX`**     │ 3    │ Transmits packet directly back out the same NIC interface it arrived on.  │
+ │                  │      │ (Used for ultra-fast Layer 4 Load Balancing / DSR).                       │
+ │ **`XDP_REDIRECT`**│ 4   │ Redirects packet to another NIC, a veth pair, CPU core, or `AF_XDP` sock. │
+ │ **`XDP_ABORTED`**│ 0    │ Fatal eBPF program error; drops packet and logs tracepoint for debugging. │
+ └──────────────────┴──────┴───────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. XDP vs Traffic Control (TC)
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Feature              │ XDP (eXpress Data Path)                  │ TC (Traffic Control cls_bpf)             │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **Execution Point**  │ Before `sk_buff` allocation (NIC driver) │ After `sk_buff` allocation in kernel     │
+ │ **Traffic Direction**│ **Ingress Only**                         │ **Both Ingress and Egress**              │
+ │ **Context Struct**   │ Lightweight `struct xdp_md` (Raw bytes)  │ Full `struct __sk_buff` (Socket metadata)│
+ │ **Throughput**       │ ~40 Million PPS (Maximal)                │ ~10–15 Million PPS (Very High)           │
+ │ **Primary Use Case** │ L4 DDoS defense, L4 DSR Load Balancing   │ Ingress/Egress shaping, Container CNI    │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 3. AF_XDP (XSK — XDP Sockets) & Zero-Copy Architecture
+
+Traditional user-space packet capturing (`libpcap` / `tcpdump`) copies packet memory from kernel to user space.
+- **`AF_XDP` (Address Family XDP):** Sets up a lockless shared UMEM memory ring directly between the NIC driver's DMA memory and user space. Packets bypass the Linux kernel entirely and land in user-space RAM at line rate with **Zero-Copy (0 memory copies)**.
+
+---
+
+## Hands-On Lab: Attaching & Inspecting XDP Programs
+
+```bash
+# Step 1: Inspect whether your network driver supports native XDP
+ip link show dev eth0
+
+# Step 2: Attach an eBPF program in XDP mode to an interface
+# (Example: sudo ip link set dev eth0 xdp obj my_xdp_prog.o sec my_section)
+
+# Step 3: Inspect active XDP programs attached to network links
+ip -d link show | grep -i "xdp"
+
+# Step 4: Attach an eBPF TC filter to the ingress hook of an interface
+sudo tc qdisc add dev eth0 clsact 2>/dev/null || true
+# sudo tc filter add dev eth0 ingress bpf da obj my_tc_prog.o sec my_sec
+
+# Step 5: Detach XDP program from the interface
+sudo ip link set dev eth0 xdp off 2>/dev/null
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why can an XDP program running in native driver mode drop 40+ million packets per second while iptables chokes at 1–2 million?**
+
+Standard `iptables` runs inside the core Linux IP stack. For every arriving packet, the kernel must: 1) allocate a 240-byte `struct sk_buff`, 2) initialize metadata fields, 3) invoke connection tracking (`conntrack`), and 4) walk through sequential iptables chains. **XDP runs in the NIC driver ring buffer before the `sk_buff` is ever allocated**. Returning `XDP_DROP` takes ~5 nanoseconds (a single CPU register check), allowing a single server to absorb massive volumetric DDoS attacks at 100 Gbps line rate.
+
+**Q2: What is the difference between Native XDP, Offloaded XDP, and Generic XDP?**
+
+- **Offloaded XDP:** The eBPF bytecode is JIT-compiled directly into the ASIC / FPGA of a **SmartNIC** (e.g. Netronome, Mellanox BlueField). Packets are processed on hardware with 0% host CPU utilization.
+- **Native / Driver XDP (Default):** Runs in the Linux NIC driver's receive ring buffer before `sk_buff` allocation. Requires NIC driver support (supported by Intel `ixgbe`/`i40e`, Mellanox `mlx5`, virtio-net).
+- **Generic XDP:** Runs after the kernel allocates an `sk_buff`. Used purely for testing on hardware whose drivers do not support native XDP.
+
+**Q3: How does Katran (Meta's open-source L4 Load Balancer) leverage XDP and Consistent Hashing?**
+
+Katran runs as an XDP program attached to the ingress NIC driver on border servers. When an incoming packet hits the VIP, Katran calculates a 5-tuple hash, performs a Maglev consistent hash lookup in a BPF Map to select a backend real server, encapsulates the packet with an outer IP header, and returns **`XDP_TX`**. The packet is immediately transmitted back out the NIC directly to the backend server with sub-microsecond latency.
+
+**Q4: Why does Cilium CNI use TC (Traffic Control) hooks in addition to XDP?**
+
+While XDP is the fastest hook, it is **ingress-only** and lacks access to socket-level metadata. **TC (Traffic Control cls_bpf)** runs on **both Ingress and Egress** and operates on `struct __sk_buff`. Cilium uses TC programs on container virtual ethernet (`veth`) interfaces to enforce egress network policies, perform L7 proxy redirection (to Envoy), and apply QoS bandwidth shaping.
+
+**Q5: What is `AF_XDP` and how does it compare to DPDK (Data Plane Development Kit)?**
+
+Both `AF_XDP` and DPDK achieve kernel-bypass line-rate packet streaming to user-space applications. However:
+- **DPDK:** Unbinds the NIC from the Linux kernel completely, meaning standard Linux tools (`ethtool`, `ip`, `tcpdump`, standard firewalling) no longer work on that interface.
+- **`AF_XDP`:** Reuses the standard Linux driver infrastructure; only packets explicitly matched by an `XDP_REDIRECT` rule are passed to the `AF_XDP` socket, while regular OS traffic continues flowing through standard Linux sockets normally.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 5 XDP action verdicts: `DROP`, `PASS`, `TX`, `REDIRECT`, `ABORTED`
+- [ ] Understand why XDP drops packets before `sk_buff` allocation
+- [ ] Differentiate Native XDP (Driver) from Offloaded XDP (SmartNIC)
+- [ ] Master XDP (Ingress raw) vs TC (Ingress/Egress `__sk_buff`)
+- [ ] Understand `AF_XDP` zero-copy memory ring buffers

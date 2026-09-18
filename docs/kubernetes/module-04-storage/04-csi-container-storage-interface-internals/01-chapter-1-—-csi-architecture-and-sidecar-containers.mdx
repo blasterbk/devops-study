@@ -1,0 +1,278 @@
+---
+title: "Chapter 1 — CSI Architecture & Sidecar Containers"
+sidebar_position: 1
+module: "Module 4.4 — CSI Internals"
+description: "Master the Kubernetes Container Storage Interface (CSI) — Controller vs Node plugins, the 6 standard CSI sidecar containers (provisioner, attacher, resizer, snapshotter), and Unix domain socket IPC."
+---
+
+# Chapter 1 — CSI Architecture & Sidecar Containers
+
+> **Goal:** Master the internal architecture and sidecar helper ecosystem of the Container Storage Interface (CSI) in Kubernetes — understanding the functional decoupling between Controller and Node plugins, the roles of the 6 official Kubernetes CSI sidecar containers, how Kubelet registers out-of-tree drivers via Unix domain sockets, and how to debug storage driver control loops.
+>
+> By the end of this chapter, you will understand:
+> 1. The Container Storage Interface (CSI) specification and why it replaced in-tree drivers
+> 2. The division of responsibility: CSI Controller Plugin vs CSI Node Plugin
+> 3. The 6 official Kubernetes CSI sidecar containers and their specific API triggers
+> 4. How `node-driver-registrar` discovers and registers local CSI node endpoints with Kubelet
+> 5. How gRPC communication flows over host-mounted Unix Domain Sockets (`csi.sock`)
+> 6. How to inspect and troubleshoot CSI sidecar logs during storage failures
+
+---
+
+## Real-Life Analogy
+
+Think of the Kubernetes CSI architecture as a **modern automated car manufacturing plant**:
+
+- **The Core Car Factory (Kubernetes Core API Server & Kubelet):** The factory knows how to assemble the car body and chassis, but it doesn't want to manufacture custom rubber tires, transmissions, or batteries from 50 different third-party vendors.
+- **The Standard Interface Socket (CSI Specification):** The factory publishes a universal standard connector socket (**CSI gRPC API**). Any tire company (AWS EBS, GCP PD, Ceph, NetApp) can plug into this exact socket.
+- **The Factory Logistics Office (CSI Controller Plugin Deployment):** A centralized control tower. When a work order arrives (PVC created), it calls the tire supplier and orders 4 customized off-road tires manufactured and delivered to the loading dock (**`csi-provisioner` and `csi-attacher`**).
+- **The Assembly Floor Mechanics (CSI Node Plugin DaemonSet):** A mechanic stationed at every single workstation (Node). When the car pulls up, the mechanic physically bolts the tires onto the axle (**`NodeStageVolume` & `NodePublishVolume`**).
+- **The Translator Interpreters (The 6 CSI Sidecars):** Kubernetes does not speak vendor gRPC directly; it speaks Kubernetes API objects (PVCs, PVs, VolumeSnapshots). The sidecar containers act as translators, watching Kubernetes objects and issuing gRPC commands to the vendor driver.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes CSI Architecture & Sidecar Flow
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES CONTROL PLANE (kube-system)                                 │
+ │                                                                        │
+ │ CSI Controller Plugin (Deployment: ebs-csi-controller)                │
+ │ ┌───────────────────┐ ┌───────────────────┐ ┌────────────────────────┐ │
+ │ │ csi-provisioner   │ │ csi-attacher      │ │ csi-resizer            │ │
+ │ │ (Watches PVCs)    │ │ (Watches VolAttach│ │ (Watches PVC resize)   │ │
+ │ └─────────┬─────────┘ └─────────┬─────────┘ └───────────┬────────────┘ │
+ │           │                     │                       │              │
+ │           └─────────────────────┼───────────────────────┘              │
+ │                                 │ gRPC over Unix Domain Socket         │
+ │                                 ▼                                      │
+ │ ┌────────────────────────────────────────────────────────────────────┐ │
+ │ │ Vendor CSI Driver Container (e.g. aws-ebs-csi-driver)              │ │
+ │ │ Implements Identity & Controller gRPC Services                     │ │
+ │ └────────────────────────────────────────────────────────────────────┘ │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Network Attach Call (AWS/Cloud API)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ WORKER NODE (worker-01)                                                │
+ │                                                                        │
+ │ CSI Node Plugin (DaemonSet: ebs-csi-node)                              │
+ │ ┌──────────────────────────────────┐ ┌───────────────────────────────┐ │
+ │ │ node-driver-registrar            │ │ Vendor Node Driver Container  │ │
+ │ │ (Registers socket with Kubelet)  │ │ (Implements Node gRPC Service)│ │
+ │ └──────────────────────────────────┘ └──────────────┬────────────────┘ │
+ │                                                     ▲                  │
+ │                                                     │ gRPC Socket      │
+ │ ┌───────────────────────────────────────────────────┼────────────────┐ │
+ │ │ Kubelet Daemon (VolumeManager) ───────────────────┘                │ │
+ │ │ Calls NodeStageVolume & NodePublishVolume                          │ │
+ │ └────────────────────────────────────────────────────────────────────┘ │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CSI Controller Plugin vs CSI Node Plugin
+
+A production CSI driver is deployed as two distinct workloads:
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ CSI Controller Plugin           │ CSI Node Plugin                 │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Workload Type**         │ `Deployment` or `StatefulSet`   │ `DaemonSet` (Runs on ALL nodes) │
+ │ **Replica Count**         │ 2–3 Replicas (Leader Elected)   │ Exactly 1 Pod per worker node   │
+ │ **Target Services**       │ `Identity`, `Controller` gRPC   │ `Identity`, `Node` gRPC         │
+ │ **Execution Scope**       │ Cluster-wide (Cloud API calls)  │ Node-local (Kernel format/mount)│
+ │ **Host Privileges**       │ Non-privileged                  │ **Privileged (`privileged: true`│
+ │                           │                                 │ hostPath mounts to `/dev`, `/`) │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The 6 Standard Kubernetes CSI Sidecars
+
+Kubernetes SIG Storage provides standard helper sidecars packaged alongside the vendor's driver container:
+
+```text
+ ┌──────────────────────────────────┬─────────────────────────────┬───────────────────────────────────────────────────┐
+ │ Sidecar Container                │ Kubernetes Object Trigger   │ CSI gRPC Call Invoked                             │
+ │──────────────────────────────────┼─────────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`csi-provisioner`**            │ Watches unbound `PVC`s      │ `CreateVolume()` / `DeleteVolume()`               │
+ │ **`csi-attacher`**               │ Watches `VolumeAttachment`s │ `ControllerPublishVolume()` / `ControllerUnpublish`│
+ │ **`csi-resizer`**                │ Watches expanded `PVC` size │ `ControllerExpandVolume()`                        │
+ │ **`csi-snapshotter`**            │ Watches `VolumeSnapshot`s   │ `CreateSnapshot()` / `DeleteSnapshot()`           │
+ │ **`node-driver-registrar`**      │ Node boot registration      │ Registers node plugin socket with Kubelet plugin  │
+ │                                  │                             │ directory (`/var/lib/kubelet/plugins_registry`)   │
+ │ **`livenessprobe`**              │ Health checks               │ `Probe()` (Exposes `/healthz` HTTP endpoint)      │
+ └──────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Unix Domain Socket Communication
+
+The CSI specification standardizes inter-process communication (IPC) via **gRPC over Unix Domain Sockets**:
+
+1. The CSI driver listens on a local socket file:
+   `/var/lib/kubelet/plugins/ebs.csi.aws.com/csi.sock`
+2. All helper sidecars (`csi-provisioner`, `csi-attacher`) and the local `kubelet` mount this directory via `hostPath` and send standard Protocol Buffer messages.
+3. This guarantees zero network serialization latency, zero TCP port collisions, and tight security isolation.
+
+---
+
+## The `VolumeAttachment` Object
+
+When a Pod is scheduled to a node, the control plane's `AttachDetachController` creates a **`VolumeAttachment`** object in `storage.k8s.io/v1`:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttachment
+metadata:
+  name: csi-vol-attach-9x4la
+spec:
+  attacher: ebs.csi.aws.com
+  nodeName: worker-01
+  source:
+    persistentVolumeName: pvc-a8e2194f-1234
+status:
+  attached: true
+```
+
+The `csi-attacher` sidecar watches this object, executes `ControllerPublishVolume`, and sets `.status.attached: true` when the cloud disk is attached to the VM.
+
+---
+
+## Complete CSI Controller Deployment Architecture
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aws-ebs-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aws-ebs-csi-controller
+  template:
+    metadata:
+      labels:
+        app: aws-ebs-csi-controller
+    spec:
+      serviceAccountName: ebs-csi-controller-sa
+      containers:
+      # 1. Vendor CSI Driver Container
+      - name: ebs-plugin
+        image: registry.k8s.io/provider-aws/aws-ebs-csi-driver:v1.25.0
+        args:
+          - controller
+          - --endpoint=$(CSI_ENDPOINT)
+        env:
+          - name: CSI_ENDPOINT
+            value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+        volumeMounts:
+          - name: socket-dir
+            mountPath: /var/lib/csi/sockets/pluginproxy/
+
+      # 2. CSI Provisioner Sidecar
+      - name: csi-provisioner
+        image: registry.k8s.io/sig-storage/csi-provisioner:v3.6.0
+        args:
+          - --csi-address=$(ADDRESS)
+          - --feature-gates=Topology=true
+          - --leader-election
+        env:
+          - name: ADDRESS
+            value: /var/lib/csi/sockets/pluginproxy/csi.sock
+        volumeMounts:
+          - name: socket-dir
+            mountPath: /var/lib/csi/sockets/pluginproxy/
+
+      # 3. CSI Attacher Sidecar
+      - name: csi-attacher
+        image: registry.k8s.io/sig-storage/csi-attacher:v4.4.0
+        args:
+          - --csi-address=$(ADDRESS)
+          - --leader-election
+        env:
+          - name: ADDRESS
+            value: /var/lib/csi/sockets/pluginproxy/csi.sock
+        volumeMounts:
+          - name: socket-dir
+            mountPath: /var/lib/csi/sockets/pluginproxy/
+
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+```
+
+---
+
+## Hands-On Lab: Inspecting CSI Driver Registrations & Sockets
+
+```bash
+# Step 1: Query all registered CSI Drivers in the cluster
+kubectl get csidrivers
+# Common output: ebs.csi.aws.com, pd.csi.storage.gke.io, or hostpath.csi.k8s.io
+
+# Step 2: Inspect CSI Driver capabilities
+kubectl get csidriver -o yaml
+
+# Step 3: Inspect CSI Node registrations across all worker nodes
+kubectl get csinodes -o wide
+# Observe: Displays driver names, node topologies, and maximum volume attachment limits!
+
+# Step 4: Inspect active VolumeAttachments
+kubectl get volumeattachments
+
+# Step 5: Check running CSI Controller pods in kube-system
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver 2>/dev/null || kubectl get pods -A | grep -i csi
+
+# Step 6: Tail logs of the csi-provisioner sidecar
+CSI_POD=$(kubectl get pods -n kube-system -l app=aws-ebs-csi-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ ! -z "$CSI_POD" ]; then
+  kubectl logs $CSI_POD -n kube-system -c csi-provisioner --tail=20
+fi
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Container Storage Interface (CSI), and what architecture does it employ?**
+
+The Container Storage Interface (CSI) is an industry-standard gRPC interface that allows third-party storage vendors to write plugins that attach, mount, and manage storage without modifying core Kubernetes code. A CSI driver consists of: (1) A centralized **Controller Plugin** (Deployment) managing cloud volume creation, deletion, and attachments; (2) A distributed **Node Plugin** (DaemonSet) executing filesystem formatting and bind-mounting on each node; and (3) Standard **CSI Sidecar Containers** that translate Kubernetes API events into CSI gRPC calls.
+
+**Q2: What is the role of the `csi-provisioner` and `csi-attacher` sidecars?**
+
+- `csi-provisioner`: Watches the Kubernetes API server for unbound `PersistentVolumeClaims`. When a claim references its `StorageClass`, it issues a `CreateVolume()` gRPC call to the storage driver and creates the corresponding `PersistentVolume` in `etcd`.
+- `csi-attacher`: Watches `VolumeAttachment` API objects created by `kube-controller-manager`. It issues a `ControllerPublishVolume()` gRPC call to attach the storage block device to the target worker node VM.
+
+**Q3: How does `node-driver-registrar` integrate a CSI Node Plugin with Kubelet?**
+
+The `node-driver-registrar` sidecar runs inside the CSI Node DaemonSet. Upon node startup, it communicates with the local Kubelet via the Kubelet Plugin Registration mechanism (`/var/lib/kubelet/plugins_registry/`). It registers the driver's name, supported CSI capabilities, and the path to the driver's local Unix Domain Socket (`csi.sock`), allowing Kubelet to directly invoke `NodeStageVolume` and `NodePublishVolume` calls.
+
+**Q4: Why do CSI components communicate via Unix Domain Sockets instead of standard TCP network ports?**
+
+Unix Domain Sockets (UDS) are used because: (1) All communication between helper sidecars and the vendor driver container occurs **within the same Pod sandbox**, where filesystem sharing via `emptyDir` or `hostPath` is native; (2) UDS eliminates TCP stack overhead, network serialization latency, and port conflict risks; (3) UDS leverages Linux file permissions for tight process-level access control.
+
+**Q5: What is a `CSINode` object in Kubernetes?**
+
+A `CSINode` is a cluster-scoped API object automatically created for every worker node in the cluster. It records: (1) The list of all CSI drivers installed on that specific node; (2) The node's unique storage ID recognized by the cloud provider (e.g. AWS EC2 Instance ID); (3) The maximum number of volumes the node can physically attach (e.g. max 28 EBS volumes); and (4) The node's topology failure domains (`topology.kubernetes.io/zone`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that CSI decouples third-party storage drivers from core Kubernetes code
+- [ ] Know the difference between Controller Plugin (Deployment) and Node Plugin (DaemonSet)
+- [ ] Know the 6 CSI sidecars: provisioner, attacher, resizer, snapshotter, registrar, liveness
+- [ ] Know that `VolumeAttachment` objects trigger `csi-attacher` calls
+- [ ] Know that `node-driver-registrar` registers the driver socket with Kubelet
+- [ ] Know that CSI IPC flows over Unix Domain Sockets (`csi.sock`)
+- [ ] Can view registered drivers with `kubectl get csidrivers` and `kubectl get csinodes`

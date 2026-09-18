@@ -1,0 +1,186 @@
+---
+title: "Chapter 2 — IPv6 Addressing, NDP, SLAAC & Dual-Stack Migration"
+sidebar_position: 1
+module: "Module 3.2 — IPv6 Addressing"
+description: "Comprehensive guide to 128-bit IPv6 architecture, hextets, zero-compression, Link-Local vs Global Unicast, Neighbor Discovery Protocol (NDP), SLAAC autoconfiguration, and Dual-Stack coexistence."
+---
+
+# Chapter 2 — IPv6 Addressing, NDP, SLAAC & Dual-Stack Migration
+
+> **Goal:** Master the 128-bit architecture of IPv6. Understand address representation, zero compression rules, Link-Local vs Global Unicast scopes, Neighbor Discovery Protocol (NDP) mechanics replacing ARP, Stateless Address Autoconfiguration (SLAAC with EUI-64), and production dual-stack transition strategies.
+>
+> By the end of this chapter, you will understand:
+> 1. The 128-bit hexadecimal IPv6 structure and RFC 5952 canonical formatting rules
+> 2. IPv6 address classifications: Global Unicast (`2000::/3`), Link-Local (`fe80::/10`), Unique Local (`fc00::/7`), and Multicast (`ff00::/8`)
+> 3. How Neighbor Discovery Protocol (NDP: ICMPv6 types 133–137) replaces IPv4 ARP and broadcast
+> 4. Stateless Address Autoconfiguration (SLAAC) using Router Advertisements and EUI-64 MAC derivation
+> 5. Duplicate Address Detection (DAD) and neighbor unreachability detection (NUD)
+> 6. Dual-stack networking, NAT64/DNS64 translation, and IPv6 Linux kernel debugging commands
+
+---
+
+## Real-Life Analogy
+
+Think of IPv6 addressing as **a universal interplanetary coordinate and courier system**:
+
+- **IPv4 Address Space (32-bit: 4.3 Billion Addresses):**
+  - Like having a phone system with only 10-digit numbers for the whole planet. Soon, every number is exhausted, requiring complex internal extension boards (**NAT/PAT**) to share numbers.
+- **IPv6 Address Space (128-bit: $3.4 \times 10^{38}$ Addresses):**
+  - Enough addresses to assign a unique public IP to every single atom on the surface of the Earth, with enough left over for 100 more planets. NAT is no longer required; every device has direct end-to-end reachability.
+- **NDP & SLAAC (Smart Beaconing in an Apartment Complex):**
+  - In IPv4, a new resident screams in the courtyard with a megaphone: *"What's the gateway address?"* (**ARP broadcast**).
+  - In IPv6, the building manager broadcasts a quiet encrypted radio signal (**Router Advertisement**). The new tenant instantly builds their own unique apartment number from their DNA (**SLAAC + EUI-64**) and verifies nobody else has it before using it (**DAD**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  IPv6 Neighbor Discovery Protocol (NDP) & SLAAC Workflow
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. ROUTER DISCOVERY (SLAAC):                                                │
+ │                                                                             │
+ │   [New Host NIC]                                      [IPv6 Edge Router]    │
+ │         │                                                      │            │
+ │         │──── Router Solicitation (ICMPv6 Type 133: RS) ──────►│            │
+ │         │     Target: All-Routers Multicast `ff02::2`          │            │
+ │         │                                                      │            │
+ │         │◄─── Router Advertisement (ICMPv6 Type 134: RA) ──────│            │
+ │         │     Contains: Prefix `2001:db8:acad:1::/64`          │            │
+ │         │               Flags: Managed (M=0), Other (O=0)      │            │
+ └─────────┼──────────────────────────────────────────────────────┼────────────┘
+           │
+           ▼ (Host combines Prefix + EUI-64 Interface ID -> 2001:db8:acad:1:5054:ff:fe12:3456)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 2. DUPLICATE ADDRESS DETECTION (DAD):                                       │
+ │                                                                             │
+ │   [Host] ──── Neighbor Solicitation (ICMPv6 Type 135: NS) ──► (Local Link)  │
+ │               Target: Solicited-Node Multicast `ff02::1:ff12:3456`          │
+ │               "Is anyone already using this IP?"                            │
+ │                                                                             │
+ │   (No Neighbor Advertisement received within timeout -> IP is valid & assigned)
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. IPv6 Structure & RFC 5952 Compression Rules
+
+An IPv6 address is 128 bits long, written as eight 16-bit blocks (hextets) in hexadecimal separated by colons:
+
+```text
+Full:        2001 : 0db8 : 0000 : 0000 : 0000 : 0000 : 1428 : 57ab
+Rule 1:      Omit leading zeros in any 16-bit hextet:
+             2001 :  db8 :    0 :    0 :    0 :    0 : 1428 : 57ab
+Rule 2:      Replace longest contiguous run of zeros with double colon `::` (once only):
+Canonical:   2001:db8::1428:57ab
+```
+
+---
+
+### 2. IPv6 Address Types & Scopes
+
+```text
+ ┌──────────────────────────┬──────────────────────────┬────────────────────────────────────────────────────────┐
+ │ Scope / Type             │ Prefix                   │ Description & Modern Use Case                          │
+ │──────────────────────────┼──────────────────────────┼────────────────────────────────────────────────────────┤
+ │ **Global Unicast (GUA)** │ `2000::/3`               │ Globally routable public internet addresses (RFC 3587) │
+ │ **Link-Local (LLA)**     │ `fe80::/10`              │ Non-routable; used for NDP, routing adjacencies (BGP)   │
+ │ **Unique Local (ULA)**   │ `fc00::/7` (`fd00::/8`)  │ Equivalent to RFC 1918 private IPv4 addresses          │
+ │ **Multicast**            │ `ff00::/8`               │ 1-to-many communication; replaces IPv4 broadcast       │
+ │ **Loopback**             │ `::1/128`                │ Host local loopback (equivalent to `127.0.0.1`)        │
+ │ **Unspecified**          │ `::/128`                 │ Default / Unassigned binding address                   │
+ └──────────────────────────┴──────────────────────────┴────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 3. Neighbor Discovery Protocol (NDP) vs IPv4 ARP
+
+NDP runs directly over ICMPv6 and uses multicast to eliminate network-wide broadcast interruptions:
+
+```text
+ ┌───────────────────────┬─────────────────┬─────────────────────────────────────────────────────────────────┐
+ │ ICMPv6 Message        │ Type Number     │ Functional Role                                                 │
+ │───────────────────────┼─────────────────┼─────────────────────────────────────────────────────────────────┤
+ │ **Router Solicitation** | Type 133 (RS)   | Sent by hosts to locate local on-link routers                   │
+ │ **Router Advertisement**| Type 134 (RA)   | Sent periodically by routers with prefix, MTU & SLAAC flags     │
+ │ **Neighbor Solicitation**| Type 135 (NS)  | Resolves Layer 2 MAC address (replaces ARP) & performs DAD      │
+ │ **Neighbor Advertisement**| Type 136 (NA) | Replies with MAC address to an NS query                         │
+ │ **Redirect**          | Type 137        | Informs host of a more optimal next-hop gateway on the subnet   │
+ └───────────────────────┴─────────────────┴─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 4. SLAAC and the Modified EUI-64 Process
+
+Under SLAAC, a 64-bit Interface Identifier can be generated directly from the 48-bit MAC address:
+1. Split 48-bit MAC into two 24-bit halves: `52:54:00` and `12:34:56`.
+2. Insert `FF:FE` in the middle: `52:54:00:FF:FE:12:34:56`.
+3. Invert the 7th bit (Universal/Local bit): `52` (`01010010`$_2$) $\to$ `50` (`01010000`$_2$).
+4. Resulting Interface ID: `5054:00ff:fe12:3456`.
+
+*(Note: Modern operating systems now default to **RFC 7217 Stable Privacy Addresses** to prevent MAC address tracking across networks).*
+
+---
+
+## Hands-On Lab: IPv6 Address & NDP Inspection in Linux
+
+```bash
+# Step 1: List all IPv6 addresses (Global Unicast + Link-Local fe80::)
+ip -6 addr show
+
+# Step 2: Inspect the IPv6 neighbor cache (equivalent to the IPv4 ARP table)
+ip -6 neigh show
+
+# Step 3: View the IPv6 kernel routing table
+ip -6 route show
+
+# Step 4: Ping the All-Nodes link-local multicast group on interface eth0
+ping -6 -c 2 -I eth0 ff02::1
+
+# Step 5: Test DNS resolution and connectivity to a dual-stack public host
+dig +short AAAA google.com
+ping6 -c 3 2001:4860:4860::8888
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does IPv6 eliminate the need for NAT in modern enterprise architectures?**
+
+IPv6 provides $2^{128}$ addresses ($\approx 3.4 \times 10^{38}$), allowing every individual device, server, container, and IoT sensor on Earth to have a globally unique Global Unicast Address (`2000::/3`). This restores end-to-end IP connectivity, eliminates stateful NAT translation tables, and drastically reduces latency and firewall state-exhaustion vulnerabilities.
+
+**Q2: What is the purpose of an IPv6 Link-Local Address (`fe80::/10`), and where is it used?**
+
+A Link-Local address is automatically configured on every IPv6-enabled interface upon boot. It is non-routable beyond the local Layer 2 broadcast domain and is used for core control-plane functions: Neighbor Discovery Protocol (NDP), DHCPv6 discovery, and establishing BGP/OSPFv3 dynamic routing neighbor adjacencies.
+
+**Q3: How does Duplicate Address Detection (DAD) work in IPv6?**
+
+Before an interface assigns and enables an IPv6 address, it joins the corresponding **Solicited-Node Multicast Group** (`ff02::1:ffxx:xxxx`) and transmits a Neighbor Solicitation (NS) packet targeting its own tentative address. If another host on the local link replies with a Neighbor Advertisement (NA), a duplicate address collision is detected, and the interface marks the address as disabled.
+
+**Q4: What is the difference between Dual-Stack, NAT64/DNS64, and 6in4 Tunnels?**
+
+- **Dual-Stack:** Hosts and routers run both IPv4 and IPv6 protocol stacks simultaneously (preferred migration standard).
+- **NAT64 / DNS64:** Allows pure IPv6-only clients to communicate with legacy IPv4-only servers by translating DNS A records into synthetic IPv6 addresses (`64:ff9b::/96`) and statefully translating packets at the edge router.
+- **6in4 Tunnels:** Encapsulates native IPv6 packets inside IPv4 headers (IP Protocol 41) to cross legacy IPv4-only ISP networks.
+
+**Q5: What are the Managed (M) and Other (O) configuration flags in an ICMPv6 Router Advertisement?**
+
+- **M Flag (Managed Address Configuration):** When set to `1`, instructs hosts to obtain their IPv6 stateful address from a DHCPv6 server rather than using SLAAC.
+- **O Flag (Other Configuration):** When set to `1`, instructs hosts to use SLAAC for IP addressing, but query a stateless DHCPv6 server for DNS servers, domain search lists, and NTP servers.
+
+---
+
+## Summary Checksheet
+
+- [ ] Understand 128-bit hex formatting and RFC 5952 zero-compression rules
+- [ ] Differentiate Global Unicast (`2000::/3`), Link-Local (`fe80::/10`), and ULA (`fc00::/7`)
+- [ ] Know how NDP (RS, RA, NS, NA) replaces IPv4 ARP and broadcast
+- [ ] Understand SLAAC address derivation and Duplicate Address Detection (DAD)
+- [ ] Master Dual-Stack and NAT64/DNS64 coexistence mechanisms

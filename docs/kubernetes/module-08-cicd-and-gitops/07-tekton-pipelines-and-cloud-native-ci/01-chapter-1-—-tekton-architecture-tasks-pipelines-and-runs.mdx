@@ -1,0 +1,259 @@
+---
+title: "Chapter 1 — Tekton Architecture & Pipelines"
+sidebar_position: 1
+module: "Module 8.7 — Tekton & Cloud-Native CI"
+description: "Master CNCF Tekton Pipelines — Steps, Tasks, Pipelines, TaskRuns, PipelineRuns, shared PVC workspaces, parameter passing, and Tekton Triggers."
+---
+
+# Chapter 1 — Tekton Architecture: Tasks, Pipelines, and Runs
+
+> **Goal:** Master Kubernetes-native continuous integration (CI) and build automation using **CNCF Tekton** — understanding the foundational Custom Resource hierarchy (**`Step`**, **`Task`**, **`Pipeline`**, **`TaskRun`**, **`PipelineRun`**), structuring Directed Acyclic Graphs (DAGs) of tasks with `runAfter`, sharing persistent storage across build steps using **`Workspaces`**, passing dynamic outputs using **`Results`**, and triggering automated builds from Git webhooks using **Tekton Triggers**.
+>
+> By the end of this chapter, you will understand:
+> 1. How Tekton provides a serverless, Kubernetes-native CI execution engine
+> 2. The structural relationship between Steps, Tasks, and Pipelines
+> 3. How a `Task` executes as a single Kubernetes Pod with sequential Step containers
+> 4. How `Workspaces` share source code and artifacts across multi-pod pipeline stages
+> 5. How to pass build metadata and commit hashes between tasks using `results`
+> 6. How Tekton Triggers (`EventListener`, `TriggerBinding`, `TriggerTemplate`) handle webhooks
+
+---
+
+## Real-Life Analogy
+
+Think of Tekton as **a modular, robotic automotive assembly factory built entirely out of standardized shipping containers and cranes**:
+
+- **The Monolithic CI Server Trap (The Giant Fragile Machine - Jenkins):** In traditional CI, a giant monolithic server runs on a virtual machine. If 50 developers push code at 5:00 PM, the server runs out of memory, jobs queue up for hours, and if the VM crashes, all build history is lost.
+- **The Tekton Cloud-Native Model (On-Demand Modular Robots):** Tekton has no permanent build servers. It is 100% serverless inside Kubernetes. When a build is requested, Tekton spins up ephemeral pods on-demand and destroys them the second the build finishes.
+- **The 4 Tekton Building Blocks:**
+  - **1. The Single Tool Motion (`Step`):** An individual container command (*"Run `npm test` inside a Node.js container"*).
+  - **2. The Workstation Desk (`Task`):** A sequence of steps executed sequentially inside a single Kubernetes Pod on the same physical node (*"Clone code $\to$ Run tests $\to$ Compile binary"*).
+  - **3. The Factory Master Assembly Plan (`Pipeline`):** A Directed Acyclic Graph (DAG) of workstations (*"Station 1 builds frontend; Station 2 builds backend; Station 3 packages Docker image after both finish (**`runAfter`**)"*).
+  - **4. The Shared Conveyor Belt (`Workspace`):** A PersistentVolumeClaim conveyor belt that rolls files between Station 1, Station 2, and Station 3.
+  - **5. The Work Order Ticket (`PipelineRun`):** The physical timestamped order sheet that tells the factory: *"Run the Master Plan on Commit `a1b2c3d` right now!"*
+
+---
+
+## Architecture Diagram
+
+```text
+               Tekton Custom Resource Hierarchy & DAG Pipeline
+
+ PIPELINERUN (`kind: PipelineRun`, Triggered on Git Push Webhook)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Binds: Parameters (Commit SHA) + Shared Workspace (PVC: 10Gi)          │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Instantiates Pipeline DAG
+                    ▼
+ PIPELINE (`kind: Pipeline`, Name: `build-test-deploy`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ WORKSPACE: `/workspace/source` (Shared across all Task Pods via PVC)   │
+ │                                                                        │
+ │ [ Task 1: git-clone ]                                                  │
+ │ (Pod 1: Clones Git Repo to `/workspace/source`)                        │
+ │        │                                                               │
+ │        ├───────────────────────────────┐                               │
+ │        ▼                               ▼                               │
+ │ [ Task 2: test-frontend ]      [ Task 3: test-backend ]                │
+ │ (Pod 2: Runs Jest Tests)       (Pod 3: Runs Go Unit Tests)             │
+ │        │                               │                               │
+ │        └───────────────┬───────────────┘                               │
+ │                        ▼ `runAfter: [test-frontend, test-backend]`     │
+ │ [ Task 4: kaniko-build-and-push ]                                      │
+ │ (Pod 4: Builds Docker Image & Pushes to Registry)                      │
+ │        │ Emits `results.IMAGE_DIGEST`                                  │
+ │        ▼                                                               │
+ │ [ Task 5: update-gitops-manifests ]                                    │
+ │ (Pod 5: Updates image tag in GitOps repo via Git commit!)              │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Tekton CRD Hierarchy
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Resource Kind        │ Scope / Abstraction     │ Kubernetes Runtime Representation                 │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Step`**           │ Container Command       │ Individual container running inside a Task Pod.   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Task`**           │ Workstation (Reusable)  │ Reusable blueprint of sequential Steps.           │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`TaskRun`**        │ Execution Instance      │ **A single Kubernetes Pod** created on a node.    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Pipeline`**       │ DAG Workflow (Reusable) │ Multi-Task orchestration blueprint with `runAfter`│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`PipelineRun`**    │ Execution Instance      │ Controller orchestrating multiple TaskRun Pods.   │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Reusable `Task` Manifest with Parameters & Results
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: run-unit-tests
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: GO_VERSION
+      type: string
+      default: "1.22"
+  workspaces:
+    - name: source-dir
+  results:
+    - name: TEST_REPORT_STATUS
+      description: "Test execution outcome"
+  steps:
+    - name: run-tests
+      image: golang:$(params.GO_VERSION)-alpine
+      workingDir: $(workspaces.source-dir.path)
+      script: |
+        #!/bin/sh
+        set -e
+        echo "Running Go Unit Tests..."
+        go test -v ./...
+        echo "PASSED" > $(results.TEST_REPORT_STATUS.path)
+```
+
+---
+
+## 2. Multi-Task `Pipeline` Manifest with DAG Dependencies
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-and-promote-pipeline
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: git-url
+      type: string
+    - name: git-revision
+      type: string
+  workspaces:
+    - name: shared-workspace
+  tasks:
+    # TASK 1: Clone Source Repository
+    - name: fetch-repository
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+
+    # TASK 2: Execute Unit Tests (Runs after fetch-repository)
+    - name: test-app
+      taskRef:
+        name: run-unit-tests
+      runAfter:
+        - fetch-repository
+      workspaces:
+        - name: source-dir
+          workspace: shared-workspace
+
+    # TASK 3: Container Build (Runs after unit tests succeed!)
+    - name: build-image
+      taskRef:
+        name: kaniko-build
+      runAfter:
+        - test-app
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+```
+
+---
+
+## 3. Instantiating with a `PipelineRun`
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: payment-build-run-001
+  namespace: tekton-pipelines
+spec:
+  pipelineRef:
+    name: build-and-promote-pipeline
+  params:
+    - name: git-url
+      value: "https://github.com/enterprise-org/payment-service.git"
+    - name: git-revision
+      value: "main"
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:             # Ephemeral 5Gi PVC provisioned dynamically!
+        spec:
+          accessModes: [ "ReadWriteOnce" ]
+          resources:
+            requests:
+              storage: 5Gi
+```
+
+---
+
+## Hands-On Lab: Querying Tekton Pipelines & Logs
+
+```bash
+# Step 1: Query installed Tekton CRDs
+kubectl get crd | grep tekton.dev 2>/dev/null || echo "Tekton CRDs active / simulated"
+
+# Step 2: Query active PipelineRuns and TaskRuns
+kubectl get pipelineruns,taskruns -n tekton-pipelines
+
+# Step 3: Stream live logs from a running PipelineRun via tkn CLI
+# tkn pipelinerun logs payment-build-run-001 -f -n tekton-pipelines
+
+# Step 4: Describe TaskRun pod execution details
+# kubectl describe taskrun <taskrun-name> -n tekton-pipelines
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNCF Tekton, and how does its architecture differ from traditional CI tools like Jenkins?**
+
+Tekton is an open-source, Kubernetes-native CI/CD framework. Unlike Jenkins, which requires maintaining persistent controller VMs and long-running agent executors, Tekton is **completely serverless and Kubernetes-native**. Every `TaskRun` is instantiated as a standard Kubernetes `Pod`, and each `Step` inside the task runs as an individual container within that pod sharing a local volume. Pods scale up on-demand during builds and terminate immediately upon completion, maximizing cluster resource efficiency.
+
+**Q2: How do Steps inside a Tekton `Task` share data, and how do Tasks inside a `Pipeline` share data?**
+
+- **Within a `Task`**: All `Step` containers execute inside the **exact same Kubernetes Pod**. They share files using a shared `emptyDir` volume mounted at `/workspace` or by using standard Unix filesystem pipes.
+- **Across different `Tasks` in a `Pipeline`**: Different Tasks run as **completely separate Pods** (potentially on different physical nodes). They share source code and compiled binaries using a shared **`Workspace`** backed by a `PersistentVolumeClaim` (PVC) or an object store.
+
+**Q3: What is the purpose of `results` in a Tekton Task?**
+
+Tekton `results` provide a strongly typed mechanism for a Task to output small scalar string values (such as a Git commit SHA, image digest, or test status code) by writing them to `$(results.<name>.path)`. Downstream Tasks in the Pipeline can consume these values directly as input parameters using the syntax `$(tasks.<task-name>.results.<result-name>)`, enabling clean data pipelines without reading raw files.
+
+**Q4: How does Tekton handle task dependencies and parallel execution in a Pipeline?**
+
+A Tekton `Pipeline` defines a Directed Acyclic Graph (DAG). By default, all tasks in a pipeline run **in parallel** unless constrained. By specifying the `runAfter: [task-a, task-b]` field, a task will pause and wait until all prerequisite tasks have completed successfully. If any upstream task fails, the pipeline controller halts the execution of downstream dependent tasks.
+
+**Q5: What are Tekton Triggers (`EventListener`, `TriggerBinding`, `TriggerTemplate`)?**
+
+Tekton Triggers is an event-handling extension that enables webhook-driven automation:
+- **`EventListener`**: A lightweight HTTP service that accepts incoming webhooks from GitHub, GitLab, or Docker registries.
+- **`TriggerBinding`**: Extracts payload fields (e.g. `$(body.head_commit.id)`, `$(body.repository.clone_url)`).
+- **`TriggerTemplate`**: A blueprint that takes the extracted variables and programmatically instantiates a new `PipelineRun` in the cluster.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the CRD hierarchy: Step (Container) $\to$ Task (Pod) $\to$ Pipeline (DAG) $\to$ Runs
+- [ ] Know that a `TaskRun` creates a single Pod with sequential container Steps
+- [ ] Know how `Workspaces` backed by PVCs share source code across pipeline tasks
+- [ ] Know how `results` pass string outputs (image digests) to downstream tasks
+- [ ] Know how `runAfter` constructs multi-stage DAG pipelines
+- [ ] Can view Tekton runs using `kubectl get pipelineruns,taskruns -A`

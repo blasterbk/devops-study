@@ -1,0 +1,149 @@
+---
+title: "Chapter 2 — CDN Web Performance: Brotli Compression, Cache-Control & Edge Optimization"
+sidebar_position: 1
+module: "Module 16.2 — Edge Optimization"
+description: "Master modern web performance optimization at the CDN edge — Brotli vs Gzip compression, Cache-Control header tuning (s-maxage, stale-while-revalidate), modern image transcoding (AVIF/WebP), and Early Hints (103)."
+---
+
+# Chapter 2 — CDN Web Performance: Brotli Compression, Cache-Control & Edge Optimization
+
+> **Goal:** Master edge web performance optimization techniques that maximize Google Core Web Vitals (Largest Contentful Paint [LCP], First Input Delay [FID], Cumulative Layout Shift [CLS]). Understand modern compression algorithms (Gzip vs Brotli vs Zstandard), edge image optimization and dynamic format transcoding (JPEG $\to$ WebP/AVIF), 103 Early Hints server pre-loading, and advanced `Cache-Control` header engineering.
+>
+> By the end of this chapter, you will understand:
+> 1. Compression mechanics: Gzip (RFC 1952) vs Brotli (RFC 7932 / Google) achieving 20–30% higher compression ratios
+> 2. Fine-grained HTTP caching headers: `max-age`, `s-maxage`, `stale-while-revalidate`, `stale-if-error`, and `immutable`
+> 3. Dynamic Edge Image Optimization: on-the-fly resizing, WebP/AVIF format conversion, and responsive srcset delivery
+> 4. HTTP 103 Early Hints: transmitting Link headers during the 200–500ms server backend compute window
+> 5. HTML minification and Edge Workers (Cloudflare Workers, Fastly VCL)
+> 6. Benchmarking web performance and inspecting Brotli/Gzip responses via `curl`
+
+---
+
+## Real-Life Analogy
+
+Think of CDN Web Performance Optimization as **a high-speed automated cargo packaging and express courier service**:
+
+- **Brotli Compression (Vacuum-Sealing Bulky Clothes):**
+  - Instead of shipping fluffy coats in giant cardboard boxes (**Uncompressed HTML/JS**), an industrial vacuum sealer compresses the clothes into a paper-thin, rigid brick (**Brotli compression**). It travels $3\times$ faster through postal pipes and uses $30\%$ less fuel.
+- **103 Early Hints (Calling Ahead to Warm Up the Oven):**
+  - While the chef in the kitchen is cooking your complex 5-course steak dinner (**Server database query taking 400ms**), the waiter immediately brings you water, bread, and menus (**103 Early Hints preloading CSS & Fonts**). By the time the steak arrives, your table is already 100% prepared!
+- **Edge Image Transcoding (Instant Tailoring):**
+  - If a mobile phone with a 4-inch screen orders a 4000x3000 pixel 4K wallpaper, the edge store shrinks the image to 400x300 and converts it from a heavy 5MB BMP to a tiny 20KB WebP before sending it.
+
+---
+
+## Architecture Diagram
+
+```text
+                  HTTP 103 Early Hints & Edge Image Transcoding Flow
+                  
+ 1. HTTP 103 EARLY HINTS TIMELINE:
+   Client Browser                                      CDN Edge / Origin Server
+        │                                                         │
+        │─── GET /index.html ────────────────────────────────────►│
+        │                                                         │ (Origin begins slow DB query)
+        │◄── HTTP/1.1 103 Early Hints ────────────────────────────│ (Transmitted in 5ms!)
+        │    Link: </app.css>; rel=preload; as=style              │
+        │    Link: </font.woff2>; rel=preload; as=font            │
+        │                                                         │
+        │─── GET /app.css & GET /font.woff2 (Fetches CSS now!) ──►│
+        │                                                         │
+        │◄── HTTP/1.1 200 OK (Full HTML body delivered) ──────────│ (Delivered at 300ms)
+        ▼
+   [Browser already has CSS and fonts in memory -> Renders instantly with 0ms visual delay!]
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Compression Algorithms: Gzip vs Brotli
+
+```text
+ ┌──────────────────────┬──────────────────────────┬──────────────────────────┬────────────────────────────────────────┐
+ │ Algorithm            │ Compression Ratio        │ CPU Decompression Speed  │ Best File Type                         │
+ │──────────────────────┼──────────────────────────┼──────────────────────────┼────────────────────────────────────────┤
+ │ **Gzip (deflate)**   │ Baseline ($1\times$)     │ Ultra-Fast               │ Universal legacy support (All clients) │
+ │ **Brotli (`br`)**    │ **20–30% smaller than Gzip**│ Equivalent to Gzip    │ HTML, CSS, JavaScript, JSON, SVG       │
+ │ **Zstandard (`zstd`)**│ Highest ratio at high speed│ Fastest decompression  │ Internal microservices / Next-Gen HTTP │
+ └──────────────────────┴──────────────────────────┴──────────────────────────┴────────────────────────────────────────┘
+```
+
+---
+
+### 2. The `immutable` Directive for Cache Busting
+
+Modern web frameworks (React, Vite, Next.js) append content hashes to build assets (e.g. `main.8f9b2c.js`). Because the filename changes whenever the code changes:
+
+```http
+Cache-Control: public, max-age=31536000, immutable
+```
+
+- **`max-age=31536000` (1 Year):** Instructs browser to cache file for 1 year.
+- **`immutable`:** Informs the browser that the file contents **will never change**. The browser will **never send conditional 304 revalidation requests (`If-None-Match`)** even when the user clicks the browser Refresh button, delivering 0ms instant page loads.
+
+---
+
+### 3. Edge Image Optimization & Modern Formats
+
+```text
+ ┌──────────────┬──────────────────────────┬────────────────────────────────────────────────────────┐
+ │ Image Format │ Compression Type         │ Average Size Reduction vs JPEG                         │
+ │──────────────┼──────────────────────────┼────────────────────────────────────────────────────────┤
+ │ **JPEG**     │ Lossy (Legacy baseline)  │ Baseline ($1\times$)                                   │
+ │ **WebP**     │ Lossy & Lossless         │ **25% – 35% smaller** than JPEG (Universal browser sup)│
+ │ **AVIF**     │ AV1 Video Keyframe codec │ **50% – 60% smaller** than JPEG (Highest modern quality│
+ └──────────────┴──────────────────────────┴────────────────────────────────────────────────────────┘
+```
+
+CDNs inspect the browser's incoming `Accept: image/avif,image/webp,*/*` header and automatically transcode images to the highest supported format on-the-fly.
+
+---
+
+## Hands-On Lab: Inspecting Brotli & Cache Headers via CLI
+
+```bash
+# Step 1: Request an asset with Brotli compression using cURL
+curl -s -I -H "Accept-Encoding: br" https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js | grep -i "content-encoding"
+
+# Step 2: Request the same asset with Gzip compression and compare headers
+curl -s -I -H "Accept-Encoding: gzip" https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js | grep -i "content-encoding"
+
+# Step 3: Inspect stale-while-revalidate and cache-control headers on a live asset
+curl -I https://cdn.jsdelivr.net/npm/vue@3.2.37/dist/vue.global.prod.js | grep -i "cache-control"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is Brotli significantly more effective than Gzip for text assets (HTML, CSS, JS)?**
+
+Brotli utilizes a **pre-built static dictionary of over 13,000 common words, phrases, and HTML/CSS snippets** (such as `<html>`, `<div>`, `function()`, `background-color`, `https://`) embedded directly into the decompression library. When compressing web assets, Brotli replaces these entire words with tiny 1-byte dictionary references, achieving **20%–30% smaller file sizes than Gzip** with near-identical decompression speed.
+
+**Q2: What is the `stale-if-error` Cache-Control directive and how does it protect website uptime?**
+
+`stale-if-error=86400` instructs the CDN edge that if the origin server crashes, throws HTTP 500/502/503 errors, or suffers a database outage, the CDN should **continue serving the existing cached version for up to 24 hours** rather than displaying an error page to users. This guarantees high availability during transient backend failures.
+
+**Q3: How does HTTP 103 Early Hints accelerate page rendering?**
+
+In standard web requests, after the browser sends `GET /`, it sits completely idle for 200–500ms waiting for the origin server to query databases and generate the HTML. With **103 Early Hints**, the server immediately sends an informational 103 response containing `Link: </app.css>; rel=preload` headers within 5ms. The browser begins downloading critical CSS, fonts, and scripts **in parallel while the server is still rendering the HTML**, eliminating the network idle time and cutting Largest Contentful Paint (LCP) by up to 50%.
+
+**Q4: What is the difference between client-side image resizing and Edge Image Optimization?**
+
+- **Client-Side:** The server transmits a heavy 5MB (4000x3000) image. The mobile phone downloads 5MB over cellular data and uses CSS (`width: 300px`) to shrink it in browser memory (wasting bandwidth and draining battery).
+- **Edge Optimization:** The CDN dynamically resizes the image to exactly 300x225, transcodes it to AVIF/WebP, strips EXIF metadata, and delivers a tiny 15KB file, reducing bandwidth by $99\%$.
+
+**Q5: Why should you never set `Cache-Control: immutable` on an un-versioned file (like `/index.html`)?**
+
+`immutable` informs the browser to never check with the server for updates under any circumstances until the TTL expires. If you set `immutable` on `/index.html` with a 1-year `max-age`, any user who visits your site will be stuck on that version for a year, even if you deploy critical bug fixes or new features! **Immutable must only be used on hashed assets (`app.v123.js`)**, while `/index.html` should use `Cache-Control: no-cache`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Brotli (`br`) vs Gzip (`gzip`) compression trade-offs
+- [ ] Understand `Cache-Control` directives: `s-maxage`, `stale-while-revalidate`, `immutable`
+- [ ] Know how 103 Early Hints preloads critical CSS/fonts during backend compute
+- [ ] Understand WebP and AVIF edge image transcoding
+- [ ] Explain why content-hashed assets allow 1-year immutable caching

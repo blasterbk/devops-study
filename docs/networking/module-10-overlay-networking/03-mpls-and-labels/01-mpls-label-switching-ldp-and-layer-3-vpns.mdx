@@ -1,0 +1,148 @@
+---
+title: "Chapter 3 — MPLS Architecture: Label Switching, LDP, Push/Swap/Pop & Layer 3 VPNs"
+sidebar_position: 1
+module: "Module 10.3 — MPLS & Labels"
+description: "Master Multi-Protocol Label Switching (MPLS, RFC 3031) — 32-bit shim header, Label Distribution Protocol (LDP), Push/Swap/Pop forwarding operations, Penultimate Hop Popping (PHP), and MPLS Layer 3 VPNs."
+---
+
+# Chapter 3 — MPLS Architecture: Label Switching, LDP, Push/Swap/Pop & Layer 3 VPNs
+
+> **Goal:** Master Multi-Protocol Label Switching (MPLS, RFC 3031), the core routing and traffic engineering foundation of telecommunications carriers and large enterprise WAN backbones. Understand how MPLS replaces CPU-intensive Layer 3 IP table lookups with fixed-length 32-bit label switching, Label Distribution Protocol (LDP), Push/Swap/Pop operations, Penultimate Hop Popping (PHP), and MPLS Layer 3 VPNs (VRF, MP-BGP, Route Distinguishers, Route Targets).
+>
+> By the end of this chapter, you will understand:
+> 1. The 32-bit MPLS Shim Header format (Label 20 bits, Exp/TC 3 bits, Bottom-of-Stack 1 bit, TTL 8 bits)
+> 2. Router roles: Customer Edge (CE), Provider Edge (PE / Ingress/Egress LER), and Provider Core (P / LSR)
+> 3. Label forwarding operations: **PUSH** (impose label), **SWAP** (switch label), **POP** (remove label)
+> 4. Label Distribution Protocol (LDP / RFC 5036) and Label Forwarding Information Base (LFIB)
+> 5. Penultimate Hop Popping (PHP / Implicit Null Label 3) to offload egress PE router CPU load
+> 6. MPLS Layer 3 VPNs (L3VPN / RFC 4364): Virtual Routing & Forwarding (VRF), Route Distinguishers (RD), and Route Targets (RT)
+
+---
+
+## Real-Life Analogy
+
+Think of MPLS as **an express luggage conveyor system at an international airport terminal**:
+
+- **Traditional IP Routing (Opening Every Bag at Every Checkpoint):**
+  - At every intersection in the airport, security guards stop the luggage cart, open the bag, read the 10-page passenger itinerary (**Layer 3 IP routing lookup**), decide the next hallway, and close the bag. Very slow and CPU-heavy.
+- **MPLS Label Switching (Color-Coded Barcode Stickers):**
+  - When the bag enters the terminal (**Ingress PE Router**), a guard slaps a red barcode sticker labeled `#104` on the handle (**Label PUSH**).
+  - Internal conveyor belt switches (**P Routers**) don't open the bag; they glance at `#104`, swap it with `#208` (**Label SWAP**), and flick it down the express chute in microseconds!
+  - Right before the final exit gate, the worker strips off the sticker (**Label POP**) and hands the original bag back to the passenger (**Egress PE**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  MPLS Label Switching & Router Roles Pipeline
+                  
+ ┌─────────────┐                                                               ┌─────────────┐
+ │ Customer A  │                                                               │ Customer A  │
+ │  Site 1     │                                                               │  Site 2     │
+ │  [CE-1]     │                                                               │  [CE-2]     │
+ └──────┬──────┘                                                               └──────▲──────┘
+        │ IP Packet (Unlabeled)                                                │ IP Packet
+        ▼                                                                      │ (Unlabeled)
+ ┌──────────────────────┐     ┌──────────────────┐     ┌──────────────────────┐│
+ │ INGRESS PE ROUTER    │     │ CORE P ROUTER    │     │ EGRESS PE ROUTER     ││
+ │ (Label Edge Router)  │     │ (Label Switch)   │     │ (Label Edge Router)  ││
+ │                      │     │                  │     │                      ││
+ │ PUSH Label: [100]    ├────►│ SWAP [100]->[200]├────►│ POP Label: [200]     ├┘
+ └──────────────────────┘     └──────────────────┘     └──────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The 32-Bit MPLS Shim Header
+
+MPLS inserts a 4-byte (32-bit) shim header between Layer 2 (Ethernet) and Layer 3 (IP):
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                Label (20 bits)                | Exp/TC|S| TTL |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+```text
+ ┌───────────────┬────────────┬────────────────────────────────────────────────────────────────────────┐
+ │ Field         │ Bit Width  │ Purpose & Description                                                  │
+ │───────────────┼────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ **Label**     │ 20 Bits    │ The forwarding label value ($2^{20} = 1,048,576$ possible labels)      │
+ │ **Exp / TC**  │ 3 Bits     │ Traffic Class / Experimental (Used for QoS DiffServ / CoS mapping)     │
+ │ **S (BoS)**   │ 1 Bit      │ Bottom-of-Stack flag: `1` if this is the final label, `0` if more stack│
+ │ **TTL**       │ 8 Bits     │ Time-To-Live (copied from inner IP TTL for loop prevention)            │
+ └───────────────┴────────────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Reserved Labels:** Label `0` (IPv4 Explicit Null), Label `3` (Implicit Null for PHP), Label `14` (OAM).
+
+---
+
+### 2. MPLS Layer 3 VPNs (L3VPN / RFC 4364)
+
+MPLS L3VPN allows service providers to host thousands of enterprise customers with overlapping private IP addresses (`10.0.0.0/8`) on a shared physical core:
+1. **Virtual Routing & Forwarding (VRF):** Independent per-customer routing tables on PE routers.
+2. **Route Distinguisher (RD):** An 8-byte prefix (e.g. `65000:100`) prepended to the customer IPv4 prefix to make it a globally unique **VPNv4 prefix** in Multi-Protocol BGP (MP-BGP).
+3. **Route Target (RT):** BGP Extended Community that dictates which VRF routing tables import/export the prefix.
+4. **Dual Label Stack:**
+   - **Outer IGP Label (Transport):** Directs packet across core P routers to the remote PE.
+   - **Inner VPN Label (Service):** Directs packet inside the remote PE to the specific customer VRF interface.
+
+---
+
+## Hands-On Lab: Inspecting MPLS in Linux Kernel
+
+```bash
+# Step 1: Verify and load Linux kernel MPLS routing modules
+sudo modprobe mpls_router mpls_gso mpls_iptunnel
+
+# Step 2: Configure maximum MPLS label depth on interface eth0
+sudo sysctl -w net.mpls.conf.eth0.input=1
+sudo sysctl -w net.mpls.platform_labels=1048575
+
+# Step 3: Add an MPLS route in Linux (PUSH label 100 on egress)
+sudo ip route add 10.55.0.0/24 encap mpls 100 via 192.168.1.2 dev eth0
+
+# Step 4: Inspect the Linux kernel MPLS routing and label table
+ip -f mpls route show
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Penultimate Hop Popping (PHP) and why is it used in MPLS?**
+
+In standard MPLS, the Egress PE router would have to perform **two lookups**: 1) Lookup the LFIB to POP the MPLS label, and 2) Lookup the IP FIB to route the internal IP packet. **Penultimate Hop Popping (PHP)** instructs the second-to-last core router (**P router**) to POP the outer MPLS label before sending the packet to the Egress PE. The Egress PE receives a native IP packet and performs only a **single lookup**, drastically reducing CPU and memory overhead on busy edge routers.
+
+**Q2: What is the difference between a Route Distinguisher (RD) and a Route Target (RT)?**
+
+- **Route Distinguisher (RD):** Makes identical customer IPv4 addresses unique inside MP-BGP (e.g. Customer A `10.0.0.0/24` with RD `100:1` $\to$ VPNv4 `100:1:10.0.0.0/24`). It has no effect on routing policy.
+- **Route Target (RT):** A BGP Extended Community attribute that defines **routing policy and topology** (Hub-and-Spoke, Full Mesh) by specifying which VRF instances import and export specific routes.
+
+**Q3: What is the Bottom-of-Stack (`S`) bit in the MPLS shim header?**
+
+MPLS supports **Label Stacking** (multiple 32-bit labels pushed on top of each other, e.g. Outer Transport Label, Middle RSVP-TE Traffic Engineering Label, Inner VPN Label). The `S` bit (Bottom of Stack) is set to `0` on all intermediate labels, and set to **`1` on the innermost label** to inform the router ASIC that the next header in the payload is the original Layer 3 IP header.
+
+**Q4: How does MPLS Traffic Engineering (MPLS-TE) differ from standard IGP routing?**
+
+Standard IGPs (OSPF/IS-IS) always route traffic along the single shortest metric path, causing primary fiber links to become congested while parallel backup links sit idle. **MPLS-TE** uses **Constraint-Based Shortest Path First (CSPF)** and **RSVP-TE (Resource Reservation Protocol)** to steer high-bandwidth traffic along explicit paths with guaranteed reserved bandwidth and low latency across the network.
+
+**Q5: What is Segment Routing (SR-MPLS / SRv6) and how does it replace LDP and RSVP-TE?**
+
+Traditional MPLS requires running complex signaling state daemons (**LDP** for labels and **RSVP-TE** for tunnels) on all core routers. **Segment Routing (SR)** eliminates all core state by encoding the complete forwarding path directly in the packet header as an ordered list of segments (MPLS labels in SR-MPLS or IPv6 extension headers in SRv6). Core routers remain completely stateless, drastically simplifying network automation.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 32-bit MPLS Shim Header: Label (20b), Exp (3b), S (1b), TTL (8b)
+- [ ] Understand PUSH (Ingress LER), SWAP (Core LSR), and POP (Egress LER)
+- [ ] Master Penultimate Hop Popping (PHP / Label 3 Implicit Null)
+- [ ] Differentiate Route Distinguisher (RD) from Route Target (RT) in L3VPNs
+- [ ] Understand Segment Routing (SR-MPLS) eliminating LDP/RSVP-TE

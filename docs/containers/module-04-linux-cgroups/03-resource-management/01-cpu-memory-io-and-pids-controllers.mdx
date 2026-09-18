@@ -1,0 +1,190 @@
+---
+title: "Chapter 1 — CPU, Memory, IO & PIDs Controllers"
+sidebar_position: 1
+module: "Module 4.3 — Resource Management"
+description: "Master Linux cgroup resource management — CFS CPU bandwidth quotas, memory throttling and OOM mechanics, block I/O bandwidth capping, and PID fork-bomb limits."
+---
+
+# Chapter 1 — Resource Management: CPU, Memory, IO & PIDs
+
+> **Goal:** Master the kernel algorithms, mathematical formulas, and operational tuning of the 4 foundational cgroup resource controllers — analyzing **Completely Fair Scheduler (CFS) CPU Bandwidth Quotas** (`cpu.max`), **Memory Watermarks & OOM Killer Invocations** (`memory.max`, `memory.high`), **Block I/O Bandwidth & IOPS Throttling** (`io.max`), and **PID Limit Protections** (`pids.max`).
+>
+> By the end of this chapter, you will understand:
+> 1. How the CFS scheduler enforces CPU quotas and why micro-bursts cause CPU throttling latency
+> 2. How the Linux kernel calculates CPU fractional cores using `[quota] [period]`
+> 3. The difference between Anonymous Memory, Page Cache, and Kernel memory during OOM kills
+> 4. How to throttle disk read/write bandwidth (MB/s) and IOPS using major:minor block device IDs
+> 5. How `pids.max` protects multi-tenant nodes from thread pool runaways and fork bombs
+> 6. How to verify real-time CPU throttling and memory pressure metrics in production
+
+---
+
+## Real-Life Analogy
+
+Think of the 4 cgroup resource controllers as **the mechanical speed governors, fuel tanks, hydraulic brakes, and passenger turnstiles on a fleet of city transit buses**:
+
+- **1. The CPU Controller / CFS Quota (The Speed Governor & Stopwatch):**
+  - A bus is allowed to drive for **50 milliseconds every 100 milliseconds** (**`cpu.max: 50000 100000` = 0.5 CPU Cores**).
+  - The driver floors the gas pedal and burns all 50ms of driving time in the first 20ms of the window (**A bursty web request**).
+  - For the remaining 80ms of the window, the governor cuts the engine completely (**CPU Throttling**). The passengers experience a sudden jerk and delayed arrival (**Latency Spikes**)!
+- **2. The Memory Controller / `memory.max` (The Water Tank & Ejection Seat):**
+  - The bus has a strict 500-liter water tank (**`memory.max: 500MB`**).
+  - When the tank reaches 400 liters (**`memory.high`**), the bus manager dumps old used wash-water onto the road (**Page Cache Reclaim**).
+  - If a passenger suddenly floods the tank to 501 liters (**Anonymous RAM leak**), an automated ejection seat fires instantly and tosses the passenger out of the bus (**The OOM-Killer**)!
+- **3. The I/O Controller / `io.max` (The Highway Tollgate Gatekeeper):**
+  - Restricts the bus to exiting the highway at a maximum rate of **20 Megabytes/second or 500 toll transactions/second**.
+- **4. The PIDs Controller / `pids.max` (The Bus Turnstile):**
+  - Strictly prevents more than 50 passengers from boarding, stopping a flash mob from overcrowding the aisle.
+
+---
+
+## Architecture Diagram
+
+```text
+               CFS CPU Bandwidth Scheduler & Memory OOM Watermarks
+
+ 1. CFS CPU BANDWIDTH ENFORCEMENT (`cpu.max: 50000 100000` = 0.5 Cores):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 100ms CFS SCHEDULER PERIOD WINDOW (`cpu.cfs_period_us: 100000`):      │
+ │ ├── [0ms..50ms]:   ⚡ App consumes 50ms of CPU quota at full speed!   │
+ │ └── [50ms..100ms]: 🛑 QUOTA EXHAUSTED ──► PROCESS THROTTLED! (Frozen)  │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ [ At 100ms: New period starts ──► CPU Quota is replenished to 50ms! ] │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. MEMORY CONTROLLER WATERMARKS & OOM LIFECYCLE:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TOTAL CGROUP MEMORY BOUNDARY (`memory.max: 2048 MB`):                  │
+ │                                                                        │
+ │ [0MB .. 1600MB]: NORMAL USAGE (Anonymous RAM + Page Cache)             │
+ │ ────────────────────────────────────────────────────────────────────── │
+ │ [1600MB]: `memory.high` (WARNING: Kernel aggressively reclaims cache)  │
+ │ ────────────────────────────────────────────────────────────────────── │
+ │ [2048MB]: `memory.max` (HARD CEILING: Reclaim fails ──► 💥 OOM-KILLER!)│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. CPU Resource Management (`cpu.max`, `cpu.weight`)
+
+### The CFS Quota Formula:
+In cgroup v2, CPU limits are defined in `/sys/fs/cgroup/<name>/cpu.max` as two space-separated integers: `[quota] [period]` (both in microseconds):
+
+$$\text{Allocated CPU Cores} = \frac{\text{Quota (\mu s)}}{\text{Period (\mu s)}}$$
+
+#### Examples:
+- **`200000 100000`** $= \frac{200,000}{100,000} = \mathbf{2.0\text{ CPU Cores}}$.
+- **`50000 100000`** $= \frac{50,000}{100,000} = \mathbf{0.5\text{ CPU Cores}}$ (Equivalent to Kubernetes `resources.limits.cpu: 500m`).
+- **`max 100000`** $=$ **Uncapped CPU** (No throttling).
+
+### The CPU Throttling Hazard:
+When multi-threaded applications (e.g. Java JVM, Node.js, Go) spawn 16 threads in a container with a 2-core limit, all 16 threads execute simultaneously, **burning the entire 200ms quota in just 12.5ms**. For the remaining 87.5ms of the CFS period, the container is frozen, causing extreme API p99 latency spikes!
+
+---
+
+## 2. Memory Resource Management (`memory.max`, `memory.high`)
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Control File         │ Kernel Enforcement Action                                                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`memory.max`**     │ **Hard Limit (OOM).** If exceeded, kernel triggers Out-of-Memory killer.    │
+ │ **`memory.high`**    │ **Soft Limit (Throttle).** Throttles allocating processes and reclaims page │
+ │                      │ cache memory in the background. Avoids sudden OOM terminations.             │
+ │ **`memory.min`**     │ **Hard Protection.** Memory below this threshold is NEVER reclaimed.        │
+ │ **`memory.low`**     │ **Best-Effort Protection.** Reclaimed only if no other memory is available. │
+ │ **`memory.swap.max`**│ **Swap Limit.** Maximum swap space allowed (default: 0 in secure clusters). │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Block I/O Resource Management (`io.max`)
+
+`io.max` sets hard read/write byte bandwidth (BPS) and IOPS limits on specific block storage devices using **Major:Minor device numbers**:
+
+```bash
+# Find device major:minor for root disk (/dev/nvme0n1 is 259:0)
+ls -l /dev/nvme0n1
+# Output: brw-rw---- 1 root disk 259, 0 ...
+
+# Limit container to 50MB/s Read, 20MB/s Write, and 500 Write IOPS:
+echo "259:0 rbps=52428800 wbps=20971520 wiops=500" > /sys/fs/cgroup/my-app/io.max
+```
+
+---
+
+## 4. Process Count Limits (`pids.max`)
+
+```bash
+# Set a hard limit of 50 concurrent threads/processes
+echo "50" > /sys/fs/cgroup/my-app/pids.max
+
+# Check current active thread/process count in this cgroup
+cat /sys/fs/cgroup/my-app/pids.current
+```
+
+---
+
+## Hands-On Lab: Observing CPU CFS Throttling in Action
+
+```bash
+# Step 1: Run an intensive CPU load container with a 0.2 core limit (20,000 / 100,000 us)
+docker run -d --name throttled-app --cpus="0.2" alpine sh -c "while true; do :; done"
+
+# Step 2: Extract the container's host PID
+APP_PID=$(docker inspect throttled-app --format '{{.State.Pid}}')
+
+# Step 3: Inspect the container's cpu.stat metrics directly in /sys/fs/cgroup/
+sudo cat /sys/fs/cgroup/system.slice/docker-$(docker inspect throttled-app --format '{{.Id}}').scope/cpu.stat 2>/dev/null || \
+  cat /sys/fs/cgroup/docker/$(docker inspect throttled-app --format '{{.Id}}')/cpu.stat 2>/dev/null || \
+  echo "cpu.stat telemetry available"
+
+# Look for metrics:
+# nr_periods: Total CFS periods elapsed
+# nr_throttled: Number of periods where the container was FROZEN
+# throttled_usec: Total microseconds spent in frozen throttled state!
+
+# Cleanup
+docker rm -f throttled-app
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the Linux Completely Fair Scheduler (CFS) calculate and enforce container CPU limits?**
+
+CFS enforces CPU limits using a **time-slice budgeting mechanism** over a fixed period window (default: `cpu.cfs_period_us = 100,000 \mu s` or $100\text{ms}$). The limit is defined by `cpu.max: [quota] [period]`. For a 2.0 core limit, the container is granted $200,000\mu\text{s}$ of cumulative execution time across all host CPU cores every $100\text{ms}$. The kernel tracks runtime via a timer interrupt: once the container's threads collectively consume $200,000\mu\text{s}$, the kernel removes all threads in that cgroup from the CPU run-queue until the next $100\text{ms}$ period begins.
+
+**Q2: What is CPU Throttling, and why can setting strict CPU limits hurt application latency?**
+
+CPU throttling occurs when a container exhausts its allocated CFS CPU quota *before* the current $100\text{ms}$ period window finishes. When throttled, the Linux kernel completely suspends thread execution until the next period. For multi-threaded applications (e.g. Java, Node.js, Go), a sudden surge of incoming HTTP requests can consume the entire quota in the first $15\text{ms}$ of a period, **leaving the container completely frozen for the remaining $85\text{ms}$**. This introduces severe **tail latency spikes (p99 latency)** even when overall host CPU utilization is low.
+
+**Q3: What is the difference between Anonymous Memory and Page Cache memory when a container approaches `memory.max`?**
+
+- **Anonymous Memory (Anon)**: Heap allocations, stack memory, variables, and process execution data (`malloc()`, Python objects, JVM heap). It **cannot be dropped** from RAM without being written to swap.
+- **Page Cache (File-backed)**: Cached copies of files read from disk.
+When a container approaches `memory.max`, the Linux kernel first attempts to **evict inactive Page Cache memory**. If memory demand continues to grow and only Anonymous memory remains, the kernel cannot reclaim space and triggers the **Out-of-Memory (OOM) Killer**.
+
+**Q4: How does the `io.max` controller prevent disk I/O starvation on shared multi-tenant worker nodes?**
+
+On shared nodes running I/O-heavy workloads (e.g. database backups, log shippers, data pipelines), an unconstrained container can saturate the storage controller's queue depth and drive SSD latency from $0.2\text{ms}$ to $500\text{ms}$. By configuring `io.max` (specifying device major:minor numbers with `rbps`, `wbps`, `riops`, `wiops`), the kernel's block layer enforces **token-bucket rate limiting on both direct and buffered asynchronous I/O writes**, guaranteeing that noisy neighbor containers cannot monopolize disk throughput.
+
+**Q5: What happens when a container reaches its `pids.max` limit?**
+
+When the number of active tasks (processes + threads) in a cgroup equals `pids.max`, any subsequent system call that creates a new process or thread (`fork()`, `vfork()`, `clone()`, `pthread_create()`) is **blocked and rejected by the kernel with error code `EAGAIN` (Resource temporarily unavailable)**. Existing running processes continue executing normally, but the container cannot spawn additional worker threads until existing processes terminate.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that CPU cores are calculated as $\text{Quota} / \text{Period}$ in $\mu\text{s}$ via `cpu.max`
+- [ ] Know that CPU throttling freezes processes when quotas are exhausted mid-period
+- [ ] Know the difference: Anonymous memory (Heap) vs Page Cache (File-backed)
+- [ ] Know that `memory.high` throttles processes before `memory.max` triggers OOM
+- [ ] Know how `io.max` limits MB/s and IOPS using major:minor block device IDs
+- [ ] Can inspect CPU throttling stats in `/sys/fs/cgroup/.../cpu.stat`

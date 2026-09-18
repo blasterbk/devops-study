@@ -1,0 +1,309 @@
+---
+title: "Chapter 1 — Online vs Offline Volume Expansion"
+sidebar_position: 1
+module: "Module 4.6 — Expansion & Snapshots"
+description: "Master Kubernetes volume expansion — online filesystem resizing, csi-resizer controller workflows, NodeExpandVolume Kubelet execution, and FileSystemResizePending status troubleshooting."
+---
+
+# Chapter 1 — Online vs Offline Volume Expansion
+
+> **Goal:** Master volume expansion in Kubernetes — understanding the requirements for `allowVolumeExpansion: true` in StorageClasses, the two-phase expansion sequence (`ControllerExpandVolume` in the cloud followed by `NodeExpandVolume` on the node), online versus offline expansion requirements, resolving the `FileSystemResizePending` status condition, and why volume shrinking is mathematically prohibited.
+>
+> By the end of this chapter, you will understand:
+> 1. How editing `pvc.spec.resources.requests.storage` triggers the expansion control loop
+> 2. The division of labor between `csi-resizer` (Cloud Block Device) and Kubelet (Filesystem Resize)
+> 3. The difference between Online (Zero-Downtime) and Offline (Pod-Restart) expansion
+> 4. Why PVC status displays `FileSystemResizePending` during in-flight resizes
+> 5. How underlying Linux filesystems (`ext4` with `resize2fs` vs `XFS` with `xfs_growfs`) expand online
+> 6. Why volume shrinking/reduction is strictly impossible in Kubernetes
+
+---
+
+## Real-Life Analogy
+
+Think of volume expansion as **expanding the square footage of a leased business office**:
+
+- **Phase 1: Expanding the Physical Walls (`ControllerExpandVolume`):** Your company needs more space (`requests.storage: 200Gi`). You notify the building owner (`csi-resizer`). The building owner buys the empty vacant room next door and knocks down the brick partition in the building structure (Cloud provider expands the virtual EBS block device from 100GB to 200GB).
+- **The Transition Phase (`FileSystemResizePending`):** The physical space now exists, but the carpet, lighting, and desks have not been installed yet. The room is not usable by your employees until the interior remodel is finished.
+- **Phase 2: Laying the Carpet & Desks (`NodeExpandVolume`):** The maintenance crew (Kubelet) walks into the room while your employees are working (**Online Expansion**) and rolls out the carpet and desks (`resize2fs` / `xfs_growfs`). The entire expanded space is instantly accessible without sending anyone home!
+- **Why You Can Never Shrink (The Irreversible Tear-Down):** If you try to shrink an office from 200GB to 50GB, you cannot predict which rooms hold critical employee filing cabinets. Slicing off half the building destroys files irreversibly (**Filesystem Corruption**).
+
+---
+
+## Architecture Diagram
+
+```text
+               The 2-Phase Volume Expansion Sequence
+
+ 1. Developer edits PVC:
+    kubectl edit pvc database-pvc ──► spec.resources.requests.storage: 200Gi
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Phase 1: Controller Device Expansion (Cloud Layer)                     │
+ │                                                                        │
+ │ 1. `csi-resizer` sidecar intercepts PVC edit                           │
+ │ 2. Calls CSI gRPC: `ControllerExpandVolume(vol-123, 200Gi)`            │
+ │ 3. Cloud Provider (AWS/GCP/Azure) resizes block storage                │
+ │ 4. PVC Status updated:                                                 │
+ │    - `spec.capacity: 200Gi`                                            │
+ │    - `status.conditions: [Type: FileSystemResizePending]`              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Block device `/dev/xvdf` is now 200GB!
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Phase 2: Node Filesystem Expansion (Kubelet Layer)                     │
+ │                                                                        │
+ │ 1. Kubelet detects `FileSystemResizePending` condition                 │
+ │ 2. Calls CSI gRPC: `NodeExpandVolume()`                                │
+ │ 3. Node Driver executes kernel filesystem expansion:                   │
+ │    - For ext4: `resize2fs /dev/xvdf`                                   │
+ │    - For XFS:  `xfs_growfs /var/data`                                  │
+ │ 4. PVC condition CLEARED ──► `status.capacity: 200Gi` (COMPLETE!)      │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## StorageClass Prerequisite: `allowVolumeExpansion`
+
+To enable volume resizing, the `StorageClass` **must** declare `allowVolumeExpansion: true`:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: expandable-gp3-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+# Mandatory flag enabling PVC resizing:
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+```
+
+> [!IMPORTANT]
+> If `allowVolumeExpansion` is `false` or omitted, the Kubernetes API server will immediately reject any `kubectl patch` or `kubectl edit` command attempting to increase `.spec.resources.requests.storage` with a `Forbidden: field is immutable` error.
+
+---
+
+## Online vs Offline Volume Expansion
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature                   │ Online Expansion (Standard)     │ Offline Expansion               │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Pod State**             │ Pod is actively **RUNNING** and │ Pod must be **STOPPED / SCALED  │
+ │                           │ executing read/write I/O.       │ DOWN TO 0** during expansion.   │
+ │ **Downtime**              │ **ZERO Downtime.**              │ Application downtime required.  │
+ │ **Filesystem Action**     │ Live kernel mount resize        │ Resized during unmounted state  │
+ │                           │ (`resize2fs` / `xfs_growfs`).   │ or on next container boot.      │
+ │ **Supported Backends**    │ Modern AWS EBS, GCP PD, Azure   │ Certain bare-metal SANs, local  │
+ │                           │ Disk, Ceph RBD CSI drivers.     │ LVM drivers, older in-tree.     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The `FileSystemResizePending` Status Condition
+
+When you increase the size of a PVC, you may observe the PVC status reporting `FileSystemResizePending`:
+
+```yaml
+status:
+  capacity:
+    storage: 100Gi    # Old capacity still reported by filesystem
+  conditions:
+  - type: FileSystemResizePending
+    status: "True"
+    message: Waiting for user (or pod) to mount volume for filesystem resize.
+```
+
+```text
+ What FileSystemResizePending Means:
+ 1. Phase 1 (Cloud block device resize) has SUCCEEDED. The virtual disk is now larger in AWS/GCP.
+ 2. Phase 2 (Filesystem resize) is WAITING because either:
+    - The Pod is not currently running on a node (Kubelet cannot run `NodeExpandVolume`).
+    - The filesystem is in the process of expanding in the background.
+ 3. As soon as the Pod starts and Kubelet mounts the volume, Kubelet expands the filesystem 
+    and removes the condition automatically.
+```
+
+---
+
+## Why Volume Shrinking is Strictly Impossible
+
+> [!CAUTION]
+> **You can NEVER decrease or shrink the size of a PersistentVolumeClaim.**
+
+If you attempt to edit a PVC from `100Gi` down to `50Gi`, the Kubernetes API server will reject the request immediately:
+
+```text
+ Why Volume Shrinking is Prohibited:
+ 1. Block Storage Fragmentation: Filesystem data blocks and inodes are scattered across the 
+    entire physical block range of the disk.
+ 2. Filesystem Limitations: While `ext4` supports offline shrinking with extreme risk, `XFS` 
+    (the enterprise standard in RedHat, Rocky, and Amazon Linux) DOES NOT SUPPORT SHRINKING AT ALL.
+ 3. Irreversible Data Loss: Slicing off trailing disk blocks from a cloud volume would permanently 
+    destroy unmapped database pages.
+```
+
+---
+
+## Complete Production Manifest with Volume Expansion
+
+```yaml
+# 1. Expandable StorageClass
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: scalable-database-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  iops: "3000"
+---
+# 2. Initial PVC Created at 50Gi
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-pvc
+  namespace: database
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: scalable-database-sc
+  resources:
+    requests:
+      storage: 50Gi
+```
+
+---
+
+## Hands-On Lab: Performing Live Online Volume Expansion
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace expansion-lab
+
+# Step 2: Create an expandable StorageClass (mock or cloud)
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lab-expandable-sc
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+EOF
+
+# Step 3: Create a PersistentVolume and Claim
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: lab-expand-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lab-expandable-sc
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /tmp/expand-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: expand-pvc
+  namespace: expansion-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lab-expandable-sc
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+
+# Step 4: Deploy a Pod consuming the PVC
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: live-app-pod
+  namespace: expansion-lab
+spec:
+  volumes:
+  - name: storage
+    persistentVolumeClaim:
+      claimName: expand-pvc
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    volumeMounts:
+    - name: storage
+      mountPath: /data
+EOF
+
+# Step 5: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/live-app-pod -n expansion-lab --timeout=30s
+
+# Step 6: Expand the PVC from 1Gi to 2Gi online!
+kubectl patch pvc expand-pvc -n expansion-lab -p '{"spec":{"resources":{"requests":{"storage":"2Gi"}}}}'
+
+# Step 7: Verify the updated capacity on the PVC
+kubectl get pvc expand-pvc -n expansion-lab
+# Notice: spec.resources.requests.storage is now 2Gi!
+
+# Step 8: Test that shrinking is rejected by API Server
+kubectl patch pvc expand-pvc -n expansion-lab -p '{"spec":{"resources":{"requests":{"storage":"500Mi"}}}}' 2>&1 || echo "SUCCESS: Volume shrinking rejected by API server!"
+
+# Step 9: Clean up lab
+kubectl delete namespace expansion-lab
+kubectl delete pv lab-expand-pv
+kubectl delete storageclass lab-expandable-sc
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the two distinct phases of volume expansion in Kubernetes?**
+
+Volume expansion is split into two phases:
+1. **Control-Plane Block Expansion (`ControllerExpandVolume`)**: Managed by the `csi-resizer` sidecar. When `pvc.spec.resources.requests.storage` increases, `csi-resizer` calls the cloud API to resize the underlying virtual block device.
+2. **Node-Level Filesystem Expansion (`NodeExpandVolume`)**: Managed by Kubelet. When the Pod mounts the larger block device, Kubelet invokes the node CSI driver to expand the filesystem online (`resize2fs` for ext4 or `xfs_growfs` for XFS) without interrupting running application I/O.
+
+**Q2: What is the purpose of `allowVolumeExpansion: true` in a StorageClass?**
+
+`allowVolumeExpansion: true` is an admission gate that grants permission for PersistentVolumeClaims dynamically provisioned from that StorageClass to be resized. If this parameter is omitted or set to `false`, the Kubernetes API server treats the PVC's storage request field as strictly immutable, rejecting any modification attempts.
+
+**Q3: What causes a PVC to display the status condition `FileSystemResizePending`?**
+
+`FileSystemResizePending` indicates that the first phase of expansion (the cloud provider block device resizing) has finished successfully, but the second phase (filesystem expansion by Kubelet) has not yet completed. This commonly occurs if the volume is not actively mounted by any running Pod (e.g. during maintenance or scaling down). As soon as a Pod mounts the volume, Kubelet detects the condition, expands the filesystem, and clears the status.
+
+**Q4: Why is shrinking or decreasing the size of a PersistentVolumeClaim unsupported in Kubernetes?**
+
+Volume shrinking is prohibited because Linux filesystems (especially XFS, which mathematically cannot shrink at all, and ext4, which requires dangerous offline block reallocation) cannot safely reduce volume size without catastrophic data corruption. Furthermore, cloud storage providers do not support non-destructive block volume truncation.
+
+**Q5: What is the difference between Online and Offline Volume Expansion?**
+
+- **Online Expansion**: The volume size is expanded while the Pod is actively running, with filesystems mounted and processing transactions, with zero application downtime.
+- **Offline Expansion**: The volume can only be resized when it is detached and unmounted; it requires scaling the application Pods to 0 replicas, waiting for cloud block resize, and starting the Pods again.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `allowVolumeExpansion: true` in StorageClass is mandatory for resizing
+- [ ] Know the 2 phases: `ControllerExpandVolume` (Cloud Disk) $\to$ `NodeExpandVolume` (Filesystem)
+- [ ] Know the role of the `csi-resizer` sidecar in watching PVC edits
+- [ ] Know what `FileSystemResizePending` means and how Kubelet resolves it
+- [ ] Know that online expansion requires zero container downtime on modern CSI drivers
+- [ ] Know that volume shrinking is permanently prohibited in Kubernetes
+- [ ] Can expand PVCs via `kubectl patch pvc <name> -p '{"spec":{"resources":{"requests":{"storage":"XGi"}}}}'`

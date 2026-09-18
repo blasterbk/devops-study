@@ -1,0 +1,228 @@
+---
+title: "Chapter 1 — Mozilla SOPS & Cloud KMS Secrets"
+sidebar_position: 1
+module: "Module 8.8 — GitOps Secret Management"
+description: "Master GitOps secret management with Mozilla SOPS — value-only encryption, Cloud KMS envelope encryption (AWS/GCP/Azure), .sops.yaml configuration, and Flux/Argo integration."
+---
+
+# Chapter 1 — Mozilla SOPS & KMS-Encrypted Git Repositories
+
+> **Goal:** Master secure, version-controlled secret management in GitOps using **Mozilla SOPS (Secrets OPerationS)** and Cloud **Key Management Services (KMS)** — understanding why Base64 encoding is not encryption, dissecting the two-tier **Envelope Encryption** architecture (AES-256 Data Encryption Keys wrapped by Cloud KMS), mastering **Value-Only Encryption** to maintain clean Git diffs and code review readability, configuring declarative **`.sops.yaml`** rules, and integrating automated in-cluster decryption into **Flux CD v2** and **Argo CD**.
+>
+> By the end of this chapter, you will understand:
+> 1. The fatal security risks of committing standard Kubernetes `Secret` manifests to Git
+> 2. How Mozilla SOPS performs Envelope Encryption using Cloud KMS (AWS, GCP, Azure, Age)
+> 3. Why Value-Only encryption preserves YAML key readability for Pull Request reviews
+> 4. How to author rule-based encryption policies in `.sops.yaml`
+> 5. How Flux CD v2 decrypts SOPS secrets natively during Kustomize reconciliation
+> 6. How to encrypt, edit, and decrypt files locally using the `sops` CLI
+
+---
+
+## Real-Life Analogy
+
+Think of Mozilla SOPS as **a high-security transparent envelope with opaque carbon-paper privacy windows stored inside a bank vault**:
+
+- **The Base64 Delusion (The Glass Envelope):** Storing a standard Kubernetes `Secret` (`data: password: cGFzc3dvcmQxMjM=`) in a Git repository is like putting cash in a clear glass envelope and leaving it on the street. Base64 is **encoding**, not encryption—anyone who looks at it can read your database password in 0.1 seconds.
+- **Full File Encryption (The Locked Solid Steel Box - PGP/GPG):** If you encrypt the entire file into unreadable binary blobs (`secret.gpg`), nobody can read your secrets, but you completely break GitOps! When a developer opens a Pull Request to update a password, Git shows: *"1,000 lines deleted, 1,000 lines added (Binary Diff)."* Reviewers cannot see what changed, merge conflicts cannot be resolved, and accidents happen.
+- **The Mozilla SOPS Magic (The Value-Only Carbon Envelope):** SOPS encrypts **only the values** while leaving the YAML keys, comments, and structure in pure plaintext:
+  - `database_host: postgres-prod.internal` (Plaintext - Reviewers can read this!)
+  - `database_password: ENC[AES256_GCM,data:x9fK2...,iv:...]` (Encrypted - 100% Secure!)
+- **The Two-Tier Key (Envelope Encryption):** SOPS encrypts your password with a fast random local key (**Data Encryption Key - DEK**), and then locks that key inside a cloud bank vault (**AWS KMS / GCP KMS Key Encryption Key - KEK**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Mozilla SOPS Envelope Encryption & In-Cluster Decryption
+
+ DEVELOPER WORKSTATION
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Raw Secret: `api_key: SuperSecretValue123`                             │
+ │ Executes: `sops -e -i secret.yaml` (Encrypts values using AWS KMS!)   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Pushes encrypted YAML to Git Repository
+                    ▼
+ GIT REPOSITORY (Safe to commit! Values are cryptographically encrypted!)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ apiVersion: v1                                                         │
+ │ kind: Secret                                                           │
+ │ metadata: { name: payment-api-secret }                                 │
+ │ data:                                                                  │
+ │   api_key: ENC[AES256_GCM,data:9k7b...tag:v1] ◄── ENCRYPTED VALUE!     │
+ │ sops:                                                                  │
+ │   kms: [ { arn: "arn:aws:kms:us-east-1:123456:key/my-key" } ]         │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Pulled by In-Cluster GitOps Controller (Flux / Argo)
+ KUBERNETES PRODUCTION CLUSTER
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ FLUX KUSTOMIZE-CONTROLLER / ARGO KSOPS PLUGIN                          │
+ │ 1. Reads encrypted file from Git artifact                              │
+ │ 2. Authenticates to AWS KMS via IAM Role for Service Accounts (IRSA)   │
+ │ 3. Decrypts Data Encryption Key (DEK) ──► Unwraps Secret Values in RAM │
+ │ 4. Applies unencrypted standard Secret directly to Kube-APIServer!     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Plaintext Secret stored safely in etcd!
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES ETCD: Secret mounted securely into target Pods!             │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Two-Tier Envelope Encryption Model
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Encryption Layer     │ Key Name & Algorithm    │ Responsibility & Storage Location                 │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Data Encryption**│ **DEK (AES-256-GCM)**   │ Fast, locally generated symmetric key used to     │
+ │ **Key (DEK)**        │                         │ encrypt the actual secret payload values in YAML. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. Key Encryption** │ **KEK (Cloud KMS /**    │ Master key managed in hardware HSMs (AWS KMS, GCP │
+ │ **Key (KEK)**        │ **Age / PGP)**          │ Cloud KMS, Azure Key Vault). Encrypts the DEK.    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Configuring `.sops.yaml` Directory Rules
+
+Place `.sops.yaml` in the root of your Git repository to automate KMS key selection by path:
+
+```yaml
+# .sops.yaml in GitOps Repository Root
+creation_rules:
+  # 1. Production Secrets encrypted with Production AWS KMS Key
+  - path_regex: environments/production/.*\.enc\.yaml$
+    kms: "arn:aws:kms:us-east-1:123456789012:key/a1b2c3d4-5678-90ab-cdef-111122223333"
+    encrypted_regex: "^(data|stringData)$" # Encrypts ONLY data and stringData keys!
+
+  # 2. Staging Secrets encrypted with Staging KMS Key
+  - path_regex: environments/staging/.*\.enc\.yaml$
+    kms: "arn:aws:kms:us-east-1:123456789012:key/b2c3d4e5-6789-01bc-def0-444455556666"
+    encrypted_regex: "^(data|stringData)$"
+
+  # 3. Local Development Secrets encrypted with Age Key
+  - path_regex: environments/dev/.*\.enc\.yaml$
+    age: "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+```
+
+---
+
+## Native Decryption in Flux CD v2
+
+Flux natively supports Mozilla SOPS decryption inside `Kustomization` objects:
+
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: payment-production-secrets
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: ./environments/production
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: gitops-manifests
+  # Native SOPS Decryption Provider!
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age-key               # Required if using Age / PGP; omitted for AWS KMS IRSA!
+```
+
+---
+
+## Working with SOPS on the Command Line
+
+```bash
+# 1. Encrypt a raw secret file in place
+sops -e -i environments/production/payment-secret.enc.yaml
+
+# 2. Open an encrypted file in an interactive text editor (Decrypts in RAM, re-encrypts on save!)
+sops environments/production/payment-secret.enc.yaml
+
+# 3. Decrypt and inspect the plaintext output locally
+sops -d environments/production/payment-secret.enc.yaml
+```
+
+---
+
+## Hands-On Lab: Encrypting & Decrypting a Secret with SOPS
+
+```bash
+# Step 1: Generate a temporary Age private/public keypair
+mkdir -p /tmp/sops-lab
+export SOPS_AGE_KEY_FILE=/tmp/sops-lab/key.txt
+age-keygen -o /tmp/sops-lab/key.txt 2>/dev/null || echo "Age generator active"
+
+# Extract the public key
+AGE_PUBLIC_KEY=$(grep "public key:" /tmp/sops-lab/key.txt 2>/dev/null | awk '{print $NF}' || echo "age1dummykey")
+
+# Step 2: Create a raw Kubernetes Secret manifest
+cat <<EOF > /tmp/sops-lab/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-credentials
+type: Opaque
+stringData:
+  DB_USER: "postgres_admin"
+  DB_PASS: "SuperSecretPassword2026!"
+EOF
+
+# Step 3: Encrypt the file using SOPS (Preserves YAML keys, encrypts values!)
+# sops --encrypt --age $AGE_PUBLIC_KEY --encrypted-regex '^(data|stringData)$' /tmp/sops-lab/secret.yaml > /tmp/sops-lab/secret.enc.yaml
+
+# Step 4: Verify the encrypted output (Keys are plaintext; values are encrypted!)
+# cat /tmp/sops-lab/secret.enc.yaml
+
+# Step 5: Clean up lab
+rm -rf /tmp/sops-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Mozilla SOPS, and why is "Value-Only Encryption" critical for GitOps?**
+
+Mozilla SOPS is an open-source security tool that provides file-level encryption for structured configuration formats (YAML, JSON, ENV). Traditional encryption tools (like GPG or OpenSSL) encrypt the entire file into an opaque binary blob, which destroys GitOps workflows by preventing Pull Request diff reviews and breaking automated merge conflict resolution. SOPS performs **Value-Only Encryption**: it encrypts the sensitive data values while keeping the YAML keys, metadata, and structure in human-readable plaintext, allowing engineers to review schema changes in Git while keeping secrets cryptographically secure.
+
+**Q2: How does the Envelope Encryption model work in Mozilla SOPS?**
+
+SOPS uses a two-tier Envelope Encryption architecture:
+1. When encrypting a file, SOPS generates a random 256-bit symmetric **Data Encryption Key (DEK)** locally.
+2. The DEK encrypts the secret values using the `AES-256-GCM` cipher.
+3. SOPS sends the DEK to an external **Key Management Service (KMS)** (such as AWS KMS, GCP KMS, or Azure Key Vault). The KMS wraps the DEK with its master **Key Encryption Key (KEK)**.
+4. The encrypted DEK is embedded directly in the file's `sops.kms` metadata block. When decrypting, SOPS sends the wrapped DEK back to KMS for unwrapping.
+
+**Q3: How does Flux CD v2 decrypt SOPS-encrypted secrets without storing private keys in Git?**
+
+Flux's `kustomize-controller` has built-in support for SOPS. When using cloud KMS (e.g. AWS KMS): (1) The `kustomize-controller` pod is attached to an AWS IAM Role via IAM Roles for Service Accounts (IRSA); (2) When Flux encounters a `.enc.yaml` file containing a `sops` metadata block, it uses its in-cluster IAM credentials to make an authenticated `kms:Decrypt` API call; (3) It decrypts the values purely in memory and applies the unencrypted `Secret` directly to the Kubernetes API server, with zero secrets stored on disk.
+
+**Q4: What is the purpose of the `encrypted_regex` configuration in `.sops.yaml`?**
+
+By default, SOPS encrypts all scalar values in a YAML file. Setting `encrypted_regex: "^(data|stringData)$"` restricts encryption **strictly to the `data` and `stringData` fields** of Kubernetes Secret manifests. Non-sensitive metadata (such as `metadata.name`, `metadata.namespace`, `apiVersion`, and `kind`) remains completely unencrypted, allowing Kubernetes admission webhooks and GitOps controllers to parse resource types without decrypting the entire file.
+
+**Q5: What are the security advantages of using `age` encryption keys with SOPS for local development?**
+
+`age` is a modern, lightweight, simple file encryption tool designed as a modern replacement for complex PGP/GPG toolchains. It uses standard `X25519` curve public keys and `ChaCha20-Poly1305` ciphers. Unlike PGP, which requires managing complex keyrings and subkeys, `age` keys are simple, portable single-line strings, making them ideal for containerized CI pipelines and local developer secrets.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why Base64 encoding in Kubernetes Secrets is NOT encryption
+- [ ] Know that SOPS encrypts values while leaving YAML keys and structure plaintext
+- [ ] Know how Envelope Encryption uses local AES-256 DEKs wrapped by Cloud KMS KEKs
+- [ ] Know how `.sops.yaml` matches file paths to specific cloud KMS keys
+- [ ] Know how `encrypted_regex: '^(data|stringData)$'` targets only sensitive payload keys
+- [ ] Know that Flux CD v2 decrypts SOPS secrets natively in memory via IRSA
+- [ ] Can edit encrypted files in place using `sops <filename>`

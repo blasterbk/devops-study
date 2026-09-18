@@ -1,0 +1,1275 @@
+---
+title: "Chapter 4 — Validating Admission Webhooks & ValidatingAdmissionPolicy"
+sidebar_position: 4
+module: "Module 1.10 — Admission Controllers"
+description: "> **Goal:** Understand how Kubernetes validates API requests using **Validating Admission Webhooks** and the newer **ValidatingAdmissionPolicy (CEL)** framework..."
+---
+
+# Module 1.10 — Admission Controllers
+
+# Chapter 4 — Validating Admission Webhooks & ValidatingAdmissionPolicy
+
+> **Goal:** Understand how Kubernetes validates API requests using **Validating Admission Webhooks** and the newer **ValidatingAdmissionPolicy (CEL)** framework. By the end of this chapter, you'll understand how Kubernetes enforces security, compliance, governance, and business rules without modifying Kubernetes itself.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Validating Admission Phase: parallel webhook execution and binary allow/deny decisions
+> 2. AdmissionReview response format: `allowed: true/false`, status code, and human-readable message
+> 3. ValidatingWebhookConfiguration: rules, object/namespace selectors, matchConditions, and timeouts
+> 4. Failure policies (`Fail` vs `Ignore`) and their impact on cluster availability
+> 5. Introduction to ValidatingAdmissionPolicy: in-tree CEL-based policy validation (Kubernetes 1.30+ GA)
+> 6. Common Expression Language (CEL) syntax for object validation without external webhooks
+> 7. ValidatingAdmissionPolicyBinding: scoping CEL policies to namespaces and parameter CRDs
+> 8. Performance comparison: Webhook latency (network roundtrip) vs CEL in-process speed ($<0.1$ ms)
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Validating Webhooks & CEL like an airport customs passport scanner and luggage X-Ray.
+
+```text
+Security Scanner Analogy:
+
+Baggage has passed through auto-tagging (Mutating Webhooks)
+Luggage enters the inspection checkpoint (Validating Phase):
+  - Check 1 (CEL Policy): Laser scanner checks weight < 50 lbs (Instant in-process check)
+  - Check 2 (Validating Webhook): Image sent to off-site specialist (HTTP webhook request)
+  - Decision: All checks must approve (allow = true). If ANY check denies -> luggage rejected
+  - If off-site link drops:
+      - `failurePolicy: Fail` -> Airport halts all departures
+      - `failurePolicy: Ignore` -> Security lets bag through with a warning
+```
+
+| Security Checkpoint | Validating Admission & CEL |
+| :--- | :--- |
+| On-site laser weight scanner | `ValidatingAdmissionPolicy` (CEL expression evaluated in-process) |
+| Off-site specialist inspection | Validating Admission Webhook (HTTPS request to external pod) |
+| Specialist approval ticket | `AdmissionResponse.Allowed: true` |
+| Security violation alarm | `AdmissionResponse.Allowed: false` with custom rejection message |
+| Network failure policy | `failurePolicy: Fail` (strict) vs `failurePolicy: Ignore` (permissive) |
+| Inspection rules binding | `ValidatingAdmissionPolicyBinding` linking CEL rules to namespaces |
+
+> **Important:** `ValidatingAdmissionPolicy` using Common Expression Language (CEL) is a major architectural evolution in Kubernetes. Because CEL expressions are compiled and executed **directly inside the `kube-apiserver` binary**, they eliminate the external network hop, TLS certificate management, and webhook downtime failure modes of traditional validating webhook servers while evaluating complex policies in sub-millisecond time.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Admission Controllers
+- Built-in Admission Controllers
+- Mutating Admission Webhooks
+- Authentication
+- Authorization
+- Kubernetes Objects
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapter we learned:
+
+```text
+Request
+  |
+  v
+Mutating Admission
+  |
+  v
+Modified Object
+```
+
+After mutation,
+
+Kubernetes must answer one final question.
+
+> **Should this object actually be allowed into the cluster?**
+
+That is the responsibility of **Validating Admission**.
+
+---
+
+# The Problem
+
+Suppose a developer creates:
+
+```yaml
+securityContext:
+  privileged: true
+```
+
+Should Kubernetes allow it?
+
+Or suppose:
+
+```yaml
+image: docker.io/latest
+```
+
+Organization policy says:
+
+- Only internal registry
+- No privileged containers
+- Labels are mandatory
+- CPU requests required
+
+Who enforces these rules?
+
+The Scheduler?
+
+Controllers?
+
+No.
+
+Validation happens **before the object is stored**.
+
+---
+
+# Kubernetes Solution
+
+```text
+Incoming Request
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Mutation
+  |
+  v
+Validation
+  |
+  v
+Persist
+```
+
+Validation is the final approval gate.
+
+---
+
+# What is a Validating Admission Webhook?
+
+A Validating Admission Webhook is an external HTTPS service that examines an API request and decides:
+
+```text
+Allow
+
+or
+
+Reject
+```
+
+Unlike a Mutating Webhook,
+
+it **cannot modify** the object.
+
+It only returns a decision.
+
+---
+
+# Mutation vs Validation
+
+```text
+Mutating Webhook
+  |
+  v
+Modify Object
+
+----------------------
+
+Validating Webhook
+  |
+  v
+Allow
+
+or
+
+Reject
+```
+
+Validation protects the cluster from invalid or non-compliant resources.
+
+---
+
+# High-Level Architecture
+
+```text
+                API Server
+  |
+  v
+        Validating Admission Webhook
+
+                     |
+
+             Inspect Object
+
+                     |
+
+          ┌──────────┴──────────┐
+
+          v                     v
+
+       Allow                 Reject
+
+          |                     |
+
+          v                     v
+
+     Persist etcd         Return Error
+```
+
+---
+
+# Why Validation Happens After Mutation
+
+Suppose:
+
+Webhook A adds:
+
+```yaml
+runAsNonRoot: true
+```
+
+Validation should inspect:
+
+```yaml
+runAsNonRoot: true
+```
+
+not the original object.
+
+Therefore:
+
+```text
+Mutation
+  |
+  v
+Validation
+  |
+  v
+Persist
+```
+
+---
+
+# Complete Admission Flow
+
+```text
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Built-in Mutation
+  |
+  v
+Mutating Webhooks
+  |
+  v
+Built-in Validation
+  |
+  v
+Validating Webhooks
+  |
+  v
+API Validation
+  |
+  v
+Persist
+```
+
+---
+
+# AdmissionReview
+
+Like Mutating Webhooks,
+
+Validating Webhooks communicate using:
+
+```text
+AdmissionReview
+```
+
+The webhook receives:
+
+- User
+- Operation
+- Namespace
+- Object
+- Old Object
+- Resource
+- UID
+
+---
+
+# AdmissionReview Response
+
+Unlike mutation,
+
+the response contains:
+
+```text
+Allowed
+  |
+  v
+True
+
+or
+
+False
+```
+
+No JSON Patch is returned.
+
+---
+
+# Validation Workflow
+
+```text
+AdmissionReview
+  |
+  v
+Evaluate Policy
+  |
+  v
+Allowed?
+  |
+  v
+Yes → Continue
+
+No → Reject
+```
+
+---
+
+# ValidatingWebhookConfiguration
+
+The API Server discovers validating webhooks through:
+
+```text
+ValidatingWebhookConfiguration
+```
+
+This resource defines:
+
+- Webhook endpoint
+- Resources
+- Operations
+- Rules
+- Failure policy
+- Selectors
+
+---
+
+# Rules
+
+Rules specify when validation occurs.
+
+Example:
+
+```text
+CREATE
+
+UPDATE
+
+DELETE
+```
+
+Resources:
+
+```text
+Pods
+
+Deployments
+
+Services
+
+Secrets
+
+Custom Resources
+```
+
+---
+
+# Namespace Selector
+
+Validation may be limited to selected namespaces.
+
+Example:
+
+```text
+production
+  |
+  v
+Validate
+
+-------------------
+
+development
+  |
+  v
+Skip
+```
+
+---
+
+# Object Selector
+
+Objects can also be filtered.
+
+Example:
+
+```text
+environment=prod
+  |
+  v
+Validate
+
+------------------
+
+environment=test
+  |
+  v
+Skip
+```
+
+---
+
+# Match Policy
+
+Resources may exist in multiple API versions.
+
+Example:
+
+```text
+apps/v1
+
+apps/v1beta1
+```
+
+Match Policy controls how webhook rules apply across API versions.
+
+---
+
+# Match Conditions
+
+Modern Kubernetes allows additional filtering before calling a webhook.
+
+Example:
+
+```text
+Operation = CREATE
+
+AND
+
+Namespace = production
+  |
+  v
+Invoke Webhook
+```
+
+This reduces unnecessary webhook calls.
+
+---
+
+# Failure Policy
+
+Suppose the webhook is unavailable.
+
+Two choices exist.
+
+---
+
+# Fail
+
+```text
+Webhook Down
+  |
+  v
+Reject Request
+```
+
+Recommended for:
+
+- Security
+- Compliance
+- Regulatory requirements
+
+---
+
+# Ignore
+
+```text
+Webhook Down
+  |
+  v
+Continue Admission
+```
+
+Suitable for:
+
+- Advisory validation
+- Optional governance
+
+---
+
+# Timeout
+
+The API Server waits only a limited time.
+
+```text
+API Server
+  |
+  v
+Webhook
+  |
+  v
+Response
+```
+
+If the timeout expires,
+
+Failure Policy determines the outcome.
+
+---
+
+# Multiple Validating Webhooks
+
+A cluster may have many validators.
+
+Example:
+
+```text
+Webhook A
+  |
+  v
+Security
+  |
+  v
+Webhook B
+  |
+  v
+Compliance
+  |
+  v
+Webhook C
+  |
+  v
+Naming Rules
+```
+
+Every webhook evaluates the request independently.
+
+---
+
+# Internal API Server Flow
+
+```text
+Incoming Request
+  |
+  v
+Mutating Admission
+  |
+  v
+Webhook A
+  |
+  v
+Webhook B
+  |
+  v
+Validation Complete
+  |
+  v
+Persist
+```
+
+---
+
+# Allow vs Reject
+
+Example:
+
+Incoming Pod:
+
+```yaml
+privileged: true
+```
+
+Policy:
+
+```text
+No Privileged Pods
+```
+
+Webhook:
+
+```text
+Reject
+```
+
+Nothing reaches etcd.
+
+---
+
+# Example — Required Labels
+
+Incoming Deployment:
+
+```yaml
+metadata:
+  labels: {}
+```
+
+Policy:
+
+```text
+owner label required
+```
+
+Decision:
+
+```text
+Reject
+```
+
+Developer must correct the request.
+
+---
+
+# Example — Approved Registry
+
+Incoming image:
+
+```text
+docker.io/nginx
+```
+
+Policy:
+
+```text
+registry.company.local/*
+```
+
+Decision:
+
+```text
+Reject
+```
+
+---
+
+# Example — CPU Requests
+
+Incoming Pod:
+
+```yaml
+resources: {}
+```
+
+Policy:
+
+```text
+CPU request required
+```
+
+Decision:
+
+```text
+Reject
+```
+
+---
+
+# ValidatingAdmissionPolicy
+
+Historically,
+
+custom validation always required:
+
+```text
+API Server
+  |
+  v
+Webhook
+  |
+  v
+External Service
+```
+
+This introduced:
+
+- Network latency
+- TLS
+- Availability concerns
+- Operational complexity
+
+Modern Kubernetes provides:
+
+```text
+ValidatingAdmissionPolicy
+```
+
+---
+
+# What is ValidatingAdmissionPolicy?
+
+ValidatingAdmissionPolicy is a built-in Kubernetes resource that evaluates validation rules using **CEL (Common Expression Language)**.
+
+Unlike webhooks,
+
+it does **not** require an external HTTP service.
+
+---
+
+# Architecture
+
+```text
+API Server
+  |
+  v
+CEL Engine
+  |
+  v
+Evaluate Policy
+  |
+  v
+Allow / Reject
+```
+
+Everything happens inside the API Server.
+
+---
+
+# Why CEL?
+
+CEL is:
+
+- Safe
+- Fast
+- Deterministic
+- Sandboxed
+
+It allows Kubernetes to evaluate expressions without executing arbitrary code.
+
+---
+
+# High-Level CEL Flow
+
+```text
+Incoming Object
+  |
+  v
+CEL Expression
+  |
+  v
+True?
+  |
+  v
+Allow
+
+------------
+
+False
+  |
+  v
+Reject
+```
+
+---
+
+# Example Policy
+
+Conceptually:
+
+```text
+Object
+  |
+  v
+Replicas > 0 ?
+  |
+  v
+Yes
+  |
+  v
+Allow
+```
+
+---
+
+# Another Example
+
+```text
+Image Starts With
+
+registry.company.local/
+  |
+  v
+Yes
+  |
+  v
+Allow
+```
+
+---
+
+# ValidatingAdmissionPolicyBinding
+
+A policy defines **what** to evaluate.
+
+A binding defines **where** the policy applies.
+
+Relationship:
+
+```text
+Policy
+  |
+  v
+Binding
+  |
+  v
+Namespaces
+  |
+  v
+Resources
+```
+
+This separation allows the same policy to be reused across different scopes.
+
+---
+
+# Webhooks vs ValidatingAdmissionPolicy
+
+| Validating Webhook | ValidatingAdmissionPolicy |
+|-------------------|---------------------------|
+| External service | Runs inside API Server |
+| HTTPS required | No network calls |
+| Any programming language | CEL expressions |
+| Operational overhead | Simpler management |
+| Maximum flexibility | High performance for declarative rules |
+
+---
+
+# When to Use Webhooks
+
+Use Validating Webhooks when you need:
+
+- External API lookups
+- Database access
+- Complex business logic
+- Organization-specific integrations
+- Cross-system validation
+
+---
+
+# When to Use ValidatingAdmissionPolicy
+
+Use ValidatingAdmissionPolicy when validation depends only on the Kubernetes request itself.
+
+Examples:
+
+- Required labels
+- Naming conventions
+- Resource limits
+- Image prefixes
+- Security settings
+- Immutable field checks
+
+---
+
+# Production Example 1 — Mandatory Labels
+
+Policy:
+
+```text
+Every Deployment
+  |
+  v
+Must Have
+  |
+  v
+owner
+
+team
+
+cost-center
+```
+
+Requests without these labels are rejected.
+
+---
+
+# Production Example 2 — Security
+
+Reject:
+
+```yaml
+privileged: true
+```
+
+unless explicitly permitted.
+
+---
+
+# Production Example 3 — Registry Enforcement
+
+Allow only:
+
+```text
+registry.company.local/*
+```
+
+Reject every external registry.
+
+---
+
+# Production Example 4 — Immutable Environment
+
+Once created,
+
+developers cannot modify:
+
+```text
+environment
+  |
+  v
+production
+```
+
+Validation prevents accidental changes.
+
+---
+
+# Production Example 5 — Replica Limits
+
+Policy:
+
+```text
+Maximum Replicas = 100
+```
+
+Incoming Deployment:
+
+```text
+replicas = 500
+```
+
+Decision:
+
+```text
+Reject
+```
+
+---
+
+# End-to-End Validation Flow
+
+```text
+Developer
+  |
+  v
+kubectl apply
+  |
+  v
+API Server
+  |
+  v
+Authentication
+  |
+  v
+Authorization
+  |
+  v
+Mutation
+  |
+  v
+ValidatingAdmissionPolicy
+  |
+  v
+Validating Webhooks
+  |
+  v
+API Validation
+  |
+  v
+Persist
+  |
+  v
+etcd
+```
+
+---
+
+# Performance Comparison
+
+```text
+ValidatingAdmissionPolicy
+  |
+  v
+In-Process
+  |
+  v
+Very Low Latency
+
+------------------------
+
+Webhook
+  |
+  v
+HTTPS
+  |
+  v
+TLS
+  |
+  v
+Network
+  |
+  v
+Higher Latency
+```
+
+---
+
+# High Availability
+
+Webhook deployments should be:
+
+```text
+Replica 1
+
+Replica 2
+
+Replica 3
+  |
+  v
+Service
+  |
+  v
+API Server
+```
+
+ValidatingAdmissionPolicy requires no additional deployment because it executes inside the API Server.
+
+---
+
+# Production Best Practices
+
+✔ Prefer ValidatingAdmissionPolicy for declarative validation.
+
+✔ Use webhooks only when external logic is required.
+
+✔ Keep validation deterministic.
+
+✔ Avoid slow external dependencies.
+
+✔ Keep timeout values reasonable.
+
+✔ Use namespace selectors to reduce webhook load.
+
+✔ Monitor validation failures.
+
+✔ Return clear error messages.
+
+✔ Deploy validating webhooks with multiple replicas.
+
+✔ Test policies before production rollout.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Validating Webhooks can modify objects.
+
+**Correct:** They can only allow or reject requests.
+
+---
+
+### ❌ Misconception 2
+
+Validation occurs before mutation.
+
+**Correct:** Mutation always finishes before validation begins.
+
+---
+
+### ❌ Misconception 3
+
+ValidatingAdmissionPolicy replaces every webhook.
+
+**Correct:** It replaces many simple validation webhooks, but complex logic still requires webhooks.
+
+---
+
+### ❌ Misconception 4
+
+CEL can call external APIs.
+
+**Correct:** CEL evaluates expressions locally inside the API Server and cannot perform arbitrary network operations.
+
+---
+
+### ❌ Misconception 5
+
+Every webhook should use Failure Policy = Ignore.
+
+**Correct:** Security-critical validation often requires `Fail`.
+
+---
+
+### ❌ Misconception 6
+
+A rejected request reaches etcd.
+
+**Correct:** Rejected requests are discarded before persistence.
+
+---
+
+### ❌ Misconception 7
+
+Multiple validating webhooks share one decision.
+
+**Correct:** Each webhook evaluates independently, and a rejection from one webhook prevents the request from being admitted.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is a Validating Admission Webhook?
+
+An external HTTPS service that validates Kubernetes API requests and either allows or rejects them.
+
+---
+
+### Q2. Can a Validating Webhook modify an object?
+
+No. It can only return an allow or deny decision.
+
+---
+
+### Q3. Why does validation happen after mutation?
+
+To ensure validators inspect the final object that will be stored.
+
+---
+
+### Q4. What is ValidatingWebhookConfiguration?
+
+A Kubernetes resource that configures when and how validating webhooks are invoked.
+
+---
+
+### Q5. What is ValidatingAdmissionPolicy?
+
+A built-in Kubernetes validation framework that uses CEL expressions instead of external webhooks.
+
+---
+
+### Q6. What is CEL?
+
+Common Expression Language, a safe expression language used by Kubernetes to evaluate declarative admission policies.
+
+---
+
+### Q7. What is the purpose of ValidatingAdmissionPolicyBinding?
+
+It binds a policy to specific resources, namespaces, or scopes.
+
+---
+
+### Q8. When should you choose a webhook instead of ValidatingAdmissionPolicy?
+
+When validation requires external systems or complex business logic.
+
+---
+
+### Q9. Why is ValidatingAdmissionPolicy generally faster?
+
+Because it runs inside the API Server and avoids network communication.
+
+---
+
+### Q10. What happens when a validating webhook rejects a request?
+
+The API Server returns an error to the client, and the object is never persisted.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Request rejected unexpectedly | Validation policy matched the request |
+| Webhook never invoked | Rules, selectors, or match conditions did not match |
+| Admission latency high | Slow webhook or network delay |
+| Policy not enforced | Missing ValidatingAdmissionPolicyBinding or incorrect webhook configuration |
+| Registry policy ignored | Validation rule not matching image field |
+| Webhook unavailable | Failure Policy determines allow or reject |
+| CEL expression always fails | Invalid or incorrect policy expression |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is a Validating Admission Webhook?
+2. Why can it not modify Kubernetes objects?
+3. What is the purpose of ValidatingWebhookConfiguration?
+4. What is AdmissionReview?
+5. What is ValidatingAdmissionPolicy?
+6. Why was CEL introduced?
+7. What is the role of ValidatingAdmissionPolicyBinding?
+8. When should you use webhooks instead of ValidatingAdmissionPolicy?
+9. Why is ValidatingAdmissionPolicy generally faster?
+10. What happens when validation rejects a request?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes validates API requests using **Validating Admission Webhooks** and **ValidatingAdmissionPolicy**.
+
+You learned:
+
+- How validating webhooks make allow-or-deny decisions
+- Why validation always follows mutation
+- The purpose of `ValidatingWebhookConfiguration`
+- How AdmissionReview is used during validation
+- How Failure Policy, Match Conditions, and Selectors influence webhook execution
+- How **ValidatingAdmissionPolicy** uses CEL to provide high-performance, in-process validation
+- The role of **ValidatingAdmissionPolicyBinding**
+- The trade-offs between external webhooks and CEL-based policies
+- Real-world production validation patterns
+
+Together, Validating Admission Webhooks and ValidatingAdmissionPolicy form the final enforcement layer before Kubernetes accepts an object into the cluster, ensuring every admitted resource complies with your organization's security, governance, and operational standards.
+
+---
+
+# Next Chapter
+
+**Chapter 5 — Dynamic Admission Control**
+
+Topics include:
+
+- What is Dynamic Admission?
+- Dynamic Admission Architecture
+- AdmissionReview Protocol
+- Request Routing
+- Webhook Discovery
+- Sequential Webhook Execution
+- Reliability
+- TLS & CA Bundles
+- Performance
+- Scaling
+- Observability
+- Production Design Patterns
+```

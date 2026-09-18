@@ -1,0 +1,398 @@
+---
+title: "Chapter 4 — TCPRoute and TLSRoute"
+sidebar_position: 4
+module: "Module 2.6 — Gateway API"
+description: "Deep dive into TCPRoute and TLSRoute — the Gateway API resources for non-HTTP traffic. Covers TCP proxying for databases, TLS passthrough routing by SNI, the experimental channel, and real-world use cases for TCP and TLS routing."
+---
+
+# Chapter 4 — TCPRoute and TLSRoute
+
+> **Goal:** Understand how Gateway API extends beyond HTTP to TCP and TLS routing, enabling Kubernetes-native load balancing for databases, message brokers, and any TCP-based service — with TLSRoute adding SNI-based routing for TLS traffic.
+>
+> By the end of this chapter, you will understand:
+> 1. Why HTTP-only routing isn't enough (databases, MQTT, Redis, custom protocols)
+> 2. TCPRoute — routing raw TCP connections by listener port
+> 3. TLSRoute — routing TLS connections by SNI hostname (passthrough mode)
+> 4. The Gateway listener configurations required for TCP and TLS routes
+> 5. Real-world use cases: PostgreSQL, Redis, Kafka, MongoDB routing
+> 6. When to use TCPRoute vs TLSRoute vs exposing a separate LoadBalancer Service
+
+---
+
+## Real-Life Analogy
+
+HTTPRoute is like a **hotel concierge** who reads the address on every package (HTTP host/path) and routes it to the right room.
+
+**TCPRoute** is like a **dedicated package lift** — it doesn't open packages (no protocol inspection). It just knows: "Port 5432 always goes to the database floor, port 6379 always goes to the cache floor." No inspection, pure port-based routing.
+
+**TLSRoute** is like a **package scanner** that reads only the OUTSIDE of the sealed package (SNI hostname in the TLS ClientHello) — it knows which floor to deliver to by reading the label without opening the seal.
+
+---
+
+## Architecture Diagram
+
+```text
+          TCPRoute and TLSRoute — Gateway Listeners
+
+  Gateway with multiple protocol listeners:
+
+  Port 80   → HTTP   listener → HTTPRoute (web traffic)
+  Port 443  → HTTPS  listener → HTTPRoute (web traffic, TLS terminated)
+  Port 5432 → TCP    listener → TCPRoute  → PostgreSQL Service
+  Port 6379 → TCP    listener → TCPRoute  → Redis Service
+  Port 8883 → TLS    listener → TLSRoute  → MQTT Broker (passthrough)
+                                            (routed by SNI without decrypt)
+
+  Key difference:
+  TCP listener: No protocol awareness. Port N → Service X. Period.
+  TLS listener: Passthrough. Reads SNI → routes to matching service.
+               Backend handles TLS (no cert at Gateway level).
+```
+
+---
+
+## Why TCP/TLS Routes Are in the Experimental Channel
+
+TCPRoute and TLSRoute are in the Gateway API **experimental channel** (not standard GA). Reasons:
+- HTTP routing is well-understood; TCP semantics have more edge cases
+- Feedback still being collected from implementations
+- Not all controllers implement them (NGINX Gateway Fabric, Cilium, Contour support them; others may not)
+
+```bash
+# Install experimental channel to get TCPRoute/TLSRoute CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.1.0/experimental-install.yaml
+
+# Verify CRDs
+kubectl get crd | grep -E "tcproutes|tlsroutes|udproutes"
+```
+
+---
+
+## Gateway Listener for TCP
+
+To use TCPRoute, the Gateway needs a `TCP` protocol listener:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: multi-protocol-gateway
+  namespace: gateway-infra
+spec:
+  gatewayClassName: nginx
+  listeners:
+  # Standard HTTP/HTTPS
+  - name: http
+    port: 80
+    protocol: HTTP
+
+  # PostgreSQL
+  - name: postgres
+    port: 5432
+    protocol: TCP
+    allowedRoutes:
+      namespaces:
+        from: Selector
+        selector:
+          matchLabels:
+            database-access: "allowed"
+      kinds:
+      - group: gateway.networking.k8s.io
+        kind: TCPRoute
+
+  # Redis
+  - name: redis
+    port: 6379
+    protocol: TCP
+    allowedRoutes:
+      namespaces:
+        from: Same
+      kinds:
+      - kind: TCPRoute
+```
+
+---
+
+## TCPRoute Resource
+
+```yaml
+# Route port 5432 traffic to PostgreSQL StatefulSet
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: postgres-route
+  namespace: database
+spec:
+  parentRefs:
+  - name: multi-protocol-gateway
+    namespace: gateway-infra
+    sectionName: postgres        # Attach to the 'postgres' listener
+
+  rules:
+  - backendRefs:
+    - name: postgres-service
+      port: 5432
+      weight: 1
+```
+
+TCPRoute is deliberately simple — it has no matching rules other than the listener port. The listener port IS the selector. Multiple backends with weights enable basic TCP load balancing.
+
+### Load Balancing with TCPRoute
+
+```yaml
+# TCP load balancing (e.g., across Redis replicas for reads)
+rules:
+- backendRefs:
+  - name: redis-replica-0
+    port: 6379
+    weight: 33
+  - name: redis-replica-1
+    port: 6379
+    weight: 33
+  - name: redis-replica-2
+    port: 6379
+    weight: 34
+```
+
+> [!IMPORTANT]
+> TCP load balancing operates at the **connection level** (not request level). Once a connection is established to a backend, all data on that connection goes to the same backend. This is fine for most TCP applications but means different semantics from HTTP request-level load balancing.
+
+---
+
+## Gateway Listener for TLS Passthrough
+
+TLSRoute works with a `TLS` protocol listener in `Passthrough` mode:
+
+```yaml
+spec:
+  listeners:
+  # MQTT Broker (TLS passthrough — SNI-based routing)
+  - name: mqtt-tls
+    port: 8883
+    protocol: TLS
+    tls:
+      mode: Passthrough          # Don't terminate — route by SNI
+    allowedRoutes:
+      kinds:
+      - kind: TLSRoute
+      namespaces:
+        from: All
+```
+
+---
+
+## TLSRoute Resource
+
+```yaml
+# Route TLS traffic by SNI hostname (without terminating TLS)
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: mqtt-tls-route
+  namespace: iot
+spec:
+  parentRefs:
+  - name: multi-protocol-gateway
+    namespace: gateway-infra
+    sectionName: mqtt-tls
+
+  # SNI-based matching
+  hostnames:
+  - "mqtt.example.com"
+  - "mqtt-prod.example.com"
+
+  rules:
+  - backendRefs:
+    - name: mqtt-broker-service
+      port: 8883
+```
+
+The TLSRoute reads the SNI from the TLS ClientHello to decide which backend to forward to. The TLS connection itself is forwarded intact — the backend (MQTT broker, database) handles decryption with its own certificate.
+
+---
+
+## Real-World Use Cases
+
+### PostgreSQL Primary/Replica Routing
+
+```yaml
+# Two listeners: one for writes (primary), one for reads (replicas)
+listeners:
+- name: pg-write
+  port: 5432
+  protocol: TCP
+
+- name: pg-read
+  port: 5433
+  protocol: TCP
+---
+# Write route: only primary
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: postgres-write
+spec:
+  parentRefs:
+  - sectionName: pg-write
+  rules:
+  - backendRefs:
+    - name: postgres-primary
+      port: 5432
+---
+# Read route: all replicas with load balancing
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: postgres-read
+spec:
+  parentRefs:
+  - sectionName: pg-read
+  rules:
+  - backendRefs:
+    - name: postgres-replica-0
+      port: 5432
+      weight: 50
+    - name: postgres-replica-1
+      port: 5432
+      weight: 50
+```
+
+### Redis with TLS
+
+```yaml
+# TLS passthrough for Redis with TLS (Redis 6+)
+listeners:
+- name: redis-tls
+  port: 6380
+  protocol: TLS
+  tls:
+    mode: Passthrough
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: redis-tls-route
+spec:
+  hostnames:
+  - "redis.internal.example.com"
+  rules:
+  - backendRefs:
+    - name: redis-service
+      port: 6380
+```
+
+### Kafka Broker Routing
+
+```yaml
+# Route by port to different Kafka brokers
+# Kafka clients connect to specific brokers via direct port mapping
+listeners:
+- name: kafka-broker-0
+  port: 9092
+  protocol: TCP
+- name: kafka-broker-1
+  port: 9093
+  protocol: TCP
+- name: kafka-broker-2
+  port: 9094
+  protocol: TCP
+---
+# Each listener routes to a specific broker Pod
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: kafka-broker-0
+spec:
+  parentRefs:
+  - sectionName: kafka-broker-0
+  rules:
+  - backendRefs:
+    - name: kafka-0       # StatefulSet Pod 0 headless Service
+      port: 9092
+```
+
+---
+
+## TCPRoute vs Alternative Approaches
+
+| Approach | When to Use |
+|----------|------------|
+| `TCPRoute` | Non-HTTP TCP through a shared Gateway. Single entry point for all traffic. |
+| Separate `LoadBalancer` Service | Simple, direct cloud LB per service. No need to share a gateway. |
+| Headless Service + external DNS | StatefulSets where each Pod needs its own stable DNS (Kafka, Cassandra). |
+| `externalTrafficPolicy: Local` + NodePort | When client IP preservation is critical for TCP services. |
+
+---
+
+## Hands-On: TCP and TLS Routing
+
+```bash
+# 1. Verify experimental CRDs are installed
+kubectl get crd tcproutes.gateway.networking.k8s.io
+kubectl get crd tlsroutes.gateway.networking.k8s.io
+
+# 2. Create and check a TCPRoute
+kubectl apply -f postgres-tcproute.yaml
+kubectl get tcproute -n database
+kubectl describe tcproute postgres-route -n database
+
+# 3. Test TCP connectivity through the Gateway
+GATEWAY_IP=$(kubectl get gateway multi-protocol-gateway \
+  -n gateway-infra -o jsonpath='{.status.addresses[0].value}')
+
+# Test PostgreSQL connection through Gateway
+psql -h $GATEWAY_IP -p 5432 -U myuser -d mydb
+
+# Test Redis connection through Gateway
+redis-cli -h $GATEWAY_IP -p 6379 ping
+# PONG
+
+# 4. Test TLS passthrough (SNI routing)
+openssl s_client -connect $GATEWAY_IP:8883 \
+  -servername mqtt.example.com
+# Certificate should come from the BACKEND (not the Gateway)
+
+# 5. Verify TCPRoute status
+kubectl get tcproute postgres-route -n database \
+  -o jsonpath='{.status.parents[0].conditions}' | python3 -m json.tool
+
+# 6. Check which controller is handling the route
+kubectl get tcproute postgres-route -n database \
+  -o jsonpath='{.status.parents[0].controllerName}'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between TCPRoute and TLSRoute?**
+
+TCPRoute proxies raw TCP connections based solely on the listener port — no protocol inspection, no SNI reading. Traffic arriving on a specific Gateway listener port is forwarded to the configured backend. TLSRoute works in TLS passthrough mode: it reads the SNI hostname from the TLS ClientHello (without decrypting) and routes to matching backends based on hostname. TCPRoute is port-based routing; TLSRoute is hostname-based routing for TLS traffic without termination.
+
+**Q2: Why are TCPRoute and TLSRoute in the experimental channel?**
+
+Gateway API graduated HTTP routing to GA (v1) in October 2023 after extensive real-world testing. TCP and TLS routing have more complex semantics (connection-level vs request-level load balancing, limited matching options, PROXY protocol considerations) and fewer production deployments across diverse controllers. The experimental channel collects feedback without committing to API stability guarantees. They're expected to graduate to standard channel as more implementations mature.
+
+**Q3: What are the limitations of TCPRoute compared to HTTPRoute?**
+
+TCPRoute has minimal matching capability — it routes based only on the listener port (which is configured in the Gateway listener, not the TCPRoute itself). It cannot route based on hostnames, paths, or headers (all requiring HTTP parsing). Load balancing is connection-level (a single TCP session sticks to one backend for its duration). There are no filters for request modification. It's essentially a pure L4 proxy — powerful for its purpose but lacking the L7 richness of HTTPRoute.
+
+**Q4: When would you use TCPRoute for a database vs a separate LoadBalancer Service?**
+
+Use TCPRoute when: (1) you want a single external IP for all services (reduces cloud LB costs), (2) the database traffic can share a Gateway with other services, (3) you want Kubernetes-native routing lifecycle management (create/delete routes without cloud console interaction). Use a separate LoadBalancer Service when: simplicity is preferred, the database needs its own fixed IP (for firewall allowlisting), or when the controller doesn't support TCPRoute in your setup.
+
+**Q5: How does TLSRoute enable multi-tenant TLS routing without certificate access at the Gateway?**
+
+With TLSRoute and TLS passthrough mode, the Gateway never sees the private key of any backend's TLS certificate. It reads only the SNI hostname from the unencrypted portion of the TLS ClientHello, routes to the backend, and forwards the encrypted stream intact. Each backend (MQTT broker, database) holds its own certificate and handles TLS decryption independently. This is ideal for compliance scenarios where TLS keys must not be held in shared infrastructure.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know TCPRoute and TLSRoute are in the experimental channel (install with experimental-install.yaml)
+- [ ] Know TCPRoute routes by listener port only — no protocol inspection, connection-level LB
+- [ ] Know TLSRoute routes by SNI hostname in passthrough mode — no decryption at Gateway
+- [ ] Know Gateway listener protocols: TCP for TCPRoute, TLS (Passthrough) for TLSRoute
+- [ ] Know real-world use cases: PostgreSQL primary/replica, Redis TLS, Kafka direct broker routing
+- [ ] Understand TCPRoute vs separate LoadBalancer Service trade-offs
+- [ ] Can debug with `kubectl get tcproute/tlsroute` and test with `psql`, `redis-cli`, `openssl s_client`

@@ -1,0 +1,295 @@
+---
+title: "Chapter 4 — Flannel"
+sidebar_position: 4
+module: "Module 2.2 — CNI Plugins"
+description: "Deep dive into Flannel — the simplest Kubernetes CNI plugin covering its VXLAN and host-gateway backends, subnet management via etcd/Kubernetes API, the flanneld daemon, and when Flannel is the right choice."
+---
+
+# Chapter 4 — Flannel
+
+> **Goal:** Understand Flannel's architecture, how `flanneld` manages per-node subnet allocation, how the VXLAN and host-gateway backends work, and when Flannel is appropriate versus more feature-rich alternatives.
+>
+> By the end of this chapter, you will understand:
+> 1. What Flannel does and what it deliberately does NOT do
+> 2. How `flanneld` allocates subnets and distributes routing information
+> 3. The VXLAN backend — how it uses `flannel.1` and the FDB
+> 4. The host-gateway backend — how it achieves zero-overhead direct routing
+> 5. The `cni0` bridge and how Pods connect to Flannel's network
+> 6. Why Flannel has no NetworkPolicy support and what to use instead
+
+---
+
+## Real-Life Analogy
+
+Flannel is like a **basic postal service** that only delivers mail within the country:
+
+It has one job: make sure every house (Pod) gets its own address and can exchange letters (packets) with any other house, including across city lines (nodes). It uses a simple approach: either put letters in a standard shipping envelope (VXLAN) for cross-city mail, or deliver directly if the destination is in the same city (host-gateway).
+
+What it does NOT do: it doesn't care what's IN the letters (no NetworkPolicy), it doesn't track relationships between recipients, and it doesn't provide fancy delivery analytics. It's the most basic, reliable postal service — and for many use cases, that's exactly what you need.
+
+---
+
+## Architecture Diagram
+
+```text
+                        Flannel Architecture
+
+    Kubernetes API / etcd
+    (stores subnet assignments per node)
+          │
+          │ Watch
+    ┌─────▼───────────────────────────────────────────────┐
+    │  flanneld daemon (on every node)                     │
+    │                                                      │
+    │  - Reads: node's assigned subnet from API            │
+    │  - Reads: all other nodes' subnets from API          │
+    │  - Creates: flannel.1 VTEP interface (VXLAN mode)    │
+    │  - Updates: FDB entries for remote VTEPs             │
+    │  - Updates: kernel routing table                     │
+    │  - Writes: /run/flannel/subnet.env (for CNI plugin)  │
+    └──────────────────────────┬──────────────────────────┘
+                               │
+    ┌──────────────────────────▼──────────────────────────┐
+    │  flannel CNI plugin binary (/opt/cni/bin/flannel)    │
+    │                                                      │
+    │  Called by containerd for each new Pod:              │
+    │  - Reads /run/flannel/subnet.env                     │
+    │  - Delegates to bridge plugin (creates cni0, veth)   │
+    │  - Assigns IP from node's subnet                     │
+    └─────────────────────────────────────────────────────┘
+```
+
+---
+
+## What Flannel Does (And Doesn't)
+
+### Flannel's Scope
+
+Flannel is intentionally minimal. It provides:
+- ✅ IP-per-Pod assignment from a node-local subnet
+- ✅ Cross-node Pod-to-Pod connectivity (via VXLAN or host-gateway)
+- ✅ Automatic subnet allocation per node
+- ✅ Works on any cloud or bare-metal without network team involvement
+
+Flannel deliberately does NOT provide:
+- ❌ NetworkPolicy enforcement (no iptables policy rules)
+- ❌ Load balancing (use kube-proxy separately)
+- ❌ Service mesh features
+- ❌ L7 observability
+
+> [!IMPORTANT]
+> Flannel has **no NetworkPolicy support**. If you need NetworkPolicy enforcement with Flannel, you must pair it with a separate policy engine. The most common pairing is **Flannel + kube-router** or migration to Calico/Cilium.
+
+---
+
+## Subnet Management: How flanneld Works
+
+When `flanneld` starts on a node:
+
+```text
+1. Connects to Kubernetes API (or etcd)
+2. Checks if this node already has a subnet assigned:
+   kubectl get node <name> -o jsonpath='{.metadata.annotations.flannel\.alpha\.coreos\.com/backend-data}'
+
+3. If no subnet: claims the next available /24 from the cluster CIDR
+   - Reads "network": "10.244.0.0/16" from ConfigMap
+   - Atomically claims "10.244.3.0/24" for this node
+   - Writes assignment to node annotation
+
+4. Writes /run/flannel/subnet.env:
+   FLANNEL_NETWORK=10.244.0.0/16
+   FLANNEL_SUBNET=10.244.3.1/24
+   FLANNEL_MTU=1450
+   FLANNEL_IPMASQ=true
+
+5. Creates flannel.1 interface (VXLAN mode) or routes (host-gw mode)
+
+6. Watches API for other nodes' subnet announcements
+   → Updates FDB and routing table when nodes join/leave
+```
+
+Flannel's subnet allocation is stored as **node annotations**:
+```bash
+kubectl get nodes -o json | jq '.items[].metadata.annotations | to_entries[] | select(.key | contains("flannel"))'
+```
+
+---
+
+## Backend 1: VXLAN (Default)
+
+The VXLAN backend creates a `flannel.1` VTEP interface on each node and uses UDP encapsulation for cross-node traffic.
+
+```bash
+# Flannel ConfigMap configuration for VXLAN backend
+kubectl get configmap kube-flannel-cfg -n kube-flannel -o yaml
+```
+
+```yaml
+net-conf.json: |
+  {
+    "Network": "10.244.0.0/16",
+    "Backend": {
+      "Type": "vxlan",
+      "VNI": 1,
+      "Port": 4789
+    }
+  }
+```
+
+### VXLAN Packet Flow
+
+```text
+Pod A (10.244.1.5) on Node A → Pod B (10.244.2.7) on Node B
+
+1. Pod A sends packet (src: 10.244.1.5, dst: 10.244.2.7)
+2. Exits Pod A's eth0 → veth → cni0 bridge on Node A
+3. Node A kernel: route lookup → 10.244.2.0/24 via flannel.1
+4. flannel.1 VTEP: VXLAN encapsulate
+   - Outer src: 192.168.1.10 (Node A)
+   - Outer dst: 192.168.1.11 (Node B) ← from FDB: MAC of flannel.1 on Node B
+   - UDP dst port: 4789, VNI: 1
+5. Packet sent via Node A's physical eth0
+6. Node B receives UDP:4789 → kernel decapsulates via flannel.1
+7. Inner packet: dst 10.244.2.7 → cni0 bridge → Pod B
+```
+
+```bash
+# Inspect VXLAN setup on a node
+ip link show flannel.1          # VTEP interface (MTU 1450)
+ip route show | grep flannel    # Routes through tunnel
+bridge fdb show dev flannel.1   # FDB: remote VTEP MAC → Node IP mappings
+```
+
+---
+
+## Backend 2: host-gw (High Performance)
+
+The `host-gw` (host gateway) backend achieves direct routing with **zero encapsulation overhead**:
+
+```yaml
+net-conf.json: |
+  {
+    "Network": "10.244.0.0/16",
+    "Backend": {
+      "Type": "host-gw"
+    }
+  }
+```
+
+With host-gw, `flanneld` installs direct kernel routes on each node:
+
+```bash
+# Routes on Node A with host-gw backend:
+ip route show
+# 10.244.1.0/24 dev cni0 proto kernel scope link src 10.244.1.1
+# 10.244.2.0/24 via 192.168.1.11 dev eth0 proto static  ← direct to Node B
+# 10.244.3.0/24 via 192.168.1.12 dev eth0 proto static  ← direct to Node C
+```
+
+No VXLAN encapsulation. Packets from Pod A to Pod B travel with Pod IPs as src/dst, routed directly via Node B's host IP.
+
+> [!IMPORTANT]
+> `host-gw` requires **all nodes to be on the same Layer 2 network** (same subnet). If nodes are on different subnets (different AZs, across routers), `host-gw` will not work — use VXLAN instead.
+
+---
+
+## The cni0 Bridge
+
+Flannel's CNI plugin creates a Linux bridge named `cni0` on each node. This bridge connects all Pod veth interfaces and acts as the default gateway for Pods on that node:
+
+```bash
+# Inspect cni0 bridge
+ip addr show cni0
+# inet 10.244.1.1/24 scope global cni0  ← Gateway for all Pods on this node
+
+# See all Pods connected to the bridge
+bridge link show
+# veth12345abc  master cni0  ← Pod A's veth
+# vethcba98765  master cni0  ← Pod B's veth
+```
+
+---
+
+## Hands-On: Flannel Debugging
+
+```bash
+# 1. Check flanneld is running
+kubectl get pods -n kube-flannel
+kubectl logs -n kube-flannel kube-flannel-<id> -c kube-flannel
+
+# 2. Verify subnet assignment for this node
+cat /run/flannel/subnet.env
+# FLANNEL_NETWORK=10.244.0.0/16
+# FLANNEL_SUBNET=10.244.1.1/24
+# FLANNEL_MTU=1450
+# FLANNEL_IPMASQ=true
+
+# 3. Check flannel.1 interface (VXLAN mode)
+ip -d link show flannel.1  # -d for details including VNI
+
+# 4. Check FDB entries (VTEP IP → remote node mapping)
+bridge fdb show dev flannel.1
+
+# 5. Ping between Pods on different nodes
+kubectl exec -it pod-a -- ping 10.244.2.7 -c 3
+
+# 6. Capture VXLAN traffic
+tcpdump -i eth0 -nn "udp port 4789" -X
+
+# 7. Check node subnet annotations
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.flannel\.alpha\.coreos\.com/backend-data}{"\n"}{end}'
+
+# 8. Common issue: Pods can reach same-node Pods but not cross-node
+# → Usually FDB not updated → Check flanneld logs
+kubectl logs -n kube-flannel kube-flannel-<id> | grep -i error
+```
+
+---
+
+## When to Choose Flannel
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Simple dev/test cluster | ✅ Flannel VXLAN — easiest setup |
+| Production with NetworkPolicy needs | ❌ Use Calico or Cilium |
+| Bare-metal, all nodes L2-adjacent, max performance | ✅ Flannel host-gw |
+| Cloud environment, managed Kubernetes | ❌ Use cloud-native CNI (VPC CNI, GKE native) |
+| Need L7 observability | ❌ Use Cilium + Hubble |
+| Large scale (500+ nodes) | ❌ Flannel doesn't scale as well; use Calico/Cilium |
+| Learning Kubernetes networking concepts | ✅ Flannel is the simplest to understand |
+
+---
+
+## Common Interview Questions
+
+**Q1: What does Flannel do and what does it deliberately not do?**
+
+Flannel provides IP-per-Pod networking and cross-node Pod connectivity using either VXLAN encapsulation or direct host-gateway routing. It deliberately does not implement NetworkPolicy — there are no iptables enforcement rules, no policy engine, and no L7 awareness. This simplicity is a design choice: Flannel is minimal, reliable, and easy to operate. For NetworkPolicy, Flannel users pair it with kube-router or migrate to Calico/Cilium.
+
+**Q2: What is the difference between Flannel's VXLAN and host-gw backends?**
+
+VXLAN wraps Pod packets in UDP (port 4789) using the `flannel.1` VTEP interface — works on any network topology, adds 50 bytes overhead, Pod MTU is 1450. `host-gw` installs direct kernel routes through the physical node IP — zero overhead, full 1500 MTU, but requires all nodes to be on the same Layer 2 subnet (no routers between nodes). VXLAN is the default; host-gw is used for maximum performance on L2-flat networks.
+
+**Q3: How does flanneld distribute subnet information across nodes?**
+
+`flanneld` uses the Kubernetes API (or etcd) as a coordination backend. Each node claims a `/24` subnet from the cluster CIDR and stores its assignment in a node annotation. `flanneld` watches the API for other nodes' subnet annotations. When a new node joins, `flanneld` on all existing nodes receives the new annotation and updates their local FDB entries (VXLAN mode) or kernel routes (host-gw mode) to route traffic to the new node's Pod subnet.
+
+**Q4: What is the `cni0` bridge in Flannel and what is its IP?**
+
+`cni0` is a Linux bridge created by Flannel's CNI plugin on each node. It acts as the Layer 2 switch connecting all Pod veth interfaces on that node. Its IP address is the first IP of the node's subnet (e.g., `10.244.1.1/24`) and serves as the default gateway for all Pods on the node. Pods send all traffic destined outside their local subnet to `cni0`, which then routes it to `flannel.1` (for VXLAN) or directly via eth0 (for host-gw).
+
+**Q5: Can Flannel enforce Kubernetes NetworkPolicy?**
+
+No. Flannel provides no policy enforcement whatsoever. All Pods on a Flannel cluster can reach all other Pods by default — Flannel has no mechanism to enforce `NetworkPolicy` objects. To use NetworkPolicy with Flannel, you must deploy a separate policy engine (e.g., kube-router). In production environments that require NetworkPolicy, most teams migrate to Calico or Cilium, which provide both networking and policy in a single CNI.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know what Flannel does (IP-per-Pod, cross-node routing) and doesn't do (no NetworkPolicy)
+- [ ] Understand the VXLAN backend: `flannel.1` VTEP, FDB, UDP 4789, MTU 1450
+- [ ] Understand host-gw backend: direct kernel routes, zero overhead, L2-only restriction
+- [ ] Know `cni0` is the per-node bridge and the default gateway for all Pods
+- [ ] Know how `flanneld` distributes subnet info via Kubernetes node annotations
+- [ ] Know when to choose Flannel (simple use cases) vs Calico/Cilium (production)
+- [ ] Can use `bridge fdb show`, `ip route show`, and `tcpdump` to debug Flannel connectivity

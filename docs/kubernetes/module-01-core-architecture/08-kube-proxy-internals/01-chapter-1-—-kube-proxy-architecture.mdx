@@ -1,0 +1,1420 @@
+---
+title: "Chapter 1 — kube-proxy Architecture"
+sidebar_position: 1
+module: "Module 1.8 — kube-proxy Internals"
+description: "> **Goal:** Understand how Kubernetes Services actually forward traffic to Pods. Learn how **kube-proxy** implements Service networking using **iptables**, **IP..."
+---
+
+# Module 1.8 — kube-proxy Internals
+
+> **Deep Learning Guide (University-Level + Interview-Oriented)**
+
+---
+
+## Why We Study This Module
+
+Module 1.7 taught you how kubelet creates containers via CRI. Module 1.8 teaches you how **network traffic reaches those containers** — how a Service Virtual IP (ClusterIP) is translated into actual Pod IPs using Linux kernel networking.
+
+---
+
+## Learning Roadmap
+
+```text
+Module 1.8 — kube-proxy Internals
+
+Chapter 1   kube-proxy Architecture
+Chapter 2   iptables Mode Internals
+Chapter 3   IPVS Mode Internals
+Chapter 4   conntrack Internals
+Chapter 5   Service Load Balancing
+Chapter 6   eBPF-Based kube-proxy Replacement
+```
+
+---
+
+# Chapter 1 — kube-proxy Architecture
+
+> **Goal:** Understand how Kubernetes Services actually forward traffic to Pods. Learn how **kube-proxy** implements Service networking using **iptables**, **IPVS**, or **eBPF-based replacements**, how **conntrack** maintains connection state, and how Kubernetes performs Service load balancing.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What kube-proxy is: a Node-level DaemonSet that programs the kernel
+> 2. Why Kubernetes needs Service abstraction: Pods have ephemeral IPs
+> 3. How kube-proxy watches Services and Endpoints via API Server
+> 4. kube-proxy modes: iptables, IPVS, kernelspace (Windows), nftables
+> 5. How kube-proxy programs kernel rules (not application-layer proxying)
+> 6. The Service VIP (ClusterIP): a virtual IP that exists only in kernel rules
+> 7. EndpointSlices: replacing Endpoints for large-scale clusters
+> 8. Why kube-proxy is being replaced by eBPF-based dataplanes (Cilium)
+> ```
+
+---
+
+---
+
+# Real-Life Analogy
+
+Think of kube-proxy like the routing department inside a large post office.
+
+```text
+Post Office Routing Analogy:
+
+Post office (cluster) has a central P.O. Box number (Service ClusterIP)
+Customers (clients) send letters to the P.O. Box (Service IP)
+Routing department (kube-proxy) sets up forwarding rules in the mail system
+Rules say: "P.O. Box 100 -> Deliver to any of: Room 1, Room 2, Room 3"
+Letter (packet) is delivered directly by the mail carrier (Linux kernel)
+Routing department does NOT carry letters: it only sets up the rules
+If a room closes (Pod dies): routing department updates its rules
+```
+
+| Post Office | kube-proxy |
+| :--- | :--- |
+| P.O. Box number | Service ClusterIP (virtual IP) |
+| Routing department | kube-proxy |
+| Forwarding rules | iptables / IPVS rules in Linux kernel |
+| Mail carrier delivering letters | Linux kernel forwarding packets |
+| Room addresses | Pod IPs (backend Endpoints) |
+| Room closes | Pod deleted -> Endpoint removed -> rules updated |
+| Central mailroom notification | kube-proxy Watch on API Server |
+
+> **Important:** kube-proxy does **NOT** proxy traffic at the application layer. It programs **iptables or IPVS rules in the Linux kernel**, then steps aside. After rules are programmed, **kube-proxy is not in the packet path at all** — the kernel forwards packets directly using those rules. This is why kube-proxy has almost zero overhead per connection once rules are in place.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Pods
+- Services (basic concept)
+- ClusterIP
+- Pod Networking
+- CNI Basics
+- Linux Networking Fundamentals
+
+---
+
+# Where This Chapter Fits
+
+So far, we have learned:
+
+```text
+User
+  |
+  v
+Deployment
+  |
+  v
+ReplicaSet
+  |
+  v
+Pod
+  |
+  v
+Container Runtime
+  |
+  v
+Running Containers
+```
+
+Now a new question appears:
+
+> **How does traffic reach those Pods?**
+
+For example,
+
+Suppose we have three Pods.
+
+```text
+Pod A
+
+10.244.1.5
+
+────────────
+
+Pod B
+
+10.244.2.8
+
+────────────
+
+Pod C
+
+10.244.3.12
+```
+
+Users don't connect directly to Pod IPs.
+
+Instead they connect to a Service.
+
+```text
+Client
+  |
+  v
+Service IP
+  |
+  v
+Pods
+```
+
+Something must translate:
+
+```text
+Service IP
+  |
+  v
+Pod IP
+```
+
+That "something" is traditionally **kube-proxy**.
+
+---
+
+# The Networking Problem
+
+Pods are temporary.
+
+Today:
+
+```text
+Pod
+
+10.244.1.5
+```
+
+Tomorrow:
+
+```text
+Pod
+
+10.244.9.17
+```
+
+Pod IPs constantly change.
+
+Applications cannot depend on Pod IP addresses.
+
+---
+
+# Kubernetes Solution
+
+Instead of exposing Pods,
+
+Kubernetes exposes **Services**.
+
+```text
+Pods
+  |
+  v
+Service
+  |
+  v
+Stable Virtual IP
+```
+
+Applications always connect to the Service.
+
+---
+
+# Example
+
+Without Services:
+
+```text
+Frontend
+  |
+  v
+10.244.1.7
+```
+
+Tomorrow:
+
+```text
+Frontend
+  |
+  v
+10.244.8.19
+```
+
+Everything breaks.
+
+Instead:
+
+```text
+Frontend
+  |
+  v
+ClusterIP
+  |
+  v
+10.96.0.15
+```
+
+The Service IP never changes.
+
+---
+
+# But There is a Mystery
+
+Question:
+
+```text
+Service IP
+  |
+  v
+Where Does It Exist?
+```
+
+There is no process listening on:
+
+```text
+10.96.0.15
+```
+
+No Pod owns it.
+
+No container owns it.
+
+No VM owns it.
+
+So how does it work?
+
+---
+
+# The Answer
+
+The Service IP is a **virtual IP (VIP)**.
+
+Packets destined for the VIP are intercepted and rewritten before reaching the application.
+
+Historically,
+
+this packet rewriting is performed by **kube-proxy**.
+
+---
+
+# What is kube-proxy?
+
+kube-proxy is a Kubernetes Node component responsible for implementing the Service abstraction.
+
+It watches the Kubernetes API and programs the Node's networking stack so that packets sent to Service IPs reach the correct backend Pods.
+
+Important:
+
+> kube-proxy **does not proxy packets in userspace** in modern Kubernetes.
+
+Instead,
+
+it programs Linux networking.
+
+---
+
+# High-Level Architecture
+
+```text
+               API Server
+
+                    |
+
+             Watch Services
+
+             Watch Endpoints
+
+                    |
+
+                    ▼
+
+              kube-proxy
+
+                    |
+
+       Programs Linux Network
+
+                    |
+
+         ┌──────────┼──────────┐
+
+         ▼          ▼          ▼
+
+      iptables     IPVS      (or)
+
+                               ▼
+
+                             eBPF
+```
+
+---
+
+# Responsibilities of kube-proxy
+
+kube-proxy is responsible for:
+
+- Watching Services
+- Watching EndpointSlices
+- Programming forwarding rules
+- Maintaining load balancing configuration
+- Supporting session affinity
+- Cleaning obsolete rules
+
+It does **not**:
+
+- Forward every packet in userspace
+- Terminate TCP connections
+- Replace the CNI plugin
+
+---
+
+# kube-proxy Watch Loop
+
+Internally:
+
+```text
+API Server
+  |
+  v
+Watch Services
+  |
+  v
+Watch EndpointSlices
+  |
+  v
+Update Rules
+  |
+  v
+Linux Kernel
+```
+
+No polling is required.
+
+---
+
+# Example
+
+Suppose a Deployment scales.
+
+Old state:
+
+```text
+Service
+  |
+  v
+2 Pods
+```
+
+Later:
+
+```text
+Service
+  |
+  v
+5 Pods
+```
+
+kube-proxy receives the EndpointSlice update and immediately updates forwarding rules.
+
+---
+
+# kube-proxy Modes
+
+Historically Kubernetes has supported three approaches.
+
+```text
+kube-proxy
+
++-- Userspace (legacy)
+
++-- iptables
+
++-- IPVS
+```
+
+Today,
+
+iptables and IPVS are the primary kube-proxy modes.
+
+Many modern platforms replace kube-proxy entirely using eBPF.
+
+---
+
+# Packet Flow
+
+```text
+Client
+  |
+  v
+Service VIP
+  |
+  v
+Linux Networking
+  |
+  v
+Pod IP
+```
+
+Notice:
+
+The packet is rewritten inside the kernel.
+
+---
+
+# iptables Mode
+
+This is the most widely deployed kube-proxy mode.
+
+Instead of forwarding packets,
+
+kube-proxy installs **iptables rules**.
+
+---
+
+# What is iptables?
+
+iptables is the Linux packet filtering and Network Address Translation (NAT) framework.
+
+It allows rules such as:
+
+```text
+Destination == Service IP
+  |
+  v
+Rewrite Destination
+  |
+  v
+Pod IP
+```
+
+---
+
+# iptables Architecture
+
+```text
+API Server
+  |
+  v
+kube-proxy
+  |
+  v
+iptables Rules
+  |
+  v
+Linux Kernel
+  |
+  v
+Packets
+```
+
+The kernel evaluates the rules.
+
+---
+
+# Example
+
+Suppose:
+
+```text
+Service
+
+10.96.0.15
+```
+
+Backends:
+
+```text
+Pod A
+
+10.244.1.5
+
+────────────
+
+Pod B
+
+10.244.2.8
+```
+
+iptables creates rules equivalent to:
+
+```text
+10.96.0.15
+  |
+  v
+Random Choice
+  |
+  v
+Pod A
+
+or
+  |
+  v
+Pod B
+```
+
+---
+
+# Packet Flow in iptables Mode
+
+```text
+Client
+  |
+  v
+10.96.0.15
+  |
+  v
+iptables
+  |
+  v
+DNAT
+  |
+  v
+10.244.1.5
+  |
+  v
+Application
+```
+
+The application believes the packet arrived directly.
+
+---
+
+# Characteristics
+
+Advantages:
+
+- Mature
+- Stable
+- Simple
+- No additional kernel subsystem required
+
+Limitations:
+
+- Very large rule sets in huge clusters
+- Rule updates become increasingly expensive
+- Rule traversal is sequential
+
+---
+
+# IPVS Mode
+
+IPVS stands for:
+
+```text
+IP Virtual Server
+```
+
+It is another Linux kernel subsystem dedicated to load balancing.
+
+Instead of long rule chains,
+
+IPVS maintains efficient lookup tables.
+
+---
+
+# Architecture
+
+```text
+API Server
+  |
+  v
+kube-proxy
+  |
+  v
+IPVS Table
+  |
+  v
+Linux Kernel
+  |
+  v
+Backend Pods
+```
+
+---
+
+# Why IPVS?
+
+Suppose:
+
+```text
+20 Services
+```
+
+iptables works well.
+
+Now suppose:
+
+```text
+40,000 Services
+```
+
+Sequential rule traversal becomes less efficient.
+
+IPVS uses optimized kernel data structures designed for load balancing.
+
+---
+
+# IPVS Load Balancing Algorithms
+
+IPVS supports multiple scheduling algorithms.
+
+Examples include:
+
+```text
+Round Robin
+
+Least Connections
+
+Source Hashing
+
+Weighted Round Robin
+```
+
+Historically, kube-proxy has primarily used round-robin style scheduling, though IPVS itself supports many algorithms.
+
+---
+
+# Packet Flow
+
+```text
+Client
+  |
+  v
+Service VIP
+  |
+  v
+IPVS Lookup
+  |
+  v
+Backend Pod
+  |
+  v
+Application
+```
+
+No long iptables traversal is required for backend selection.
+
+---
+
+# iptables vs IPVS
+
+| Feature | iptables | IPVS |
+|----------|----------|------|
+| Implementation | Netfilter rules | Kernel load balancer |
+| Rule Lookup | Sequential | Efficient lookup structures |
+| Scalability | Good | Better for very large numbers of Services |
+| Scheduling Algorithms | Limited | Multiple algorithms |
+| Complexity | Simpler | More components |
+
+---
+
+# eBPF-Based Replacement
+
+Modern Kubernetes platforms increasingly replace kube-proxy.
+
+Examples:
+
+- Cilium
+- Other eBPF dataplanes
+
+Instead of:
+
+```text
+kube-proxy
+  |
+  v
+iptables
+```
+
+they use:
+
+```text
+eBPF
+  |
+  v
+Kernel Programs
+```
+
+---
+
+# What is eBPF?
+
+eBPF allows safe programs to execute inside the Linux kernel.
+
+Instead of programming:
+
+```text
+iptables Rules
+```
+
+the platform installs:
+
+```text
+Kernel eBPF Programs
+```
+
+---
+
+# Architecture
+
+```text
+API Server
+  |
+  v
+eBPF Agent
+  |
+  v
+eBPF Maps
+  |
+  v
+Kernel Programs
+  |
+  v
+Packets
+```
+
+No iptables or IPVS dataplane is required.
+
+---
+
+# Why eBPF?
+
+Advantages include:
+
+- Lower latency
+- Fewer rule updates
+- Better scalability
+- Rich observability
+- Flexible packet processing
+
+---
+
+# Packet Flow
+
+```text
+Client
+  |
+  v
+Service VIP
+  |
+  v
+eBPF Program
+  |
+  v
+Pod IP
+  |
+  v
+Application
+```
+
+Everything happens inside the kernel.
+
+---
+
+# conntrack
+
+One topic often overlooked is:
+
+```text
+conntrack
+```
+
+Yet it is essential.
+
+---
+
+# What is conntrack?
+
+**conntrack** (Connection Tracking) is the Linux kernel subsystem that tracks the state of network connections.
+
+It remembers:
+
+```text
+TCP
+
+UDP
+
+ICMP
+```
+
+connections after the first packet.
+
+---
+
+# Why conntrack Exists
+
+Suppose a TCP connection begins.
+
+Packet 1:
+
+```text
+Client
+  |
+  v
+Service
+  |
+  v
+Pod A
+```
+
+Packet 2 must also reach:
+
+```text
+Pod A
+```
+
+Otherwise the TCP session breaks.
+
+---
+
+# Without conntrack
+
+```text
+Packet 1
+  |
+  v
+Pod A
+
+────────────
+
+Packet 2
+  |
+  v
+Pod B
+```
+
+TCP fails.
+
+---
+
+# With conntrack
+
+```text
+Packet 1
+  |
+  v
+Pod A
+  |
+  v
+Connection Recorded
+  |
+  v
+Packet 2
+  |
+  v
+Pod A
+```
+
+Connection consistency is preserved.
+
+---
+
+# conntrack Workflow
+
+```text
+New Connection
+  |
+  v
+Select Backend
+  |
+  v
+Store Mapping
+  |
+  v
+Future Packets
+  |
+  v
+Reuse Mapping
+```
+
+---
+
+# Example
+
+Client:
+
+```text
+192.168.1.20
+```
+
+Service:
+
+```text
+10.96.0.15
+```
+
+Selected Pod:
+
+```text
+10.244.1.5
+```
+
+conntrack stores this mapping until the connection expires.
+
+---
+
+# Service Load Balancing
+
+Now we can understand Kubernetes load balancing.
+
+Suppose:
+
+```text
+Service
+  |
+  v
+3 Pods
+```
+
+```text
+Pod A
+
+Pod B
+
+Pod C
+```
+
+Incoming requests are distributed across available endpoints.
+
+---
+
+# High-Level Workflow
+
+```text
+Client
+  |
+  v
+Service VIP
+  |
+  v
+Backend Selection
+  |
+  v
+Chosen Pod
+```
+
+---
+
+# Endpoint Discovery
+
+kube-proxy does not discover Pods directly.
+
+Instead:
+
+```text
+API Server
+  |
+  v
+EndpointSlice
+  |
+  v
+kube-proxy
+```
+
+EndpointSlices contain the current backend Pod IPs.
+
+---
+
+# Scaling Example
+
+Initially:
+
+```text
+2 Pods
+```
+
+Later:
+
+```text
+8 Pods
+```
+
+Workflow:
+
+```text
+Deployment
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+kube-proxy
+  |
+  v
+Rules Updated
+  |
+  v
+Traffic Distributed
+```
+
+No application configuration changes are required.
+
+---
+
+# Session Affinity
+
+Some applications require the same client to continue reaching the same backend.
+
+Example:
+
+```text
+Shopping Cart
+  |
+  v
+Client
+  |
+  v
+Same Pod
+```
+
+Kubernetes supports Service session affinity.
+
+Internally,
+
+kube-proxy works together with Linux networking and conntrack to maintain consistent backend selection according to the configured affinity policy.
+
+---
+
+# Complete Traffic Flow
+
+```text
+Client
+  |
+  v
+ClusterIP
+  |
+  v
+Linux Kernel
+  |
+  v
+iptables
+
+(or)
+  |
+  v
+IPVS
+
+(or)
+  |
+  v
+eBPF
+  |
+  v
+Selected Pod
+  |
+  v
+Application
+  |
+  v
+Response
+  |
+  v
+Client
+```
+
+---
+
+# Complete Internal Architecture
+
+```text
+                API Server
+
+                     |
+
+        Services / EndpointSlices
+
+                     |
+
+                     ▼
+
+                kube-proxy
+
+                     |
+
+     ┌───────────────┼───────────────┐
+
+     ▼               ▼               ▼
+
+  iptables         IPVS            eBPF
+
+                     |
+
+                conntrack
+
+                     |
+
+                     ▼
+
+               Selected Pod
+```
+
+---
+
+# Production Example 1
+
+E-commerce
+
+```text
+Checkout Service
+  |
+  v
+20 Pods
+  |
+  v
+ClusterIP
+  |
+  v
+Load Balanced
+```
+
+Customers connect to one Service while traffic is distributed across many Pods.
+
+---
+
+# Production Example 2
+
+Rolling Update
+
+```text
+Old Pod Removed
+  |
+  v
+EndpointSlice Updated
+  |
+  v
+kube-proxy Updates Rules
+  |
+  v
+Traffic Moves
+  |
+  v
+New Pod
+```
+
+No client-side changes are required.
+
+---
+
+# Production Example 3
+
+Large Cluster
+
+```text
+50,000 Services
+  |
+  v
+IPVS
+  |
+  v
+Efficient Kernel Lookup
+```
+
+---
+
+# Production Example 4
+
+Modern Platform
+
+```text
+Cilium
+  |
+  v
+eBPF
+  |
+  v
+No kube-proxy Dataplane
+```
+
+Traffic is handled directly by kernel eBPF programs.
+
+---
+
+# Production Best Practices
+
+✔ Use EndpointSlices instead of relying on the legacy Endpoints object.
+
+✔ Monitor conntrack table utilization on busy Nodes.
+
+✔ Choose an appropriate dataplane for your cluster size and operational model.
+
+✔ Keep kube-proxy configuration consistent across Nodes.
+
+✔ Understand Service traffic before troubleshooting applications.
+
+✔ Use eBPF-based dataplanes when their operational and feature trade-offs align with your environment.
+
+✔ Regularly monitor packet drops, latency, and conntrack exhaustion.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+kube-proxy is a network proxy process that forwards every packet.
+
+**Correct:** Modern kube-proxy primarily programs Linux networking (iptables or IPVS). The kernel forwards the packets.
+
+---
+
+### ❌ Misconception 2
+
+A Service IP belongs to a Pod.
+
+**Correct:** A Service IP is a virtual IP implemented through networking rules.
+
+---
+
+### ❌ Misconception 3
+
+iptables mode sends traffic to userspace.
+
+**Correct:** Packet forwarding occurs inside the Linux kernel after kube-proxy installs the rules.
+
+---
+
+### ❌ Misconception 4
+
+IPVS replaces Services.
+
+**Correct:** IPVS is one implementation used by kube-proxy to realize the Service abstraction.
+
+---
+
+### ❌ Misconception 5
+
+eBPF is another kube-proxy mode.
+
+**Correct:** Most eBPF solutions replace the kube-proxy dataplane rather than acting as another built-in kube-proxy mode.
+
+---
+
+### ❌ Misconception 6
+
+conntrack performs load balancing.
+
+**Correct:** conntrack tracks connection state. Backend selection is performed before connection tracking maintains consistency.
+
+---
+
+### ❌ Misconception 7
+
+kube-proxy watches Pods directly.
+
+**Correct:** kube-proxy watches Services and EndpointSlices to determine available backends.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is kube-proxy?
+
+A Node component that implements Kubernetes Services by programming the Linux networking stack.
+
+---
+
+### Q2. Why is kube-proxy needed?
+
+To translate Service virtual IPs into backend Pod IPs and provide Service load balancing.
+
+---
+
+### Q3. What is the difference between iptables and IPVS mode?
+
+iptables uses Netfilter rules for packet rewriting, while IPVS uses a dedicated kernel load-balancing subsystem with efficient lookup structures.
+
+---
+
+### Q4. What is conntrack?
+
+The Linux kernel's connection-tracking subsystem that maintains state for network connections.
+
+---
+
+### Q5. Why is conntrack important?
+
+It ensures packets belonging to an existing connection continue reaching the same backend.
+
+---
+
+### Q6. Does kube-proxy forward packets itself?
+
+No. It configures the kernel; the kernel performs packet forwarding.
+
+---
+
+### Q7. Why are eBPF-based dataplanes becoming popular?
+
+They reduce overhead, improve scalability, and enable advanced networking and observability features directly inside the kernel.
+
+---
+
+### Q8. What resource tells kube-proxy which Pods belong to a Service?
+
+EndpointSlices.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Service unreachable | Missing or incorrect kube-proxy rules, eBPF program issues, or networking problems |
+| Service has no backends | EndpointSlice contains no ready endpoints |
+| Traffic reaches only one Pod | Session affinity configuration or only one healthy backend |
+| New Pods receive no traffic | EndpointSlice update not reflected in dataplane |
+| Random connection failures | conntrack exhaustion, networking issues, or backend instability |
+| High latency | Large rule updates, networking bottlenecks, or dataplane configuration problems |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does Kubernetes need kube-proxy?
+2. What is a Service virtual IP?
+3. How does kube-proxy learn about backend Pods?
+4. What is the difference between iptables and IPVS?
+5. Why are eBPF dataplanes replacing kube-proxy in some environments?
+6. What does conntrack do?
+7. Why do all packets in one TCP connection reach the same backend?
+8. How does kube-proxy implement Service load balancing?
+9. What happens when a Deployment scales?
+10. Does kube-proxy process every packet in userspace?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes Services are implemented beneath the surface.
+
+You learned:
+
+- Why kube-proxy exists and how it implements the Service abstraction
+- How kube-proxy watches Services and EndpointSlices
+- How iptables mode performs packet rewriting using Linux Netfilter
+- How IPVS provides a scalable kernel load-balancing implementation
+- Why modern platforms increasingly adopt eBPF-based dataplanes
+- How conntrack preserves connection consistency
+- How Kubernetes distributes traffic across healthy backend Pods
+
+Understanding kube-proxy is essential because every ClusterIP Service ultimately depends on a dataplane implementation to transform a virtual IP into traffic reaching real Pods. Whether that dataplane uses iptables, IPVS, or eBPF, the goal remains the same: reliable, scalable, and transparent Service networking.
+
+---
+
+# Next Chapter
+
+**Chapter 2 — Kubernetes Service Networking Deep Dive**
+
+Topics include:
+
+- ClusterIP Internals
+- NodePort Internals
+- LoadBalancer Flow
+- ExternalTrafficPolicy
+- InternalTrafficPolicy
+- EndpointSlices
+- Hairpin NAT
+- Session Affinity Internals
+
+We'll trace packets hop-by-hop from a client to a Pod, explore NAT behavior, and understand how Kubernetes Services behave under different traffic patterns.
+```

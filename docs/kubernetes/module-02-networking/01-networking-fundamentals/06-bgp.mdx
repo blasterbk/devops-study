@@ -1,0 +1,293 @@
+---
+title: "Chapter 6 — BGP (Border Gateway Protocol)"
+sidebar_position: 6
+module: "Module 2.1 — Networking Fundamentals"
+description: "Deep dive into BGP in Kubernetes — how nodes advertise Pod CIDR routes to physical network infrastructure, AS numbers, eBGP vs iBGP, route reflectors, and how Calico implements BGP for zero-overhead direct Pod routing."
+---
+
+# Chapter 6 — BGP (Border Gateway Protocol) in Kubernetes
+
+> **Goal:** Understand how BGP enables direct Pod-to-Pod routing without encapsulation, how nodes advertise their Pod subnets to the physical network, and how Calico uses BGP (via BIRD) to achieve near wire-speed Kubernetes networking.
+>
+> By the end of this chapter, you will understand:
+> 1. What BGP is and why it's the internet's routing protocol
+> 2. Key BGP concepts: AS numbers, eBGP vs iBGP, route reflectors
+> 3. How Calico uses BGP to distribute Pod CIDR routes across nodes
+> 4. What the BIRD daemon does and how to inspect its routing table
+> 5. How BGP peering with physical network infrastructure enables direct routing
+> 6. When BGP is practical and when you should use overlay instead
+
+---
+
+## Real-Life Analogy
+
+Imagine **postal codes and national postal networks**:
+
+Each country (Autonomous System / node) controls its own internal mail delivery. The **Universal Postal Union (BGP)** is the protocol that tells every country's postal service: "Country A handles postcodes 10244-1xx, Country B handles 10244-2xx."
+
+When someone in Country A wants to send mail to a postcode in Country B, they don't re-package it — they just hand it directly to Country B's postal system because they know the routing. The postal union keeps everyone informed when a new country joins or their postcodes change.
+
+In Kubernetes with BGP:
+- Each node is an "Autonomous System" (or peers with one)
+- Nodes advertise their Pod CIDR ("I handle 10.244.2.0/24")
+- Physical routers learn these routes
+- Packets flow directly node-to-node with no encapsulation
+
+---
+
+## Architecture Diagram
+
+```text
+                 BGP Route Distribution
+
+  Physical Router (AS 65000)
+  ┌──────────────────────────────────────┐
+  │ Routing table (learned via BGP):     │
+  │   10.244.1.0/24 → 192.168.1.10      │
+  │   10.244.2.0/24 → 192.168.1.11      │
+  │   10.244.3.0/24 → 192.168.1.12      │
+  └──────┬─────────────┬────────────────┘
+         │ BGP         │ BGP
+         │ peering     │ peering
+  ┌──────┴───────┐ ┌───┴──────────┐
+  │ Node A       │ │ Node B       │
+  │ AS 65001     │ │ AS 65001     │
+  │ BIRD daemon  │ │ BIRD daemon  │
+  │ Pod CIDR:    │ │ Pod CIDR:    │
+  │ 10.244.1.0/24│ │ 10.244.2.0/24│
+  │              │ │              │
+  │ Advertises:  │ │ Advertises:  │
+  │ "I own       │ │ "I own       │
+  │  10.244.1.0" │ │  10.244.2.0" │
+  └──────────────┘ └──────────────┘
+
+Packet from Pod A (10.244.1.5) to Pod B (10.244.2.7):
+  Node A kernel: route 10.244.2.0/24 via 192.168.1.11 (learned from BGP)
+  Sends: src=10.244.1.5, dst=10.244.2.7 → physical NIC → Router → Node B
+  No encapsulation. Router forwards by Pod IP directly.
+```
+
+---
+
+## BGP Fundamentals
+
+### What is BGP?
+
+BGP (Border Gateway Protocol) is the **routing protocol of the internet** — it's how autonomous systems (ISPs, data centers, cloud providers) exchange routing information. BGP is a **path-vector protocol**: each route advertisement includes the complete path (sequence of AS numbers) to prevent loops.
+
+BGP is used in Kubernetes not as the global internet BGP, but as a local routing protocol between nodes and physical network infrastructure.
+
+### Key BGP Concepts
+
+**Autonomous System (AS):** A collection of IP networks under a single routing policy, identified by an **AS Number (ASN)**. In Kubernetes with Calico:
+
+```text
+Private ASN ranges (RFC 6996):
+  64512 – 65534  (16-bit ASNs for small deployments)
+  4200000000 – 4294967294  (32-bit ASNs for large deployments)
+
+Typical Calico setup:
+  Nodes: AS 64512
+  Physical router: AS 64512 (iBGP) or AS 65000 (eBGP)
+```
+
+**eBGP vs iBGP:**
+
+| Type | Between | Behavior |
+|------|---------|----------|
+| **eBGP** (external) | Different AS numbers | Routes exchanged between different organizations/systems |
+| **iBGP** (internal) | Same AS number | Routes exchanged within the same organization |
+
+In Calico's full-mesh mode: all nodes peer with each other via **iBGP** (same ASN). In Route Reflector mode: designated nodes act as mirrors so not every node needs a full mesh.
+
+---
+
+## How Calico Implements BGP
+
+Calico embeds the **BIRD** (BIRD Internet Routing Daemon) BGP speaker in each node's `calico-node` pod.
+
+```text
+Calico Node Architecture:
+┌─────────────────────────────────────────┐
+│ calico-node DaemonSet Pod               │
+│                                         │
+│  ┌─────────────────┐                    │
+│  │  Felix           │ Programs iptables  │
+│  │  (policy agent)  │ and routes into   │
+│  │                  │ kernel            │
+│  └─────────────────┘                    │
+│                                         │
+│  ┌─────────────────┐                    │
+│  │  BIRD            │ BGP speaker       │
+│  │  (BGP daemon)    │ Advertises Pod    │
+│  │                  │ CIDR to peers     │
+│  └─────────────────┘                    │
+│                                         │
+│  ┌─────────────────┐                    │
+│  │  confd           │ Watches Calico    │
+│  │  (config sync)   │ datastore,        │
+│  │                  │ updates BIRD conf │
+│  └─────────────────┘                    │
+└─────────────────────────────────────────┘
+```
+
+### BIRD Route Advertisements
+
+When a node's Pod CIDR is `10.244.1.0/24`, BIRD announces to all BGP peers:
+```
+BGP UPDATE: 10.244.1.0/24 is reachable via NEXT_HOP 192.168.1.10
+```
+
+All other nodes receive this and install a kernel route:
+```bash
+# Kernel route on Node B (learned via BGP from Node A):
+ip route show
+# 10.244.1.0/24 via 192.168.1.10 dev eth0 proto bird
+# → Traffic to Pod A's subnet goes directly to Node A
+```
+
+---
+
+## BGP Modes in Calico
+
+### Full Mesh (Default for ≤ 50 nodes)
+
+Every node peers with every other node. N nodes = N*(N-1)/2 BGP sessions.
+
+```text
+3 nodes: 3 BGP sessions (manageable)
+50 nodes: 1,225 BGP sessions (still OK)
+500 nodes: 124,750 BGP sessions (too many!)
+```
+
+```bash
+# Check current BGP peers from a node
+kubectl exec -n kube-system calico-node-<id> -- birdcl show protocols
+```
+
+### Route Reflector (For ≥ 50 nodes)
+
+Designate 2-3 nodes as **Route Reflectors** (RR). All other nodes peer only with RRs. RRs reflect routes to all clients.
+
+```yaml
+# Label a node as a route reflector
+kubectl label node node-rr-1 route-reflector=true
+
+# Calico BGPPeer configuration for route reflector
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: peer-with-rr
+spec:
+  peerIP: 192.168.1.100  # Route Reflector IP
+  asNumber: 64512
+  nodeSelector: "!has(route-reflector)"  # All non-RR nodes use this peer
+```
+
+### Peering with Physical Infrastructure
+
+For truly direct routing (Pod IPs routable on the physical network):
+
+```yaml
+# Peer Calico with the ToR (Top of Rack) switch
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: tor-switch-peer
+spec:
+  peerIP: 192.168.1.1    # Physical router/switch IP
+  asNumber: 65000         # Router's ASN (different from nodes = eBGP)
+```
+
+After this, the physical router learns Pod CIDR routes and can forward packets directly to nodes without any encapsulation — Pod IPs become routable on your enterprise LAN.
+
+---
+
+## Hands-On: Inspecting BGP in Calico
+
+```bash
+# 1. Check BGP session status
+kubectl exec -n kube-system -it calico-node-<id> -- birdcl show protocols
+# Output:
+# Name     Proto    Table    State  Since     Info
+# Kernel1  Kernel   master   up     12:00:00
+# Node_192_168_1_11 BGP    master up 12:01:00  Established
+
+# 2. View BGP routing table
+kubectl exec -n kube-system -it calico-node-<id> -- birdcl show route
+# Output:
+# 10.244.2.0/24 via 192.168.1.11 on eth0 [Node_192_168_1_11 12:01:00] * (100/0) [AS64512i]
+# 10.244.3.0/24 via 192.168.1.12 on eth0 [Node_192_168_1_12 12:01:00] * (100/0) [AS64512i]
+
+# 3. View kernel routes installed by BGP
+ip route show | grep bird
+# 10.244.2.0/24 via 192.168.1.11 dev eth0 proto bird
+
+# 4. Check Calico BGP configuration
+calicoctl get bgpconfiguration -o yaml
+
+# 5. Check BGP peers
+calicoctl get bgppeer -o wide
+
+# 6. Check Calico node status
+calicoctl node status
+# Calico process is running.
+# IPv4 BGP status
+# +--------------+-------------------+-------+----------+--------------------------------+
+# | PEER ADDRESS | PEER TYPE         | STATE | SINCE    | INFO                           |
+# +--------------+-------------------+-------+----------+--------------------------------+
+# | 192.168.1.11 | node-to-node mesh | up    | 12:01:00 | Established                   |
+```
+
+---
+
+## When to Use BGP (vs Overlay)
+
+**BGP is the right choice when:**
+- You have bare-metal servers with BGP-capable ToR switches
+- You're using managed cloud services that support VPC native routing (AWS VPC CNI, GKE Dataplane V2)
+- You need maximum performance (no encapsulation CPU cost, full MTU)
+- Your network team can configure BGP peering on switches
+- You want Pod IPs visible in network monitoring and firewalls
+
+**Stick with overlay (VXLAN/IPIP) when:**
+- You don't control the physical network
+- Your cloud VPC doesn't support BGP peering with nodes
+- You want operational simplicity (CNI handles all routing automatically)
+- You need Pod IPs isolated from the physical network
+
+---
+
+## Common Interview Questions
+
+**Q1: What is BGP and why does Kubernetes use it for networking?**
+
+BGP (Border Gateway Protocol) is the internet's routing protocol, used to exchange route information between autonomous systems. Kubernetes (via CNI plugins like Calico) uses BGP to distribute Pod CIDR routes across cluster nodes and optionally to physical network infrastructure. This allows Pod-to-Pod traffic to route directly without any encapsulation overhead — packets travel at wire speed with full MTU.
+
+**Q2: What is the difference between eBGP and iBGP in the context of Calico?**
+
+iBGP (internal BGP) peers have the same AS number — used when Calico nodes peer with each other (full mesh or via route reflectors). eBGP (external BGP) peers have different AS numbers — used when Calico nodes peer with physical routers/switches (which have their own ASN). eBGP typically requires direct connectivity (TTL=1) between peers.
+
+**Q3: What is a BGP Route Reflector and when is it needed?**
+
+A Route Reflector (RR) is a designated BGP peer that reflects routes from one peer to all other peers. In a full-mesh setup, N nodes need N*(N-1)/2 BGP sessions, which becomes unmanageable at scale (100 nodes = 4,950 sessions). With route reflectors, all nodes peer only with 2-3 RR nodes, dramatically reducing BGP session count. Calico recommends route reflectors for clusters with >50 nodes.
+
+**Q4: What does BIRD do in a Calico-managed Kubernetes cluster?**
+
+BIRD (BIRD Internet Routing Daemon) is embedded in each `calico-node` pod as the BGP speaker. It establishes BGP sessions with peer nodes (or physical routers), advertises the local node's Pod CIDR, receives remote Pod CIDR advertisements from peers, and programs these routes into the Linux kernel's routing table. Felix (Calico's policy agent) then uses these routes to program dataplane rules.
+
+**Q5: If Calico is using BGP with no encapsulation, how does a Pod packet reach another node?**
+
+Calico's BIRD daemon distributes Pod CIDR routes to all nodes (and optionally physical routers) via BGP. The Linux kernel on the sending node has a route like `10.244.2.0/24 via 192.168.1.11 dev eth0`. When Pod A sends to Pod B (10.244.2.7), the kernel uses this route to forward the packet directly to Node B's physical NIC IP. The packet is not encapsulated — it contains the Pod source/destination IPs. The router/switch forwards it using its BGP-learned routing table.
+
+---
+
+## Summary Checksheet
+
+- [ ] Understand what BGP is and why it's used in Kubernetes for route distribution
+- [ ] Know the difference between iBGP (same AS) and eBGP (different AS)
+- [ ] Understand Calico's BIRD daemon role (BGP speaker that advertises Pod CIDRs)
+- [ ] Know the three BGP modes in Calico: full mesh, route reflector, physical peering
+- [ ] Know when route reflectors are needed (clusters > 50 nodes)
+- [ ] Can use `birdcl show protocols`, `birdcl show route`, and `calicoctl node status` to inspect BGP
+- [ ] Understand when BGP is preferable over overlay networking (bare-metal, performance-critical)

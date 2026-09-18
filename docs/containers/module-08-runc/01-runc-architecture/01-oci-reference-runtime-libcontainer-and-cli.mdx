@@ -1,0 +1,165 @@
+---
+title: "Chapter 1 — runc Architecture & libcontainer"
+sidebar_position: 1
+module: "Module 8.1 — runc Architecture"
+description: "Master runc internals — libcontainer Go engine, the CGO nsenter.c multi-threading bootstrap dilemma, step-by-step kernel execution pipeline, and OCI compliance."
+---
+
+# Chapter 1 — runc Architecture & libcontainer
+
+> **Goal:** Master the low-level systems programming architecture, kernel bootstrap sequence, and CGO execution mechanics of **`runc`** and **`libcontainer`** — analyzing how `runc` serves as the official **OCI Reference Runtime**, dissecting the **Go multi-threading `setns()` dilemma and the `nsenter.c` C-constructor solution**, and tracing the step-by-step pipeline from declarative **`config.json`** to **`clone()`**, **`pivot_root()`**, and **`execve()`**.
+>
+> By the end of this chapter, you will understand:
+> 1. The historical origins of `libcontainer` and its donation to the OCI
+> 2. How `runc` translates JSON configuration schemas into concrete Linux kernel system calls
+> 3. Why the Go runtime's multi-threading prevents calling `setns()` directly in pure Go
+> 4. How `nsenter.c` executes C-level initialization hooks before the Go runtime boots
+> 5. The 6-step kernel execution pipeline of container initialization
+> 6. How to audit and execute raw OCI runtime operations using `runc`
+
+---
+
+## Real-Life Analogy
+
+Think of `runc` and `libcontainer` as **the mechanical starter motor and ignition spark plug in a high-performance sports car**:
+
+- **1. The Dashboard Computer (`The High-Level Runtime - containerd`):**
+  - The driver turns the key. The computer checks fuel levels, confirms all seatbelts are fastened, and sends an electrical signal to the starter motor (**Passes `config.json` and `rootfs/` to `runc`**).
+- **2. The Starter Motor (`runc` / `libcontainer`):**
+  - A small, high-torque electric motor.
+  - Its only job is to spin the heavy engine crankshaft up to 500 RPM (**Creates Linux namespaces, mounts rootfs, sets up cgroups, drops security capabilities**).
+- **3. The Ignition Spark (`execve()`):**
+  - The spark plug fires, igniting gasoline in the combustion chamber (**PID 1 starts executing `nginx`**).
+- **4. The Immediate Disengagement (`runc` Exits):**
+  - As soon as the main engine is running under its own power, the starter motor's gear **instantly retracts and stops spinning (`runc` terminates and exits)**.
+  - The starter motor does not stay running while you drive on the highway!
+
+---
+
+## Architecture Diagram
+
+```text
+               runc Execution Pipeline & The `nsenter.c` CGO Bootstrap
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `runc` CLI: Reads `config.json` & Validates OCI Bundle              │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Calls `libcontainer` (Go Library)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. THE CGO BOOTSTRAP STAGE (`nsenter.c` - C Constructor):              │
+ │    💥 Solves the Go Multi-Threading setns() Bug!                       │
+ │    - Executes `__attribute__((constructor)) init()` in C before Go init│
+ │    - Forks raw single-threaded process & invokes `setns()` / `unshare()`│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Passes execution back to Go libcontainer
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. LINUX KERNEL ISOLATION PIPELINE:                                    │
+ │    ├── A. Sets up cgroups in `/sys/fs/cgroup/` (CPU / RAM limits)      │
+ │    ├── B. Mounts filesystems (`/proc`, `/sys`, `/dev`)                 │
+ │    ├── C. `pivot_root()`: Traps process inside container `rootfs`      │
+ │    ├── D. Drops Linux Capabilities (`CAP_SYS_ADMIN`, `CAP_SYS_RAWIO`)  │
+ │    └── E. Loads Seccomp BPF Syscall Whitelist filter                   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Executes `execve("/usr/sbin/nginx", args, env)`
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 4. USER APPLICATION RUNNING: `runc` process exits immediately!         │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Go Multi-Threading Problem & `nsenter.c`
+
+One of the most fascinating engineering triumphs in container history is how `runc` solved the **Go Runtime `setns()` Dilemma**:
+
+### The Linux Kernel Rule:
+In Linux, system calls like `setns(CLONE_NEWUSER)` and `unshare()` **MUST be called when the process is single-threaded**. If a process has multiple OS threads, `setns()` returns `EINVAL` (Invalid argument) to prevent security race conditions.
+
+### The Go Language Problem:
+The Go runtime is **inherently multi-threaded**. As soon as a Go program boots, the Go runtime spawns multiple OS threads for the garbage collector, scheduler, and sysmon *before* `main()` even runs! A pure Go program **cannot safely call `setns()`**!
+
+### The `runc` Solution (`nsenter.c`):
+`runc` embeds a small C file named **`nsenter.c`** using CGO. It declares a GCC C-constructor:
+```c
+__attribute__((constructor)) void init(void) {
+    // This C function executes at the ELF binary loader level,
+    // BEFORE the Go runtime initializes its threads!
+    nsexec(); // Sets up namespaces while strictly single-threaded!
+}
+```
+When `runc` needs to enter or create namespaces, it re-executes itself (`/proc/self/exe`), allowing `nsenter.c` to configure all namespaces in C before handing control back to Go!
+
+---
+
+## Step-by-Step runc Execution Pipeline
+
+```text
+ ┌──────────────────┬─────────────────────────────────────────────────────────────────────────────────┐
+ │ Pipeline Step    │ Systems Action Executed by `runc`                                               │
+ │──────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+ │ **Step 1: Read** │ Loads and parses `config.json`; validates OCI version and Linux capabilities.   │
+ │ **Step 2: Fork** │ Forks child process and triggers `nsenter.c` to establish namespace boundaries. │
+ │ **Step 3: Cgroup**│ Writes PID to `/sys/fs/cgroup/<name>/cgroup.procs` and applies limits.          │
+ │ **Step 4: Mount**│ Mounts `/proc`, `/sys`, `/dev`, and invokes **`pivot_root()`** to isolate rootfs│
+ │ **Step 5: Secure**│ Drops bounding Linux capabilities and compiles Seccomp BPF syscall filters.     │
+ │ **Step 6: Exec** │ Invokes **`execve()`** to replace `runc` with the container binary; `runc` exits!│
+ └──────────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Inspecting `runc` Binary & Version Metadata
+
+```bash
+# Step 1: Check runc version and commit hash
+runc --version 2>/dev/null || echo "runc version 1.1.x ready"
+
+# Output will display:
+# runc version 1.1.12
+# commit: v1.1.12-0-g51d5e94
+# spec: 1.0.2-dev
+# go: go1.21.7
+# libseccomp: 2.5.5
+
+# Step 2: Verify active OCI features supported by the runc binary
+runc features 2>/dev/null || echo "runc features command ready"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is `runc`, and what is its role in the container ecosystem?**
+
+`runc` is a lightweight, command-line tool for spawning and running containers according to the **OCI Runtime Specification**. Originally developed by Docker as `libcontainer` and donated to the Linux Foundation, `runc` is the universal **OCI Reference Implementation**. Higher-level container engines (like `containerd`, `CRI-O`, and Docker) do not interact directly with Linux kernel syscalls; instead, they generate an OCI bundle (`rootfs` + `config.json`) and invoke `runc` to execute the container.
+
+**Q2: What is `libcontainer`, and how does it relate to `runc`?**
+
+`libcontainer` is the **core Go library** that powers `runc`. Before `libcontainer`, early versions of Docker relied on LXC (Linux Containers) tools to create containers. Docker created `libcontainer` to interact directly with Linux kernel APIs (`clone`, `unshare`, `pivot_root`, cgroups, seccomp, AppArmor, capabilities) without external C tooling. `runc` is simply the thin command-line CLI wrapper around the `libcontainer` library.
+
+**Q3: Why can't standard Go programs call `setns(CLONE_NEWUSER)` directly, and how does `runc` solve this with `nsenter.c`?**
+
+In Linux, changing user namespaces via `setns()` or `unshare()` is rejected if the calling process has spawned multiple threads. The Go runtime automatically spawns multiple background operating system threads (for scheduling, garbage collection, and timers) before `main()` executes, making it impossible for pure Go code to enter namespaces. `runc` solves this by embedding **`nsenter.c`** with a C constructor (`__attribute__((constructor))`). The C constructor executes during dynamic ELF binary loading **before the Go runtime initializes**, creating and joining namespaces while the process is strictly single-threaded.
+
+**Q4: What happens to the `runc` process once a container is running?**
+
+The `runc` process **terminates and exits completely**. When `runc` completes namespace creation, cgroup allocation, and filesystem pivoting, it calls the **`execve(2)`** system call. `execve` replaces the `runc` binary image in memory with the container's target application binary (e.g. `/usr/sbin/nginx`). The container process is adopted by `containerd-shim-v2` (or host PID 1), and zero `runc` processes remain in the system process table.
+
+**Q5: What is the difference between `runc create` and `runc run`?**
+
+- **`runc run <id>`**: Runs the entire container lifecycle synchronously. It creates namespaces, mounts rootfs, executes the entrypoint binary, and attaches standard I/O in a single command.
+- **`runc create <id>`**: Initializes the container's namespaces, cgroups, and rootfs, but **pauses execution before calling `execve()`**, leaving the container in the `Created` state. This allows high-level orchestrators (`containerd`, Kubelet) to execute CNI network configuration and OCI hooks *before* issuing **`runc start <id>`** to launch the user application.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `runc` is the official OCI reference implementation for runtimes
+- [ ] Know that `libcontainer` is the pure Go library underlying `runc`
+- [ ] Know how `nsenter.c` solves the Go multi-threading `setns()` dilemma
+- [ ] Know the 6 execution steps: Parse, Fork, Cgroups, Pivot_root, Security, Execve
+- [ ] Know that `runc` exits immediately after executing `execve()`
+- [ ] Can inspect runc capabilities and OCI features using `runc features`

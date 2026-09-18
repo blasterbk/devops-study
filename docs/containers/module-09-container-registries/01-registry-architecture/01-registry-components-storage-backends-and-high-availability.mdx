@@ -1,0 +1,191 @@
+---
+title: "Chapter 1 — Registry Architecture: Backends & High Availability"
+sidebar_position: 1
+module: "Module 9.1 — Registry Architecture"
+description: "Master enterprise container registry architecture — stateless API engines, S3 object storage backends, pre-signed 307 redirects, Redis caching, and active-active geo-replication."
+---
+
+# Chapter 1 — Registry Architecture: Backends & High Availability
+
+> **Goal:** Master the systems architecture, object storage backends, and high-availability topologies of **Enterprise Container Registries** — dissecting the **Stateless OCI API Frontend**, designing resilient **Object Storage Backends (AWS S3, MinIO, Ceph)**, configuring **HTTP 307 Pre-Signed S3 Redirects** for petabyte-scale throughput, utilizing **Redis Layer Caching**, and deploying **Active-Active Geo-Replication**.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4 foundational architectural tiers of an enterprise container registry
+> 2. How S3 pre-signed 307 redirects offload multi-gigabyte layer streaming from registry nodes
+> 3. How Redis accelerates layer deduplication checks and token verification
+> 4. How to design a multi-region active-active geo-replicated registry topology
+> 5. How to run and configure the open-source Distribution Registry
+> 6. How to deploy and test an OCI-compliant local registry in seconds
+
+---
+
+## Real-Life Analogy
+
+Think of an Enterprise Container Registry as **a global automated Amazon e-commerce distribution and fulfillment network**:
+
+- **1. The Web Order Desk (`The Stateless Registry API Gateway`):**
+  - Receives customer orders (**`docker pull` / `docker push`**).
+  - Validates credit cards and shipping addresses (**OAuth2 / JWT Token Authentication**).
+  - The order desk doesn't store 50-inch televisions on its office floor; it generates an automated warehouse dispatch ticket (**Pre-Signed S3 URL**).
+- **2. The High-Speed Robot Picking Aisles (`Redis Cache`):**
+  - A fast memory cache checking if a product SKU is in stock in 0.1 milliseconds (**`HEAD /v2/<name>/blobs/<digest>`**).
+- **3. The Deep Mega-Warehouse (`S3 / MinIO Object Storage`):**
+  - Vast, endless rows of standardized industrial storage pallets (**Immutable Content-Addressable SHA-256 Blobs**).
+  - When the delivery truck arrives, the robot loads crates directly from the warehouse pallet onto the truck (**Direct S3 Streaming via 307 Redirects**), completely bypassing the front-desk office!
+- **4. The Regional Hub Airfreight Sync (`Geo-Replication`):**
+  - When a popular item is manufactured in California (**Image pushed in US-West**), cargo planes automatically clone the crates to Frankfurt and Tokyo fulfillment centers (**Cross-Region Replication**) so local delivery trucks don't drive across the Atlantic Ocean!
+
+---
+
+## Architecture Diagram
+
+```text
+               Enterprise High-Availability Container Registry Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CLIENT TRAFFIC: `docker push` / `kubelet pull` (10,000 Nodes)          │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ HTTPS Traffic (Port 443)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GLOBAL LAYER 7 LOAD BALANCER (AWS ALB / Cloudflare / NGINX Ingress)    │
+ └──────┬───────────────────────────┬───────────────────────────┬─────────┘
+        ▼                           ▼                           ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ REGISTRY API NODE 01   │  │ REGISTRY API NODE 02   │  │ REGISTRY API NODE 03   │
+ │ (Stateless Go Engine)  │  │ (Stateless Go Engine)  │  │ (Stateless Go Engine)  │
+ └──────┬─────────────────┴──┴──────┬─────────────────┴──┴──────┬─────────────────┘
+        │                           │                           │
+        ▼                           ▼                           ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ REDIS DISTRIBUTED CACHE CLUSTER (Manifest Caching & Rate Limiting)     │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ POSTGRESQL METADATA DATABASE (RBAC, Webhooks, Image Tags, Audit Logs)  │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ S3-COMPATIBLE OBJECT STORAGE POOL (AWS S3 / MinIO / Ceph Objectstore)  │
+ │ ├── `blobs/sha256/` (Immutable layer tarballs and config JSONs)        │
+ │ └── ⚡ Direct S3 307 Redirect: Clients download blobs directly from S3!│
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Core Architectural Tiers
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+ │ Registry Tier             │ Systems Function & Scaling Strategy                                     │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **1. API Gateway / Core** │ **Stateless.** Handles HTTP requests according to OCI Distribution Spec.│
+ │                           │ Scales horizontally from 2 to 100+ instances behind a load balancer.    │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **2. Auth & Token Service**│ Validates OAuth2 bearer tokens, integrates with LDAP/OIDC/SAML, and     │
+ │                           │ evaluates RBAC permissions (Read/Write/Delete).                         │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **3. Cache & Metadata**   │ **Redis & PostgreSQL.** Caches blob existence (`HEAD` calls), indexes   │
+ │                           │ image tags, and tracks artifact vulnerability reports.                  │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **4. Blob Storage Backend**│ **S3 / GCS / Azure Blob.** Stores multi-gigabyte layer tarballs.       │
+ │                           │ Provides 99.999999999% (11 9s) data durability.                         │
+ └───────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## S3 Direct Streaming & 307 Pre-Signed Redirects
+
+When 5,000 Kubernetes nodes pull a 2GB image simultaneously during a rolling update, routing 10 Terabytes of network traffic through the registry API nodes would saturate their network interfaces and crash the control plane.
+
+### The Solution: HTTP 307 Temporary Redirect:
+1. Kubelet requests layer: `GET /v2/my-app/blobs/sha256:abcd...`
+2. Registry validates token and generates a **Time-Limited S3 Pre-Signed URL**.
+3. Registry returns: **`HTTP/1.1 307 Temporary Redirect`** with `Location: https://s3.amazonaws.com/my-bucket/blobs/abcd?...`
+4. Kubelet streams the 2GB file **directly from AWS S3 storage**, consuming **zero registry CPU, memory, or bandwidth**!
+
+---
+
+## High Availability & Geo-Replication
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Replication Model    │ Architecture & SRE Use Case                                                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Active-Passive**   │ Primary registry replicates asynchronously to backup DR region. Used for    │
+ │                      │ disaster recovery failover.                                                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Active-Active**    │ Multi-region registries (e.g. US-East and EU-West) synchronize image pushes │
+ │                      │ bi-directionally. Kubelet pulls locally, avoiding international egress costs!│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Running a Local OCI Distribution Registry
+
+```bash
+# Step 1: Run an open-source OCI distribution registry on port 5000
+docker run -d -p 5000:5000 --name registry-demo registry:2
+
+# Step 2: Tag a local image to point to our private local registry
+docker tag alpine:latest localhost:5000/my-alpine:v1
+
+# Step 3: Push the image over the OCI Distribution API!
+docker push localhost:5000/my-alpine:v1
+
+# Step 4: Query the registry's OCI catalog endpoint to list repositories
+curl -s http://localhost:5000/v2/_catalog | jq .
+
+# Step 5: Query the tags available for 'my-alpine'
+curl -s http://localhost:5000/v2/my-alpine/tags/list | jq .
+
+# Cleanup
+docker rm -f registry-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How do modern container registries scale to handle thousands of concurrent image pulls during massive Kubernetes cluster deployments?**
+
+Registries achieve petabyte-scale throughput by using **HTTP 307 Pre-Signed Object Storage Redirects**:
+1. Registry API servers remain strictly **stateless** and handle only authentication and metadata lookups.
+2. When a node requests a multi-gigabyte layer blob (`GET /v2/<name>/blobs/<digest>`), the registry generates a signed, temporary object storage URL (e.g. AWS S3 / GCS) and returns an **`HTTP 307 Temporary Redirect`**.
+3. The cluster nodes download the layer bytes **directly from the cloud object storage CDN**, bypassing the registry API entirely. This allows the registry to handle tens of thousands of simultaneous pulls with minimal server hardware.
+
+**Q2: What is the role of Redis in an enterprise container registry architecture?**
+
+Redis functions as a high-performance in-memory cache for three critical bottlenecks:
+1. **Blob Existence Checks**: When a client pushes an image, it issues `HEAD /v2/<name>/blobs/<digest>` for each layer. Checking Redis avoids making expensive metadata queries or S3 API calls.
+2. **Manifest Caching**: Serves frequently requested image manifests directly from RAM with sub-millisecond latency.
+3. **Session & Rate Limiting**: Tracks authenticated OAuth2 tokens and enforces pull rate limits per tenant.
+
+**Q3: How does Active-Active Geo-Replication work in container registries like Harbor or Quay?**
+
+In Active-Active Geo-Replication:
+1. Registries are deployed in multiple geographic regions (e.g., US, Europe, Asia) close to local Kubernetes clusters.
+2. When an engineer or CI/CD pipeline pushes an image to Region A, an event webhook triggers a **replication worker daemon**.
+3. The replication daemon transfers the image layers to Region B and Region C registries.
+4. When Kubernetes nodes in Europe scale up, they pull images from the European registry over the local low-latency network, **slashing deployment times and eliminating expensive cross-region cloud egress fees**.
+
+**Q4: Why should container registries use Object Storage (S3/GCS/MinIO) instead of POSIX filesystems (NFS/ext4) for blob backends?**
+
+Object storage is designed for **immutable, content-addressable data**:
+1. **Infinite Scalability & 11 9s Durability**: Object storage eliminates disk partition capacity limits and RAID failures.
+2. **Direct Pre-Signed URLs**: Object storage natively supports HTTP GET redirects.
+3. **Stateless API Redundancy**: Multiple registry API instances across different availability zones can attach to the same object storage bucket simultaneously without the file-locking or corruption risks inherent in shared NFS mounts.
+
+**Q5: How does the OCI Registry Catalog API (`/v2/_catalog`) work, and why is it often disabled in public registries?**
+
+The `/v2/_catalog` endpoint returns a JSON list of all repositories hosted in the registry. In private enterprise registries, it powers the administrative UI. However, in large public multi-tenant registries (like Docker Hub or GitHub Packages), `/v2/_catalog` is **intentionally disabled or restricted** because enumerating millions of repositories would cause severe database performance degradation and expose private repository names to scrapers.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 registry tiers: Stateless API, Auth/Token, Cache/DB, Object Storage
+- [ ] Know that HTTP 307 Redirects offload blob streaming directly to S3
+- [ ] Know that Redis caches `HEAD` blob lookups and manifests for high speed
+- [ ] Know that Geo-Replication saves cross-region bandwidth and cuts latency
+- [ ] Know that Object Storage provides 11 9s durability for layer blobs
+- [ ] Can query the registry catalog using `curl http://<host>:5000/v2/_catalog`

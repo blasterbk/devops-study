@@ -1,0 +1,205 @@
+---
+title: "Chapter 1 — Docker Architecture: Client, Daemon & REST API"
+sidebar_position: 1
+module: "Module 6.1 — Docker Architecture"
+description: "Master Docker Engine internals — CLI, dockerd daemon, /var/run/docker.sock UNIX socket, Docker REST API, containerd integration, and daemon.json tuning."
+---
+
+# Chapter 1 — Docker Architecture: Client, Daemon & REST API
+
+> **Goal:** Master the internal systems architecture, daemon execution hierarchy, and API communication protocols of **Docker Engine** — dissecting the journey of a container from the **`docker` CLI** over the **`/var/run/docker.sock` UNIX Socket REST API** to **`dockerd`**, **`containerd`**, **`containerd-shim-v2`**, and **`runc`**, configuring **`/etc/docker/daemon.json`** for enterprise reliability, and managing remote hosts via **Docker Contexts**.
+>
+> By the end of this chapter, you will understand:
+> 1. The 5-layer execution stack of modern Docker Engine
+> 2. How the Docker CLI communicates with `dockerd` over a local UNIX socket or remote TLS TCP port
+> 3. How to interact directly with the Docker Engine using raw HTTP REST API calls
+> 4. Why `"live-restore": true` is mandatory in `/etc/docker/daemon.json` to survive daemon restarts
+> 5. How Docker Contexts switch CLI execution between local engines and remote SSH servers
+> 6. How to query and control Docker containers using raw `curl` commands over UNIX sockets
+
+---
+
+## Real-Life Analogy
+
+Think of the Docker Engine architecture as **the operations of an international airport and flight control network**:
+
+- **1. The Airline Ticket Kiosk (`The Docker CLI`):**
+  - The passenger taps a screen (**`docker run -d nginx`**).
+  - The kiosk does not fly airplanes; it simply encodes the passenger's request into a standardized electronic flight booking (**An HTTP REST API JSON payload**).
+- **2. The Central Terminal Operations Center (`Docker Daemon - dockerd`):**
+  - Receives the request over the airport internal fiber network (**`/var/run/docker.sock`**).
+  - Validates user credentials, bills the passenger's credit card, and verifies baggage policies (**Authentication, volume routing, network IP allocation**).
+- **3. The Runway Dispatcher (`containerd`):**
+  - Takes the validated flight schedule, orders the baggage handlers to load the cargo crates (**Pulls and unpacks OCI image layers**), and assigns an available departure gate.
+- **4. The Individual Gate Attendant (`containerd-shim`):**
+  - Stands by the boarding door holding the passenger manifest. If the main terminal building loses power or reboots (**`dockerd` crashes**), the gate attendant keeps the plane doors sealed and running on auxiliary power (**Container process never dies**)!
+- **5. The Jet Engine Starter (`runc`):**
+  - Turns the ignition key, starts the jet turbine (**Calls Linux kernel `clone()` and `pivot_root()`**), and immediately walks off the tarmac (**`runc` terminates**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               The 5-Layer Docker Engine Internal Execution Stack
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. DOCKER CLIENT (`docker run -d -p 80:80 nginx`)                      │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ HTTP REST API (Protocol: `/v1.44/containers/create`)
+                    ▼ (UNIX Socket: `/var/run/docker.sock` or TLS TCP)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. DOCKER DAEMON (`dockerd`)                                           │
+ │    - Manages Networks (Bridge / Overlay), Volumes, & User Auth         │
+ │    - Translates REST requests to gRPC calls                            │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ gRPC API (`/run/containerd/containerd.sock`)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. CNCF containerd (`containerd`)                                      │
+ │    - Content Store & Image Puller (SHA-256 Blobs)                      │
+ │    - Snapshotter: Unpacks layers into OverlayFS rootfs bundle          │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Spawns 1 Shim per Container Process
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 4. THE SHIM LAYER (`containerd-shim-v2` - Daemonless Survival)         │
+ │    - Holds stdin/stdout/stderr pipes open                              │
+ │    - Adopts container process so `dockerd` can restart with zero drops │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Executes low-level OCI command
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 5. LOW-LEVEL OCI RUNTIME (`runc create` ──► `runc start`)              │
+ │    - Calls Linux Kernel: `clone()`, `pivot_root()`, `/sys/fs/cgroup/`  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Spawns user process & immediately exits!
+                    ▼
+ [ 6. RUNNING APPLICATION: Isolated NGINX process executing on CPU! ]
+```
+
+---
+
+## The Docker Engine REST API
+
+The Docker CLI is simply a command-line wrapper around an **HTTP REST API**:
+
+```text
+ ┌──────────────────────────────────────┬────────┬────────────────────────────────────────────┐
+ │ HTTP REST Endpoint                   │ Method │ Operational Purpose                        │
+ │──────────────────────────────────────┼────────┼────────────────────────────────────────────┤
+ │ `/v1.44/containers/json`             │ `GET`  │ List active containers (`docker ps`).      │
+ │ `/v1.44/containers/create`           │ `POST` │ Create a new container (`docker create`).  │
+ │ `/v1.44/containers/<id>/start`       │ `POST` │ Start created container (`docker start`).  │
+ │ `/v1.44/containers/<id>/stop`        │ `POST` │ Gracefully stop container (`docker stop`). │
+ │ `/v1.44/containers/<id>/json`        │ `GET`  │ Low-level inspect metadata (`inspect`).    │
+ │ `/v1.44/images/json`                 │ `GET`  │ List local images (`docker images`).       │
+ │ `/v1.44/system/df`                   │ `GET`  │ Storage breakdown (`docker system df`).    │
+ └──────────────────────────────────────┴────────┴────────────────────────────────────────────┘
+```
+
+---
+
+## Production Daemon Configuration: `/etc/docker/daemon.json`
+
+```json
+{
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  },
+  "live-restore": true,
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 65536,
+      "Soft": 65536
+    }
+  },
+  "default-address-pools": [
+    { "base": "172.20.0.0/16", "size": 24 }
+  ],
+  "userland-proxy": false
+}
+```
+
+### Critical Production Settings:
+- **`"live-restore": true`**: Allows containers to **remain running with zero downtime** when the Docker daemon is upgraded, restarted, or crashed!
+- **`"max-size": "50m"`**: Prevents container JSON log files from growing infinitely and consuming 100% of host disk space.
+- **`"userland-proxy": false`**: Disables the inefficient `docker-proxy` user-space process; forces port forwarding to execute directly via high-speed kernel `iptables` NAT rules.
+
+---
+
+## Docker Contexts: Managing Multi-Node Fleets
+
+```bash
+# Create a context targeting a remote production server over secure SSH
+docker context create prod-node-01 --docker "host=ssh://deployer@192.168.1.50"
+
+# Switch your local CLI to execute commands directly on the remote server!
+docker context use prod-node-01
+
+# Now 'docker ps' and 'docker run' execute remotely over SSH!
+docker ps
+
+# Switch back to local laptop engine
+docker context use default
+```
+
+---
+
+## Hands-On Lab: Interacting with Docker via Raw UNIX Socket REST API
+
+```bash
+# Step 1: Query the Docker Daemon engine version using raw curl over UNIX socket!
+curl -s --unix-socket /var/run/docker.sock http://localhost/v1.44/version 2>/dev/null | jq .
+
+# Step 2: List all running containers using raw HTTP GET!
+curl -s --unix-socket /var/run/docker.sock http://localhost/v1.44/containers/json 2>/dev/null | jq .
+
+# Step 3: Query engine disk usage breakdown via REST API
+curl -s --unix-socket /var/run/docker.sock http://localhost/v1.44/system/df 2>/dev/null | jq .LayersSize
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the complete architectural execution chain when a user runs `docker run`?**
+
+1. **Docker CLI**: Parses user flags and sends an HTTP `POST /containers/create` request over `/var/run/docker.sock` to `dockerd`.
+2. **`dockerd` (Docker Daemon)**: Validates requests, sets up networks/volumes, and issues a gRPC request to `containerd`.
+3. **`containerd`**: Downloads image layers if missing, unpacks them via OverlayFS snapshotter into an OCI bundle, and generates `config.json`.
+4. **`containerd-shim-v2`**: Spawns as a monitoring supervisor process to hold I/O file descriptors open.
+5. **`runc`**: Consumes the OCI bundle, makes Linux system calls (`clone`, `unshare`, `pivot_root`, cgroups setup), executes the application process, and terminates.
+
+**Q2: What is the architectural purpose of the Docker UNIX Socket (`/var/run/docker.sock`)?**
+
+`/var/run/docker.sock` is the local Inter-Process Communication (IPC) boundary for Docker. It is a standard Linux POSIX UNIX domain socket that implements the Docker REST API. The Docker CLI communicates with the background daemon exclusively through this socket. Access to the socket is restricted by standard Linux file permissions (owned by `root:docker`). Anyone with write access to this socket has the equivalent of **full root access to the physical host**.
+
+**Q3: Why is `"live-restore": true` mandatory in enterprise `/etc/docker/daemon.json` configs?**
+
+By default, when the Docker daemon (`dockerd`) stops or restarts (e.g. during a security update or system crash), it automatically terminates all running containers on the host. Enabling `"live-restore": true` instructs `dockerd` to leave container processes running under their individual **`containerd-shim`** parent processes. When `dockerd` boots back up, it automatically re-attaches to the running shims with **zero container downtime or network disruption**.
+
+**Q4: What is the difference between `docker-proxy` and kernel iptables routing?**
+
+When a container publishes a port (`-p 8080:80`):
+- **`docker-proxy` (User-Space Proxy)**: Docker spawns a user-space Go process that listens on host port 8080 and forwards packets to the container over a socket connection. This incurs high CPU context switching overhead and memory usage.
+- **Kernel iptables NAT**: Packets are rewritten directly in the Linux kernel network stack using `PREROUTING` DNAT rules. Setting `"userland-proxy": false` disables `docker-proxy`, routing all traffic at line-rate through kernel `iptables`.
+
+**Q5: How do Docker Contexts (`docker context`) streamline DevOps operations?**
+
+Docker Contexts allow developers and SREs to switch the target of the `docker` CLI dynamically between multiple distinct Docker engines without modifying environment variables (`DOCKER_HOST`). A context can point to a **local UNIX socket**, a **remote server over SSH (`ssh://user@host`)**, or **cloud endpoints (Amazon ECS, Azure ACI)**. Running `docker context use prod` redirects all subsequent CLI commands (`docker ps`, `docker logs`) to the production engine over an encrypted SSH tunnel.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 5-layer stack: CLI $\to$ `dockerd` $\to$ `containerd` $\to$ `shim` $\to$ `runc`
+- [ ] Know that the CLI communicates via HTTP REST over `/var/run/docker.sock`
+- [ ] Know that `"live-restore": true` prevents container restarts during daemon upgrades
+- [ ] Know that `"userland-proxy": false` routes traffic via kernel `iptables` NAT
+- [ ] Know how Docker Contexts switch CLI targets to remote servers via SSH
+- [ ] Can query the Docker daemon using raw `curl --unix-socket /var/run/docker.sock`

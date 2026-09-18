@@ -1,0 +1,334 @@
+---
+title: "Chapter 1 — DaemonSet Architecture & Node Coverage"
+sidebar_position: 1
+module: "Module 3.4 — DaemonSets"
+description: "Master Kubernetes DaemonSets — node coverage mechanics, modern kube-scheduler integration, hostNetwork and hostPath integration, log and metric daemon deployment, and CNI networking agents."
+---
+
+# Chapter 1 — DaemonSet Architecture & Node Coverage
+
+> **Goal:** Master the architecture and operational mechanics of Kubernetes DaemonSets — understanding how the DaemonSet controller guarantees single-instance execution per node, how modern DaemonSets leverage the default `kube-scheduler`, how host-level privileges (`hostNetwork`, `hostPID`, `hostPath`) enable infrastructure daemons, and how to operate critical CNI, logging, and monitoring agents.
+>
+> By the end of this chapter, you will understand:
+> 1. The core purpose of DaemonSets vs. Deployments (Node-Bound Infrastructure vs. Workload Scaling)
+> 2. How the DaemonSet controller detects node additions and deletions in real time
+> 3. How modern DaemonSets are scheduled using standard scheduler `NodeAffinity` injection
+> 4. Why infrastructure agents require `hostNetwork`, `hostPID`, and `hostPath` mounts
+> 5. Production use cases: CNI networking (Cilium/Calico), log shipping (Fluent Bit), and node metrics (Node Exporter)
+> 6. How to interpret `DESIRED`, `CURRENT`, `READY`, and `AVAILABLE` DaemonSet status metrics
+
+---
+
+## Real-Life Analogy
+
+Think of a DaemonSet as a **facility management mandate for every office floor in a corporate skyscraper**:
+
+- **Deployments (The Office Workers):** You need 20 software engineers (`replicas: 20`). It doesn't matter which floor they sit on; if Floor 3 has empty desks, put 10 engineers on Floor 3 and 10 on Floor 4. If a floor closes, move the workers to another floor.
+- **DaemonSets (The Fire Extinguishers & Janitors):** Company safety regulations mandate: *"Every single floor (Node) MUST have exactly ONE fire extinguisher and ONE janitor."*
+  - When the construction team builds Floor 5 (a new worker node joins the cluster), the building manager immediately places a fire extinguisher and assigns a janitor to Floor 5.
+  - When Floor 2 is demolished (node drained/deleted), the equipment on Floor 2 is decommissioned.
+  - You never have 2 janitors on one floor and 0 on another; the distribution is strictly **1 per matching floor**.
+
+---
+
+## Architecture Diagram
+
+```text
+               DaemonSet Architecture & Cluster Coverage
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ DaemonSet Controller: prometheus-node-exporter                         │
+ │ Watches cluster nodes ──► Detects 3 active worker nodes                │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+ ┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+ │ Node 1: worker-01    │    │ Node 2: worker-02    │    │ Node 3: worker-03    │
+ │ Labels:              │    │ Labels:              │    │ Labels:              │
+ │  kubernetes.io/os=   │    │  kubernetes.io/os=   │    │  kubernetes.io/os=   │
+ │  linux               │    │  linux               │    │  linux               │
+ │ ┌──────────────────┐ │    │ ┌──────────────────┐ │    │ ┌──────────────────┐ │
+ │ │ Pod: exporter-9x │ │    │ │ Pod: exporter-4k │ │    │ │ Pod: exporter-2w │ │
+ │ │ hostNetwork:true │ │    │ │ hostNetwork:true │ │    │ │ hostNetwork:true │ │
+ │ │ hostPath: /proc  │ │    │ │ hostPath: /proc  │ │    │ │ hostPath: /proc  │ │
+ │ │ hostPath: /sys   │ │    │ │ hostPath: /sys   │ │    │ │ hostPath: /sys   │ │
+ │ └──────────────────┘ │    │ └──────────────────┘ │    │ └──────────────────┘ │
+ └──────────────────────┘    └──────────────────────┘    └──────────────────────┘
+```
+
+---
+
+## Core Purpose: DaemonSet vs Deployment
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Deployment                      │ DaemonSet                       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Target Workload**       │ Business logic, Web APIs, Apps  │ System infrastructure daemons   │
+ │ **Placement Goal**        │ Bin-packed across nodes by RAM  │ Exactly ONE Pod per matching    │
+ │                           │ and CPU availability            │ node in the cluster             │
+ │ **Scale Mechanism**       │ Explicit replica count ($N$)    │ Automatic (Tied to Node count)  │
+ │ **When New Node Joins**   │ Pods stay where they are        │ Pod automatically launched      │
+ │ **When Node is Removed**  │ Pods rescheduled to other nodes │ Pod deleted (No reschedule)     │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## How DaemonSets are Scheduled: Modern Scheduler Integration
+
+Historically (prior to Kubernetes 1.12), the DaemonSet controller directly scheduled its own Pods by setting `.spec.nodeName`, completely bypassing `kube-scheduler`. This caused major issues: DaemonSet Pods ignored Pod Priorities, Preemption, and Resource Quotas.
+
+### Modern Scheduling Mechanism:
+1. The DaemonSet controller creates Pods **without** `.spec.nodeName`.
+2. Instead, it injects a default `NodeAffinity` constraint into the Pod spec matching the target node:
+   ```yaml
+   spec:
+     affinity:
+       nodeAffinity:
+         requiredDuringSchedulingIgnoredDuringExecution:
+           nodeSelectorTerms:
+           - matchFields:
+             - key: metadata.name
+               operator: In
+               values: ["worker-01"]
+   ```
+3. The standard `kube-scheduler` evaluates the Pod, respects scheduler plugins, handles `PriorityClasses` and preemption, and binds the Pod to the designated node.
+
+---
+
+## Host Integration: `hostNetwork`, `hostPID`, and `hostPath`
+
+Infrastructure daemons frequently need access to the underlying Linux host system to collect hardware metrics, read system logs, or configure kernel network interfaces.
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Host Setting         │ Purpose & Security Implications                                             │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`hostNetwork: true`**│ Bypasses Pod network namespace; binds directly to the node's physical IP  │
+ │                      │ and network interfaces. (Used by CNI plugins, kube-proxy, Ingress NodePort).│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`hostPID: true`**  │ Shares the host's Linux process namespace. The container can see and signal │
+ │                      │ all processes running on the host OS. (Used by security agents, Falco).     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`hostPath` Mounts**│ Mounts host directories directly into container filesystem:                 │
+ │                      │ - `/var/log` ──► For log collectors (Fluent Bit, Promtail)                  │
+ │                      │ - `/proc`, `/sys` ──► For kernel metric exporters (Prometheus Node Exporter)│
+ │                      │ - `/var/run/docker.sock` / `/run/containerd/containerd.sock` ──► CRI runtime│
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Targeted DaemonSets: Filtering by Node Labels
+
+A DaemonSet does not have to run on *every* node. You can target specific subsets of nodes using `.spec.template.spec.nodeSelector` or `.spec.template.spec.affinity.nodeAffinity`:
+
+```yaml
+spec:
+  template:
+    spec:
+      # Target ONLY GPU-accelerated nodes for NVIDIA device plugin daemon
+      nodeSelector:
+        accelerator: nvidia-gpu
+        kubernetes.io/os: linux
+```
+
+```text
+ Node Coverage Targeting Examples:
+ - Storage Daemon (Ceph OSD): `nodeSelector: storage-node=true`
+ - Edge Ingress Daemon: `nodeSelector: ingress-ready=true`
+ - Windows Log Shipper: `nodeSelector: kubernetes.io/os=windows`
+ - Kernel Tracing (eBPF): `nodeSelector: kernel-version=6.x`
+```
+
+---
+
+## Primary Production DaemonSet Use Cases
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Domain               │ Popular Tools           │ Host Configuration Required                       │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. CNI Networking**│ Cilium, Calico, Flannel │ `hostNetwork: true`, `privileged: true`, `/sys`   │
+ │ **2. Log Collection**│ Fluent Bit, Promtail    │ `hostPath: /var/log`, `hostPath: /var/lib/docker` │
+ │ **3. Node Metrics**  │ Prometheus NodeExporter │ `hostNetwork: true`, `hostPID: true`, `/proc`     │
+ │ **4. Node Security** │ Falco, Datadog Agent    │ `hostPID: true`, `privileged: true`, BPF mounts   │
+ │ **5. Hardware Drivers**│ NVIDIA Device Plugin  │ `hostPath: /var/lib/kubelet/device-plugins`       │
+ └──────────────────────┴─────────────────────────┴───────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production DaemonSet Manifest (Prometheus Node Exporter)
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      # Run on control-plane nodes as well!
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.7.0
+        args:
+        - --path.procfs=/host/proc
+        - --path.sysfs=/host/sys
+        - --path.rootfs=/host/root
+        ports:
+        - name: metrics
+          containerPort: 9100
+          hostPort: 9100
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: root
+          mountPath: /host/root
+          readOnly: true
+
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+```
+
+---
+
+## Hands-On Lab: Deploying & Inspecting a DaemonSet
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace ds-lab
+
+# Step 2: Deploy a custom logging DaemonSet
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: host-logger
+  namespace: ds-lab
+spec:
+  selector:
+    matchLabels:
+      app: host-logger
+  template:
+    metadata:
+      labels:
+        app: host-logger
+    spec:
+      tolerations:
+      - operator: Exists    # Allow scheduling on all tainted nodes
+      containers:
+      - name: logger
+        image: alpine:latest
+        command: ["sh", "-c", "tail -n 10 -F /var/log/messages 2>/dev/null || tail -n 10 -F /var/log/syslog 2>/dev/null || sleep 3600"]
+        volumeMounts:
+        - name: host-log
+          mountPath: /var/log
+          readOnly: true
+      volumes:
+      - name: host-log
+        hostPath:
+          path: /var/log
+EOF
+
+# Step 3: Inspect DaemonSet status columns
+kubectl get ds -n ds-lab
+# Verify DESIRED == CURRENT == READY == Number of Nodes!
+
+# Step 4: Verify Pod placement across all nodes
+kubectl get pods -n ds-lab -o wide
+
+# Step 5: Test Node Selector Filtering
+# Label one specific node for special hardware
+FIRST_NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+kubectl label node $FIRST_NODE sensor=iot-gateway
+
+# Step 6: Update DaemonSet to run ONLY on labeled nodes
+kubectl patch daemonset host-logger -n ds-lab -p '{"spec":{"template":{"spec":{"nodeSelector":{"sensor":"iot-gateway"}}}}}'
+
+# Step 7: Verify DESIRED count drops to exactly 1!
+sleep 3
+kubectl get ds -n ds-lab
+kubectl get pods -n ds-lab -o wide
+
+# Step 8: Clean up lab
+kubectl label node $FIRST_NODE sensor-
+kubectl delete namespace ds-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between a Kubernetes Deployment and a DaemonSet?**
+
+A Deployment manages stateless applications with a decoupled replica count ($N$), where Pods are placed onto any worker node with available CPU and memory capacity. A DaemonSet enforces a node-bound placement topology where exactly one Pod instance is automatically scheduled on every node (or a labeled subset of nodes) matching its selector. When new nodes join the cluster, the DaemonSet controller automatically schedules a Pod on them; when nodes leave, those Pods are reclaimed.
+
+**Q2: How are DaemonSet Pods scheduled in modern Kubernetes (v1.18+)?**
+
+In modern Kubernetes, DaemonSet Pods are scheduled directly by the standard `kube-scheduler` rather than the DaemonSet controller. The DaemonSet controller creates the Pod object and injects a `NodeAffinity` term into `.spec.affinity.nodeAffinity.requiredDuringScheduling...` targeting the specific node name. The `kube-scheduler` processes the Pod, allowing it to benefit from standard scheduler plugins, PriorityClasses, preemption, resource evaluation, and scheduling queue optimizations.
+
+**Q3: Why do infrastructure daemons (like CNI plugins or Node Exporter) require `hostNetwork: true`?**
+
+`hostNetwork: true` allows a container to share the host node's physical network namespace, bypassing the virtualized container network interface (`veth`) and bridge abstractions. This is mandatory for: (1) CNI plugins (Cilium, Calico) that must directly configure physical interfaces, IP route tables, and eBPF kernel hooks; (2) metric collectors (Node Exporter) monitoring physical NIC bandwidth and packet drops; and (3) Ingress controllers binding to low-level host ports (80/443).
+
+**Q4: How can you run a DaemonSet on a specific subset of nodes (e.g. only GPU nodes)?**
+
+You restrict DaemonSet node placement by adding `.spec.template.spec.nodeSelector` or `.spec.template.spec.affinity.nodeAffinity` to the Pod template. For example, setting `nodeSelector: { "nvidia.com/gpu": "true" }` instructs the scheduler to filter out all general-purpose nodes and schedule DaemonSet Pods exclusively on nodes bearing that label. The `DESIRED` count reported by `kubectl get ds` will dynamically adjust to match the count of labeled nodes.
+
+**Q5: Why do DaemonSet Pods typically require custom `tolerations`?**
+
+By default, Kubernetes applies taints to special nodes — such as `node-role.kubernetes.io/control-plane:NoSchedule` on master nodes or `node.kubernetes.io/unschedulable:NoSchedule` on cordoned nodes. Because DaemonSets often run cluster-wide infrastructure agents (like log forwarders, monitoring agents, or network proxies), they must declare matching tolerations in `.spec.template.spec.tolerations` (e.g. tolerating `control-plane` or `master` taints) so they can collect telemetry from all nodes across the entire cluster.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that a DaemonSet guarantees one Pod per matching node in the cluster
+- [ ] Know that modern DaemonSets use `kube-scheduler` via injected `NodeAffinity`
+- [ ] Know why CNI and Node Exporter daemons use `hostNetwork: true`
+- [ ] Know why logging daemons use `hostPath: /var/log` mounts
+- [ ] Know how to target DaemonSets to subsets of nodes via `nodeSelector`
+- [ ] Know why DaemonSets require tolerations to run on control-plane nodes
+- [ ] Can inspect DaemonSet status using `kubectl get ds -A`

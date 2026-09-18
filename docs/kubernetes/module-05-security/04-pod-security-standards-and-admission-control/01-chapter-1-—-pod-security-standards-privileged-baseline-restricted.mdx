@@ -1,0 +1,271 @@
+---
+title: "Chapter 1 — Pod Security Standards (PSS)"
+sidebar_position: 1
+module: "Module 5.4 — Pod Security & Admission"
+description: "Master Kubernetes Pod Security Standards (PSS) — Privileged, Baseline, and Restricted profiles, deprecation of PSP, Linux capability restrictions, and read-only rootfs enforcement."
+---
+
+# Chapter 1 — Pod Security Standards: Privileged, Baseline & Restricted
+
+> **Goal:** Master the three official Kubernetes Pod Security Standards (PSS) profiles — understanding why the legacy `PodSecurityPolicy` (PSP) was deprecated and removed in favor of PSS, analyzing the exact security controls enforced across the `Privileged`, `Baseline`, and `Restricted` tiers, configuring production-grade `securityContext` definitions, dropping Linux capabilities, and enforcing read-only root filesystems and non-root execution.
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural flaws that led to the deprecation and removal of `PodSecurityPolicy` (PSP)
+> 2. The 3 official Pod Security Standards: `Privileged`, `Baseline`, and `Restricted`
+> 3. The exact security control matrix governing host namespaces, volume types, and root privileges
+> 4. How to configure compliant `securityContext` blocks under the `Restricted` profile
+> 5. How `allowPrivilegeEscalation: false` and `capabilities.drop: ["ALL"]` prevent container breakouts
+> 6. How to audit existing workloads against PSS profiles using `kubectl-slice` and dry-run admission
+
+---
+
+## Real-Life Analogy
+
+Think of Pod Security Standards as **building safety building codes for different commercial tenants**:
+
+- **`Privileged` Profile (The Heavy Industrial Blast Furnace / Construction Zone):** A heavy industrial zone where engineers use open flames, heavy bulldozers, and high-voltage power lines (`privileged: true`, `hostNetwork`, `hostPath`). Only certified maintenance staff (CNI network plugins, CSI storage drivers) are allowed in this zone.
+- **`Baseline` Profile (A Standard Commercial Office Suite):** A standard office building. Employees can bring laptops and coffee makers, but they are forbidden from tearing down structural concrete walls, drilling through the floor into the basement (`hostPath`), or tapping into the main electrical grid (`hostNetwork`). This prevents 90% of common accidents with minimal operational friction.
+- **`Restricted` Profile (A High-Security Semiconductor Cleanroom / Bio-Hazard Lab):** An ultra-hardened cleanroom. Every person must wear a sealed hazmat suit (`runAsNonRoot: true`), all toolboxes must be transparent and inventoried (`capabilities.drop: ["ALL"]`), no permanent alterations can be made to the walls (`readOnlyRootFilesystem: true`), and all movements are tracked through airlocks (`seccompProfile: RuntimeDefault`).
+
+---
+
+## Architecture Diagram
+
+```text
+               The 3 Pod Security Standards (PSS) Profiles
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. PRIVILEGED (Unrestricted / Infrastructure Systems)                  │
+ │    - Unrestricted root privileges, `privileged: true`                  │
+ │    - Full host access: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath` │
+ │    - Used ONLY for CNI plugins, CSI drivers, and node monitoring.      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Adds Security Baselines
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. BASELINE (Default Standard / Prevents Known Privilege Escalations)  │
+ │    - Blocks `privileged: true`                                         │
+ │    - Blocks host access (`hostNetwork: false`, `hostPID: false`)       │
+ │    - Blocks `hostPath` volumes (Allows configMap, secret, PVC, etc.)   │
+ │    - Restricts Linux capabilities (Allows default container caps).     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Enforces Hardened Best Practices
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. RESTRICTED (Hardened Production Standard / Zero-Trust Defense)      │
+ │    - MUST run as non-root: `runAsNonRoot: true`                        │
+ │    - MUST disable privilege escalation: `allowPrivilegeEscalation:false│
+ │    - MUST drop ALL Linux capabilities: `capabilities.drop: ["ALL"]`    │
+ │    - MUST use Seccomp profile: `seccompProfile.type: RuntimeDefault`   │
+ │    - Highly Recommended: `readOnlyRootFilesystem: true`                │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why PodSecurityPolicy (PSP) was Removed
+
+In Kubernetes 1.21, `PodSecurityPolicy` was deprecated, and it was permanently removed in Kubernetes 1.25:
+
+```text
+ The 4 Fatal Flaws of PodSecurityPolicy (PSP):
+ 1. Non-Deterministic Mutation: PSP both validated and mutated pods. If a user was bound to 
+    multiple PSPs, the mutation order was non-deterministic, causing unexpected configuration drift.
+ 2. Inability to Dry-Run / Audit: PSP could only hard-block requests; it had no mechanism to 
+    "warn" or "audit" non-compliant pods before enforcing rules.
+ 3. Complex RBAC Binding Model: Binding PSPs to users via ServiceAccounts and ClusterRoleBindings 
+    was notoriously difficult to debug and audit.
+ 4. Control-Plane Performance: Evaluating deep PSP trees on every Pod creation slowed down API server 
+    admission throughput.
+```
+
+---
+
+## The PSS Security Control Matrix
+
+```text
+ ┌───────────────────────────┬───────────────────┬───────────────────┬───────────────────┐
+ │ Security Control          │ Privileged        │ Baseline          │ Restricted        │
+ │───────────────────────────┼───────────────────┼───────────────────┼───────────────────┤
+ │ **`privileged` Container**│ Allowed           │ **BLOCKED**       │ **BLOCKED**       │
+ │ **`hostNetwork` / `hostPID`**│ Allowed        │ **BLOCKED**       │ **BLOCKED**       │
+ │ **`hostPath` Volumes**    │ Allowed           │ **BLOCKED**       │ **BLOCKED**       │
+ │ **`hostPorts`**           │ Allowed           │ **BLOCKED**       │ **BLOCKED**       │
+ │ **`runAsNonRoot`**        │ Unchecked         │ Unchecked         │ **MANDATORY**     │
+ │                           │ (Can run as root) │ (Can run as root) │ (`true`)          │
+ │ **`allowPrivilegeEscalate`**│ Allowed         │ Allowed           │ **MANDATORY**     │
+ │                           │                   │                   │ (`false`)         │
+ │ **Linux Capabilities**    │ Unrestricted      │ Default Set       │ **DROP ALL**      │
+ │                           │                   │ (Restricts added) │ (Only NET_BIND_..)│
+ │ **Seccomp Profile**       │ Unrestricted      │ Unrestricted      │ **RuntimeDefault**│
+ │ **Root Filesystem**       │ Read-Write        │ Read-Write        │ **readOnlyRoot-** │
+ │                           │                   │                   │ **Filesystem** rec│
+ └───────────────────────────┴───────────────────┴───────────────────┴───────────────────┘
+```
+
+---
+
+## Hardening Under the `Restricted` Profile
+
+To pass the `Restricted` Pod Security Standard, every Pod manifest must declare an explicit, hardened `securityContext` at both the **Pod level** and **Container level**:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hardened-microservice
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hardened-api
+  template:
+    metadata:
+      labels:
+        app: hardened-api
+    spec:
+      # 1. Pod-Level Security Context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault              # Mandatory in Restricted!
+
+      containers:
+      - name: api
+        image: my-app:v1.2.0
+        # 2. Container-Level Security Context
+        securityContext:
+          allowPrivilegeEscalation: false    # Mandatory in Restricted!
+          readOnlyRootFilesystem: true       # Immutability best practice!
+          capabilities:
+            drop:
+              - ALL                          # Drops all 38+ kernel capabilities!
+            add:
+              - NET_BIND_SERVICE             # Permitted exception for binding port 80
+
+        # Writable scratch directories mapped via emptyDir
+        volumeMounts:
+        - name: tmp-scratch
+          mountPath: /tmp
+        - name: cache-dir
+          mountPath: /var/cache/app
+
+      volumes:
+      - name: tmp-scratch
+        emptyDir: {}
+      - name: cache-dir
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Mi
+```
+
+---
+
+## Linux Capabilities: Dropping `ALL`
+
+By default, Docker and containerd run containers with ~14 default Linux capabilities (such as `CAP_CHOWN`, `CAP_FOWNER`, `CAP_SETUID`, `CAP_NET_RAW`).
+
+```text
+ Why Dropping ALL Capabilities is Mandatory:
+ - `CAP_NET_RAW`: Allows crafting raw network packets (ARP spoofing, DNS poisoning).
+ - `CAP_SETUID`: Allows binaries with the setuid bit (like `sudo` or `passwd`) to switch to root.
+ - `CAP_SYS_CHROOT`: Allows changing root directory boundaries.
+ 
+ ──► Under `capabilities.drop: ["ALL"]`, the container process is stripped of all kernel superpowers.
+```
+
+---
+
+## Hands-On Lab: Testing Pod Security Standards Compliance
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace pss-lab
+
+# Step 2: Deploy a non-compliant Pod (Runs as Root with hostNetwork)
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insecure-pod
+  namespace: pss-lab
+spec:
+  hostNetwork: true    # Violates Baseline and Restricted!
+  containers:
+  - name: root-app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Deploy a fully compliant Restricted Pod
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-restricted-pod
+  namespace: pss-lab
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: secure-app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+EOF
+
+# Step 4: Verify running states of both pods
+kubectl get pods -n pss-lab
+
+# Step 5: Clean up lab
+kubectl delete namespace pss-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the three official Kubernetes Pod Security Standards (PSS) profiles?**
+
+The three PSS profiles are:
+1. **`Privileged`**: Completely unrestricted; permits privileged containers, host networking, host namespaces, and raw block/hostPath mounts. Used only for core infrastructure components (CNIs, storage drivers).
+2. **`Baseline`**: The recommended default tier; prevents known privilege escalations by blocking `privileged: true`, host namespaces (`hostNetwork`, `hostPID`), host ports, and `hostPath` volumes with minimal configuration overhead.
+3. **`Restricted`**: The hardened production tier; enforces strict isolation: must run as non-root (`runAsNonRoot: true`), block privilege escalation (`allowPrivilegeEscalation: false`), drop all Linux capabilities (`capabilities.drop: ["ALL"]`), and enforce `seccompProfile: RuntimeDefault`.
+
+**Q2: Why was `PodSecurityPolicy` (PSP) removed from Kubernetes in version 1.25?**
+
+`PodSecurityPolicy` was deprecated and removed due to fundamental architectural flaws: (1) It combined both validation and mutation non-deterministically; (2) It lacked dry-run, audit, and warning capabilities, making it dangerous to apply to production clusters; (3) It relied on an overly complex RBAC binding model that was difficult to manage and debug; and (4) It introduced significant API server performance overhead.
+
+**Q3: What does `allowPrivilegeEscalation: false` do inside a container's security context?**
+
+`allowPrivilegeEscalation: false` sets the Linux kernel `PR_SET_NO_NEW_PRIVS` flag on the container process. This kernel flag guarantees that the container and all of its child sub-processes can never gain more privileges than their parent process, effectively neutralizing setuid/setgid binaries (such as `sudo` or `/usr/bin/passwd`) from escalating privileges to root.
+
+**Q4: Why does the `Restricted` profile mandate `seccompProfile.type: RuntimeDefault`?**
+
+Linux system calls (syscalls) are the direct interface between container processes and the host kernel. By default, Linux exposes over 300+ syscalls. The `RuntimeDefault` seccomp profile configures a kernel eBPF/seccomp filter that blocks ~50+ dangerous or obsolete syscalls (such as `reboot`, `kexec_load`, `ptrace`, and `sys_admin`), dramatically reducing the kernel attack surface if a container is compromised.
+
+**Q5: How do applications write temporary files when `readOnlyRootFilesystem: true` is enforced?**
+
+When `readOnlyRootFilesystem: true` is enabled, the container's root OverlayFS layer is mounted read-only by the Linux kernel. Any application attempting to write to `/tmp`, `/var/log`, or `/var/run` will fail with `Read-only file system`. To allow the application to function, administrators mount writable ephemeral scratch volumes (such as `emptyDir: {}` or `emptyDir: { medium: Memory }`) explicitly to the specific required directories (e.g. `mountPath: /tmp`).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 3 PSS profiles: `Privileged`, `Baseline`, and `Restricted`
+- [ ] Know why PodSecurityPolicy (PSP) was deprecated and removed in K8s 1.25
+- [ ] Know that `Baseline` blocks host namespaces (`hostNetwork`, `hostPID`) and `hostPath`
+- [ ] Know that `Restricted` mandates `runAsNonRoot: true` and `allowPrivilegeEscalation: false`
+- [ ] Know that `Restricted` requires dropping `ALL` Linux capabilities
+- [ ] Know that `Restricted` requires `seccompProfile.type: RuntimeDefault`
+- [ ] Can mount writable `emptyDir` scratch disks for `readOnlyRootFilesystem` pods

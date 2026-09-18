@@ -1,0 +1,311 @@
+---
+title: "Chapter 4 — Update Strategies & Canary Partitioning"
+sidebar_position: 4
+module: "Module 3.3 — StatefulSets"
+description: "Master StatefulSet update strategies — reverse ordinal RollingUpdate, staged canary releases via partition tuning, OnDelete manual governance, maxUnavailable concurrency, and database cluster rolling upgrades."
+---
+
+# Chapter 4 — Update Strategies & Canary Partitioning
+
+> **Goal:** Master the release engineering and rolling update strategies of Kubernetes StatefulSets — understanding the reverse-ordinal update sequence ($N-1 \to 0$), implementing staged canary rollouts using the `partition` parameter, controlling update concurrency with `maxUnavailable`, and utilizing `OnDelete` for manual database failover governance.
+>
+> By the end of this chapter, you will understand:
+> 1. The reverse-ordinal ($N-1 \dots 0$) execution flow of StatefulSet `RollingUpdate`
+> 2. How the `partition` field enables canary testing on specific database replicas
+> 3. When and why to use `updateStrategy: OnDelete` for mission-critical databases
+> 4. How `maxUnavailable` (Kubernetes 1.24+ / 1.30+ GA) accelerates updates in massive clusters
+> 5. How to safely upgrade stateful database clusters without breaking consensus quorum
+> 6. How to monitor and debug stuck StatefulSet rollouts using `kubectl rollout status`
+
+---
+
+## Real-Life Analogy
+
+Think of upgrading a **fleet of naval warships in an active carrier battle group**:
+
+- **Reverse-Order Rolling Update (`RollingUpdate`):** The fleet consists of `carrier-0` (the Flagship/Leader), `cruiser-1` (Support), and `destroyer-2` (Escort). When upgrading naval radar software, you never take the Flagship offline first. You pull the rearmost escort ship (`destroyer-2`) into the shipyard first. Once it is fully upgraded, tested, and back in formation, you upgrade `cruiser-1`. Only when all escorts are fully operational do you upgrade the Flagship (`carrier-0`).
+- **Canary Testing (`partition: 2`):** You only want to test the experimental radar on one single ship before risking the entire fleet. You tell the shipyard: *"Only upgrade ships with index $\ge 2$."* The shipyard upgrades `destroyer-2` while `cruiser-1` and `carrier-0` continue running the stable version undisturbed.
+- **Manual Control (`OnDelete`):** For nuclear reactors on the Flagship, automated scripts are forbidden. The admiral must manually approve and power down each ship individually (`OnDelete`) after verifying data synchronization.
+
+---
+
+## Architecture Diagram
+
+```text
+            StatefulSet Rolling Update & Canary Partitioning
+
+ 1. Default Reverse-Ordinal Rolling Update (replicas: 3, partition: 0)
+ 
+ Step 1: Terminate & update pod-2 ──► Wait until pod-2 is Running & Ready!
+ Step 2: Terminate & update pod-1 ──► Wait until pod-1 is Running & Ready!
+ Step 3: Terminate & update pod-0 ──► Update Complete!
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. Staged Canary Release with partition: 2
+ 
+ spec:
+   updateStrategy:
+     rollingUpdate:
+       partition: 2    # <--- Only ordinals >= 2 will be updated!
+
+ ┌───────────────────────────┐ ┌───────────────────────────┐ ┌───────────────────────────┐
+ │ Pod: db-0                 │ │ Pod: db-1                 │ │ Pod: db-2                 │
+ │ Image: postgres:14 (Old)  │ │ Image: postgres:14 (Old)  │ │ Image: postgres:15 (New)  │
+ │ Status: Running / Active  │ │ Status: Running / Active  │ │ Status: CANARY TEST REPLICA │
+ └───────────────────────────┘ └───────────────────────────┘ └───────────────────────────┘
+   (Ignored by controller)       (Ignored by controller)       (Updated & Verified)
+```
+
+---
+
+## StatefulSet Update Strategies
+
+Under `.spec.updateStrategy`, a StatefulSet supports two distinct strategy types:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Strategy Type        │ Operational Behavior & Use Cases                                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`RollingUpdate`**  │ **Automated Sequential Rollout (Default).**                                 │
+ │                      │ Updates Pods in reverse ordinal order ($N-1 \to 0$). Each Pod must be       │
+ │                      │ completely running and pass its readiness probe before the next is updated. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`OnDelete`**       │ **Manual Governance.**                                                      │
+ │                      │ Modifying `.spec.template` does NOT touch any running Pods. A Pod is only   │
+ │                      │ updated to the new template when an operator manually deletes that Pod.     │
+ │                      │ *Best for:* Production databases requiring controlled primary failover.     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Canary Deployments via `partition` Tuning
+
+The `.spec.updateStrategy.rollingUpdate.partition` field is one of Kubernetes' most powerful, underutilized features:
+
+```text
+ The Partition Rule:
+ When a StatefulSet is updated, ONLY Pods with an ordinal index GREATER THAN OR EQUAL 
+ to `partition` are updated. All Pods with ordinal < partition are completely ignored.
+```
+
+### Staged Rollout Workflow (Example: 5 Replicas, Index 0 to 4):
+
+```text
+ Phase 1: Deploy Canary on Replica 4
+ Set partition: 4 ──► Only Pod 4 is updated to v2. Pods 0, 1, 2, 3 stay on v1.
+ (Monitor logs, latency, and database replication health on Pod 4).
+
+ Phase 2: Expand Canary to 50% of Fleet
+ Set partition: 2 ──► Pods 3 and 2 are updated to v2. Pods 0 and 1 stay on v1.
+
+ Phase 3: Complete Cluster Rollout
+ Set partition: 0 ──► Pods 1 and 0 are updated to v2. All 5 replicas now run v2!
+```
+
+```yaml
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 2    # Only ordinals 2, 3, 4 receive the update
+```
+
+---
+
+## Parallel Upgrades with `maxUnavailable`
+
+In massive clusters (such as a 100-node Kafka cluster or a 50-node Elasticsearch pool), updating one single node at a time can take several hours.
+
+The `maxUnavailable` parameter for StatefulSets (Kubernetes 1.24+ beta, 1.30+ GA) allows updating multiple stateful pods concurrently:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+spec:
+  replicas: 30
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 3    # <--- Updates 3 Pods simultaneously!
+```
+
+> [!CAUTION]
+> When using `maxUnavailable` on quorum-based distributed databases (Raft/Paxos), ensure that `maxUnavailable` is strictly less than $(N-1)/2$ to prevent losing consensus quorum during the rollout.
+
+---
+
+## The `OnDelete` Strategy for Mission-Critical Databases
+
+For primary-replica database topologies (like MySQL or PostgreSQL replication):
+1. Pod 0 is typically the **Read/Write Primary (Leader)**.
+2. Pod 1 and Pod 2 are **Read-Only Replicas (Followers)**.
+
+If you run a standard `RollingUpdate`, Pod 2 updates, then Pod 1 updates, and finally Pod 0 (the Primary) is terminated. When Pod 0 restarts, it triggers an unplanned database failover election.
+
+### The `OnDelete` Best Practice:
+1. Configure `updateStrategy: type: OnDelete`.
+2. Apply the manifest containing the new container image or memory limits.
+3. Manually delete `db-2` (`kubectl delete pod db-2`). Controller recreates `db-2` with the new version.
+4. Manually delete `db-1`. Verify replication caught up.
+5. Perform a graceful application-level failover promoting `db-1` to Primary.
+6. Finally, manually delete `db-0` to complete the upgrade with zero data loss or election storms.
+
+```yaml
+spec:
+  updateStrategy:
+    type: OnDelete
+```
+
+---
+
+## Complete Production StatefulSet Rollout Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-broker
+  namespace: messaging
+spec:
+  serviceName: "kafka-headless"
+  replicas: 4
+  
+  # Canary Rollout Strategy: Update only broker-3 first
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 3        # Canary on broker-3
+      maxUnavailable: 1   # Never take more than 1 broker down
+
+  selector:
+    matchLabels:
+      app: kafka-broker
+  template:
+    metadata:
+      labels:
+        app: kafka-broker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: kafka
+        image: confluentinc/cp-kafka:7.5.0
+        ports:
+        - name: client
+          containerPort: 9092
+        readinessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 15
+          periodSeconds: 5
+```
+
+---
+
+## Hands-On Lab: Canary Partitioning & OnDelete Upgrades
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace rollout-lab
+
+# Step 2: Deploy a 3-replica StatefulSet with partition: 2
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: partition-demo
+  namespace: rollout-lab
+spec:
+  serviceName: partition-demo
+  replicas: 3
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 2    # <--- Only Pod 2 should update!
+  selector:
+    matchLabels:
+      app: partition-demo
+  template:
+    metadata:
+      labels:
+        app: partition-demo
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.24-alpine
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 2
+          periodSeconds: 2
+EOF
+
+# Step 3: Wait for all 3 Pods to be created on v1.24
+kubectl wait --for=condition=Ready pod/partition-demo-2 -n rollout-lab --timeout=30s
+kubectl get pods -n rollout-lab -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[0].image}{"\n"}{end}'
+
+# Step 4: Update the image to nginx:1.25-alpine
+kubectl set image statefulset/partition-demo web=nginx:1.25-alpine -n rollout-lab
+
+# Step 5: Verify that ONLY Pod 2 was updated, while Pods 0 and 1 remain on nginx:1.24!
+sleep 5
+kubectl get pods -n rollout-lab -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[0].image}{"\n"}{end}'
+# Expected Output:
+# partition-demo-0: nginx:1.24-alpine
+# partition-demo-1: nginx:1.24-alpine
+# partition-demo-2: nginx:1.25-alpine  <--- CANARY UPDATED!
+
+# Step 6: Advance partition to 0 to complete the rollout across all Pods
+kubectl patch statefulset partition-demo -n rollout-lab -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":0}}}}'
+
+# Step 7: Watch rolling update progress from 1 down to 0
+kubectl rollout status statefulset/partition-demo -n rollout-lab
+
+# Step 8: Verify all Pods now run nginx:1.25
+kubectl get pods -n rollout-lab -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[0].image}{"\n"}{end}'
+
+# Step 9: Clean up lab
+kubectl delete namespace rollout-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: In what order does a StatefulSet update its Pods during a rolling update, and why?**
+
+A StatefulSet executes rolling updates in strict **reverse ordinal order** ($N-1 \to N-2 \to \dots \to 0$). Pod $K$ is terminated, updated with the new template, and started; the controller blocks and waits until Pod $K$ is in the `Running` phase and passes its readiness probes before proceeding to terminate Pod $K-1$. Reverse order is chosen because in most stateful clustering architectures, higher ordinals are workers or followers, while lower ordinals (often ordinal 0) represent the cluster leader, master, or bootstrap node.
+
+**Q2: What is the `partition` parameter in a StatefulSet's update strategy, and how does it enable canary rollouts?**
+
+The `partition` parameter sets an ordinal threshold for rolling updates. When a StatefulSet is updated, the controller only mutates and restarts Pods with an ordinal index greater than or equal to `partition` ($\text{ordinal} \ge \text{partition}$). Pods with ordinals strictly less than `partition` remain untouched on the previous version. Setting `partition: N-1` on an $N$-replica StatefulSet updates only the single highest ordinal pod, creating a native canary instance for production validation before committing the full cluster.
+
+**Q3: When should an engineering team use `updateStrategy: OnDelete` instead of `RollingUpdate`?**
+
+`updateStrategy: OnDelete` is preferred for complex, mission-critical distributed databases (like primary-replica MySQL/PostgreSQL or Cassandra/Elasticsearch with strict quorum SLAs) where automated, sequential restarts could trigger premature failover elections, replication lag spikes, or split-brain scenarios. With `OnDelete`, changes to the Pod template are staged in `etcd`, but no Pods are restarted until an operator or custom automation tool manually deletes each Pod at an opportune, verified time.
+
+**Q4: What is `maxUnavailable` in a StatefulSet, and what precautions must be taken when using it?**
+
+Introduced as a beta feature in 1.24 and GA in 1.30, `maxUnavailable` allows a StatefulSet to update multiple Pods in parallel rather than strictly one by one, significantly speeding up rolling updates in large clusters (e.g. 50+ replicas). However, when operating consensus-driven clusters (such as Raft, Paxos, or ZooKeeper), setting `maxUnavailable` too high can cause the cluster to lose quorum (which requires at least $\lfloor N/2 \rfloor + 1$ active nodes), resulting in a complete cluster outage.
+
+**Q5: How do you verify the progress of an active StatefulSet rollout using the CLI?**
+
+You monitor rollout progress using `kubectl rollout status statefulset/<name>`. The command watches the API server stream, tracking the recreation of each ordinal and reporting when each Pod achieves `Ready` status. In CI/CD pipelines, adding a `--timeout` flag (e.g., `kubectl rollout status statefulset/db --timeout=300s`) ensures that if a stateful pod hangs due to failing readiness probes or storage mount errors, the pipeline fails automatically and halts further progression.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that StatefulSet `RollingUpdate` executes in reverse order ($N-1 \to 0$)
+- [ ] Know that Pod $K$ must be `Ready` before the controller begins updating Pod $K-1$
+- [ ] Know how `partition` restricts updates to ordinals $\ge \text{partition}$ for canary testing
+- [ ] Know when to use `updateStrategy: OnDelete` for manual database failover control
+- [ ] Know how `maxUnavailable` enables concurrent rolling updates on large stateful clusters
+- [ ] Know the quorum risk of setting `maxUnavailable` too high on Raft/Paxos clusters
+- [ ] Can track rollout progression using `kubectl rollout status statefulset/<name>`

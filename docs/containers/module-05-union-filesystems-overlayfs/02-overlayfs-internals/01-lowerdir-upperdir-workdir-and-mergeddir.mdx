@@ -1,0 +1,193 @@
+---
+title: "Chapter 1 — OverlayFS: lowerdir, upperdir & mergeddir"
+sidebar_position: 1
+module: "Module 5.2 — OverlayFS Internals"
+description: "Master OverlayFS kernel internals — lowerdir, upperdir, workdir, mergeddir, whiteout character devices (0/0), opaque directory xattrs, and manual overlay mounts."
+---
+
+# Chapter 1 — OverlayFS: lowerdir, upperdir & mergeddir
+
+> **Goal:** Master the internal kernel architecture, directory plumbing, and low-level mount options of the Linux **OverlayFS** storage driver — dissecting the 4 fundamental directories (**`lowerdir`**, **`upperdir`**, **`workdir`**, and **`mergeddir`**), analyzing the role of `workdir` during atomic copy-ups, inspecting **Whiteout Character Devices (`0/0`)** and **Opaque Directory Extended Attributes (`trusted.overlay.opaque=y`)**, and constructing manual OverlayFS mounts from scratch.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural responsibilities of `lowerdir`, `upperdir`, `workdir`, and `mergeddir`
+> 2. How the Linux kernel merges colon-separated `lowerdir` paths into a unified filesystem
+> 3. Why `workdir` is mandatory for ensuring atomic copy-up operations and preventing corruption
+> 4. How deleted files are represented as 0/0 character device whiteout nodes in `upperdir`
+> 5. How `/var/lib/docker/overlay2` organizes layer shorteners (`/l/`) to avoid mount string limits
+> 6. How to create, modify, and dismantle a functional OverlayFS mount using native Linux commands
+
+---
+
+## Real-Life Analogy
+
+Think of OverlayFS as **an architect's drafting table with tracing paper, a temporary scratchpad, and a final blueprint view**:
+
+- **1. The Base Blueprints (`lowerdir`):**
+  - Stacks of historical structural drawings on thick cardstock (**`lowerdir`**).
+  - You can look through them, but you are **strictly forbidden from writing on them (Read-Only)**.
+- **2. The Top Tracing Sheet (`upperdir`):**
+  - A blank clear sheet taped to the top of the stack (**`upperdir` - Read/Write**).
+  - Any new ink you draw lands solely on this sheet (**Newly created or modified files**).
+- **3. The Architect's Scratchpad Desk (`workdir`):**
+  - When you need to trace a complex mechanical part from a lower drawing, you don't draw directly on the final sheet immediately.
+  - You trace it on a side scratchpad table (**`workdir`**), refine the lines, and then instantly slide it under the top sheet in one clean atomic motion. If your hand shakes or ink spills halfway through, the main drawing is **never corrupted (Atomic Copy-Up)**!
+- **4. The Final Assembled View (`mergeddir`):**
+  - When the client looks down at the drafting table, they see the seamless combination of all layers (**`mergeddir` - The Container Rootfs**).
+
+---
+
+## Architecture Diagram
+
+```text
+               OverlayFS 4-Directory Architecture & Kernel Mount Flow
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 4. MERGED MOUNT DIRECTORY (`mergeddir`): `/var/lib/docker/overlay2/...` │
+ │    - The active unified rootfs presented to the container!             │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Unified via Linux Kernel `mount -t overlay`
+ ┌──────────────────┴─────────────────────────────────────────────────────┐
+ │ 2. UPPER DIRECTORY (`upperdir` - Read/Write):                          │
+ │    - New files, modified file copies, and Whiteout files (`0/0`)       │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 3. WORK DIRECTORY (`workdir` - Internal Kernel Scratchpad):            │
+ │    - Prepares atomic file copy-ups; MUST reside on same filesystem as  │
+ │      `upperdir`! Invisible to user space.                              │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 1. LOWER DIRECTORIES (`lowerdir` - Colon-Separated Read-Only Layers):  │
+ │    ├── `lowerdir[0]`: `/layer-app-code`                                │
+ │    ├── `lowerdir[1]`: `/layer-python-runtime`                          │
+ │    └── `lowerdir[2]`: `/layer-alpine-base`                             │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Fundamental Directories of OverlayFS
+
+```text
+ ┌──────────────────┬────────────┬────────────────────────────────────────────────────────────────────┐
+ │ Directory Role   │ Access     │ Kernel System Responsibility                                       │
+ │──────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+ │ **`lowerdir`**   │ **Read-Only│ Colon-separated list of image layer directories stacked top-to-    │
+ │                  │ (Immutable)│ bottom (`lowerdir=/layerB:/layerA`). Max 500 lower layers.         │
+ │──────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+ │ **`upperdir`**   │ **Read/    │ The single directory containing all newly written files, delta     │
+ │                  │  Write**   │ modifications, and deletion whiteout markers for this container.   │
+ │──────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+ │ **`workdir`**    │ **Internal │ Private kernel scratchpad. Used to prepare file copy-up operations │
+ │                  │ Kernel**   │ before atomically renaming them into `upperdir`.                   │
+ │──────────────────┼────────────┼────────────────────────────────────────────────────────────────────┤
+ │ **`mergeddir`**  │ **Unified  │ The target mount point. Merges `lowerdir` and `upperdir` into a    │
+ │                  │ View**     │ single unified directory tree presented to the container.          │
+ └──────────────────┴────────────┴────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The OverlayFS Linux Mount Command Syntax
+
+```bash
+sudo mount -t overlay overlay \
+  -o lowerdir=/opt/layers/layer2:/opt/layers/layer1:/opt/layers/base,upperdir=/opt/container/upper,workdir=/opt/container/work \
+  /opt/container/merged
+```
+
+> [!IMPORTANT]
+> **Workdir Filesystem Rule:** The `upperdir` and `workdir` directories **MUST reside on the exact same underlying filesystem mount** (e.g. both on the same ext4 or XFS partition). This is because the kernel uses the `rename(2)` system call to move completed files from `workdir` to `upperdir`, which is only atomic within a single filesystem.
+
+---
+
+## Whiteout Files & Opaque Directories
+
+When files and directories are deleted in OverlayFS, the underlying lower layers cannot be touched.
+
+### 1. File Deletion: Character Device `0/0`
+When a file `data.txt` is deleted, OverlayFS creates a **special Character Device file with major number 0 and minor number 0** named `data.txt` in `upperdir`:
+```bash
+ls -l /opt/container/upper/data.txt
+# Output: c--------- 1 root root 0, 0 ... data.txt (Character Device 0/0)
+```
+
+### 2. Directory Deletion & Replacement: Opaque Directories
+If an entire directory `/etc/config` is replaced, OverlayFS sets a special extended attribute (xattr) on the directory in `upperdir`:
+```text
+trusted.overlay.opaque = "y"
+```
+This tells the kernel to **blindly ignore all lower layers** for `/etc/config`, preventing old files from bleeding through!
+
+---
+
+## Hands-On Lab: Building a Real OverlayFS Mount from Scratch
+
+```bash
+# Step 1: Create our test environment directories
+mkdir -p /tmp/overlay-lab/{lower,upper,work,merged}
+cd /tmp/overlay-lab
+
+# Step 2: Populate lower directory with base files (Read-Only layer)
+echo "Base OS Config v1" > lower/config.txt
+echo "Original Image File" > lower/image_file.txt
+
+# Step 3: Mount the OverlayFS unified filesystem!
+sudo mount -t overlay overlay -o lowerdir=lower,upperdir=upper,workdir=work merged
+
+# Step 4: Inspect the merged view (Both files appear!)
+ls -la merged/
+cat merged/config.txt
+
+# Step 5: Modify an existing file inside the merged mount (Triggers Copy-Up!)
+echo "Container Custom Config v2" >> merged/config.txt
+
+# Step 6: Verify that the modification exists ONLY in upperdir, while lowerdir is UNTOUCHED!
+cat upper/config.txt   # (Contains updated text)
+cat lower/config.txt   # (Still contains pure original v1 text!)
+
+# Step 7: Delete a file inside mergeddir and observe the 0/0 character device whiteout!
+rm merged/image_file.txt
+ls -l upper/image_file.txt
+# Output: c--------- 1 root root 0, 0 ... (Character device 0/0 Whiteout!)
+
+# Step 8: Unmount and clean up
+sudo umount merged
+cd /tmp && rm -rf /tmp/overlay-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the roles of `lowerdir`, `upperdir`, `workdir`, and `mergeddir` in Linux OverlayFS?**
+
+- **`lowerdir`**: An ordered, colon-separated list of read-only directories representing immutable image layers. Lookups proceed from left-to-right (top-to-bottom).
+- **`upperdir`**: The single read-write directory where all new files, modifications to existing files, and whiteout markers are stored.
+- **`workdir`**: An internal, empty scratch directory used by the Linux kernel to stage file copy-up operations atomically before moving them into `upperdir`.
+- **`mergeddir`**: The destination mount point where the kernel presents the unified, combined view of `lowerdir` and `upperdir` to user-space applications.
+
+**Q2: Why is the `workdir` directory mandatory for OverlayFS mounts?**
+
+`workdir` is required to guarantee **Atomic Copy-Up operations**. When a file from `lowerdir` is modified, the kernel cannot copy it directly into `upperdir` in real-time, because if the system loses power or crashes halfway through the copy, `upperdir` would be left with a corrupted, partial file. Instead, the kernel copies the file into `workdir` first, and once complete, executes an **atomic `rename()` syscall** into `upperdir`.
+
+**Q3: How does OverlayFS represent a deleted file in `upperdir`?**
+
+OverlayFS represents deleted files by creating a **Whiteout File**, which is implemented at the filesystem level as a **Character Special Device with major number 0 and minor number 0 (`0/0`)** possessing the exact same filename. When the kernel's OverlayFS lookup function encounters a character device with major/minor `0/0` in `upperdir`, it stops looking in `lowerdir` and returns `ENOENT` (File not found) to the calling process.
+
+**Q4: What is an "Opaque Directory" in OverlayFS, and how is it marked?**
+
+An Opaque Directory is a directory in `upperdir` that instructs OverlayFS to **completely hide and suppress all underlying lower-layer files within that directory path**. It is marked by setting the filesystem extended attribute **`trusted.overlay.opaque=y`** on the directory in `upperdir`. This is used when a container replaces an entire directory (e.g. `rm -rf /etc/ssl && mkdir /etc/ssl`), ensuring old certificates from base image layers do not bleed through into the container.
+
+**Q5: How does `/var/lib/docker/overlay2` avoid hitting Linux mount argument string length limits?**
+
+When an image has 50 layers, combining 50 long SHA-256 layer directory paths into a `lowerdir=/var/lib/docker/overlay2/...` mount option can exceed the Linux kernel's `PAGE_SIZE` (4KB) mount string limit. To solve this, Docker creates a dedicated **`/var/lib/docker/overlay2/l/` directory containing short, randomized alphanumeric symlinks** (e.g. `l/ABCDEF -> ../<full-sha256>/diff`). Docker passes these shortened symlinks to `mount -t overlay`, keeping the mount option string well within kernel limits.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 OverlayFS directories: `lowerdir`, `upperdir`, `workdir`, `mergeddir`
+- [ ] Know that `workdir` enables crash-safe atomic copy-up operations via `rename()`
+- [ ] Know that `upperdir` and `workdir` MUST reside on the same filesystem
+- [ ] Know that deleted files are stored as Character Special Device `0/0` whiteout nodes
+- [ ] Know that opaque directories use the `trusted.overlay.opaque=y` extended attribute
+- [ ] Can mount a manual OverlayFS filesystem using `mount -t overlay`

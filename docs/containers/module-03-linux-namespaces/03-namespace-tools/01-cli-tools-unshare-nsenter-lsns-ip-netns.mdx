@@ -1,0 +1,182 @@
+---
+title: "Chapter 1 — CLI Tools: unshare, nsenter, lsns & ip-netns"
+sidebar_position: 1
+module: "Module 3.3 — Namespace Tools"
+description: "Master Linux namespace CLI tools — unshare for process sandboxing, nsenter for debugging distroless containers, lsns for host inspection, and ip-netns."
+---
+
+# Chapter 1 — Namespace CLI Tools: unshare, nsenter, lsns & ip-netns
+
+> **Goal:** Master the essential systems administration, SRE debugging, and low-level CLI toolkit for managing and inspecting Linux Namespaces — mastering **`unshare`** for ad-hoc process isolation, **`nsenter`** for attaching host debugging utilities to distroless/scratch containers, **`lsns`** for auditing system-wide namespace trees, and **`ip netns`** for persistent software-defined networking.
+>
+> By the end of this chapter, you will understand:
+> 1. The operational roles of the 4 primary Linux namespace CLI utilities
+> 2. How `unshare` creates isolated execution sandboxes directly from shell scripts
+> 3. How `nsenter` enters container namespaces to run `tcpdump` on containers lacking shells
+> 4. How `lsns` discovers orphaned, leaked, or active namespaces across all host processes
+> 5. How `ip netns` coordinates virtual network namespace topologies
+> 6. How to author production diagnostic one-liners to debug live container incidents
+
+---
+
+## Real-Life Analogy
+
+Think of the 4 Namespace CLI tools as **the specialized equipment carried by an expert deep-sea salvage diver and underwater engineer**:
+
+- **1. `unshare` (The Portable Hyperbaric Chamber):**
+  - You need to run a quick, hazardous chemical test (**An isolated process execution**).
+  - You open a portable, sealable plastic hyperbaric chamber (**`unshare -m -u -n -p --fork`**), step inside, run the test safely, and step back out into the main room without contaminating the building.
+- **2. `nsenter` (The Master SRE Skeleton Key):**
+  - An automated submarine (**A Distroless / Scratch Container**) is locked from the inside and has no doors, no windows, and no interior toolboxes (**No `sh`, no `bash`, no `curl`, no `tcpdump`**).
+  - The engineer pulls out a master magnetic docking clamp (**`nsenter -t <pid>`**).
+  - The engineer docks directly into the submarine's interior airspace, bringing their own high-tech host diagnostic instruments (**Host `tcpdump`**) into the submarine's private network stack!
+- **3. `lsns` (The X-Ray Sonar Radar):**
+  - Sweeps the entire ocean and displays every single active underwater habitat, its exact GPS coordinate, and how many divers are inside.
+- **4. `ip netns` (The Subsea Pipeline Plumber):**
+  - Drills dedicated underwater pipes and patches fiber cables directly between different submerged habitats.
+
+---
+
+## Architecture Diagram
+
+```text
+               The 4 Linux Namespace CLI Tools: Roles & Interaction
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `lsns` (INSPECTION & DISCOVERY):                                    │
+ │    Scans `/proc/*/ns/*` ──► Lists all active namespaces on the host OS │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Discovers Container Process (PID: 48921)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. `nsenter` (ATTACHMENT & DEBUGGING):                                 │
+ │    Takes Host Debugger (e.g. `gdb`, `tcpdump`, `strace`, `curl`)       │
+ │    ──► Injects execution into Container PID 48921's Network/Mount NS!  │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 3. `unshare` (ISOLATION CREATOR):                                      │
+ │    Shell Script ──► Creates ad-hoc sandbox (`unshare --net --pid ...`) │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 4. `ip netns` (NETWORK TOPOLOGY MANAGER):                              │
+ │    Manages persistent `/var/run/netns/` network stacks & `veth` cables │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Namespace CLI Command Matrix
+
+```text
+ ┌──────────────────┬─────────────────────────────┬───────────────────────────────────────────────────┐
+ │ CLI Tool         │ Core Syntax / Flags         │ Primary Systems Administration Purpose            │
+ │──────────────────┼─────────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`unshare`**    │ `unshare -m -u -i -n -p -f` │ Executes a program in newly created, isolated     │
+ │                  │ `--mount-proc`              │ Linux namespaces (mount, UTS, IPC, net, PID).     │
+ │──────────────────┼─────────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`nsenter`**    │ `nsenter -t <PID> -n -m`    │ Enters one or more existing namespaces of a target│
+ │                  │ `--target <PID>`            │ process to execute host binaries inside its scope.│
+ │──────────────────┼─────────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`lsns`**       │ `lsns -t net`               │ Lists all active namespaces on the host, showing  │
+ │                  │ `lsns -p <PID>`             │ type, namespace inode ID, user, & process count.  │
+ │──────────────────┼─────────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ip netns`**   │ `ip netns add <name>`       │ Manages named, persistent network namespaces      │
+ │                  │ `ip netns exec <name> ...`  │ pinned via bind mounts in `/var/run/netns/`.      │
+ └──────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. `nsenter`: Debugging Distroless & Scratch Containers
+
+Modern security best practices build **Distroless or Scratch container images** containing *zero* shell binaries (`/bin/sh`), zero package managers, and zero debugging tools (`curl`, `netstat`, `tcpdump`).
+
+### The SRE Problem:
+When an application inside a distroless container has a network bug, `docker exec -it <container> sh` **fails immediately** with:
+`OCI runtime exec failed: exec: "/bin/sh": executable file not found in $PATH`.
+
+### The `nsenter` Solution:
+Run the host's native `tcpdump` or `curl` directly inside the container's network namespace:
+```bash
+# 1. Find the container's host PID
+CONTAINER_PID=$(docker inspect <container-name> --format '{{.State.Pid}}')
+
+# 2. Enter the container's Network Namespace using the HOST's tcpdump binary!
+sudo nsenter -t $CONTAINER_PID --net tcpdump -i eth0 -n -vv port 8080
+```
+
+---
+
+## 2. `lsns`: Auditing Host Namespaces
+
+```bash
+# List all active network namespaces across the system
+sudo lsns -t net
+
+# Example Output:
+#         NS TYPE NPROCS   PID USER   COMMAND
+# 4026531992 net     142     1 root   /sbin/init
+# 4026532841 net       1 48921 1000   python3 app.py
+```
+
+---
+
+## Hands-On Lab: Capturing Traffic from an Isolated Container
+
+```bash
+# Step 1: Launch a background NGINX container
+docker run -d --name debug-target -p 8085:80 nginx:alpine
+
+# Step 2: Extract its real Linux Host PID
+TARGET_PID=$(docker inspect debug-target --format '{{.State.Pid}}')
+echo "Target Container Host PID: $TARGET_PID"
+
+# Step 3: Inspect all namespaces owned by this container PID using lsns
+sudo lsns -p $TARGET_PID
+
+# Step 4: Use nsenter to inspect the container's IP configuration from host
+sudo nsenter -t $TARGET_PID --net ip addr show dev eth0
+
+# Step 5: Clean up
+docker rm -f debug-target
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How do you troubleshoot a network issue inside a Distroless or Scratch container that contains no shell or utilities?**
+
+Use **`nsenter` (Namespace Enter)** from the host operating system. Because Distroless containers lack `/bin/sh` and diagnostic binaries (`curl`, `tcpdump`, `ss`), `docker exec` will fail. By discovering the container's host PID (`docker inspect <name> --format '{{.State.Pid}}'`), an SRE can execute `sudo nsenter -t <PID> --net <host-command>`. The command executes using the **host's binary and libraries**, but operates directly **inside the container's isolated network namespace**.
+
+**Q2: What is the purpose of the `--fork` and `--mount-proc` flags in `unshare`?**
+
+- **`--fork`**: Required when creating a new **PID Namespace (`-p`)**. In Linux, the calling process cannot change its own PID namespace; only child processes spawned after the syscall enter the new namespace. `--fork` tells `unshare` to fork a child process into the new PID namespace.
+- **`--mount-proc`**: Automatically mounts a new, private `/proc` filesystem inside the new Mount and PID namespace. Without this, tools like `ps` will continue reading the host's `/proc`, incorrectly displaying all host processes!
+
+**Q3: How does `lsns` discover namespaces on a Linux host?**
+
+`lsns` reads the **`/proc` filesystem**. It scans every running process directory (`/proc/[pid]/ns/`), reads the magic symlinks for each namespace type (`mnt`, `net`, `pid`, `uts`, `ipc`, `user`, `cgroup`, `time`), and extracts their inode numbers. It groups processes that share the same namespace inode, calculates process counts (`NPROCS`), and displays the namespace hierarchy.
+
+**Q4: What is the difference between `ip netns exec <name> <cmd>` and `nsenter --net=/var/run/netns/<name> <cmd>`?**
+
+They are functionally equivalent under the hood:
+- **`ip netns exec`**: A specialized utility provided by the `iproute2` package that looks up persistent network namespaces in the default directory `/var/run/netns/` and invokes `setns(CLONE_NEWNET)`.
+- **`nsenter --net`**: A general-purpose utility from `util-linux` that can attach to network namespaces specified either by **file path** (`--net=/path/to/ns`) or by **process ID** (`-t <PID> --net`), offering greater flexibility for container troubleshooting.
+
+**Q5: Can `nsenter` be used to enter a container's Mount namespace? What are the risks?**
+
+**Yes** (`nsenter -t <PID> -m`). Entering a container's Mount namespace changes the calling shell's view of the filesystem to the container's rootfs. **The Risk**: If the container has an insecure or corrupted rootfs, executing commands inside its mount namespace may load untrusted shared libraries or execute malicious binaries. For security-critical debugging, SREs prefer entering only the Network (`--net`) and IPC (`--ipc`) namespaces while retaining the host's trusted Mount namespace.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `unshare` creates ad-hoc sandboxes from the command line
+- [ ] Know that `nsenter -t <PID> --net` debugs distroless containers without `/bin/sh`
+- [ ] Know that `lsns` lists all active namespaces and inode IDs across the host
+- [ ] Know that `ip netns` manages persistent network namespaces in `/var/run/netns/`
+- [ ] Know why `unshare --pid` requires `--fork` and `--mount-proc`
+- [ ] Can find a container's host PID using `docker inspect --format '{{.State.Pid}}'`

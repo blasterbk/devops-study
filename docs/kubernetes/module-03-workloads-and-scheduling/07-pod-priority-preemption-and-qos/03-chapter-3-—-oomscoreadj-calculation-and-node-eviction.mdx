@@ -1,0 +1,299 @@
+---
+title: "Chapter 3 — OOMScoreAdj & Node Eviction"
+sidebar_position: 3
+module: "Module 3.7 — Priority, Preemption & QoS"
+description: "Master Kubernetes OOMScoreAdj and node pressure eviction — mathematical OOM score calculation, Kubelet proactive eviction thresholds vs Linux kernel OOM-killer, and memory pressure recovery."
+---
+
+# Chapter 3 — OOMScoreAdj Calculation & Node Eviction
+
+> **Goal:** Master the deep Linux kernel and Kubelet mechanics governing node out-of-memory handling — understanding how Kubelet computes container `oom_score_adj` values mathematically based on QoS class, how Kubelet's proactive Node Pressure Eviction prevents kernel panics, configuring hard versus soft eviction thresholds, and analyzing node allocatable capacity.
+>
+> By the end of this chapter, you will understand:
+> 1. The Linux kernel `oom_score` and `oom_score_adj` (-1000 to +1000) mechanics
+> 2. The exact mathematical formula used by Kubelet to compute `oom_score_adj` for Burstable Pods
+> 3. The critical operational difference between Kubelet Node Eviction and the Linux Kernel OOM-Killer
+> 4. Hard vs Soft eviction threshold evaluation and grace periods
+> 5. The multi-step sorting algorithm Kubelet uses to pick eviction victims
+> 6. How to diagnose and remediate `MemoryPressure` and `DiskPressure` node conditions
+
+---
+
+## Real-Life Analogy
+
+Think of node memory management as **emergency protocol aboard a leaking submarine**:
+
+- **Proactive Eviction by the Captain (Kubelet Node Eviction):** The water level reaches the warning mark (`memory.available < 500Mi`). The Captain (Kubelet) stays in control. He consults the manifest, finds the non-essential cargo crates (BestEffort pods) and low-priority research gear, and calmly ejects them through the airlock (graceful `SIGTERM` eviction). The submarine stays functional and nobody drowns.
+- **Catastrophic Kernel OOM-Killer (The Submarine Floods Completely):** Water rises so fast that the electrical panels short-circuit before the Captain can react (`memory.available == 0`). The automated emergency bulkhead doors slam shut instantly without warning (Linux Kernel OOM-Killer). The kernel looks at the `oom_score` badge on everyone's forehead and shoots the highest-scoring occupant with a tranquilizer dart (`SIGKILL / Exit Code 137`).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubelet Eviction vs Linux Kernel OOM-Killer
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Worker Node (Total RAM: 16Gi, Allocatable: 14Gi)                       │
+ │ Memory Usage Rising: 12Gi ──► 13.5Gi ──► 14Gi ──► 16Gi                 │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Layer 1: Kubelet Proactive Node Eviction                               │
+ │                                                                        │
+ │ Eviction Signal: `memory.available < 500Mi`                            │
+ │ - Threshold Crossed at 13.5Gi usage!                                   │
+ │ - Kubelet marks Node condition: `MemoryPressure: True`                 │
+ │ - Sorts Pods by QoS Class & Priority                                   │
+ │ - Sends GRACEFUL SIGTERM to Victim Pod (BestEffort / High Memory Pod)  │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ (If memory usage spikes too fast
+                                    │  before Kubelet can react)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Layer 2: Linux Kernel OOM-Killer                                       │
+ │                                                                        │
+ │ Node RAM hits 100% (Kernel Out Of Memory):                             │
+ │ - Linux kernel computes `badness` score:                               │
+ │   `Score = (RAM % of system) + oom_score_adj`                          │
+ │ - BestEffort Pod (oom_score_adj: 1000) ──► Target Score ~1050          │
+ │ - Guaranteed Pod (oom_score_adj: -997) ──► Target Score ~ -950         │
+ │ - Kernel immediately sends SIGKILL (Exit 137) to BestEffort process!   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Mathematics of `oom_score_adj`
+
+The Linux kernel assigns every process an `oom_score` ($0 \dots 1000$). When memory is exhausted, the process with the highest score is killed.
+
+Kubernetes controls process vulnerability by writing an adjustment factor (`oom_score_adj`, from $-1000$ to $+1000$) to `/proc/[pid]/oom_score_adj`:
+
+```text
+ ┌──────────────────────┬──────────────────────┬──────────────────────────────────────────────────────┐
+ │ Component / Class    │ `oom_score_adj` Value│ Vulnerability Level                                  │
+ │──────────────────────┼──────────────────────┼──────────────────────────────────────────────────────┤
+ │ Kubelet / Containerd │ `-999`               │ Immune (Only kernel itself is -1000)                 │
+ │ **Guaranteed QoS**   │ `-997`               │ Highly Protected (Killed only if node is dying)      │
+ │ **BestEffort QoS**   │ `1000`               │ Maximum Vulnerability (Killed instantly)             │
+ │ **Burstable QoS**    │ **Dynamically Computed** (Range: $2 \dots 999$)                            │
+ └──────────────────────┴──────────────────────┴──────────────────────────────────────────────────────┘
+```
+
+### The Burstable Formula:
+For a Burstable container, Kubelet computes `oom_score_adj` proportionally based on how much of the node's allocatable memory it requested:
+
+$$\text{oom\_score\_adj} = 1000 - \max\left(\left(\frac{\text{memory.requests}}{\text{node allocatable memory}}\right) \times 1000,\, 2\right)$$
+
+```text
+ Mathematical Examples on an 8GB Node:
+ - Pod A requests 4GB (50% of node):
+   oom_score_adj = 1000 - (0.50 * 1000) = 500
+   
+ - Pod B requests 7.2GB (90% of node):
+   oom_score_adj = 1000 - (0.90 * 1000) = 100 (Much harder to kill!)
+
+ - Pod C requests 100MB (1% of node):
+   oom_score_adj = 1000 - (0.01 * 1000) = 990 (Almost as vulnerable as BestEffort!)
+```
+
+---
+
+## Kubelet Node Pressure Eviction
+
+To prevent the kernel OOM-killer from executing emergency kills, Kubelet actively monitors eviction signals:
+
+```text
+ ┌───────────────────────────┬─────────────────────────────┬──────────────────────────────────────────┐
+ │ Eviction Signal           │ Description                 │ Trigger Condition                        │
+ │───────────────────────────┼─────────────────────────────┼──────────────────────────────────────────┤
+ │ `memory.available`        │ Available host RAM          │ Node free memory drops below threshold   │
+ │ `nodefs.available`        │ Root filesystem free disk   │ `/` filesystem capacity full             │
+ │ `nodefs.inodesFree`       │ Root filesystem free inodes │ Inode exhaustion on root disk            │
+ │ `imagefs.available`       │ Container runtime disk      │ Dedicated container image disk full      │
+ │ `pid.available`           │ OS Process IDs available    │ Linux PID table exhaustion               │
+ └───────────────────────────┴─────────────────────────────┴──────────────────────────────────────────┘
+```
+
+### Hard vs Soft Eviction Thresholds
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Threshold Type       │ Behavior & Grace Periods                                                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Hard Threshold**   │ **Immediate Action.** When breached, Kubelet evicts Pods immediately        │
+ │                      │ without waiting (`eviction-hard: memory.available<250Mi`).                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Soft Threshold**   │ **Graceful Observation.** The threshold must be continuously exceeded for a  │
+ │                      │ duration (`eviction-soft-grace-period: memory.available=1m30s`) before      │
+ │                      │ evictions commence, granting Pods up to `eviction-max-pod-grace-period`.    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Kubelet Eviction Victim Sorting Algorithm
+
+When `MemoryPressure` is active, Kubelet sorts Pods to pick eviction victims using a strict 3-tier precedence:
+
+```text
+ Precedence Order for Eviction Selection:
+
+ Tier 1: Resource Consumption vs Requests
+ - Does the Pod consume memory EXCEEDING its `resources.requests`?
+ - Pods exceeding their requested memory are targeted FIRST.
+
+ Tier 2: Pod PriorityClass
+ - Lowest `PriorityClass` integer value is targeted first.
+
+ Tier 3: Memory Consumption Above Request
+ - Among Pods with equal priority, the Pod consuming the greatest absolute amount 
+   of memory above its request is evicted first.
+```
+
+---
+
+## Inspecting Node Allocatable Capacity
+
+The resources available for workloads are calculated via:
+$$\text{Allocatable} = \text{Node Capacity} - \text{KubeReserved} - \text{SystemReserved} - \text{HardEvictionThreshold}$$
+
+```bash
+kubectl describe node worker-01 | grep -A 8 "Allocatable:"
+```
+
+```text
+ Output:
+ Allocatable:
+   cpu:                3800m      # (4000m total - 200m reserved)
+   memory:             14800Mi    # (16384Mi total - 1584Mi reserved & eviction threshold)
+   ephemeral-storage:  90Gi
+   pods:               110
+```
+
+---
+
+## Complete Kubelet Eviction Configuration (`kubelet-config.yaml`)
+
+```yaml
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# Hard thresholds: Evict immediately
+evictionHard:
+  memory.available: "250Mi"
+  nodefs.available: "10%"
+  nodefs.inodesFree: "5%"
+  imagefs.available: "15%"
+
+# Soft thresholds: Evict only if sustained
+evictionSoft:
+  memory.available: "500Mi"
+  nodefs.available: "15%"
+evictionSoftGracePeriod:
+  memory.available: "1m"
+  nodefs.available: "2m"
+evictionMaxPodGracePeriod: 60
+evictionPressureTransitionPeriod: "5m"
+```
+
+---
+
+## Hands-On Lab: Inspecting `oom_score_adj` & Node Conditions
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace eviction-lab
+
+# Step 2: Deploy a Guaranteed and a BestEffort Pod
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-guaranteed
+  namespace: eviction-lab
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "100Mi"
+      limits:
+        cpu: "100m"
+        memory: "100Mi"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-besteffort
+  namespace: eviction-lab
+spec:
+  containers:
+  - name: app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Wait for both Pods to be Running
+kubectl wait --for=condition=Ready pod/test-guaranteed -n eviction-lab --timeout=30s
+kubectl wait --for=condition=Ready pod/test-besteffort -n eviction-lab --timeout=30s
+
+# Step 4: Inspect the internal Linux oom_score_adj on the worker node
+# From inside the container, read /proc/self/oom_score_adj
+echo "Guaranteed Pod oom_score_adj:"
+kubectl exec -n eviction-lab test-guaranteed -- cat /proc/self/oom_score_adj
+# Output: -997 (Protected!)
+
+echo "BestEffort Pod oom_score_adj:"
+kubectl exec -n eviction-lab test-besteffort -- cat /proc/self/oom_score_adj
+# Output: 1000 (Maximum vulnerability!)
+
+# Step 5: Inspect Node Conditions for MemoryPressure
+kubectl describe nodes | grep -A 5 "Conditions:" | grep -E "(MemoryPressure|DiskPressure|PIDPressure)"
+
+# Step 6: Clean up lab
+kubectl delete namespace eviction-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between the Linux Kernel OOM-Killer and Kubelet Node Eviction?**
+
+Kubelet Node Eviction is a **proactive, graceful user-space mechanism** triggered when node resource metrics breach configured thresholds (e.g. `memory.available < 500Mi`). Kubelet marks the node as `MemoryPressure: True`, selects victim Pods based on QoS and Priority, and sends graceful `SIGTERM` signals, allowing applications to flush state and rebalance to other nodes. The Linux Kernel OOM-Killer is a **reactive kernel-space emergency mechanism** triggered when physical RAM hits 100%; the kernel abruptly terminates processes with `SIGKILL` (`Exit Code 137`) based on process `oom_score` values.
+
+**Q2: How does Kubelet calculate `oom_score_adj` for a Burstable Pod?**
+
+For Burstable Pods, Kubelet dynamically calculates `oom_score_adj` using the formula:
+$$\text{oom\_score\_adj} = 1000 - \max\left(\left(\frac{\text{memory.requests}}{\text{node allocatable memory}}\right) \times 1000,\, 2\right)$$
+A container that requests a large percentage of node memory receives a lower score (e.g. 100), making it much harder to kill, while a container requesting very little memory receives a high score (e.g. 980), making it among the first to be terminated.
+
+**Q3: What are the `oom_score_adj` values for Guaranteed and BestEffort Pods?**
+
+- `BestEffort` Pods are assigned an `oom_score_adj` of **`1000`**, ensuring they are always the first processes targeted by the kernel OOM-killer.
+- `Guaranteed` Pods are assigned an `oom_score_adj` of **`-997`**, making them virtually immune to termination, placed just above critical system processes and Kubelet (`-999`).
+
+**Q4: What is the difference between hard and soft eviction thresholds in Kubelet?**
+
+A **hard eviction threshold** triggers immediate, un-delayed Pod eviction as soon as the threshold is breached (e.g. `memory.available < 250Mi`). A **soft eviction threshold** requires the metric to remain continuously breached for a specified duration (`eviction-soft-grace-period`, e.g. 90 seconds) before Kubelet initiates evictions, allowing transient spikes to resolve without disrupting workloads.
+
+**Q5: In what sequence does Kubelet choose Pods for eviction during `MemoryPressure`?**
+
+Kubelet sorts candidate Pods by: (1) Resource usage relative to requests (Pods consuming memory *above* their requested amount are targeted first); (2) `PriorityClass` (lower-priority Pods are evicted before higher-priority Pods); (3) Absolute memory consumed in excess of requests (the Pod using the highest surplus memory is evicted first).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `oom_score_adj` ranges from $-1000$ (immune) to $+1000$ (vulnerable)
+- [ ] Know that `BestEffort` is set to `1000` and `Guaranteed` is set to `-997`
+- [ ] Know how Burstable `oom_score_adj` scales inversely with requested memory
+- [ ] Know the difference between Kubelet proactive eviction and kernel OOM-killer
+- [ ] Know the eviction signals: `memory.available`, `nodefs.available`, `pid.available`
+- [ ] Know the formula for Node Allocatable capacity
+- [ ] Can verify `oom_score_adj` inside containers via `cat /proc/self/oom_score_adj`

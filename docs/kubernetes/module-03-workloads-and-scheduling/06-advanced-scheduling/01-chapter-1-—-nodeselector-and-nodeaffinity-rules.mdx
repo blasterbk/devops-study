@@ -1,0 +1,370 @@
+---
+title: "Chapter 1 — nodeSelector & nodeAffinity Rules"
+sidebar_position: 1
+module: "Module 3.6 — Advanced Scheduling"
+description: "Master Kubernetes node placement constraints — nodeSelector vs nodeAffinity, hard filter vs soft score rules, set-based operators (In, NotIn, Exists, Gt), and multi-term boolean logic."
+---
+
+# Chapter 1 — nodeSelector & nodeAffinity Rules
+
+> **Goal:** Master node placement constraints in Kubernetes — understanding the evolution from simple `nodeSelector` key-value pairs to expressive `nodeAffinity` rules, configuring hard requirements (`requiredDuringScheduling...`) vs soft weighted preferences (`preferredDuringScheduling...`), evaluating multi-term boolean logic (AND vs OR), and leveraging standard topology labels for production placement.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural differences and expressiveness between `nodeSelector` and `nodeAffinity`
+> 2. How `requiredDuringSchedulingIgnoredDuringExecution` acts as a hard filter in the scheduling pipeline
+> 3. How `preferredDuringSchedulingIgnoredDuringExecution` scores nodes using integer weights ($1 \dots 100$)
+> 4. The 6 set-based operators: `In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, and `Lt`
+> 5. The boolean evaluation hierarchy: Multiple `nodeSelectorTerms` (OR) vs Multiple `matchExpressions` (AND)
+> 6. Why `IgnoredDuringExecution` prevents pod eviction when node labels mutate
+
+---
+
+## Real-Life Analogy
+
+Think of node selection as an **apartment hunter setting criteria for a new home**:
+
+- **`nodeSelector` (Rigid Single Requirement):** *"I will only rent an apartment if it has an in-unit washer and dryer (`amenity=washer`)."* If an apartment has a dishwasher and balcony but lacks a washer, you immediately reject it.
+- **`nodeAffinity` Hard Requirement (`requiredDuringScheduling`):** *"The apartment MUST be in Zip Code 90210 OR 90211 (`operator: In`), AND it MUST be on a floor higher than 3 (`operator: Gt, values: [3]`). If no apartment meets this, I will sleep in my car (`Pending`)."*
+- **`nodeAffinity` Soft Preference (`preferredDuringScheduling`):** *"I would really LOVE an apartment with a mountain view (`weight: 80`) and hardwood floors (`weight: 20`). If you find one with both, I'll pay top dollar (Score: 100). But if none have a view, I'll still sign the lease on a regular apartment rather than remain homeless."*
+- **`IgnoredDuringExecution`:** If you sign the lease and move in, and two months later the landlord removes the mountain view by building a billboard next door (node label changes), the landlord **cannot throw you out of your apartment** (Pod is not evicted).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kube-Scheduler NodeAffinity Evaluation Stages
+
+ Pod Manifest Submitted with Hard & Soft NodeAffinity
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Stage 1: FILTERING (requiredDuringScheduling...)                      │
+ │                                                                        │
+ │ Evaluates all nodes in cluster. Must match:                            │
+ │ (Zone In [us-east-1a, us-east-1b]) AND (instance-type In [c6i.2xlarge])│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+          ┌─────────────────────────┴─────────────────────────┐
+          ▼                                                   ▼
+ [Matching Nodes: Node A, Node B]                     [Non-Matching: Node C]
+          │                                                   │
+          ▼                                                   ▼
+ ┌──────────────────────────────────────────────┐     [FILTERED OUT / REJECTED]
+ │ Stage 2: SCORING (preferredDuringScheduling) │
+ │                                              │
+ │ Node A: Has label `disk=nvme` (weight: 80)   │
+ │         Score = 80                           │
+ │                                              │
+ │ Node B: Has label `disk=ssd` (No match)      │
+ │         Score = 0                            │
+ └──────────────────────┬───────────────────────┘
+                        │
+                        ▼
+ Highest Scored Node Selected: Pod bound to Node A!
+```
+
+---
+
+## `nodeSelector` vs `nodeAffinity`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ `nodeSelector`                  │ `nodeAffinity`                  │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Syntax Complexity**     │ Simple key-value map            │ Structured JSON / YAML arrays   │
+ │ **Condition Types**       │ Strict equality only (`key=val`)│ Set-based (`In`, `NotIn`, etc.) │
+ │ **Soft Preferences**      │ NO (Hard constraint only)       │ YES (Weighted $1 \to 100$)      │
+ │ **Multi-Term Boolean**    │ AND only                        │ Nested OR and AND logic         │
+ │ **Numerical Comparisons** │ NO                              │ YES (`Gt`, `Lt`)                │
+ │ **Scheduler Integration** │ Legacy filter                   │ Modern NodeAffinity plugin      │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Hard Filter vs Soft Score Affinity
+
+Kubernetes defines two types of node affinity rules under `.spec.affinity.nodeAffinity`:
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Affinity Type                                                          │ Scheduler Behavior                       │
+ │────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **`requiredDuringSchedulingIgnoredDuringExecution`**                   │ **Hard Rule (Filter Phase).**            │
+ │                                                                        │ The Pod CANNOT be scheduled unless a     │
+ │                                                                        │ node satisfies this rule.                │
+ │────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **`preferredDuringSchedulingIgnoredDuringExecution`**                  │ **Soft Preference (Score Phase).**       │
+ │                                                                        │ The scheduler tries to find matching     │
+ │                                                                        │ nodes; if none exist, it schedules anyway│
+ └────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+> [!NOTE]
+> **What does `IgnoredDuringExecution` mean?**
+> If a Pod is already scheduled and running on a node, and an administrator later modifies or removes the labels on that node such that the affinity rule is no longer satisfied, Kubernetes **will not evict or terminate the Pod**. The rule is evaluated *only during the scheduling phase*.
+
+---
+
+## Set-Based Operators
+
+The `operator` field within `matchExpressions` supports six powerful operations:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Operator             │ Logic & Example Definition                                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`In`**             │ Node label value must match one of the listed values.                       │
+ │                      │ `key: zone, operator: In, values: ["us-east-1a", "us-east-1b"]`            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`NotIn`**          │ Node label value must NOT match any of the listed values. (Anti-affinity)   │
+ │                      │ `key: failure-domain, operator: NotIn, values: ["faulty-rack-4"]`           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Exists`**         │ Node must have the label key present (value is ignored; `values` omitted).  │
+ │                      │ `key: nvidia.com/gpu, operator: Exists`                                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`DoesNotExist`**   │ Node must NOT possess this label key.                                       │
+ │                      │ `key: node.kubernetes.io/low-memory, operator: DoesNotExist`                │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`Gt` / `Lt`**      │ Numerical integer Greater Than / Less Than comparison.                      │
+ │                      │ `key: cpu-cores, operator: Gt, values: ["16"]`                              │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Multi-Term Boolean Logic (AND vs OR)
+
+Understanding how the scheduler parses nested terms is crucial for writing bug-free affinity rules:
+
+```text
+ The 2 Golden Rules of NodeAffinity Logic:
+
+ 1. Multiple `nodeSelectorTerms` are evaluated with OR logic.
+    (If ANY term matches, the node is accepted).
+
+ 2. Multiple `matchExpressions` inside a single term are evaluated with AND logic.
+    (EVERY expression inside that term must match).
+```
+
+```yaml
+nodeAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+    # Term 1: Must be in us-east-1a AND be an m5.2xlarge instance
+    - matchExpressions:
+      - key: topology.kubernetes.io/zone
+        operator: In
+        values: ["us-east-1a"]
+      - key: node.kubernetes.io/instance-type
+        operator: In
+        values: ["m5.2xlarge"]
+
+    # Term 2 (OR): Alternatively, ANY node in us-east-1b
+    - matchExpressions:
+      - key: topology.kubernetes.io/zone
+        operator: In
+        values: ["us-east-1b"]
+```
+
+---
+
+## Standard Kubernetes Topology Labels
+
+Modern cloud providers (AWS EKS, GCP GKE, Azure AKS) and kubelet automatically populate standardized node labels:
+
+```text
+ ┌──────────────────────────────────────────┬─────────────────────────────────────────────────────────┐
+ │ Standard Node Label                      │ Example Value & Typical Use Case                        │
+ │──────────────────────────────────────────┼─────────────────────────────────────────────────────────┤
+ │ `topology.kubernetes.io/zone`            │ `us-central1-a`, `eu-west-1b` (Multi-AZ placement)      │
+ │ `topology.kubernetes.io/region`          │ `us-central1`, `eu-west-1` (Regional boundaries)        │
+ │ `kubernetes.io/os`                       │ `linux`, `windows` (OS targeting)                       │
+ │ `kubernetes.io/arch`                     │ `amd64`, `arm64` (Graviton / Apple Silicon ARM support) │
+ │ `node.kubernetes.io/instance-type`       │ `c6g.4xlarge`, `n2-standard-8` (Compute sizing)         │
+ └──────────────────────────────────────────┴─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production NodeAffinity Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-inference-engine
+  namespace: machine-learning
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ml-inference
+  template:
+    metadata:
+      labels:
+        app: ml-inference
+    spec:
+      affinity:
+        nodeAffinity:
+          # 1. HARD REQUIREMENT: Must run on Linux ARM64 in US-East
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/os
+                operator: In
+                values: ["linux"]
+              - key: kubernetes.io/arch
+                operator: In
+                values: ["arm64"]
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: ["us-east-1a", "us-east-1b"]
+
+          # 2. SOFT PREFERENCE: Prefer high-memory instances with NVMe SSDs
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 80
+            preference:
+              matchExpressions:
+              - key: storage.custom/disk-type
+                operator: In
+                values: ["local-nvme"]
+          - weight: 20
+            preference:
+              matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values: ["r6g.2xlarge", "r6g.4xlarge"]
+
+      containers:
+      - name: inference
+        image: python:3.11-slim
+        command: ["sh", "-c", "echo 'Inference engine active'; sleep 3600"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+```
+
+---
+
+## Hands-On Lab: Testing NodeAffinity & Weighted Preferences
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace affinity-lab
+
+# Step 2: Identify and label two worker nodes
+NODE_1=$(kubectl get nodes --no-headers | head -n 1 | awk '{print $1}')
+NODE_2=$(kubectl get nodes --no-headers | tail -n 1 | awk '{print $1}')
+
+echo "Node 1: $NODE_1, Node 2: $NODE_2"
+
+# Apply custom labels
+kubectl label node $NODE_1 tier=backend storage=nvme --overwrite
+kubectl label node $NODE_2 tier=backend storage=hdd --overwrite
+
+# Step 3: Deploy Pod with Hard requirement on tier=backend and Soft preference on storage=nvme
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: affinity-test-pod
+  namespace: affinity-lab
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: tier
+            operator: In
+            values: ["backend"]
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+          - key: storage
+            operator: In
+            values: ["nvme"]
+  containers:
+  - name: test
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 4: Verify the Pod scheduled onto Node 1 (which had the storage=nvme preference score!)
+sleep 3
+SCHEDULED_NODE=$(kubectl get pod affinity-test-pod -n affinity-lab -o jsonpath='{.spec.nodeName}')
+echo "Pod was placed on: $SCHEDULED_NODE"
+
+# Step 5: Test Unschedulable Hard Requirement
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: impossible-pod
+  namespace: affinity-lab
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: non-existent-label
+            operator: In
+            values: ["impossible-value"]
+  containers:
+  - name: test
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 6: Verify the Pod remains in Pending state
+kubectl get pod impossible-pod -n affinity-lab
+kubectl describe pod impossible-pod -n affinity-lab | grep -i "FailedScheduling"
+
+# Step 7: Clean up labels and lab
+kubectl label node $NODE_1 tier- storage-
+kubectl label node $NODE_2 tier- storage-
+kubectl delete namespace affinity-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between `nodeSelector` and `nodeAffinity`?**
+
+`nodeSelector` is the original, basic node selection mechanism in Kubernetes, supporting only exact key-value string equality matching (e.g. `disk: ssd`). `nodeAffinity` provides a much richer declarative expression language supporting set operators (`In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`), composite boolean logic (AND/OR across terms), and the ability to define both hard mandatory filters (`requiredDuringScheduling...`) and soft weighted scoring preferences (`preferredDuringScheduling...`).
+
+**Q2: Explain how `requiredDuringSchedulingIgnoredDuringExecution` works in the scheduler.**
+
+`requiredDuringSchedulingIgnoredDuringExecution` functions as a mandatory filter rule in the scheduler's Filter stage. The scheduler iterates through all nodes in the cluster and eliminates any node that does not strictly satisfy the `nodeSelectorTerms`. If zero nodes match, the Pod cannot be scheduled and remains in the `Pending` state. The `IgnoredDuringExecution` suffix indicates that if node labels are mutated after the Pod has already started running, the running Pod will not be evicted.
+
+**Q3: How are multiple `nodeSelectorTerms` vs multiple `matchExpressions` evaluated?**
+
+In a `nodeAffinity` specification:
+- Multiple `nodeSelectorTerms` are evaluated with **OR** logic. If a node satisfies any one of the listed terms, it is considered a valid placement target.
+- Multiple `matchExpressions` within a single `nodeSelectorTerms` block are evaluated with **AND** logic. A node must satisfy all expressions inside that specific term to be accepted.
+
+**Q4: How does `preferredDuringSchedulingIgnoredDuringExecution` influence node selection?**
+
+`preferredDuringSchedulingIgnoredDuringExecution` operates during the scheduler's Scoring stage. For every node that passed the Filter stage, the scheduler checks the `matchExpressions` under each preference. If a node matches, the scheduler adds the associated integer `weight` ($1 \dots 100$) to that node's cumulative score. The scheduler binds the Pod to the node with the highest aggregate score. If no nodes match the preference, the scheduler still places the Pod on any available filtered node.
+
+**Q5: What is the difference between the `Exists` and `In` operators in nodeAffinity?**
+
+The `In` operator requires specifying a list of target values (`values: ["val1", "val2"]`) and checks whether the node's label value matches any item in that list. The `Exists` operator checks solely for the presence of the label key on the node, completely ignoring the label's value; consequently, the `values` array must be omitted when using `operator: Exists`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `nodeSelector` is legacy equality matching; `nodeAffinity` supports rich expressions
+- [ ] Know the 6 operators: `In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, `Lt`
+- [ ] Know that `requiredDuringScheduling` is a hard filter (leaves Pod `Pending` if no match)
+- [ ] Know that `preferredDuringScheduling` scores nodes with weights ($1 \dots 100$)
+- [ ] Know that `IgnoredDuringExecution` means running Pods are not evicted if labels change
+- [ ] Know that multiple `nodeSelectorTerms` are OR'd; multiple `matchExpressions` are AND'd
+- [ ] Can verify node placement using `kubectl describe pod <name>`

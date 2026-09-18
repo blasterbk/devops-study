@@ -1,0 +1,223 @@
+---
+title: "Chapter 2 — MachineDeployments & Auto-Healing"
+sidebar_position: 2
+module: "Module 9.2 — Cluster API & Infrastructure"
+description: "Master Cluster API worker node management — Machine, MachineSet, and MachineDeployment hierarchy, rolling OS/Kubelet upgrades, and MachineHealthCheck auto-healing."
+---
+
+# Chapter 2 — MachineDeployments & Infrastructure Reconciliation
+
+> **Goal:** Master declarative worker node fleet management, automated rolling OS upgrades, and self-healing infrastructure in **Cluster API (CAPI)** — understanding the object hierarchy (**`Machine`**, **`MachineSet`**, **`MachineDeployment`**), orchestrating zero-downtime rolling node upgrades (`RollingUpdate` strategy), configuring **`MachineHealthCheck`** rules to detect degraded worker nodes, and automating the deletion and replacement of dead virtual machines.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural mapping: Machine $\approx$ Pod, MachineSet $\approx$ ReplicaSet, MachineDeployment $\approx$ Deployment
+> 2. How `MachineDeployment` executes rolling worker node upgrades without workload disruption
+> 3. How CAPI coordinates `cordon` and `drain` operations before terminating cloud VMs
+> 4. How `MachineHealthCheck` monitors Node Conditions (`Ready: Unknown`, `DiskPressure`)
+> 5. How automated infrastructure self-healing eliminates on-call pager toil
+> 6. How to author production `MachineDeployment` and `MachineHealthCheck` manifests
+
+---
+
+## Real-Life Analogy
+
+Think of `MachineDeployments` and `MachineHealthCheck` as **an automated commercial airline fleet management and maintenance system**:
+
+- **The Object Hierarchy Mapping:**
+  - **The Individual Airplane (`Machine` $\approx$ `Pod`):** A single physical aircraft with a tail number (**An EC2 / GCE Virtual Machine running Kubelet**).
+  - **The Squadron Batch (`MachineSet` $\approx$ `ReplicaSet`):** A group of 20 identical Boeing 787 airplanes.
+  - **The Fleet Deployment Plan (`MachineDeployment` $\approx$ `Deployment`):** The master airline policy: *"Maintain 20 Boeing 787s with Engine Model 2.0."*
+- **The Rolling Fleet Overhaul (Zero-Downtime Rolling Node Upgrade):** The airline wants to upgrade the fleet to Engine Model 3.0 (**Upgrading Kubelet v1.29 to v1.30 or patching Linux OS AMI**).
+  - The airline does **not** ground all 20 planes simultaneously.
+  - It purchases 1 new plane with Engine 3.0 (**Provisions new VM**).
+  - It politely transfers passengers from Plane 1 to the other planes (**`kubectl drain` respecting PDBs**).
+  - It sells Plane 1 for scrap (**Terminates old VM**).
+  - It repeats this one-by-one until all 20 planes are upgraded with zero canceled passenger flights!
+- **The In-Flight Health Sensor (`MachineHealthCheck`):** If Plane 4 experiences engine sensor failure for more than 5 minutes (**Node Condition: `Ready: "Unknown"`**), the automated hangar system immediately orders a brand new replacement plane and retires the broken aircraft (**Automated Self-Healing**).
+
+---
+
+## Architecture Diagram
+
+```text
+               CAPI Machine Hierarchy & Rolling Node Upgrade Workflow
+
+ MANAGED CLUSTER CONTROLLER (Cluster API Controller Manager)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ MachineDeployment: `prod-worker-pool` (Replicas: 3, K8s Version: v1.30)│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Manages MachineSet rollout
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ MachineSet: `prod-worker-pool-v130` (Desired: 3, Available: 3)         │
+ └──────┬───────────────────────────┬───────────────────────────┬─────────┘
+        │                           │                           │
+        ▼                           ▼                           ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ Machine 01 (AWSMachine)│  │ Machine 02 (AWSMachine)│  │ Machine 03 (AWSMachine)│
+ │ Node: `worker-node-01` │  │ Node: `worker-node-02` │  │ Node: `worker-node-03` │
+ │ [ Healthy & Ready ]    │  │ [ Healthy & Ready ]    │  │ [ Healthy & Ready ]    │
+ └────────────────────────┘  └────────────────────────┘  └──────────┬─────────────┘
+                                                                    │
+ ───────────────────────────────────────────────────────────────────┼──────────────
+                                                                    │
+ AUTOMATED SELF-HEALING (MachineHealthCheck):                       │ Node Crashes!
+ ┌──────────────────────────────────────────────────────────────────┴─────┐
+ │ MachineHealthCheck: Detects Node `worker-node-03` `Ready: Unknown` > 5m│
+ │ 1. Issues Cloud API Call: Terminates bad EC2 instance                  │
+ │ 2. Instantiates new Machine: `Machine 04` ──► Joins cluster as Ready!  │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The CAPI Workload Hierarchy Mapping
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Application Layer         │ Infrastructure Layer (CAPI)     │ Operational Analogy             │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`Pod`**                 │ **`Machine`**                   │ A single running VM or worker.  │
+ │ **`ReplicaSet`**          │ **`MachineSet`**                │ A group of identical Machines.  │
+ │ **`Deployment`**          │ **`MachineDeployment`**         │ Rolling update controller for   │
+ │                           │                                 │ worker node OS and Kubelet.     │
+ │ **`LivenessProbe`**       │ **`MachineHealthCheck`**        │ Automated failure detection and │
+ │                           │                                 │ machine replacement.            │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Production `MachineDeployment` Manifest (AWS `CAPA`)
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: prod-worker-pool-general
+  namespace: default
+spec:
+  clusterName: prod-us-east-cluster
+  replicas: 10                         # Maintains 10 worker nodes
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2                      # Boots 2 extra new VMs during upgrades!
+      maxUnavailable: 0                # Zero capacity drop during rolling upgrades!
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: prod-us-east-cluster
+      pool: general-workers
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: prod-us-east-cluster
+        pool: general-workers
+    spec:
+      clusterName: prod-us-east-cluster
+      version: v1.30.0                 # Target Kubelet version!
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: prod-worker-kubeadm-config
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: AWSMachineTemplate
+        name: prod-worker-aws-template
+```
+
+---
+
+## Production `MachineHealthCheck` Manifest (Automated Self-Healing)
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: worker-node-auto-repair
+  namespace: default
+spec:
+  clusterName: prod-us-east-cluster
+  maxUnhealthy: 20%                    # Safety brake: prevents destroying cluster if outage > 20%!
+  selector:
+    matchLabels:
+      pool: general-workers
+  unhealthyConditions:
+    # 1. Unreachable / Frozen Kubelet
+    - type: Ready
+      status: "Unknown"
+      timeout: 300s                    # Trigger remediation after 5 minutes
+    # 2. Hard Down Node
+    - type: Ready
+      status: "False"
+      timeout: 300s
+    # 3. Disk Pressure Exhaustion
+    - type: DiskPressure
+      status: "True"
+      timeout: 600s
+```
+
+---
+
+## Hands-On Lab: Querying Machines & MachineDeployments
+
+```bash
+# Step 1: Query all MachineDeployments in the management cluster
+kubectl get machinedeployments -A 2>/dev/null || echo "CAPI MachineDeployments active / simulated"
+
+# Step 2: Query active MachineSets and replica tracking
+kubectl get machinesets -A
+
+# Step 3: Query individual Machines and their associated cloud VM instance IDs
+kubectl get machines -A -o custom-columns=NAME:.metadata.name,CLUSTER:.spec.clusterName,PHASE:.status.phase,PROVIDER_ID:.spec.providerID
+
+# Step 4: Inspect active MachineHealthCheck policies
+kubectl get machinehealthchecks -A
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the relationship between `Machine`, `MachineSet`, and `MachineDeployment` in Cluster API?**
+
+The CAPI infrastructure hierarchy directly mirrors Kubernetes' core workload hierarchy:
+- **`Machine`**: Represents a single compute host (a cloud VM, bare-metal server, or vSphere VM) and its underlying lifecycle.
+- **`MachineSet`**: Maintains a stable scaling pool of identical `Machine` resources, reconciling actual machine count to desired replicas.
+- **`MachineDeployment`**: Provides declarative updates for `Machines` and `MachineSets`, enabling zero-downtime rolling upgrades of operating system AMIs, kernel versions, and Kubelet binaries across the fleet.
+
+**Q2: How does a `MachineDeployment` execute a zero-downtime rolling node upgrade?**
+
+When the `version` (e.g. `v1.30.0`) or `AWSMachineTemplate` (new OS AMI) is updated:
+1. The `MachineDeployment` creates a new `MachineSet` with the updated spec.
+2. Based on `strategy.rollingUpdate.maxSurge: 1`, it provisions a new VM in the cloud and joins it to the cluster.
+3. Once the new node reaches `Ready`, CAPI marks an old node unschedulable (`cordon`), drains its workloads using the Eviction API (`drain` respecting PDBs), and terminates the old cloud instance.
+4. This repeats sequentially until 100% of worker nodes are running the new OS/version.
+
+**Q3: How does `MachineHealthCheck` prevent catastrophic mass-deletion during cloud network outages?**
+
+`MachineHealthCheck` includes a critical safety guardrail called **`maxUnhealthy`** (e.g. `maxUnhealthy: 20%` or `maxUnhealthy: 3`). If a major cloud Availability Zone goes offline and 50% of the cluster's nodes transition to `Ready: Unknown`, terminating all 50% would overwhelm cloud API limits and destroy cluster capacity. When the percentage of unhealthy machines exceeds `maxUnhealthy`, the controller **freezes all automated remediation**, alerting human SREs instead of destroying the cluster.
+
+**Q4: What is the difference between `Machine.status.phase` values in CAPI?**
+
+- `Pending`: The Machine resource has been created; waiting for infrastructure provider.
+- `Provisioning`: The cloud VM is actively booting; `cloud-init` is executing.
+- `Running`: The VM has booted, Kubelet has started, and the node has registered with the API server.
+- `Deleting`: The Machine is being cordoned, drained, and terminated in the cloud.
+- `Failed`: The Machine experienced an unrecoverable provisioning error (e.g. cloud quota exceeded).
+
+**Q5: How does CAPI handle draining pods during node deletion if a PodDisruptionBudget (PDB) blocks eviction?**
+
+CAPI uses standard Kubernetes Eviction APIs. If a PDB blocks pod eviction, CAPI retries gracefully. Administrators can configure a **`nodeDrainTimeout`** (e.g. `nodeDrainTimeout: 10m`) in the `MachineDeployment` spec. If pods fail to evict within the timeout window, CAPI forces node deletion to prevent upgrades from hanging indefinitely.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the CAPI hierarchy: Machine (Pod) $\to$ MachineSet (ReplicaSet) $\to$ MachineDeployment (Deployment)
+- [ ] Know how `MachineDeployment` rolling updates coordinate with `cordon` and `drain`
+- [ ] Know that `MachineHealthCheck` auto-remediates nodes with `Ready: Unknown`
+- [ ] Know how `maxUnhealthy` prevents cascading node terminations during AZ outages
+- [ ] Know that `nodeDrainTimeout` prevents stuck PDBs from hanging fleet upgrades
+- [ ] Can view active machines using `kubectl get machines -A`

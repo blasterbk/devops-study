@@ -1,0 +1,1593 @@
+---
+title: "Chapter 7 — Filter Plugins"
+sidebar_position: 7
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand how Kubernetes eliminates unsuitable Nodes before ranking them. Learn what Filter Plugins are, how they execute, how built-in plugins suc..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 7 — Filter Plugins
+
+> **Goal:** Understand how Kubernetes eliminates unsuitable Nodes before ranking them. Learn what Filter Plugins are, how they execute, how built-in plugins such as `NodeResourcesFit`, `NodeAffinity`, `TaintToleration`, `NodePorts`, `NodeName`, `VolumeBinding`, and `NodeUnschedulable` work, and how Kubernetes efficiently filters thousands of Nodes in production clusters.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What filtering means in the scheduling cycle
+> 2. NodeResourcesFit — checking CPU, memory, and extended resources
+> 3. NodeAffinity — enforcing node label matching rules
+> 4. TaintToleration — enforcing taint/toleration pairs
+> 5. NodePorts — checking host port availability
+> 6. VolumeBinding — checking PVC/PV availability on the node
+> 7. NodeUnschedulable — skipping cordoned nodes
+> 8. Parallel filtering and the percentageOfNodesToScore optimization
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Filter Plugins like a multi-checkpoint security screening at an airport.
+
+```text
+Airport Security Analogy:
+
+Passengers (Pods) must pass ALL checkpoints to board
+ID check (NodeName) -> only specific passengers allowed on this flight
+Baggage size check (NodeResourcesFit) -> must fit in overhead bin
+Liquid check (TaintToleration) -> restricted items require permits
+Visa check (NodeAffinity) -> must have correct labels/credentials
+Gate check (NodePorts) -> gate must be available
+Fail any check -> passenger is rejected from THIS flight
+All checks in parallel for speed
+```
+
+| Airport Security | Filter Plugins |
+| :--- | :--- |
+| Passenger at checkpoint | Pod being evaluated against a Node |
+| ID check | `NodeName` plugin |
+| Baggage size limit | `NodeResourcesFit` plugin |
+| Restricted items / permit | `TaintToleration` plugin |
+| Visa / credential check | `NodeAffinity` plugin |
+| Gate availability | `NodePorts` plugin |
+| Parallel screening lanes | Parallel filter execution |
+
+> **Important:** Filter plugins are evaluated **in parallel across all Nodes** simultaneously, not sequentially. A single plugin failure on one Node does **not** affect evaluation of other Nodes. All Nodes are evaluated — filtering is **not** first-match-wins. The result is a **feasible node list** of all Nodes that passed all plugins.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Scheduler Architecture
+- Scheduling Framework
+- Scheduling Cycle
+- Scheduler Cache
+- Scheduling Queue
+- Node Labels
+- Persistent Volumes
+
+---
+
+# Where Does Filtering Fit?
+
+The Scheduling Framework executes:
+
+```text
+Scheduling Queue
+
+v
+
+PreFilter
+
+v
+
+Filter
+
+v
+
+PreScore
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+
+v
+
+Bind
+```
+
+Filtering is the **first major decision point**.
+
+---
+
+# What Does Filtering Mean?
+
+Filtering answers one simple question:
+
+> **Can this Pod run on this Node?**
+
+Notice the wording.
+
+Not:
+
+> Is this the best Node?
+
+Only:
+
+> Is this Node eligible?
+
+---
+
+# Real-Life Analogy
+
+Imagine applying for a job.
+
+Company requirements:
+
+```text
+Bachelor's Degree
+
+5 Years Experience
+
+Work Visa
+
+English Speaking
+```
+
+Applicants are checked.
+
+Result:
+
+```text
+Qualified
+
+or
+
+Rejected
+```
+
+Only qualified candidates move forward.
+
+Filtering works exactly the same way.
+
+---
+
+# Scheduling Philosophy
+
+Scheduling consists of two steps:
+
+```text
+Filter
+
+v
+
+Who Can Run?
+
+v
+
+Score
+
+v
+
+Who Should Run?
+```
+
+Filtering removes impossible Nodes.
+
+Scoring ranks the remaining Nodes.
+
+---
+
+# Example
+
+Cluster:
+
+```text
+Node1
+
+4 CPU
+
+Node2
+
+8 CPU
+
+Node3
+
+16 CPU
+```
+
+Pod requires:
+
+```text
+8 CPU
+```
+
+Filtering produces:
+
+```text
+Node1
+
+Rejected
+
+Node2
+
+Accepted
+
+Node3
+
+Accepted
+```
+
+Scoring hasn't started yet.
+
+---
+
+# Why Filtering Exists
+
+Imagine skipping filtering.
+
+```text
+100 Nodes
+
+v
+
+Score Every Node
+
+v
+
+Select Winner
+
+v
+
+Oops
+
+Node Doesn't Have Memory
+```
+
+Waste of computation.
+
+Instead:
+
+```text
+Filter
+
+v
+
+Candidate Nodes
+
+v
+
+Score
+```
+
+---
+
+# High-Level Filter Architecture
+
+```text
+               Candidate Nodes
+
+                      |
+
+                      ▼
+
+              Filter Plugins
+
+        ┌─────────────┼─────────────┐
+
+        ▼             ▼             ▼
+
+ Resource Fit   Node Affinity   Volume Check
+
+        ▼             ▼             ▼
+
+     Pass?         Pass?         Pass?
+
+        +--───────────┼─────────────┘
+
+                      ▼
+
+             Remaining Candidate Nodes
+```
+
+---
+
+# Filter Plugin Execution
+
+Every candidate Node is evaluated.
+
+Example:
+
+```text
+Nodes
+
+v
+
+Node1
+
+Node2
+
+Node3
+
+Node4
+```
+
+Each plugin executes against every Node.
+
+---
+
+# Filter Result
+
+Each plugin returns one of two outcomes.
+
+```text
+Pass
+```
+
+or
+
+```text
+Unschedulable
+```
+
+If **any** Filter Plugin rejects the Node,
+
+that Node is immediately removed.
+
+---
+
+# Logical AND
+
+Conceptually:
+
+```text
+Node
+
+v
+
+Plugin A
+
+Pass
+
+v
+
+Plugin B
+
+Pass
+
+v
+
+Plugin C
+
+Reject
+
+v
+
+Node Eliminated
+```
+
+Every Filter Plugin must agree.
+
+---
+
+# Parallel Filtering
+
+Suppose:
+
+```text
+1,000 Nodes
+```
+
+The Scheduler does **not** evaluate them sequentially.
+
+Instead:
+
+```text
+1,000 Nodes
+
+v
+
+Parallel Workers
+
+v
+
+Filter Plugins
+
+v
+
+Results
+```
+
+This is one of Kubernetes' biggest scheduling optimizations.
+
+---
+
+# Built-in Filter Plugins
+
+Modern Kubernetes includes many built-in Filter Plugins.
+
+Examples:
+
+```text
+NodeResourcesFit
+
+NodeAffinity
+
+TaintToleration
+
+NodePorts
+
+NodeName
+
+VolumeBinding
+
+NodeUnschedulable
+
+InterPodAffinity
+
+PodTopologySpread
+```
+
+We'll study the major ones.
+
+---
+
+# NodeResourcesFit
+
+This is one of the most frequently executed Filter Plugins.
+
+Purpose:
+
+```text
+Can this Node satisfy
+the Pod's resource requests?
+```
+
+---
+
+# What Does It Check?
+
+Examples:
+
+```text
+CPU
+
+Memory
+
+Ephemeral Storage
+
+Extended Resources
+
+Huge Pages
+```
+
+---
+
+# Example
+
+Node:
+
+```text
+CPU
+
+4
+
+Memory
+
+8 GB
+```
+
+Pod requests:
+
+```yaml
+resources:
+  requests:
+    cpu: 6
+    memory: 2Gi
+```
+
+Result:
+
+```text
+Rejected
+
+v
+
+Not Enough CPU
+```
+
+---
+
+# Another Example
+
+Node:
+
+```text
+16 CPU
+
+64 GB
+```
+
+Pod:
+
+```text
+4 CPU
+
+8 GB
+```
+
+Result:
+
+```text
+Pass
+```
+
+---
+
+# Requested vs Actual Usage
+
+Very important:
+
+NodeResourcesFit evaluates:
+
+```text
+Requested Resources
+```
+
+Not:
+
+```text
+Actual Runtime Usage
+```
+
+Suppose:
+
+```text
+Pod Requests
+
+4 CPU
+
+Actually Uses
+
+1 CPU
+```
+
+Scheduler still reserves:
+
+```text
+4 CPU
+```
+
+---
+
+# Why?
+
+Because Kubernetes schedules based on guarantees,
+
+not current consumption.
+
+Otherwise:
+
+```text
+All Pods
+
+v
+
+Actual Usage
+
+v
+
+Sudden CPU Spike
+
+v
+
+Cluster Instability
+```
+
+---
+
+# NodeAffinity Plugin
+
+Purpose:
+
+```text
+Does the Node
+match the Pod's affinity rules?
+```
+
+---
+
+# Example
+
+Pod:
+
+```yaml
+nodeSelector:
+  region: us-east
+```
+
+Node:
+
+```yaml
+labels:
+  region: us-west
+```
+
+Result:
+
+```text
+Rejected
+```
+
+---
+
+# Another Example
+
+Pod:
+
+```yaml
+requiredDuringSchedulingIgnoredDuringExecution:
+```
+
+Requires:
+
+```text
+ssd=true
+```
+
+Node:
+
+```text
+ssd=true
+```
+
+Result:
+
+```text
+Pass
+```
+
+---
+
+# Why Affinity Matters
+
+Production clusters often dedicate Nodes for:
+
+```text
+GPU
+
+AI
+
+Database
+
+SSD
+
+High Memory
+
+ARM
+
+Compliance
+```
+
+Affinity ensures workloads land on appropriate hardware.
+
+---
+
+# TaintToleration Plugin
+
+Purpose:
+
+```text
+Can this Pod tolerate
+the Node's taints?
+```
+
+---
+
+# Example
+
+Node:
+
+```text
+gpu=true:NoSchedule
+```
+
+Pod:
+
+No toleration.
+
+Result:
+
+```text
+Rejected
+```
+
+---
+
+# Matching Example
+
+Node:
+
+```text
+gpu=true:NoSchedule
+```
+
+Pod:
+
+```yaml
+tolerations:
+- key: gpu
+```
+
+Result:
+
+```text
+Pass
+```
+
+---
+
+# Why Taints Exist
+
+Taints protect Nodes.
+
+Example:
+
+```text
+Production Database Node
+```
+
+Without taints:
+
+Any Pod
+
+could schedule there.
+
+With taints:
+
+Only authorized Pods.
+
+---
+
+# NodePorts (HostPorts) Plugin
+
+Purpose:
+
+```text
+Does another Pod
+already use
+the requested HostPort?
+```
+
+---
+
+# Example
+
+Node:
+
+```text
+Port 8080
+
+Already Used
+```
+
+New Pod:
+
+```yaml
+hostPort: 8080
+```
+
+Result:
+
+```text
+Rejected
+```
+
+---
+
+# Why?
+
+HostPorts belong to:
+
+```text
+The Node
+
+Not
+
+The Pod
+```
+
+Only one Pod can bind the same HostPort on the same Node.
+
+---
+
+# Example
+
+Node:
+
+```text
+HostPort
+
+80
+
+Occupied
+```
+
+New Pod:
+
+```yaml
+hostPort: 80
+```
+
+Scheduler removes that Node.
+
+---
+
+# NodeName Plugin
+
+Sometimes users explicitly specify:
+
+```yaml
+spec:
+  nodeName: worker-5
+```
+
+---
+
+# What Happens?
+
+Scheduler checks:
+
+```text
+Current Node
+
+v
+
+worker-5?
+
+v
+
+Yes
+
+v
+
+Pass
+
+No
+
+v
+
+Reject
+```
+
+---
+
+# Important Note
+
+Normally, Pods with `spec.nodeName` already set are **not scheduled** by the default Scheduler because they are considered pre-assigned. The `NodeName` filtering logic is primarily relevant in scheduling flows where a specific target node must be validated.
+
+---
+
+# Why Use nodeName?
+
+Typical scenarios:
+
+- Debugging
+- Static workloads
+- Custom schedulers
+- Special operational tasks
+
+It is generally **not recommended** for normal application deployments because it bypasses the Scheduler's placement logic.
+
+---
+
+# VolumeBinding Plugin
+
+Storage constraints matter.
+
+Question:
+
+```text
+Can the required volume
+be attached
+to this Node?
+```
+
+---
+
+# Example
+
+Persistent Volume:
+
+```text
+Zone
+
+us-east-1a
+```
+
+Node:
+
+```text
+Zone
+
+us-west-2b
+```
+
+Result:
+
+```text
+Rejected
+```
+
+---
+
+# Another Example
+
+Volume:
+
+```text
+Already Attached
+
+To Another Node
+```
+
+Result:
+
+```text
+Rejected
+```
+
+---
+
+# Why Storage Filtering Matters
+
+Without storage validation:
+
+```text
+Pod Scheduled
+
+v
+
+Volume Cannot Mount
+
+v
+
+Pod Never Starts
+```
+
+Filtering prevents invalid placements.
+
+---
+
+# NodeUnschedulable Plugin
+
+Every Node contains:
+
+```yaml
+spec:
+  unschedulable: true
+```
+
+or
+
+```yaml
+spec:
+  unschedulable: false
+```
+
+---
+
+# Example
+
+Administrator runs:
+
+```bash
+kubectl cordon worker-7
+```
+
+Node becomes:
+
+```text
+Unschedulable
+```
+
+---
+
+# Result
+
+Scheduler:
+
+```text
+Reject
+
+worker-7
+```
+
+Existing Pods continue running.
+
+New Pods are not placed there.
+
+---
+
+# Cordon vs Drain
+
+```text
+Cordon
+
+v
+
+No New Pods
+
+Existing Pods Continue
+```
+
+```text
+Drain
+
+v
+
+Evict Existing Pods
+
+v
+
+Node Empty
+```
+
+NodeUnschedulable only considers the cordon state.
+
+---
+
+# Filter Execution Order
+
+The Scheduler executes multiple plugins.
+
+Conceptually:
+
+```text
+Candidate Node
+
+v
+
+NodeUnschedulable
+
+v
+
+NodeName
+
+v
+
+NodeAffinity
+
+v
+
+NodeResourcesFit
+
+v
+
+VolumeBinding
+
+v
+
+NodePorts
+
+v
+
+TaintToleration
+
+v
+
+Pass?
+```
+
+**Important:** The exact ordering of built-in Filter Plugins is determined by the Scheduler Profile configuration. The sequence above is illustrative, showing how multiple filters cooperate—not a guaranteed execution order in every Kubernetes release.
+
+---
+
+# Why Ordering Matters
+
+Suppose:
+
+Node:
+
+```text
+Unschedulable
+```
+
+No reason to evaluate:
+
+- CPU
+- Memory
+- Volumes
+- Ports
+
+Reject immediately.
+
+Early elimination saves computation.
+
+---
+
+# Short-Circuit Evaluation
+
+Once a plugin rejects a Node:
+
+```text
+Node
+
+v
+
+Rejected
+
+v
+
+Stop Further Checks
+```
+
+Remaining Filter Plugins do not need to evaluate that Node.
+
+This improves scheduling performance.
+
+---
+
+# Complete Filtering Workflow
+
+```text
+Scheduling Snapshot
+
+v
+
+Candidate Nodes
+
+v
+
+Parallel Filter Plugins
+
+v
+
+Rejected Nodes Removed
+
+v
+
+Remaining Candidate Nodes
+
+v
+
+PreScore
+
+v
+
+Score
+```
+
+---
+
+# Production Example 1
+
+Cluster:
+
+```text
+100 Nodes
+```
+
+Pod:
+
+```yaml
+cpu: 8
+memory: 32Gi
+```
+
+Filter results:
+
+```text
+100 Nodes
+
+v
+
+NodeResourcesFit
+
+v
+
+24 Nodes
+
+v
+
+NodeAffinity
+
+v
+
+18 Nodes
+
+v
+
+VolumeBinding
+
+v
+
+12 Nodes
+
+v
+
+TaintToleration
+
+v
+
+10 Nodes
+
+v
+
+Score Phase
+```
+
+Filtering dramatically reduces the search space.
+
+---
+
+# Production Example 2
+
+AI Cluster
+
+Nodes:
+
+```text
+GPU Nodes
+
+CPU Nodes
+```
+
+Pod:
+
+```yaml
+nodeSelector:
+  accelerator: nvidia
+```
+
+Result:
+
+```text
+CPU Nodes
+
+v
+
+Rejected
+
+GPU Nodes
+
+v
+
+Continue
+```
+
+---
+
+# Production Example 3
+
+Database Cluster
+
+Nodes:
+
+```text
+SSD
+
+HDD
+```
+
+Pod:
+
+```yaml
+nodeAffinity:
+  disk=ssd
+```
+
+Only SSD Nodes survive filtering.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+Scheduler Queue
+
+v
+
+Scheduling Cycle
+
+v
+
+Scheduler Cache Snapshot
+
+v
+
+PreFilter
+
+v
+
+Filter Plugins
+
+v
+
+Remaining Nodes
+
+v
+
+Score Plugins
+
+v
+
+Binding Cycle
+```
+
+Filtering is the gateway to scoring.
+
+---
+
+# Performance Considerations
+
+Large production clusters may have:
+
+```text
+10,000 Nodes
+```
+
+Without filtering:
+
+```text
+Score
+
+10,000 Nodes
+```
+
+With filtering:
+
+```text
+10,000 Nodes
+
+v
+
+Filter
+
+v
+
+120 Nodes
+
+v
+
+Score
+
+120 Nodes
+```
+
+The Scheduler performs far less work.
+
+---
+
+# Production Best Practices
+
+✔ Always define realistic CPU and memory requests.
+
+✔ Use `nodeAffinity` instead of hardcoding `nodeName` for most workloads.
+
+✔ Reserve specialized Nodes using taints and tolerations.
+
+✔ Use `kubectl cordon` before maintenance.
+
+✔ Keep storage topology aligned with workload requirements.
+
+✔ Avoid unnecessary `hostPort` usage when Services can be used instead.
+
+✔ Prefer labels and affinity for flexible scheduling policies.
+
+✔ Monitor scheduling failures to identify recurring Filter Plugin rejections.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Filtering selects the best Node.
+
+Wrong.
+
+Filtering only removes unsuitable Nodes.
+
+Scoring selects the best Node.
+
+---
+
+### ❌ Misconception 2
+
+NodeResourcesFit uses actual CPU usage.
+
+Wrong.
+
+It evaluates requested resources, not real-time utilization.
+
+---
+
+### ❌ Misconception 3
+
+A Node passes if most Filter Plugins succeed.
+
+Wrong.
+
+Every required Filter Plugin must pass.
+
+One rejection eliminates the Node.
+
+---
+
+### ❌ Misconception 4
+
+`nodeName` is the recommended way to target a Node.
+
+Wrong.
+
+It bypasses normal scheduling and is intended for special cases.
+
+---
+
+### ❌ Misconception 5
+
+Taints move Pods away from Nodes.
+
+Wrong.
+
+Taints prevent new Pods from being scheduled unless they tolerate the taint. Existing Pods are handled by taint effects and controllers, depending on the effect.
+
+---
+
+### ❌ Misconception 6
+
+`hostPort` conflicts are detected by kubelet.
+
+Wrong.
+
+The Scheduler checks HostPort conflicts before assigning the Pod.
+
+---
+
+### ❌ Misconception 7
+
+Filter Plugins always execute sequentially across all Nodes.
+
+Wrong.
+
+The Scheduler evaluates many candidate Nodes in parallel to improve throughput.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the purpose of Filter Plugins?
+
+To eliminate Nodes that cannot run the Pod before scoring begins.
+
+---
+
+### Q2. What is the difference between filtering and scoring?
+
+Filtering determines feasibility. Scoring ranks feasible Nodes.
+
+---
+
+### Q3. Does `NodeResourcesFit` use actual resource usage?
+
+No. It evaluates requested resources and allocatable capacity.
+
+---
+
+### Q4. What does the `NodeAffinity` plugin check?
+
+Whether a Node satisfies the Pod's required affinity or selector rules.
+
+---
+
+### Q5. What is the purpose of the `TaintToleration` plugin?
+
+To ensure the Pod can tolerate the Node's taints before scheduling.
+
+---
+
+### Q6. Why does the Scheduler check HostPorts?
+
+To prevent multiple Pods from using the same HostPort on the same Node.
+
+---
+
+### Q7. What happens if a Node is cordoned?
+
+The `NodeUnschedulable` plugin filters it out for new scheduling decisions.
+
+---
+
+### Q8. Why is short-circuit evaluation important?
+
+Once a Node fails a Filter Plugin, additional filter checks are unnecessary, reducing scheduling overhead.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod remains Pending | All candidate Nodes were rejected by one or more Filter Plugins |
+| "Insufficient CPU" events | `NodeResourcesFit` rejected all Nodes |
+| "Node(s) didn't match node affinity" | `NodeAffinity` filter failed |
+| "Node(s) had taint ..." | `TaintToleration` rejected available Nodes |
+| HostPort conflict | Another Pod already reserves the requested HostPort on candidate Nodes |
+| PVC scheduling failures | `VolumeBinding` could not satisfy storage constraints |
+| Node skipped unexpectedly | Node is cordoned or marked unschedulable |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is the purpose of Filter Plugins?
+2. Why is filtering performed before scoring?
+3. What does `NodeResourcesFit` evaluate?
+4. Why does Kubernetes schedule based on requested resources rather than actual usage?
+5. What does the `NodeAffinity` plugin validate?
+6. How do taints and tolerations affect filtering?
+7. Why are HostPort conflicts checked during scheduling?
+8. What is the role of the `VolumeBinding` plugin?
+9. How does the `NodeUnschedulable` plugin behave when a Node is cordoned?
+10. Why does the Scheduler stop evaluating a Node after a filter rejection?
+11. Why are Filter Plugins executed in parallel across candidate Nodes?
+12. How does filtering improve scheduling performance?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes determines **where a Pod cannot run** before deciding **where it should run**.
+
+You learned:
+
+- The purpose of Filter Plugins in the Scheduling Framework
+- How filtering eliminates infeasible Nodes before scoring
+- How `NodeResourcesFit` validates requested resources
+- How `NodeAffinity` enforces placement policies
+- How `TaintToleration` protects dedicated Nodes
+- How HostPort conflicts are detected before binding
+- How `NodeName` and `NodeUnschedulable` influence scheduling
+- How `VolumeBinding` ensures storage compatibility
+- How short-circuit evaluation and parallel execution improve performance
+
+Filter Plugins dramatically reduce the number of candidate Nodes, allowing the Scheduler to focus its more expensive scoring algorithms only on Nodes that are actually capable of running the Pod.
+
+---
+
+# Next Chapter
+
+**Chapter 8 — Score Plugins**
+
+In the next chapter, we'll study how Kubernetes chooses the **best** Node after filtering.
+
+Topics include:
+
+- What is Scoring?
+- Score Plugin Architecture
+- NodeResourcesBalancedAllocation
+- NodeResourcesFit (Scoring Strategies)
+- ImageLocality
+- PodTopologySpread
+- InterPodAffinity Scoring
+- Score Normalization
+- Plugin Weights
+- Final Score Aggregation
+- Production Scoring Examples
+
+You'll learn how Kubernetes transforms a list of feasible Nodes into a single optimal placement decision using weighted scoring algorithms.
+```

@@ -1,0 +1,392 @@
+---
+title: "Chapter 4 — TLS Termination"
+sidebar_position: 4
+module: "Module 2.5 — Ingress"
+description: "Deep dive into TLS termination at the Ingress layer — how certificates are stored in Kubernetes Secrets, cert-manager for automated certificate lifecycle, TLS passthrough for end-to-end encryption, mTLS (mutual TLS), and certificate rotation."
+---
+
+# Chapter 4 — TLS Termination at the Ingress Layer
+
+> **Goal:** Understand how Ingress Controllers terminate TLS connections, how certificates are stored and referenced from Kubernetes Secrets, how cert-manager automates the full certificate lifecycle, and when to use TLS termination vs TLS passthrough.
+>
+> By the end of this chapter, you will understand:
+> 1. What TLS termination is and where it happens in the request path
+> 2. How TLS certificates are stored in Kubernetes Secrets (tls type)
+> 3. How to reference TLS certificates in Ingress resources
+> 4. cert-manager — automatic certificate issuance and renewal
+> 5. TLS passthrough — when you need end-to-end encryption
+> 6. Mutual TLS (mTLS) for client certificate authentication
+
+---
+
+## Real-Life Analogy
+
+TLS termination at the Ingress is like **customs at an airport**:
+
+All international passengers (HTTPS requests) pass through customs (Ingress/TLS termination). The customs officer checks the passport (TLS handshake, certificate verification), decrypts the luggage for inspection (decryption), stamps the passport (connection established), and then sends the passenger on the domestic flight (unencrypted HTTP) to their final destination (backend Pod).
+
+The backend doesn't deal with international travel documents (TLS). It only handles domestic passengers (plain HTTP). This is simpler and faster for the backend — but the internal journey (from Ingress to backend) is unencrypted.
+
+For **TLS passthrough**: passengers go through customs but their carry-on is sealed with a private lock. Customs can't inspect the contents — they just verify the passport (SNI) and send the passenger directly to the gate. The final destination opens the sealed bag.
+
+---
+
+## Architecture Diagram
+
+```text
+              TLS Termination vs TLS Passthrough
+
+TLS Termination (default):
+  Client ──── HTTPS (encrypted) ────▶ Ingress Controller
+                                         │ Decrypt (using cert)
+                                         │ Inspect/route based on HTTP headers
+                                         ▼
+                                      Backend Pod ◀── HTTP (unencrypted)
+
+TLS Passthrough:
+  Client ──── HTTPS (encrypted) ────▶ Ingress Controller
+                                         │ Route by SNI only (TCP level)
+                                         │ Cannot inspect HTTP headers
+                                         ▼
+                                      Backend Pod ◀── HTTPS (still encrypted)
+                                      (Backend handles decryption)
+```
+
+---
+
+## Storing Certificates as Kubernetes Secrets
+
+TLS certificates must be stored as Kubernetes Secrets of type `kubernetes.io/tls`:
+
+```yaml
+# Create secret from existing certificate files
+kubectl create secret tls api-tls-cert \
+  --cert=fullchain.pem \
+  --key=privkey.pem \
+  -n production
+
+# Or create manually
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-tls-cert
+  namespace: production
+type: kubernetes.io/tls
+data:
+  tls.crt: |  # Base64-encoded PEM certificate (full chain)
+    LS0tLS1CRUdJTi... (base64 of fullchain.pem)
+  tls.key: |  # Base64-encoded private key
+    LS0tLS1CRUdJTi... (base64 of privkey.pem)
+```
+
+```bash
+# Inspect the certificate stored in the Secret
+kubectl get secret api-tls-cert -n production \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+  openssl x509 -noout -subject -issuer -dates
+# subject=CN=api.example.com
+# issuer=C=US, O=Let's Encrypt, CN=R3
+# notBefore=Jan  1 00:00:00 2024 GMT
+# notAfter=Apr  1 00:00:00 2024 GMT
+```
+
+---
+
+## Referencing TLS in Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-ingress
+  namespace: production
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.example.com
+    - www.api.example.com    # Multiple hostnames in one cert (SAN)
+    secretName: api-tls-cert # Must be in the same namespace
+  - hosts:
+    - web.example.com
+    secretName: web-tls-cert  # Different cert for different domain
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+The Ingress Controller:
+1. Reads the Secret's `tls.crt` and `tls.key`
+2. Configures NGINX/Traefik/HAProxy to use these for the specified hosts
+3. HTTP → HTTPS redirect is typically enabled automatically (controller-dependent)
+
+---
+
+## cert-manager: Automated Certificate Lifecycle
+
+cert-manager is the de-facto standard for automated TLS in Kubernetes. It:
+- Issues certificates from Let's Encrypt, HashiCorp Vault, Venafi, or self-signed CAs
+- Stores them as Kubernetes Secrets
+- Monitors expiry and renews automatically (typically 30 days before expiry)
+
+### Installation
+
+```bash
+# Install cert-manager
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
+
+# Or via Helm
+helm repo add jetstack https://charts.jetstack.io
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set installCRDs=true
+
+# Verify
+kubectl get pods -n cert-manager
+```
+
+### ClusterIssuer: Let's Encrypt
+
+```yaml
+# Production Let's Encrypt ClusterIssuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-key
+    solvers:
+    - http01:
+        ingress:
+          class: nginx    # HTTP-01 challenge via NGINX Ingress
+---
+# Staging (for testing — unlimited requests, invalid cert)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-key
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+```
+
+### DNS-01 Challenge for Wildcard Certificates
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-dns
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-dns-key
+    solvers:
+    - dns01:
+        route53:
+          region: us-east-1
+          accessKeyIDSecretRef:
+            name: route53-credentials
+            key: access-key-id
+          secretAccessKeySecretRef:
+            name: route53-credentials
+            key: secret-access-key
+```
+
+### Ingress with cert-manager Annotation
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-ingress
+  namespace: production
+  annotations:
+    # cert-manager automatically creates and manages the Secret
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls-cert   # cert-manager creates this Secret
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+cert-manager creates a `Certificate` object and `CertificateRequest`, performs the ACME challenge, and stores the issued certificate in the specified Secret.
+
+---
+
+## TLS Passthrough
+
+For backends that must handle TLS themselves (e.g., mutual TLS to backends, database SSL):
+
+```yaml
+# NGINX Ingress: SSL passthrough (routes by SNI, TCP level)
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+spec:
+  tls:
+  - hosts:
+    - db.example.com
+  rules:
+  - host: db.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: postgres-service
+            port:
+              number: 5432
+```
+
+With passthrough:
+- NGINX cannot inspect or modify HTTP headers (it's TCP, not HTTP)
+- The TLS certificate is NOT in a Kubernetes Secret — the backend provides it
+- SNI-based routing only (hostname from TLS ClientHello)
+- Cannot use path-based routing (paths require HTTP layer access)
+
+---
+
+## Mutual TLS (mTLS)
+
+mTLS requires clients to present a certificate (not just servers):
+
+```yaml
+# NGINX Ingress: require client certificate
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/auth-tls-secret: "production/ca-secret"
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-verify-depth: "1"
+    # Pass client certificate info to backend as headers
+    nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+```
+
+```yaml
+# Create the CA certificate Secret for client verification
+kubectl create secret generic ca-secret \
+  --from-file=ca.crt=ca.pem \
+  -n production
+```
+
+Backend receives headers:
+- `X-SSL-Client-Cert` — client certificate PEM
+- `X-SSL-Client-S-DN` — client certificate subject DN
+- `X-SSL-Client-I-DN` — client certificate issuer DN
+
+---
+
+## Hands-On: Certificate Debugging
+
+```bash
+# 1. Check Certificate status (cert-manager)
+kubectl get certificate -n production
+# NAME           READY  SECRET         AGE
+# api-tls-cert   True   api-tls-cert   1h  ← Ready means cert is valid
+
+kubectl describe certificate api-tls-cert -n production
+# Status.Conditions: Ready=True
+# Status.NotAfter: 2024-04-01T00:00:00Z  ← Expiry date
+
+# 2. Check CertificateRequest (the ACME request)
+kubectl get certificaterequest -n production
+
+# 3. Check ACME challenge (HTTP-01)
+kubectl get challenge -n production
+# If stuck in "pending": ACME server can't reach /.well-known/acme-challenge/
+
+# 4. Manually test TLS on the Ingress
+openssl s_client -connect api.example.com:443 -servername api.example.com
+# Check: Certificate chain, expiry, issuer
+
+# 5. Test certificate without DNS (using node IP)
+curl -k --resolve api.example.com:443:192.168.1.10 https://api.example.com/
+
+# 6. Check cert-manager controller logs
+kubectl logs -n cert-manager cert-manager-<id> | grep -i "error\|fail"
+
+# 7. Force certificate renewal (for testing)
+kubectl annotate certificate api-tls-cert \
+  cert-manager.io/issuer-name=letsencrypt-prod \
+  --overwrite -n production
+# Or delete the CertificateRequest to force re-issue
+kubectl delete certificaterequest -n production --all
+
+# 8. View certificate in the Secret
+kubectl get secret api-tls-cert -n production -o jsonpath='{.data.tls\.crt}' | \
+  base64 -d | openssl x509 -noout -text | grep -E "Subject:|DNS:|Not After"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does Kubernetes store TLS certificates and how does the Ingress Controller use them?**
+
+TLS certificates are stored as Kubernetes Secrets of type `kubernetes.io/tls` with two fields: `tls.crt` (base64-encoded PEM certificate chain) and `tls.key` (base64-encoded private key). The Ingress Controller mounts or reads these Secrets and configures the underlying proxy (NGINX, HAProxy, etc.) to use the certificate for the specified hosts. When the Secret is updated (e.g., by cert-manager on renewal), the controller detects the change and reloads the certificate.
+
+**Q2: What is cert-manager and what problem does it solve?**
+
+cert-manager is a Kubernetes controller that automates the complete TLS certificate lifecycle: it requests certificates from CAs (Let's Encrypt, Vault, etc.) by performing ACME challenges (HTTP-01 or DNS-01), stores the issued certificate as a Kubernetes Secret, monitors certificate expiry, and automatically renews before expiry (default: 30 days before). Without cert-manager, teams manually obtain certificates, store them as Secrets, and set calendar reminders for renewal — a fragile, error-prone process that cert-manager eliminates entirely.
+
+**Q3: What is the difference between the HTTP-01 and DNS-01 ACME challenges?**
+
+**HTTP-01**: Let's Encrypt verifies domain ownership by checking that a specific file is accessible at `http://<domain>/.well-known/acme-challenge/<token>`. cert-manager creates a temporary Ingress rule to serve this file. Requires the domain to be publicly accessible on port 80. Cannot issue wildcard certificates.
+
+**DNS-01**: Let's Encrypt verifies domain ownership by checking for a specific TXT record in the domain's DNS. cert-manager creates this record via cloud DNS APIs (Route53, Cloud DNS, etc.). Works behind firewalls (no port 80 required) and supports wildcard certificates (`*.example.com`).
+
+**Q4: When should you use TLS passthrough instead of TLS termination?**
+
+Use passthrough when: (1) the backend must see the client's original TLS certificate (for end-to-end mTLS where the backend verifies client identity), (2) the backend handles its own TLS for compliance reasons (the decrypted payload must not traverse Kubernetes nodes), (3) you're proxying database connections that speak TLS (PostgreSQL, MySQL with SSL). Trade-off: passthrough is TCP-level routing only — you lose HTTP header inspection, path-based routing, and the ability to add security headers.
+
+**Q5: How does cert-manager renew certificates without downtime?**
+
+cert-manager renews the certificate by creating a new `CertificateRequest` before the old certificate expires (default: 30 days before expiry). The new certificate is issued and stored in the same Kubernetes Secret, replacing the old one. The Ingress Controller watches for Secret updates and performs a live certificate reload — in NGINX Ingress this is done without a full nginx restart (nginx gracefully reloads the TLS context). The old certificate continues to serve until the new one is loaded.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know TLS certificates are stored as `kubernetes.io/tls` Secrets (`tls.crt` + `tls.key`)
+- [ ] Understand TLS termination: Ingress decrypts, backend receives plain HTTP
+- [ ] Understand TLS passthrough: Ingress routes by SNI (TCP), backend decrypts
+- [ ] Know cert-manager's role: issue, store, renew certificates from Let's Encrypt/Vault
+- [ ] Know HTTP-01 (public HTTP port 80, no wildcards) vs DNS-01 (DNS API, supports wildcards) ACME challenges
+- [ ] Understand mTLS: client presents a certificate, verified against a CA Secret
+- [ ] Can debug with `kubectl describe certificate`, `kubectl get challenge`, and `openssl s_client`

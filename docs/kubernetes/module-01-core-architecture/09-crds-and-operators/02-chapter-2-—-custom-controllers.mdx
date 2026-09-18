@@ -1,0 +1,1457 @@
+---
+title: "Chapter 2 — Custom Controllers"
+sidebar_position: 2
+module: "Module 1.9 — CRDs & Operators"
+description: "> **Goal:** Understand how Kubernetes Controllers continuously watch the cluster, compare the desired state with the actual state, and automatically reconcile a..."
+---
+
+# Module 1.9 — CRDs & Operators
+
+# Chapter 2 — Custom Controllers
+
+> **Goal:** Understand how Kubernetes Controllers continuously watch the cluster, compare the desired state with the actual state, and automatically reconcile any differences. By the end of this chapter, you'll understand the architecture behind every Kubernetes controller—from the Deployment Controller to production Operators like cert-manager, Prometheus Operator, Crossplane, and Argo CD.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. The fundamental control loop: Watch, Informer, WorkQueue, Reconcile
+> 2. Shared Informer caching: reducing API Server load through local IndexedStores
+> 3. WorkQueue mechanics: rate limiting, deduplication, and exponential backoff
+> 4. Event handlers (Add/Update/Delete) and enqueueing resource keys
+> 5. Desired State (spec) vs Observed State (status) reconciliation
+> 6. Handling transient failures vs non-retryable configuration errors
+> 7. Leader election for high availability without split-brain reconciliation
+> 8. Production Operator design patterns across cert-manager, Crossplane, and Argo CD
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of a Custom Controller like a specialized building maintenance manager.
+
+```text
+Building Maintenance Manager Analogy:
+
+Tenant submits a maintenance ticket: "Set up a high-security server room" (Custom Resource)
+Ticket manager places the request into an urgent task tray (WorkQueue)
+Maintenance manager (Reconciler) inspects the actual room:
+  - Is air conditioning running? No -> turn it on (Create Child Resource: Deployment)
+  - Are security cameras installed? No -> install them (Create Service / Secret)
+  - Is access card active? Yes -> do nothing (idempotency check)
+Manager stamps the ticket as "Active & Healthy" (Update Status Subresource)
+Manager checks the room periodically to ensure everything remains operational (Drift detection)
+```
+
+| Building Maintenance | Custom Controller |
+| :--- | :--- |
+| Work order ticket | Custom Resource instance |
+| Task tray | Rate-limiting WorkQueue |
+| Maintenance manager | Reconcile loop (`Reconcile(ctx, req)`) |
+| Inspecting room hardware | Cache / Indexer lookup for actual state |
+| Installing missing equipment | Creating child resources (`k8sClient.Create()`) |
+| Status stamp on ticket | Status Subresource update (`k8sClient.Status().Update()`) |
+| Periodic room inspection | Informer periodic resync & drift correction |
+
+> **Important:** Custom controllers should **never poll or make direct `GET` requests to the API Server** during normal reconciliation. Instead, always read through the **Informer Cache (Indexer)**. Direct API calls bypass the local cache and will overload `kube-apiserver` and etcd when reconciling large fleets of resources. Only write operations (`Create`, `Update`, `Patch`, `Delete`) should hit the API server directly.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Kubernetes API Server
+- API Machinery
+- Watches
+- Shared Informers
+- WorkQueues
+- CRDs
+- etcd
+
+---
+
+# Where This Chapter Fits
+
+In Chapter 1, we learned that a CRD only defines a **new API object**.
+
+For example:
+
+```text
+DatabaseCluster
+```
+
+After creating the CRD, Kubernetes can now store objects like:
+
+```yaml
+apiVersion: database.example.com/v1
+kind: DatabaseCluster
+metadata:
+  name: production-db
+```
+
+But...
+
+Will Kubernetes automatically create a database?
+
+**No.**
+
+Why?
+
+Because a CRD only extends the API.
+
+It does **not** contain any business logic.
+
+That responsibility belongs to a **Controller**.
+
+---
+
+# The Problem
+
+Suppose we create:
+
+```yaml
+kind: DatabaseCluster
+
+spec:
+  replicas: 3
+```
+
+The API Server stores it.
+
+```text
+kubectl
+  |
+  v
+API Server
+  |
+  v
+etcd
+```
+
+And then...
+
+Nothing happens.
+
+Why?
+
+Because no component is watching this resource.
+
+---
+
+# The Kubernetes Solution
+
+Kubernetes introduces a Controller.
+
+```text
+DatabaseCluster
+  |
+  v
+Watch
+  |
+  v
+Controller
+  |
+  v
+Create Resources
+```
+
+The controller continuously watches the cluster and performs the required actions.
+
+---
+
+# What is a Controller?
+
+A Controller is a control loop.
+
+It continuously performs three actions:
+
+```text
+Observe
+  |
+  v
+Compare
+  |
+  v
+Act
+```
+
+This repeats forever.
+
+Unlike traditional applications,
+
+Controllers **never finish**.
+
+They run continuously for the lifetime of the cluster.
+
+---
+
+# Real Kubernetes Controllers
+
+Everything in Kubernetes is built using controllers.
+
+Examples:
+
+```text
+Deployment Controller
+  |
+  v
+ReplicaSets
+  |
+  v
+Pods
+```
+
+---
+
+```text
+Job Controller
+  |
+  v
+Pods
+```
+
+---
+
+```text
+StatefulSet Controller
+  |
+  v
+Pods
+```
+
+---
+
+```text
+Node Controller
+  |
+  v
+Nodes
+```
+
+---
+
+```text
+Certificate Controller
+  |
+  v
+Secrets
+```
+
+(cert-manager)
+
+---
+
+# The Universal Pattern
+
+Every Kubernetes controller follows the same architecture.
+
+```text
+Watch
+  |
+  v
+Queue
+  |
+  v
+Reconcile
+  |
+  v
+Update Cluster
+  |
+  v
+Repeat
+```
+
+This pattern is used throughout Kubernetes.
+
+---
+
+# Why Controllers Exist
+
+Imagine Kubernetes without controllers.
+
+User creates:
+
+```text
+Deployment
+  |
+  v
+replicas = 5
+```
+
+Who creates Pods?
+
+Nobody.
+
+The Deployment object would simply sit inside etcd.
+
+Controllers bring Kubernetes objects to life.
+
+---
+
+# Desired State vs Actual State
+
+The most important concept in Kubernetes.
+
+Desired State:
+
+```yaml
+replicas: 5
+```
+
+Actual State:
+
+```text
+Running Pods = 3
+```
+
+Difference:
+
+```text
+Missing 2 Pods
+```
+
+Controller action:
+
+```text
+Create 2 Pods
+```
+
+---
+
+# Another Example
+
+Desired:
+
+```text
+3 Pods
+```
+
+Actual:
+
+```text
+5 Pods
+```
+
+Controller:
+
+```text
+Delete 2 Pods
+```
+
+Controllers continuously eliminate this difference.
+
+---
+
+# Continuous Reconciliation
+
+The Controller never assumes the cluster stays correct.
+
+Instead:
+
+```text
+Observe
+  |
+  v
+Compare
+  |
+  v
+Difference?
+  |
+  v
+Fix
+  |
+  v
+Repeat
+```
+
+This infinite loop is called **Reconciliation**.
+
+---
+
+# High-Level Controller Architecture
+
+```text
+                API Server
+
+                     ▲
+
+                     |
+
+          Update Status / Objects
+  |
+  v
+              Custom Controller
+
+                     ▲
+
+                     |
+
+               Shared Informer
+
+                     ▲
+
+                     |
+
+                  Watch API
+
+                     ▲
+
+                     |
+
+               Kubernetes Objects
+```
+
+---
+
+# Controller Components
+
+A production controller consists of:
+
+- Informer
+- Cache
+- Event Handler
+- WorkQueue
+- Reconciler
+- Kubernetes Client
+
+Each component has a dedicated responsibility.
+
+---
+
+# Informers
+
+A controller does **not** constantly query the API Server.
+
+That would overwhelm the cluster.
+
+Instead,
+
+it uses an Informer.
+
+```text
+API Server
+  |
+  v
+Watch
+  |
+  v
+Informer
+  |
+  v
+Local Cache
+```
+
+The Informer keeps a local copy of resources.
+
+---
+
+# Why Informers?
+
+Without Informers:
+
+```text
+Controller
+  |
+  v
+API Call
+  |
+  v
+API Call
+  |
+  v
+API Call
+  |
+  v
+API Call
+```
+
+Thousands of Controllers would overload the API Server.
+
+Instead:
+
+```text
+One Watch
+  |
+  v
+Local Cache
+  |
+  v
+Read Cache
+```
+
+This dramatically reduces API traffic.
+
+---
+
+# Watches
+
+The Informer uses a Watch.
+
+Workflow:
+
+```text
+API Server
+  |
+  v
+Watch Stream
+  |
+  v
+Informer
+  |
+  v
+Cache Updated
+```
+
+Whenever an object changes,
+
+the Informer immediately knows.
+
+---
+
+# Watch Example
+
+Suppose:
+
+```text
+DatabaseCluster Created
+```
+
+API Server generates:
+
+```text
+ADDED Event
+```
+
+Controller receives:
+
+```text
+ADDED
+  |
+  v
+Process
+```
+
+No polling required.
+
+---
+
+# Event Types
+
+Controllers generally receive:
+
+```text
+ADDED
+
+MODIFIED
+
+DELETED
+
+BOOKMARK
+```
+
+These events keep the local cache synchronized.
+
+---
+
+# Event Handlers
+
+The Informer itself does not perform business logic.
+
+Instead,
+
+it calls Event Handlers.
+
+```text
+Watch Event
+  |
+  v
+Event Handler
+  |
+  v
+WorkQueue
+```
+
+---
+
+# Why Event Handlers?
+
+Suppose:
+
+```text
+100 Objects Updated
+```
+
+The Informer immediately receives all updates.
+
+Should it reconcile immediately?
+
+No.
+
+Instead:
+
+```text
+Event
+  |
+  v
+Queue
+```
+
+This decouples event processing from reconciliation.
+
+---
+
+# WorkQueue
+
+The WorkQueue stores reconciliation requests.
+
+Architecture:
+
+```text
+Event
+  |
+  v
+Queue
+  |
+  v
+Worker
+  |
+  v
+Reconcile()
+```
+
+The Queue smooths bursts of activity.
+
+---
+
+# Why WorkQueues?
+
+Imagine:
+
+```text
+1,000 Objects Updated
+```
+
+Without a Queue:
+
+```text
+1,000 Concurrent Reconciles
+```
+
+This could overwhelm the controller.
+
+Instead:
+
+```text
+Queue
+  |
+  v
+Controlled Processing
+```
+
+---
+
+# Queue Deduplication
+
+Suppose one object changes many times.
+
+```text
+Object A
+  |
+  v
+Update
+  |
+  v
+Update
+  |
+  v
+Update
+```
+
+The WorkQueue typically keeps one pending key for that object until it is processed, avoiding unnecessary duplicate reconciliations.
+
+This is one reason controllers remain efficient during frequent updates.
+
+---
+
+# Worker Threads
+
+Controllers usually have multiple workers.
+
+```text
+Queue
+  |
+  v
+Worker 1
+
+Worker 2
+
+Worker 3
+
+Worker 4
+```
+
+Each worker processes reconciliation requests independently.
+
+---
+
+# Reconcile Loop
+
+The heart of every controller.
+
+```text
+Queue
+  |
+  v
+Reconcile()
+  |
+  v
+Observe
+  |
+  v
+Compare
+  |
+  v
+Act
+  |
+  v
+Return
+```
+
+Everything eventually reaches the Reconcile function.
+
+---
+
+# Reconcile Inputs
+
+The Reconcile function does **not** receive the full object.
+
+Instead,
+
+it receives:
+
+```text
+Namespace
+
++
+
+Name
+```
+
+Example:
+
+```text
+default
+  |
+  v
+production-db
+```
+
+The controller then retrieves the latest object from the cache or API Server.
+
+---
+
+# Why Only Namespace/Name?
+
+Suppose:
+
+Object changed while waiting in queue.
+
+If the queue contained the old object,
+
+it would already be outdated.
+
+Instead:
+
+```text
+Queue
+  |
+  v
+Object Key
+  |
+  v
+Fetch Latest State
+```
+
+The controller always works with current data.
+
+---
+
+# Typical Reconcile Flow
+
+```text
+Receive Key
+  |
+  v
+Read Object
+  |
+  v
+Exists?
+  |
+  v
+Yes
+  |
+  v
+Compare Desired vs Actual
+  |
+  v
+Need Changes?
+  |
+  v
+Yes
+  |
+  v
+Apply Changes
+  |
+  v
+Update Status
+  |
+  v
+Return
+```
+
+---
+
+# Desired State
+
+Desired state comes from:
+
+```yaml
+spec:
+```
+
+Example:
+
+```yaml
+spec:
+  replicas: 5
+```
+
+This is what the user wants.
+
+---
+
+# Actual State
+
+Actual state comes from:
+
+```text
+Cluster
+```
+
+Examples:
+
+- Existing Pods
+- Services
+- StatefulSets
+- Secrets
+- PVCs
+
+The controller measures reality.
+
+---
+
+# Compare
+
+Example:
+
+Desired:
+
+```text
+5 Pods
+```
+
+Actual:
+
+```text
+3 Pods
+```
+
+Difference:
+
+```text
+2 Missing
+```
+
+---
+
+# Act
+
+Controller creates:
+
+```text
+2 Pods
+```
+
+Desired state achieved.
+
+---
+
+# Status Updates
+
+Controllers should not modify:
+
+```yaml
+spec
+```
+
+The user owns the spec.
+
+Instead,
+
+the controller reports results in:
+
+```yaml
+status
+```
+
+Example:
+
+```yaml
+status:
+  readyReplicas: 5
+  phase: Running
+```
+
+---
+
+# Why Status Exists
+
+Users ask:
+
+```text
+What is happening?
+```
+
+Status answers:
+
+```text
+Operator is Healthy
+
+Ready Replicas
+
+Conditions
+
+Errors
+```
+
+---
+
+# Retry Logic
+
+Not every reconciliation succeeds.
+
+Example:
+
+```text
+Create Pod
+  |
+  v
+API Failure
+```
+
+Should the controller stop forever?
+
+No.
+
+It retries.
+
+---
+
+# Retry Workflow
+
+```text
+Reconcile
+  |
+  v
+Error
+  |
+  v
+Requeue
+  |
+  v
+Retry
+```
+
+Transient failures are expected in distributed systems.
+
+---
+
+# Exponential Backoff
+
+Suppose an external API is unavailable.
+
+Retries occur like:
+
+```text
+1 Second
+  |
+  v
+2 Seconds
+  |
+  v
+4 Seconds
+  |
+  v
+8 Seconds
+  |
+  v
+16 Seconds
+```
+
+This prevents overwhelming failing dependencies.
+
+---
+
+# Error Handling
+
+Controllers classify failures.
+
+Examples:
+
+```text
+Temporary Error
+  |
+  v
+Retry
+```
+
+---
+
+```text
+Permanent Error
+  |
+  v
+Update Status
+  |
+  v
+Stop Retrying
+```
+
+Production controllers distinguish between recoverable and unrecoverable failures.
+
+---
+
+# Leader Election
+
+Large clusters often run multiple controller replicas.
+
+Example:
+
+```text
+Controller A
+
+Controller B
+
+Controller C
+```
+
+Should all three reconcile the same object?
+
+No.
+
+One becomes the leader.
+
+---
+
+# Leader Election Workflow
+
+```text
+Multiple Controllers
+  |
+  v
+Leader Election
+  |
+  v
+Leader
+  |
+  v
+Reconcile
+  |
+  v
+Followers Stand By
+```
+
+If the leader fails,
+
+another replica becomes leader.
+
+---
+
+# Controller Scaling
+
+Controllers scale by increasing worker threads or controller replicas.
+
+Example:
+
+```text
+Queue
+  |
+  v
+10 Workers
+  |
+  v
+Parallel Reconciliation
+```
+
+Leader election ensures only one active controller instance performs reconciliation for a given controller deployment.
+
+---
+
+# Production Controller Pattern
+
+A typical production controller:
+
+```text
+API Server
+  |
+  v
+Watch
+  |
+  v
+Informer
+  |
+  v
+Cache
+  |
+  v
+Event Handler
+  |
+  v
+WorkQueue
+  |
+  v
+Workers
+  |
+  v
+Reconcile()
+  |
+  v
+Update Objects
+  |
+  v
+Update Status
+```
+
+This architecture is shared by:
+
+- Deployment Controller
+- StatefulSet Controller
+- Job Controller
+- cert-manager
+- Prometheus Operator
+- Argo CD
+- Crossplane
+- KEDA
+
+---
+
+# Complete Internal Flow
+
+```text
+          User Creates Resource
+  |
+  v
+               API Server
+  |
+  v
+               Watch Event
+  |
+  v
+                Informer
+  |
+  v
+             Local Cache Updated
+  |
+  v
+              Event Handler
+  |
+  v
+               WorkQueue
+
+                    |
+
+        ┌───────────┴───────────┐
+        v                       v
+
+     Worker 1               Worker 2
+
+        |                       |
+        +--─────────┬───────────┘
+                    v
+
+               Reconcile()
+
+                    |
+
+      Compare Desired vs Actual
+
+                    |
+
+          Need Cluster Changes?
+
+             Yes            No
+
+              |              |
+
+              v              v
+
+      Create/Update/Delete   Exit
+  |
+  v
+         Update Status
+  |
+  v
+            Return
+```
+
+---
+
+# Production Example
+
+Suppose a user creates:
+
+```yaml
+apiVersion: database.example.com/v1
+kind: DatabaseCluster
+
+spec:
+  replicas: 3
+```
+
+Controller execution:
+
+```text
+Watch Event
+  |
+  v
+Queue
+  |
+  v
+Reconcile
+  |
+  v
+Create StatefulSet
+  |
+  v
+Create Service
+  |
+  v
+Create Secret
+  |
+  v
+Update Status
+  |
+  v
+Database Ready
+```
+
+Everything happens automatically.
+
+---
+
+# Production Best Practices
+
+✔ Keep reconciliation idempotent.
+
+✔ Read from the Informer cache whenever possible.
+
+✔ Keep Reconcile() fast and deterministic.
+
+✔ Update the Status subresource instead of modifying Spec.
+
+✔ Handle retries gracefully.
+
+✔ Use leader election for high availability.
+
+✔ Process only object keys in the WorkQueue.
+
+✔ Treat every reconciliation as if it might be retried.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+A CRD automatically creates resources.
+
+**Correct:** A CRD only extends the API. A Controller performs the automation.
+
+---
+
+### ❌ Misconception 2
+
+Controllers continuously poll the API Server.
+
+**Correct:** Controllers use Watches and Informers to receive event-driven updates.
+
+---
+
+### ❌ Misconception 3
+
+The queue stores full Kubernetes objects.
+
+**Correct:** The WorkQueue stores object keys (namespace/name), and the latest object is fetched during reconciliation.
+
+---
+
+### ❌ Misconception 4
+
+Reconcile() runs only once.
+
+**Correct:** Reconcile() may execute many times for the same object throughout its lifecycle.
+
+---
+
+### ❌ Misconception 5
+
+Controllers modify the Spec.
+
+**Correct:** Users own the Spec. Controllers typically modify cluster resources and update the Status.
+
+---
+
+### ❌ Misconception 6
+
+Every event results in immediate reconciliation.
+
+**Correct:** Events are placed into a WorkQueue and processed by workers.
+
+---
+
+### ❌ Misconception 7
+
+Running multiple controller replicas causes duplicate work.
+
+**Correct:** Leader election ensures only one replica actively reconciles at a time (for the same controller deployment).
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does Kubernetes need Controllers?
+
+To continuously reconcile the actual cluster state with the desired state defined by users.
+
+---
+
+### Q2. Why isn't a CRD enough?
+
+A CRD defines a new API resource, but it contains no automation logic.
+
+---
+
+### Q3. Why do Controllers use Informers?
+
+To maintain a local cache and avoid repeatedly querying the API Server.
+
+---
+
+### Q4. Why use a WorkQueue?
+
+To buffer events, control processing rate, and avoid excessive reconciliation.
+
+---
+
+### Q5. What does Reconcile() receive?
+
+Typically a `NamespacedName` (namespace and object name), not the full object.
+
+---
+
+### Q6. Why compare desired and actual state?
+
+To determine what actions are required to bring the cluster into the requested state.
+
+---
+
+### Q7. Why are retries necessary?
+
+Because transient failures are common in distributed systems.
+
+---
+
+### Q8. Why use leader election?
+
+To ensure only one controller replica actively reconciles resources while providing high availability.
+
+---
+
+### Q9. Why should reconciliation be idempotent?
+
+Because the same object may be reconciled multiple times, and repeating the operation should not produce incorrect results.
+
+---
+
+### Q10. What is the typical controller architecture?
+
+Watch → Informer → Cache → Event Handler → WorkQueue → Workers → Reconcile → Status Update.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| CR created but nothing happens | Controller not running or not watching the CR |
+| Reconcile never called | Informer/watch not configured correctly |
+| Endless reconciliation | Non-idempotent logic or constantly changing resources |
+| Status never updates | Status subresource missing or update failing |
+| Duplicate resource creation | Reconcile logic not checking existing resources |
+| Controller becomes inactive | Leader election issue or controller crash |
+| High API Server load | Controller bypassing Informer cache with unnecessary API reads |
+| Large reconciliation delays | Worker count too low or queue backlog too large |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why do Controllers exist?
+2. What is the difference between a CRD and a Controller?
+3. Why are Informers used?
+4. Why do Controllers use Watches instead of polling?
+5. Why is a WorkQueue necessary?
+6. What does Reconcile() actually do?
+7. What is the difference between desired and actual state?
+8. Why should controllers update Status instead of Spec?
+9. Why are retries and exponential backoff important?
+10. How does leader election enable highly available controllers?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how **Custom Controllers** provide the automation behind Kubernetes APIs.
+
+You learned:
+
+- Why Controllers exist
+- How Controllers are architected
+- How Informers, Watches, and WorkQueues cooperate
+- How the Reconcile loop continuously compares desired and actual state
+- Why Status updates, retries, and error handling are essential
+- How leader election enables high availability
+- The production architecture shared by built-in controllers and modern Operators
+
+A CRD defines **what** a new Kubernetes resource looks like. A Controller defines **how** that resource behaves. Together, they form the foundation of every Kubernetes Operator.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — Finalizers**
+
+Topics include:
+
+- Kubernetes Deletion Workflow
+- DeletionTimestamp
+- Why Finalizers Exist
+- Cleanup Logic
+- Blocking Deletion
+- Removing Finalizers
+- External Resource Cleanup
+- Production Patterns
+```

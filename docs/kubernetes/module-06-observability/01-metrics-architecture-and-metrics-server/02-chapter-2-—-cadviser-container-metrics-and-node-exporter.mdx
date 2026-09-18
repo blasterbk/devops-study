@@ -1,0 +1,262 @@
+---
+title: "Chapter 2 — cAdvisor & Node Exporter Metrics"
+sidebar_position: 2
+module: "Module 6.1 — Metrics & Metrics Server"
+description: "Master Kubernetes cAdvisor and Node Exporter metrics — container cgroup telemetry, working_set_bytes vs RSS memory accounting, CFS CPU throttling, and host OS hardware metrics."
+---
+
+# Chapter 2 — cAdvisor Container Metrics & Node Exporter
+
+> **Goal:** Master low-level container and host operating system telemetry in Kubernetes — understanding how **cAdvisor** (embedded directly inside the Kubelet binary) extracts Linux cgroup telemetry (`/sys/fs/cgroup/`), analyzing the critical difference between `container_memory_working_set_bytes` and Resident Set Size (`rss`) for OOMKill decisions, tracking CPU CFS throttling, and deploying the **Prometheus Node Exporter** DaemonSet to monitor physical host hardware, disks, filesystems, and network interfaces.
+>
+> By the end of this chapter, you will understand:
+> 1. How cAdvisor is embedded inside the Kubelet daemon to monitor all local containers
+> 2. How cAdvisor reads Linux kernel cgroups for CPU, memory, filesystem, and network stats
+> 3. The crucial mathematical difference: `working_set_bytes` vs `rss` vs page cache
+> 4. How `container_cpu_cfs_throttled_periods_total` detects multi-threaded CPU throttling
+> 5. How Prometheus Node Exporter exposes bare-metal and virtual machine OS hardware metrics
+> 6. How to scrape Kubelet port 10250 and Node Exporter port 9100 securely using RBAC
+
+---
+
+## Real-Life Analogy
+
+Think of cAdvisor and Node Exporter as **the internal smart-watch biometric monitors worn by employees inside a company building versus the building's central electrical and HVAC sensors**:
+
+- **cAdvisor (The Personal Smart Watch inside Kubelet):** Every container running on a worker node has a dedicated fitness tracker (**cAdvisor inside Kubelet**). It monitors each worker's individual pulse (**CPU usage**), how much desk space they are actively cluttering (**`working_set_bytes`**), and whether they are being choked by air conditioning limits (**CPU CFS Throttling**).
+- **Node Exporter (The Building Structural Engineer):** Node Exporter does not care about individual people; it monitors the **entire physical skyscraper (The Host Worker Node)**. It measures how much raw electrical power the building is consuming (**Total Node CPU**), how full the water tanks are (**Disk filesystem space**), the temperature of the server room (**Hardware metrics**), and the structural elevator traffic (**Disk IOPS and Network bandwidth**).
+- **The Eviction Guard (The OOM Killer Decision):** When the building manager decides who to kick out of the room during an emergency, they look strictly at **Active Desk Clutter (`working_set_bytes`)**, not the inactive library books stored in the corner cabinet (**Inactive Page Cache**).
+
+---
+
+## Architecture Diagram
+
+```text
+               cAdvisor & Node Exporter Telemetry Architecture
+
+ LINUX WORKER NODE HOST
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container A (Pod 1)        Container B (Pod 2)        Container C      │
+ │ [ cgroup: memory ]         [ cgroup: memory ]         [ cgroup: cpu ]  │
+ └─────────────┬──────────────────────────┬──────────────────────┬────────┘
+               │                          │                      │
+               ▼                          ▼                      ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX KERNEL CGROUP HIERARCHY (/sys/fs/cgroup/memory, /sys/fs/cgroup/cpu)
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Direct In-Memory Kernel Read
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBELET DAEMON (Embedded cAdvisor Engine)                              │
+ │ - Scrapes all local container cgroup files every 10-15s                │
+ │ - Exposes Container Telemetry on HTTPS Port 10250:                     │
+ │   ──► `/metrics/cadvisor` (Raw Prometheus Format)                      │
+ │   ──► `/metrics/resource` (Summarized Core Metrics)                    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+ ┌──────────────────────────────────┴─────────────────────────────────────┐
+ │ PROMETHEUS NODE EXPORTER (DaemonSet Pod on Host Network - Port 9100)   │
+ │ - Scrapes Host Hardware: `/proc/stat`, `/proc/meminfo`, `/sys/block`   │
+ │ - Exposes: `node_cpu_seconds_total`, `node_filesystem_avail_bytes`     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼ Prometheus Scrapes Ports 10250 & 9100
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PROMETHEUS SERVER (TSDB Storage & PromQL Engine)                       │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## cAdvisor: Architecture & Metric Anatomy
+
+**cAdvisor (Container Advisor)** is an open-source container resource analysis tool created by Google and statically compiled **directly inside the Kubelet binary**:
+
+```text
+ ┌──────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+ │ Metric Name                                  │ Type & Description                                  │
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ `container_cpu_usage_seconds_total`          │ **Counter.** Total cumulative CPU time consumed by   │
+ │                                              │ the container across all cores in seconds.          │
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ `container_cpu_cfs_throttled_periods_total`  │ **Counter.** Number of 100ms CFS scheduling periods  │
+ │                                              │ in which the container was actively throttled.      │
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ `container_memory_working_set_bytes`         │ **Gauge.** Active memory used by container.          │
+ │                                              │ **The exact metric evaluated by OOM Killer!**       │
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ `container_memory_rss`                       │ **Gauge.** Resident Set Size: Anonymous memory mapped│
+ │                                              │ directly in RAM (excludes OS page cache).           │
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ `container_fs_reads_bytes_total`             │ **Counter.** Cumulative bytes read from storage.    │
+ │ `container_fs_writes_bytes_total`            │ **Counter.** Cumulative bytes written to storage.   │
+ └──────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Memory Metrics Deep Dive: `working_set_bytes` vs `rss`
+
+Understanding memory accounting is critical for preventing unexpected `OOMKilled (Exit Code 137)` terminations:
+
+$$\text{Total Memory (Usage)} = \text{RSS (Anonymous Memory)} + \text{Page Cache (Mapped Files)}$$
+
+$$\text{Working Set Bytes} = \text{Total Memory Usage} - \text{Inactive File Page Cache}$$
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Memory Type          │ Eviction & OOM Killer Behavior                                              │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`rss`**            │ Heap, stack, and dynamically allocated application memory. Cannot be        │
+ │                      │ reclaimed by the OS kernel under memory pressure without killing the app.   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`working_set_**    │ **The Metric That Counts.** Includes RSS plus active file page cache that   │
+ │ **bytes`**           │ the OS cannot safely drop. **When this exceeds `resources.limits.memory`,   │
+ │                      │ the Linux Kernel OOM Killer immediately kills the Pod!**                    │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+> [!IMPORTANT]
+> Always base your memory monitoring dashboards and HPA autoscaling on `container_memory_working_set_bytes`, **never** on `container_memory_rss` or total `container_memory_usage_bytes`.
+
+---
+
+## Node Exporter: Host OS & Bare-Metal Telemetry
+
+While cAdvisor tracks container limits, **Node Exporter** tracks physical host saturation:
+
+```text
+ ┌──────────────────────────────────────────────┬─────────────────────────────────────────────────────┐
+ │ Node Exporter Metric                         │ Description & SRE Golden Signal                     │
+ │──────────────────────────────────────────────┼─────────────────────────────────────────────────────┤
+ │ `node_cpu_seconds_total{mode="idle"}`        │ CPU idle time (Calculate node CPU utilization).     │
+ │ `node_cpu_seconds_total{mode="iowait"}`      │ CPU time waiting for disk I/O (Disk bottleneck).    │
+ │ `node_memory_MemAvailable_bytes`             │ Amount of physical RAM immediately available to OS. │
+ │ `node_filesystem_avail_bytes`                │ Available storage space on root / data partitions.  │
+ │ `node_disk_io_time_seconds_total`            │ Time spent doing disk reads/writes (Disk Saturation)│
+ │ `node_network_receive_errs_total`            │ Hardware network interface packet drop/error count. │
+ └──────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Node Exporter DaemonSet Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: node-exporter
+    spec:
+      hostNetwork: true                # Mandatory: Binds directly to host IP!
+      hostPID: true                    # Mandatory: Inspects host process table!
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534               # nobody user
+      tolerations:
+      - operator: Exists               # Runs on ALL nodes, including Master/Control-Plane!
+      containers:
+      - name: node-exporter
+        image: quay.io/prometheus/node-exporter:v1.8.1
+        args:
+          - --path.procfs=/host/proc
+          - --path.sysfs=/host/sys
+          - --path.rootfs=/host/root
+          - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+        ports:
+        - name: metrics
+          containerPort: 9100
+          protocol: TCP
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: root
+          mountPath: /host/root
+          readOnly: true
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+```
+
+---
+
+## Hands-On Lab: Scraping cAdvisor & Node Exporter
+
+```bash
+# Step 1: Query cAdvisor raw Prometheus metrics directly from Kubelet (via API server proxy)
+kubectl get --raw "/api/v1/nodes/$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')/proxy/metrics/cadvisor" | grep -E "container_memory_working_set_bytes" | head -n 5
+
+# Step 2: Query CPU throttling metrics from cAdvisor
+kubectl get --raw "/api/v1/nodes/$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')/proxy/metrics/cadvisor" | grep -E "container_cpu_cfs_throttled_periods_total" | head -n 5
+
+# Step 3: Check if Node Exporter DaemonSet is deployed
+kubectl get daemonset -A -l app.kubernetes.io/name=node-exporter 2>/dev/null || echo "Node Exporter simulation active"
+
+# Step 4: Calculate active Node memory utilization via PromQL formula
+# Formula: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is cAdvisor, and where does it execute inside a Kubernetes cluster?**
+
+cAdvisor (Container Advisor) is an open-source container monitoring agent that collects, aggregates, and exports resource usage and performance metrics for all running containers on a host. In Kubernetes, cAdvisor is not deployed as a separate standalone Pod; it is **statically compiled and embedded directly inside the Kubelet binary** on every worker node, exposing container telemetry over HTTPS on Kubelet port 10250 (`/metrics/cadvisor`).
+
+**Q2: Why does Kubernetes use `container_memory_working_set_bytes` rather than `container_memory_rss` for OOMKill decisions?**
+
+`container_memory_rss` only accounts for anonymous memory mapped by the process (heap and stack), ignoring active file caches. If an application performs heavy file I/O (such as writing to a local database or log files), the OS kernel allocates memory for file page caches. `container_memory_working_set_bytes` measures RSS plus active file caches that **cannot be reclaimed by the kernel under memory pressure**. If `working_set_bytes` hits `limits.memory`, the container will cause a kernel OOM panic, so Kubernetes tracks `working_set_bytes` to trigger OOMKills accurately.
+
+**Q3: What is `container_cpu_cfs_throttled_periods_total`, and why does it indicate performance degradation?**
+
+In Linux cgroups, CPU limits are enforced using the Completely Fair Scheduler (CFS) bandwidth control across 100ms periods. If a multi-threaded application consumes its entire allotted CPU quota in the first 20ms of a 100ms window, the Linux kernel freezes (throttles) all container threads for the remaining 80ms. `container_cpu_cfs_throttled_periods_total` counts the number of periods where the container was throttled, directly explaining high application p99 latency spikes despite low average CPU usage.
+
+**Q4: Why does Node Exporter require `hostNetwork: true` and `hostPID: true`?**
+
+Node Exporter collects host operating system and hardware-level telemetry (physical CPU cores, disk I/O, RAM, network interfaces). If run inside standard container namespaces, it would only see the virtualized container interfaces and its own isolated process table. Setting `hostNetwork: true` and `hostPID: true` (combined with mounting `/proc` and `/sys` from the host) allows Node Exporter to inspect the physical host OS directly.
+
+**Q5: How can Prometheus scrape Kubelet's `/metrics/cadvisor` endpoint securely?**
+
+Because Kubelet port 10250 is protected by mTLS and Webhook authorization, Prometheus must be granted RBAC permissions. Administrators create a `ClusterRole` granting `get` on the `nodes/metrics` and `nodes/proxy` subresources in the core `""` API group, bind it to Prometheus's `ServiceAccount` via a `ClusterRoleBinding`, and configure Prometheus's scrape job to use bearer token authentication and the cluster CA certificate.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that cAdvisor is embedded inside the Kubelet binary (not a pod)
+- [ ] Know that cAdvisor reads container metrics from `/sys/fs/cgroup/`
+- [ ] Know that OOM Killer decisions evaluate `container_memory_working_set_bytes`
+- [ ] Know that CPU throttling is tracked via `container_cpu_cfs_throttled_periods_total`
+- [ ] Know that Node Exporter runs as a DaemonSet monitoring host OS hardware on port 9100
+- [ ] Know that Node Exporter requires `hostNetwork: true` and `hostPID: true`
+- [ ] Can query Kubelet cAdvisor metrics directly via API proxy

@@ -1,0 +1,507 @@
+---
+title: "Chapter 1 — Kubernetes REST API"
+sidebar_position: 1
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand how Kubernetes exposes every cluster operation through a REST API, how HTTP methods map to Kubernetes operations, and how requests flow from kubectl to etcd."
+---
+
+# Module 1.2 — API Server Deep Dive & client-go
+
+> **Deep Learning Guide (University-Level + Interview-Oriented)**
+
+---
+
+## Why We Study This Module
+
+Module 1.1 taught you how a write request flows through the API Server. Module 1.2 teaches you how Kubernetes **exposes**, **organizes**, and **serves** that API — and how Go programs interact with it using `client-go`.
+
+These topics together give you a complete picture of the Kubernetes API machinery that every controller, operator, and automation tool depends on.
+
+Each chapter includes:
+- 📖 Deep theory
+- 🏗 Architecture diagrams
+- ⚙️ Internal workflows
+- 💡 Real-world analogies
+- 🖥 Production examples
+- ❓ Interview questions
+- 🐞 Debugging scenarios
+- 📚 Best practices
+
+---
+
+# Learning Roadmap
+
+```text
+Module 1.2 — API Server Deep Dive & client-go
+
+Chapter 1   Kubernetes REST API
+Chapter 2   API Groups
+Chapter 3   API Versions
+Chapter 4   OpenAPI
+Chapter 5   Discovery API
+Chapter 6   ResourceVersion
+Chapter 7   Watches
+Chapter 8   Informers
+Chapter 9   Shared Informers
+Chapter 10  Listers
+Chapter 11  Work Queues
+Chapter 12  client-go
+Chapter 13  controller-runtime
+```
+
+---
+
+# Chapter 1 — Kubernetes REST API
+
+> **Goal:** Understand how Kubernetes exposes every cluster operation through a REST API.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. What a REST API is
+> 2. Why Kubernetes is API-first
+> 3. How API Resources are structured
+> 4. How HTTP methods map to Kubernetes operations
+> 5. What HTTP status codes mean
+> 6. How Content Negotiation works
+> 7. The complete request flow from kubectl to etcd
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Every Kubernetes operation eventually becomes an HTTP request.
+
+Whether you use:
+- `kubectl`
+- Terraform / Pulumi
+- ArgoCD / Flux
+- Helm
+- Jenkins / GitHub Actions
+- `client-go` / Python SDK
+- Kubernetes Dashboard
+
+Everything eventually sends a REST API request to **kube-apiserver**.
+
+For example:
+```bash
+kubectl get pods
+```
+internally becomes:
+```http
+GET /api/v1/namespaces/default/pods
+```
+
+And:
+```bash
+kubectl apply -f deployment.yaml
+```
+becomes:
+```http
+PATCH /apis/apps/v1/namespaces/default/deployments/nginx
+```
+
+If you don't understand the REST API, you're operating Kubernetes blindly.
+
+---
+
+# Real-Life Analogy
+
+Think of the Kubernetes REST API like ordering food at a restaurant.
+
+```text
+Customer (kubectl)
+  |
+  v
+Waiter  (HTTP Request / kube-apiserver)
+  |
+  v
+Kitchen (etcd / Control Plane)
+  |
+  v
+Waiter  (HTTP Response)
+  |
+  v
+Customer (kubectl display)
+```
+
+| Restaurant | Kubernetes |
+| :--- | :--- |
+| Customer | `kubectl` / client |
+| Menu | API Resource schema |
+| Waiter | `kube-apiserver` REST API |
+| Kitchen | etcd + control plane |
+| Ticket stub | HTTP status code |
+
+The customer never enters the kitchen directly. Everything goes through the waiter (API Server).
+
+---
+
+# What is a REST API?
+
+REST stands for **Representational State Transfer**. It is an architectural style that allows clients and servers to communicate over standard HTTP.
+
+Key principles:
+- **Stateless** — every request is self-contained
+- **Resource-oriented** — operations target URLs representing objects
+- **HTTP verbs** — standard methods (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`) express intent
+- **Status codes** — numeric codes indicate the outcome
+
+---
+
+# Kubernetes is API-First
+
+One of the most important Kubernetes architectural principles is:
+
+> **Everything is an API. Every operation goes through kube-apiserver.**
+
+```text
+kubectl        -->  kube-apiserver
+Scheduler      -->  kube-apiserver
+kubelet        -->  kube-apiserver
+Controller     -->  kube-apiserver
+Terraform      -->  kube-apiserver
+ArgoCD         -->  kube-apiserver
+```
+
+No component directly modifies `etcd`. All reads and writes go through the REST API.
+
+This design gives the API Server central authority to enforce:
+- Authentication
+- Authorization
+- Admission policy
+- Validation
+- Audit logging
+- API version conversion
+
+---
+
+# API Resources
+
+REST APIs revolve around **Resources** — objects managed by Kubernetes.
+
+Examples:
+
+```text
+Pod             Deployment      Service
+Namespace       Secret          ConfigMap
+Node            PersistentVolume   Ingress
+```
+
+Every Kubernetes object is a REST resource accessible via a URL.
+
+---
+
+# Resource URL Structure
+
+```text
+Core (v1) Resources:
+  /api/v1/pods
+  /api/v1/namespaces/default/pods
+  /api/v1/namespaces/default/services
+
+Named API Group Resources:
+  /apis/apps/v1/deployments
+  /apis/apps/v1/namespaces/default/deployments/nginx
+  /apis/batch/v1/jobs
+  /apis/networking.k8s.io/v1/ingresses
+```
+
+> **Important:** Core resources use `/api`. Named API group resources use `/apis`. This distinction is covered fully in Chapter 2.
+
+---
+
+# Namespaced vs Cluster-Scoped Resources
+
+| Namespaced Resources | Cluster-Scoped Resources |
+| :--- | :--- |
+| Pod, Service, Secret, ConfigMap, Deployment | Node, PersistentVolume, Namespace, ClusterRole |
+| URL includes `/namespaces/{name}/` | URL does not include a namespace segment |
+
+Namespaced example:
+```http
+GET /api/v1/namespaces/production/pods
+```
+
+Cluster-scoped example:
+```http
+GET /api/v1/nodes
+```
+
+---
+
+# HTTP Verbs
+
+Kubernetes maps standard HTTP methods to operations on resources:
+
+| HTTP Method | Kubernetes Operation | kubectl Equivalent |
+| :--- | :--- | :--- |
+| `GET` | Read one or list many | `kubectl get` |
+| `POST` | Create a new resource | `kubectl create` |
+| `PUT` | Replace the entire resource | (rarely used directly) |
+| `PATCH` | Update specific fields | `kubectl apply`, `kubectl patch` |
+| `DELETE` | Remove a resource | `kubectl delete` |
+
+---
+
+## GET
+
+Retrieve information. Never modifies data.
+
+```bash
+kubectl get pods
+```
+```http
+GET /api/v1/namespaces/default/pods
+```
+
+---
+
+## POST
+
+Create a new resource.
+
+```bash
+kubectl create -f pod.yaml
+```
+```http
+POST /api/v1/namespaces/default/pods
+```
+
+---
+
+## PUT
+
+Replace the entire existing resource. If a field is omitted, it is removed.
+
+```http
+PUT /api/v1/namespaces/default/pods/nginx
+```
+
+> **Important:** `PUT` requires the complete object. Missing fields are deleted. Prefer `PATCH` for targeted updates.
+
+---
+
+## PATCH
+
+Update only specific fields without affecting the rest of the object.
+
+```http
+PATCH /apis/apps/v1/namespaces/default/deployments/nginx
+```
+
+`kubectl apply` primarily uses PATCH (Server-Side Apply or Strategic Merge Patch).
+
+### PATCH Types
+
+| Type | Behavior |
+| :--- | :--- |
+| JSON Patch (RFC 6902) | Explicit `add`, `remove`, `replace` operations |
+| Merge Patch (RFC 7396) | Shallow field merge |
+| Strategic Merge Patch | Kubernetes-specific, respects list merge keys |
+| Server-Side Apply | Field ownership tracking, conflict detection |
+
+---
+
+## DELETE
+
+Remove a resource.
+
+```bash
+kubectl delete pod nginx
+```
+```http
+DELETE /api/v1/namespaces/default/pods/nginx
+```
+
+> **Important:** Deleting a Pod managed by a Deployment or ReplicaSet causes it to be immediately recreated by the reconciliation loop.
+
+---
+
+# HTTP Status Codes
+
+Every API response includes a status code describing the outcome.
+
+| Code | Name | Meaning |
+| :--- | :--- | :--- |
+| `200` | OK | Request succeeded |
+| `201` | Created | Resource successfully created |
+| `204` | No Content | Succeeded, no response body (e.g., DELETE) |
+| `400` | Bad Request | Malformed request body or invalid syntax |
+| `401` | Unauthorized | Authentication failed (identity not verified) |
+| `403` | Forbidden | Authentication passed; authorization denied |
+| `404` | Not Found | Resource does not exist |
+| `409` | Conflict | ResourceVersion mismatch (concurrent update) |
+| `422` | Unprocessable Entity | Schema or semantic validation failed |
+| `500` | Internal Server Error | API Server or etcd internal failure |
+
+---
+
+# Content Negotiation
+
+Different clients may want responses in different formats.
+
+The client advertises its preference:
+```http
+Accept: application/json
+Accept: application/yaml
+```
+
+When sending data:
+```http
+Content-Type: application/json
+Content-Type: application/yaml
+```
+
+Kubernetes also supports the binary **Protobuf** format for high-performance internal communication:
+```http
+Accept: application/vnd.kubernetes.protobuf
+```
+
+> **Important:** `kubectl` uses JSON/YAML. Internal control-plane components (Scheduler, controllers) can use Protobuf for better performance.
+
+---
+
+# Serialization Pipeline
+
+Even when you submit YAML, the API Server processes it as follows:
+
+```text
+Client submits YAML
+  |
+  v
+API Server decodes to JSON
+  |
+  v
+Converts JSON to Internal Object (Go struct)
+  |
+  v
+Validation (schema + semantic rules)
+  |
+  v
+Admission (mutate / validate)
+  |
+  v
+Converts to Storage Version
+  |
+  v
+Serializes to Protobuf / JSON
+  |
+  v
+Writes to etcd
+```
+
+---
+
+# Complete REST API Request Flow
+
+When you execute:
+```bash
+kubectl apply -f deployment.yaml
+```
+
+The full internal trace is:
+
+```text
+1. kubectl reads deployment.yaml
+  |
+  v
+2. kubectl reads kubeconfig (credentials + cluster URL)
+  |
+  v
+3. kubectl establishes TLS connection to kube-apiserver
+  |
+  v
+4. HTTP PATCH /apis/apps/v1/namespaces/default/deployments/nginx
+  |
+  v
+5. Authentication (certificate / token / OIDC)
+  |
+  v
+6. Authorization (RBAC check)
+  |
+  v
+7. Admission (mutating webhooks + validating webhooks)
+  |
+  v
+8. Schema & semantic validation
+  |
+  v
+9. Internal object conversion
+  |
+  v
+10. Storage version conversion + serialization
+  |
+  v
+11. Write to etcd (/registry/deployments/default/nginx)
+  |
+  v
+12. HTTP 200 / 201 response returned to kubectl
+  |
+  v
+13. Watch event generated -> Deployment Controller -> Pods
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the Kubernetes REST API?
+The Kubernetes REST API is the primary interface exposed by `kube-apiserver` that allows all clients to create, read, update, watch, and delete Kubernetes resources using standard HTTP methods over HTTPS.
+
+### Q2. Does kubectl communicate directly with etcd?
+No. `kubectl` always communicates with `kube-apiserver` via HTTPS. No client or Kubernetes component directly reads or writes to `etcd` except `kube-apiserver`.
+
+### Q3. What is the difference between POST and PUT?
+`POST` creates a new resource. `PUT` fully replaces an existing resource — any field omitted in the `PUT` body is deleted. `PATCH` is preferred because it updates only specified fields.
+
+### Q4. What does HTTP 409 indicate in Kubernetes?
+A `409 Conflict` means a ResourceVersion mismatch: the object was modified by another writer between when the client read it and when it submitted the update. The client must re-read the object and retry.
+
+### Q5. What is the difference between 401 and 403?
+`401` means identity could not be verified (authentication failed — invalid token, expired cert). `403` means identity was verified but the subject lacks permission (authorization failed — RBAC denied).
+
+### Q6. What PATCH types does Kubernetes support?
+JSON Patch, Merge Patch, Strategic Merge Patch (Kubernetes-specific list merge semantics), and Server-Side Apply (field ownership tracking).
+
+### Q7. Why does Kubernetes use Protobuf internally?
+Protobuf is a binary serialization format that is smaller and faster to encode/decode than JSON. Control-plane components use it for high-performance inter-component communication.
+
+### Q8. What is Content Negotiation?
+The process where the client declares which response format it can accept (`Accept` header) and what format it is sending (`Content-Type` header). The API Server honors the request if the format is supported.
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| `401 Unauthorized` | Invalid/expired credential | Check kubeconfig certificate or token expiry |
+| `403 Forbidden` | RBAC permission missing | Check `kubectl auth can-i` and RoleBindings |
+| `404 Not Found` | Wrong resource name or namespace | Verify namespace and resource name |
+| `409 Conflict` | Concurrent update (ResourceVersion mismatch) | Re-read object and retry |
+| `422 Unprocessable Entity` | Schema validation failure | Check field types and required fields in manifest |
+| `500 Internal Server Error` | etcd unavailable or webhook panic | Check API Server logs and etcd health |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain what a REST API is and why Kubernetes uses it.
+2. State why every component communicates through `kube-apiserver`.
+3. Map `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` to their Kubernetes operations.
+4. Explain the difference between `/api` and `/apis` URL paths.
+5. Distinguish namespaced resources from cluster-scoped resources.
+6. Interpret HTTP status codes `200`, `201`, `401`, `403`, `404`, `409`, `422`, `500`.
+7. Explain what Content Negotiation is and why Protobuf is used internally.
+8. Trace the complete path of `kubectl apply` from command line to `etcd`.
+
+---
+
+# Next Chapter
+
+**Chapter 2 — API Groups**
+
+In the next chapter, you'll learn why Pods use `apiVersion: v1` while Deployments use `apiVersion: apps/v1`, and how Kubernetes organizes thousands of resources into logical groups to support independent versioning and extensibility.

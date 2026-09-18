@@ -1,0 +1,292 @@
+---
+title: "Chapter 2 — ServiceMonitor & PodMonitor CRDs"
+sidebar_position: 2
+module: "Module 6.2 — Prometheus & PromQL"
+description: "Master Kubernetes ServiceMonitor and PodMonitor CRDs — 2-tier label selector matching, endpoints configuration, relabeling vs metricRelabelings, and high-cardinality management."
+---
+
+# Chapter 2 — ServiceMonitor & PodMonitor CRDs
+
+> **Goal:** Master declarative Prometheus scraping in Kubernetes using **`ServiceMonitor`** and **`PodMonitor`** Custom Resources — understanding the 2-tier label selector hierarchy between Prometheus and application Services, avoiding the #1 production configuration mismatch pitfall, configuring endpoints, intervals, and scrape timeouts, and implementing advanced target relabeling (`relabelings` vs `metricRelabelings`) to drop high-cardinality metrics.
+>
+> By the end of this chapter, you will understand:
+> 1. The architectural difference between `ServiceMonitor` and `PodMonitor` CRDs
+> 2. The 2-tier label matching chain that connects Prometheus $\to$ ServiceMonitor $\to$ Service
+> 3. Why named ports in Kubernetes Services are mandatory for `ServiceMonitor.endpoints`
+> 4. How to configure TLS, bearer tokens, and scrape intervals
+> 5. The crucial distinction: `relabelings` (target filtering) vs `metricRelabelings` (metric drop/rewrite)
+> 6. How to troubleshoot "Targets Missing / Unscraped" in the Prometheus UI
+
+---
+
+## Real-Life Analogy
+
+Think of ServiceMonitors as **a two-tier postal routing checklist between the federal postal director, the local mail truck driver, and apartment mailboxes**:
+
+- **The Master Postal Directive (The `Prometheus` Resource - Tier 1):** The postal director declares: *"Our mail trucks (`Prometheus`) will ONLY pick up route sheets stamped with `release: prometheus-stack` (`serviceMonitorSelector`)."* If a route sheet lacks that exact stamp, the mail truck drives right past it.
+- **The Route Sheet (`ServiceMonitor` - Tier 2):** The local route sheet says: *"Deliver mail to every building labeled `app: billing-service` (`spec.selector`). Check the green mailbox labeled 'metrics' (`port: http-metrics`) on the side of the house every 15 seconds."*
+- **The Building Mailbox (`Service` + `Endpoints`):** The apartment building has a named slot (`port: http-metrics`) pointing to the physical apartments inside (**The Pods**).
+- **`PodMonitor` (The Direct Drone Delivery):** For a lone tent out in the woods without a street address or formal mailbox (**A DaemonSet pod without a Kubernetes Service**), a delivery drone flies directly to the tent coordinates (**`PodMonitor`**).
+- **`metricRelabelings` (The Junk Mail Shredder):** Before loading boxes into the permanent warehouse (**TSDB**), a shredder machine discards useless junk mail and spam leaflets (**High-Cardinality metric dropping**).
+
+---
+
+## Architecture Diagram
+
+```text
+               The 2-Tier Label Matching Chain in Prometheus Operator
+
+ TIER 1 MATCH: Prometheus CRD matches ServiceMonitor CRD
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Prometheus Custom Resource (`kind: Prometheus`)                        │
+ │ spec:                                                                  │
+ │   serviceMonitorSelector:                                              │
+ │     matchLabels:                                                       │
+ │       release: prometheus-stack ◄── MUST MATCH!                        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ (Finds matching ServiceMonitors in cluster)
+                                    ▼
+ TIER 2 MATCH: ServiceMonitor CRD matches Application Service
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ServiceMonitor Custom Resource (`kind: ServiceMonitor`)                │
+ │ metadata:                                                              │
+ │   labels:                                                              │
+ │     release: prometheus-stack   ◄── Tier 1 Match Success!              │
+ │ spec:                                                                  │
+ │   selector:                                                            │
+ │     matchLabels:                                                       │
+ │       app: payment-api          ◄── MUST MATCH!                        │
+ │   endpoints:                                                           │
+ │   - port: http-metrics          ◄── References Service Port Name!      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ (Finds matching Services in cluster)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes Service (`kind: Service`)                                  │
+ │ metadata:                                                              │
+ │   labels:                                                              │
+ │     app: payment-api            ◄── Tier 2 Match Success!              │
+ │ spec:                                                                  │
+ │   ports:                                                               │
+ │   - name: http-metrics          ◄── Name matches endpoints[].port!     │
+ │     port: 8080                                                         │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ (Discovers underlying Pod IP addresses)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Target Application Pods: `GET http://<pod_ip>:8080/metrics` (SCRAPED!) │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `ServiceMonitor` vs `PodMonitor`
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Feature / Dimension       │ `ServiceMonitor`                │ `PodMonitor`                    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Target Resource**       │ Kubernetes **`Service`**        │ Kubernetes **`Pod`** directly   │
+ │                           │ (Scrapes underlying Endpoints)  │ (Bypasses Service abstraction)  │
+ │ **Port Definition**       │ References **Port Name** in     │ References **Container Port**   │
+ │                           │ Service `spec.ports[].name`     │ `spec.containers[].ports[].name`│
+ │ **Standard Use Case**     │ Web APIs, Microservices,        │ DaemonSets, batch Jobs, or      │
+ │                           │ StatefulSets with Headless Svcs │ standalone internal pods        │
+ │ **Multi-Namespace**       │ Supported via `namespaceSelector│ Supported via `namespaceSelector│
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Anatomy of a Production `ServiceMonitor`
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payment-api-monitor
+  namespace: production
+  labels:
+    # Tier 1 Label: Must match Prometheus spec.serviceMonitorSelector!
+    release: prometheus-stack
+spec:
+  # Tier 2 Selector: Must match Kubernetes Service labels!
+  selector:
+    matchLabels:
+      app: payment-api
+
+  # Multi-Namespace discovery: Scan matching services across these namespaces
+  namespaceSelector:
+    matchNames:
+      - production
+      - staging
+
+  endpoints:
+  - port: http-metrics                 # Must match Service spec.ports[].name!
+    path: /metrics                     # HTTP Path to scrape
+    interval: 15s                      # Scrape frequency
+    scrapeTimeout: 10s                 # Must be <= interval!
+    scheme: http
+```
+
+---
+
+## `relabelings` vs `metricRelabelings`
+
+Understanding the distinction between these two configuration blocks is essential for optimizing Prometheus TSDB performance:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Relabeling Block     │ Execution Timing & Purpose                                                  │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`relabelings`**    │ **Executed BEFORE the HTTP scrape occurs.**                                 │
+ │                      │ Operates on target metadata (e.g. `__address__`, `__meta_kubernetes_*`).    │
+ │                      │ Used to filter which pods are scraped, change ports, or alter target labels.│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`metricRelabel-**  │ **Executed AFTER the HTTP scrape occurs, BEFORE storing into TSDB.**        │
+ │ **ings`**            │ Operates on the actual metric names and metric labels returned in `/metrics`│
+ │                      │ Used to **drop high-cardinality metrics** or rewrite metric label values.   │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Dropping High-Cardinality Metrics via `metricRelabelings`:
+```yaml
+  endpoints:
+  - port: http-metrics
+    metricRelabelings:
+    # Drop noisy high-cardinality debug metrics before TSDB write!
+    - sourceLabels: [__name__]
+      regex: "(http_request_duration_seconds_bucket|jvm_gc_memory_allocated_bytes_total)"
+      action: drop
+    # Rename a label from 'environment' to 'env'
+    - sourceLabels: [environment]
+      targetLabel: env
+      action: replace
+```
+
+---
+
+## The #1 Production Issue: Why Prometheus Fails to Scrape
+
+```text
+ The 3-Point Checklist for Missing Targets:
+ 1. Check Tier 1 Label: Does the `ServiceMonitor.metadata.labels` match 
+    `Prometheus.spec.serviceMonitorSelector`?
+ 2. Check Tier 2 Label: Does `ServiceMonitor.spec.selector.matchLabels` match the `Service.metadata.labels`?
+ 3. Check Port Name: Does `ServiceMonitor.endpoints[].port` EXACTLY match the string in 
+    `Service.spec.ports[].name`? (Note: It must be the port NAME string, NOT the integer port number!)
+```
+
+---
+
+## Hands-On Lab: Deploying an Application with a ServiceMonitor
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace monitor-lab
+
+# Step 2: Deploy an application Pod exposing /metrics
+cat <<EOF | kubectl apply -f - -n monitor-lab
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-api
+  labels:
+    app: sample-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-api
+  template:
+    metadata:
+      labels:
+        app: sample-api
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.25-alpine
+        ports:
+        - name: http-web
+          containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-api-svc
+  labels:
+    app: sample-api
+spec:
+  selector:
+    app: sample-api
+  ports:
+  - name: http-metrics                 # Named port for ServiceMonitor!
+    port: 80
+    targetPort: http-web
+EOF
+
+# Step 3: Deploy the ServiceMonitor matching the Service
+cat <<EOF | kubectl apply -f - -n monitor-lab
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sample-api-sm
+  labels:
+    release: prometheus-stack          # Matches Tier 1 selector!
+spec:
+  selector:
+    matchLabels:
+      app: sample-api                  # Matches Tier 2 selector!
+  endpoints:
+  - port: http-metrics
+    path: /
+    interval: 15s
+EOF
+
+# Step 4: Verify ServiceMonitor creation
+kubectl get servicemonitors -n monitor-lab
+
+# Step 5: Clean up lab
+kubectl delete namespace monitor-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between a `ServiceMonitor` and a `PodMonitor`?**
+
+- `ServiceMonitor`: Discovers scraping targets by selecting a Kubernetes `Service`. The Operator watches the Service's `Endpoints`/`EndpointSlices` to find all healthy backend Pod IPs, referencing the target port via the Service's named port string (`spec.ports[].name`).
+- `PodMonitor`: Directly selects Kubernetes `Pods` using label selectors without requiring a Kubernetes `Service` abstraction. It is typically used for DaemonSets (like Node Exporter or Fluentbit) or batch processing pods that do not expose cluster service routing.
+
+**Q2: What is the 2-tier label selector hierarchy in the Prometheus Operator?**
+
+1. **Tier 1 (Prometheus $\to$ ServiceMonitor)**: The `Prometheus` custom resource defines `serviceMonitorSelector: matchLabels`. The `ServiceMonitor` object itself must carry matching labels in its `metadata.labels` for the Operator to discover it.
+2. **Tier 2 (ServiceMonitor $\to$ Service)**: Inside the `ServiceMonitor`, `spec.selector.matchLabels` defines which Kubernetes `Service` objects to scrape. The `Service`'s `metadata.labels` must match this selector. If either tier fails to match, the targets will not be scraped.
+
+**Q3: Why must `endpoints[].port` in a ServiceMonitor reference the Port Name rather than the Port Number?**
+
+A Kubernetes Service can expose multiple ports (e.g. port 80 for HTTP traffic and port 9090 for metrics). In the `ServiceMonitor` specification, the `port` field is defined as a string that references the **logical name** assigned in `Service.spec.ports[].name` (e.g. `name: http-metrics`). This decoupling allows administrators to change the physical TCP port number on the Service without breaking the monitoring configuration.
+
+**Q4: What is the difference between `relabelings` and `metricRelabelings`?**
+
+- `relabelings`: Applied **prior to the scrape**. It acts on target labels (such as `__address__`, `__meta_kubernetes_pod_name`) to alter target parameters, drop unwanted targets before connecting, or attach Kubernetes metadata labels to the scraped series.
+- `metricRelabelings`: Applied **after the scrape payload is received over HTTP, but before samples are written to the TSDB**. It inspects the actual metric names (`__name__`) and application labels, allowing operators to drop high-cardinality metrics or rewrite label names to conserve TSDB storage.
+
+**Q5: How do you configure a ServiceMonitor to scrape services located in different namespaces?**
+
+By default, a `ServiceMonitor` only discovers Services within its own namespace. To enable cross-namespace discovery, administrators configure the `spec.namespaceSelector` field:
+- To match specific namespaces: `namespaceSelector.matchNames: ["payment-prod", "auth-prod"]`
+- To match all namespaces across the entire cluster: `namespaceSelector.any: true`
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `ServiceMonitor` targets Services while `PodMonitor` targets Pods directly
+- [ ] Know the 2-tier label matching chain (Prometheus $\to$ ServiceMonitor $\to$ Service)
+- [ ] Know that `endpoints[].port` must reference the Service port NAME string
+- [ ] Know that `relabelings` executes before scrape while `metricRelabelings` executes after
+- [ ] Know how `metricRelabelings` drops high-cardinality metrics to save TSDB memory
+- [ ] Know how `namespaceSelector.any: true` enables cluster-wide target discovery
+- [ ] Can inspect ServiceMonitors using `kubectl describe servicemonitor <name>`

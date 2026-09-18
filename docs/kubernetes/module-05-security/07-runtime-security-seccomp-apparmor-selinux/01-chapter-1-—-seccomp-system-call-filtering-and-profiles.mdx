@@ -1,0 +1,278 @@
+---
+title: "Chapter 1 — Seccomp System Call Filtering"
+sidebar_position: 1
+module: "Module 5.7 — Runtime Security"
+description: "Master Linux Seccomp (Secure Computing Mode) in Kubernetes — syscall filtering, RuntimeDefault profiles, custom JSON profiles on localhost, and the Security Profiles Operator (SPO)."
+---
+
+# Chapter 1 — Seccomp System Call Filtering & Profiles
+
+> **Goal:** Master Linux kernel system call (syscall) filtering in Kubernetes using Secure Computing Mode (Seccomp) — understanding how Seccomp restricts the 300+ Linux syscalls available to container processes, configuring the GA `RuntimeDefault` profile, authoring fine-grained custom JSON seccomp profiles, and automating profile synchronization across worker nodes using the CNCF **Security Profiles Operator (SPO)**.
+>
+> By the end of this chapter, you will understand:
+> 1. How system calls (syscalls) bridge user-space container processes and the host Linux kernel
+> 2. How kernel vulnerabilities (Dirty COW, Dirty Pipe) exploit obscure, unneeded syscalls
+> 3. The 3 Seccomp profile types: `RuntimeDefault`, `Localhost`, and `Unconfined`
+> 4. The internal structure of a Seccomp JSON profile (`defaultAction`, `syscalls`, `SCMP_ACT_ALLOW`)
+> 5. How to record minimal syscall profiles using the Security Profiles Operator (SPO)
+> 6. How to troubleshoot `Operation not permitted` (EPERM) syscall rejections
+
+---
+
+## Real-Life Analogy
+
+Think of Seccomp syscall filtering as **a strictly enforced medical dictionary of allowed requests between a patient and the hospital pharmacy**:
+
+- **The Linux Kernel (The Hospital Central Pharmacy):** Contains over 300 different chemical compounds, surgical tools, and emergency buttons (**300+ Linux System Calls** like `read`, `write`, `execve`, `ptrace`, `reboot`).
+- **The Container Application (A Patient with a Headache):** A simple Node.js or Nginx web server only needs 40 basic medicines: opening files, reading network sockets, and writing responses (`read`, `write`, `epoll_wait`).
+- **The Zero-Day Exploit (The Poison Recipe):** An attacker compromises the web server and attempts to order military-grade neurotoxins or press the emergency building detonation switch (`reboot`, `kexec_load`, `bpf`).
+- **`RuntimeDefault` Seccomp (The Standard Prescription Filter):** The pharmacy technician reviews all orders through an automated filter. The filter instantly shreds requests for `ptrace`, `sys_admin`, and `reboot` with an error code (**`SCMP_ACT_ERRNO`**).
+- **Custom Seccomp Profile (The Tailored Prescription Card):** For a high-security banking app, you issue a custom card that authorizes **strictly the exact 35 syscalls** the app was compiled with, locking out the remaining 265+ kernel entry points.
+
+---
+
+## Architecture Diagram
+
+```text
+               Linux Kernel Seccomp BPF Syscall Filtering
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Process (User Space / Unprivileged UID 10001)                │
+ │ Application attempts kernel syscall: `ptrace()` (Process Injection)    │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Invokes Software Interrupt / Syscall Trap
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX HOST KERNEL: Seccomp BPF Filter Engine                           │
+ │                                                                        │
+ │ Evaluates Container's Active Seccomp Profile (`RuntimeDefault`):       │
+ │                                                                        │
+ │ 1. Is `ptrace()` in the allowed syscall whitelist?                     │
+ │    ──► NO! MATCH ACTION: `SCMP_ACT_ERRNO` (EPERM: Operation Not Perm) │
+ │                                                                        │
+ │ 2. Blocked at kernel boundary before reaching kernel subsystem!        │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Returns Error Code 1 (Operation not permitted)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Process: Syscall Fails! Attack Defeated!                     │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 Kubernetes Seccomp Profile Types
+
+Configured in `securityContext.seccompProfile`:
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Profile Type              │ Operational Behavior            │ Production Recommendation       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`RuntimeDefault`**      │ Uses the default profile built  │ **Standard Best Practice.**     │
+ │                           │ into containerd / CRI-O. Blocks │ Mandated by Pod Security        │
+ │                           │ ~50+ dangerous syscalls.        │ Standards (Restricted Profile). │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`Localhost`**           │ Loads a custom JSON profile     │ **High Security / Zero-Trust.** │
+ │                           │ located on worker node disk at  │ Tailored specifically to        │
+ │                           │ `/var/lib/kubelet/seccomp/...`  │ individual microservices.       │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **`Unconfined`**          │ **Disables Seccomp filtering.** │ **DO NOT USE in production!**   │
+ │                           │ Container can execute all 300+  │ Extreme security vulnerability. │
+ │                           │ Linux system calls.             │                                 │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Anatomy of a Custom Seccomp JSON Profile
+
+Saved on worker nodes at `/var/lib/kubelet/seccomp/profiles/custom-app.json`:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept4",
+        "bind",
+        "close",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "exit_group",
+        "futex",
+        "getpid",
+        "listen",
+        "mmap",
+        "mprotect",
+        "nanosleep",
+        "read",
+        "recvmsg",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "sendmsg",
+        "socket",
+        "write"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+```
+
+```text
+ Seccomp Actions:
+ - `SCMP_ACT_ALLOW`: Permitted to execute.
+ - `SCMP_ACT_ERRNO`: Returns `EPERM` (Operation not permitted) without terminating process.
+ - `SCMP_ACT_KILL_PROCESS`: Instantly terminates the entire container process with SIGSYS.
+ - `SCMP_ACT_LOG`: Allows the syscall but records an audit event in `/var/log/audit/audit.log`.
+```
+
+---
+
+## The Security Profiles Operator (SPO)
+
+Manually copying JSON files to `/var/lib/kubelet/seccomp/` on 500 worker nodes is unscalable.
+
+The CNCF **Security Profiles Operator (SPO)** automates profile management via Kubernetes CRDs:
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Profile Recording Mode (`ProfileRecording` CRD)                     │
+ │    - Hooks into container startup via eBPF/auditd                      │
+ │    - Automatically records every syscall the app executes during tests │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Automatically Generates
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 2. `SeccompProfile` Custom Resource                                    │
+ │    - SPO DaemonSet distributes JSON file to all worker node disks!     │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Enforces
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Pod Spec: `localhostProfile: operator/production/my-app.json`          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Manifest: Enforcing `RuntimeDefault` & `Localhost`
+
+```yaml
+# 1. Pod enforcing the standard RuntimeDefault profile
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-web-app
+  namespace: production
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault            # Standard for all production workloads!
+  containers:
+  - name: web
+    image: nginx:1.25-alpine
+    securityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 10001
+---
+# 2. Pod enforcing a fine-grained Custom Localhost profile
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ultra-secure-banking-pod
+  namespace: production
+spec:
+  securityContext:
+    seccompProfile:
+      type: Localhost
+      localhostProfile: profiles/custom-app.json # Path relative to /var/lib/kubelet/seccomp/
+  containers:
+  - name: banking-engine
+    image: banking-service:v2.1
+```
+
+---
+
+## Hands-On Lab: Testing Seccomp Syscall Blocking
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace seccomp-lab
+
+# Step 2: Deploy a Pod configured with RuntimeDefault Seccomp
+cat <<EOF | kubectl apply -f - -n seccomp-lab
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seccomp-demo-pod
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: tester
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/seccomp-demo-pod -n seccomp-lab --timeout=30s
+
+# Step 4: Attempt to execute an allowed basic syscall (e.g. read/write via echo)
+kubectl exec -n seccomp-lab seccomp-demo-pod -- echo "Standard syscalls work perfectly!"
+
+# Step 5: Attempt to invoke a restricted hardware/clock syscall (e.g. adjtimex / date change)
+kubectl exec -n seccomp-lab seccomp-demo-pod -- date -s "2030-01-01 00:00:00" 2>&1 || echo "SUCCESS: Kernel blocked unauthorized time modification syscall!"
+
+# Step 6: Clean up lab
+kubectl delete namespace seccomp-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Linux Seccomp, and what role does it play in Kubernetes container security?**
+
+Seccomp (Secure Computing Mode) is a Linux kernel security feature that restricts the system calls (syscalls) a process can issue to the host kernel. Linux provides over 300 system calls, many of which are never needed by containerized microservices. If an attacker discovers an arbitrary code execution vulnerability inside a container, Seccomp acts as a kernel firewall, blocking access to high-risk syscalls (like `ptrace`, `kexec_load`, and `reboot`) and preventing kernel privilege escalation and container breakout attacks.
+
+**Q2: What is the difference between `RuntimeDefault` and `Localhost` Seccomp profiles?**
+
+- `RuntimeDefault`: The default seccomp profile provided by the container runtime (containerd or CRI-O). It blocks ~50+ dangerous or obsolete syscalls while permitting all standard application operations with zero configuration overhead.
+- `Localhost`: A custom, fine-grained JSON seccomp profile loaded from the worker node's local filesystem (`/var/lib/kubelet/seccomp/<path>`). It enables zero-trust hardening by explicitly whitelisting only the exact 30–50 syscalls required by a specific application.
+
+**Q3: What happens when a container process executes a system call that is disallowed by its Seccomp profile?**
+
+Depending on the `action` configured in the profile:
+1. `SCMP_ACT_ERRNO`: The kernel blocks the syscall and returns an error code (such as `EPERM: Operation not permitted`) to the process.
+2. `SCMP_ACT_KILL_PROCESS`: The kernel immediately kills the entire container process with a `SIGSYS` signal.
+3. `SCMP_ACT_LOG`: The kernel allows the syscall to proceed but records an audit log in `/var/log/audit/audit.log`.
+
+**Q4: What is the CNCF Security Profiles Operator (SPO), and why is it necessary in large Kubernetes clusters?**
+
+Deploying custom seccomp JSON files manually requires copying files to `/var/lib/kubelet/seccomp/` across every worker node in the cluster, which is error-prone and unmanageable. The Security Profiles Operator (SPO) provides a declarative Kubernetes-native solution: it runs as a controller and DaemonSet, allowing teams to manage seccomp profiles as Custom Resources (`SeccompProfile`) and automatically recording application syscalls in staging environments using `ProfileRecording`.
+
+**Q5: Why is `seccompProfile.type: Unconfined` strongly discouraged in production?**
+
+`Unconfined` disables all seccomp filtering, granting the container process unrestricted access to all 300+ Linux system calls. If the container process is compromised, the attacker can exploit obscure or unpatched Linux kernel vulnerabilities (like Dirty COW or Dirty Pipe) to compromise the underlying host operating system and escape container boundaries.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Seccomp filters Linux system calls (syscalls) at the kernel layer
+- [ ] Know the 3 profile types: `RuntimeDefault` (standard), `Localhost` (custom), `Unconfined` (disabled)
+- [ ] Know that `RuntimeDefault` is mandated by Pod Security Standards (Restricted)
+- [ ] Know the Seccomp actions: `SCMP_ACT_ALLOW`, `SCMP_ACT_ERRNO`, `SCMP_ACT_KILL`
+- [ ] Know that custom profiles reside at `/var/lib/kubelet/seccomp/` on nodes
+- [ ] Know that Security Profiles Operator (SPO) automates profile recording and distribution
+- [ ] Can inspect pod seccomp configuration with `kubectl get pod <name> -o yaml`

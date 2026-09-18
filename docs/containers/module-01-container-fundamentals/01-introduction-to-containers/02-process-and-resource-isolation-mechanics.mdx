@@ -1,0 +1,203 @@
+---
+title: "Chapter 2 — Process & Resource Isolation Mechanics"
+sidebar_position: 2
+module: "Module 1.1 — Intro to Containers"
+description: "Master process and resource isolation mechanics — system call boundaries, evolution from chroot to OCI, why chroot escapes happen, and defense-in-depth security."
+---
+
+# Chapter 2 — Process & Resource Isolation Mechanics
+
+> **Goal:** Master the low-level Linux operating system mechanics governing process confinement, memory virtualization, and hardware limits — tracing the historical evolution from Unix **`chroot` (1979)** and **FreeBSD Jails** to modern **OCI Containerization**, analyzing why `chroot` is trivial to escape, dissecting the **Linux System Call (`syscall`) trap boundary**, and constructing the 5-layer **Defense-in-Depth Isolation Stack**.
+>
+> By the end of this chapter, you will understand:
+> 1. The execution boundary between User Space (Ring 3) and Kernel Space (Ring 0) during system calls
+> 2. The chronological evolution: `chroot` $\to$ FreeBSD Jails $\to$ Solaris Zones $\to$ cgroups $\to$ Docker/OCI
+> 3. Why `chroot` is not a security boundary and how root processes escape via `fchdir`
+> 4. How Linux Namespaces virtualize kernel tables without CPU virtualization overhead
+> 5. How cgroups enforce hard ceilings vs soft throttles on CPU, RAM, and disk I/O
+> 6. How to build a primitive container from scratch using raw Linux `unshare` and `chroot` commands
+
+---
+
+## Real-Life Analogy
+
+Think of Process and Resource Isolation as **equipping an actor inside a secure movie studio with a Virtual Reality (VR) headset and an automated electrical circuit breaker**:
+
+- **Process Isolation / Namespaces (The VR Headset):**
+  - You place a Virtual Reality headset on an actor (**The Containerized Process**).
+  - Inside the VR headset, the actor looks around and sees only 1 empty room with 1 process: themselves (**PID 1**), 1 private network router (**Private `eth0`**), and a private file cabinet (**Container Rootfs**).
+  - The actor has **zero awareness** that outside the VR headset, 500 other actors are working in the exact same physical warehouse building (**The Host Linux OS**).
+- **Resource Isolation / cgroups (The Electrical Circuit Breaker):**
+  - Even if the actor in the VR headset goes crazy and tries to turn on 100 high-wattage stadium spotlights (**A runaway infinite CPU loop or memory leak**), the room's master circuit breaker (**Linux cgroup**) trips instantly.
+  - The circuit breaker caps the electricity at exactly 200 Watts (**`cpu.max: 200000 100000`**).
+  - The rest of the building continues running at normal temperature without experiencing a power outage!
+- **The Chroot Trap (The Cardboard Screen vs The Concrete Vault):**
+  - `chroot` is like putting a thin cardboard folding screen around the actor. If the actor simply stands up and steps over the screen (**`fchdir` escape**), they are back in the main warehouse! Modern containers build a reinforced concrete vault (**Namespaces + cgroups + `pivot_root` + Seccomp**).
+
+---
+
+## Architecture Diagram
+
+```text
+               The 5-Layer Defense-in-Depth Container Isolation Stack
+
+ USER SPACE (Ring 3 - Unprivileged Execution):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINERIZED APPLICATION PROCESS (e.g. Python API Server)             │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 1. FILESYSTEM ISOLATION: `pivot_root` + OverlayFS (Private rootfs `/`) │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 2. VISIBILITY ISOLATION: 8 Linux Namespaces (PID, NET, MNT, UTS, IPC...)│
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 3. CAPABILITIES FILTER:  Drops 30+ root capabilities (`CAP_SYS_ADMIN`!) │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 4. SYSCALL FILTERING:    Seccomp-BPF blocks 300+ unsafe kernel syscalls│
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Triggers Hardware CPU Syscall Trap (`int 0x80` / `syscall`)
+                    ▼
+ KERNEL SPACE (Ring 0 - Privileged Execution):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 5. RESOURCE LIMITS: Linux cgroups v2 (`/sys/fs/cgroup/`)               │
+ │    - CPU: Completely Fair Scheduler (CFS) bandwidth throttles          │
+ │    - Memory: OOM-Killer kills process if `memory.max` exceeded         │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ PHYSICAL HARDWARE (Host CPU Cores, RAM Banks, NVMe SSDs, NICs)         │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Historical Evolution of Containerization
+
+```text
+ ┌──────────┬──────────────────────┬──────────────────────────────────────────────────────────────────┐
+ │ Year     │ Technology Milestone │ Systems Breakthrough & Significance                              │
+ │──────────┼──────────────────────┼──────────────────────────────────────────────────────────────────┤
+ │ **1979** │ **`chroot` (Unix v7) │ First filesystem root path isolation (`change root`).            │
+ │ **2000** │ **FreeBSD Jails**    │ Added process, network, and hostname isolation to chroot.        │
+ │ **2004** │ **Solaris Zones**    │ First production enterprise OS virtualization with quotas.       │
+ │ **2006** │ **Google Process VM**│ Google engineers author "Process Containers" (renamed **cgroups**)│
+ │ **2008** │ **Linux LXC**        │ Combined Linux Namespaces + cgroups into first complete stack.   │
+ │ **2013** │ **Docker**           │ Standardized layered image format (AUFS), REST API, & developer UX│
+ │ **2015** │ **CNCF & OCI**       │ Open Container Initiative standardizes Image and Runtime Specs.  │
+ └──────────┴──────────────────────┴──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Why `chroot` is NOT a Container (And How to Escape It)
+
+In 1979, Unix introduced `chroot(2)` to change the perceived root directory (`/`) for a process. However, **`chroot` was never designed as a security boundary**:
+
+```c
+/* Classic chroot breakout exploit (Escape from chroot jail in C) */
+#include <sys/stat.h>
+#include <unistd.h>
+
+void escape_chroot() {
+    int real_root_fd;
+    mkdir("temp_dir", 0755);
+    chroot("temp_dir");             /* Jails process into temp_dir */
+    real_root_fd = open("/", 0);    /* Retains file descriptor outside jail! */
+    fchdir(real_root_fd);           /* Changes directory back to TRUE host root! */
+    chroot(".");                    /* Resets root directory back to host system! */
+    system("/bin/sh");              /* Spawns root shell on host machine! */
+}
+```
+
+### How Modern Containers Fix This: `pivot_root`
+Modern OCI container runtimes (`runc`) use the **`pivot_root(2)`** system call instead of `chroot`. `pivot_root` moves the entire root mount point of the host OS to a temporary directory, mounts the container's rootfs as the true root mount, and unmounts the old host root, making directory traversal escapes physically impossible.
+
+---
+
+## The Linux System Call Boundary
+
+Applications running in a container communicate with the host Linux kernel via **System Calls (`syscalls`)**:
+
+```text
+ Application (User Space Ring 3) ──► Invokes `write(fd, buf, count)`
+                                           │
+                                           ▼ (CPU Trap: switches to Ring 0)
+ Linux Kernel (Kernel Space Ring 0) ──► Checks Seccomp BPF Rules
+                                           │ (If allowed)
+                                           ▼
+ Executes Physical Device Driver ─────► Writes bytes to NVMe Controller!
+```
+
+---
+
+## Hands-On Lab: Building a DIY Container from Scratch (No Docker!)
+
+Using only native Linux kernel utilities, we can assemble a functional, isolated container:
+
+```bash
+# Step 1: Create a directory for our container root filesystem
+mkdir -p /tmp/my-container/rootfs
+cd /tmp/my-container
+
+# Step 2: Download and unpack a minimal Alpine Linux rootfs
+curl -sL http://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.1-x86_64.tar.gz | tar -xz -C rootfs/
+
+# Step 3: Launch an isolated process using Linux 'unshare' (Namespaces + chroot)
+sudo unshare --mount --uts --ipc --net --pid --fork chroot rootfs /bin/sh
+
+# -------------------------------------------------------------
+# YOU ARE NOW INSIDE YOUR DIY CONTAINER!
+# -------------------------------------------------------------
+
+# Step 4: Mount the isolated proc filesystem
+mount -t proc proc /proc
+
+# Step 5: Check the process tree inside the container
+ps -ef
+# Output: PID 1 is /bin/sh! You have created a completely isolated process namespace!
+
+# Step 6: Set a private hostname inside the container
+hostname my-secure-container
+hostname
+# Exit the container
+exit
+
+# Step 7: Verify that the HOST hostname was completely untouched!
+hostname
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the fundamental difference between `chroot` and `pivot_root` in container runtimes?**
+
+- **`chroot` (Change Root)**: Modifies only the current process's view of `/` (root path resolution). The underlying mount table remains unchanged. If a process possesses `CAP_SYS_CHROOT` or retains an open file descriptor outside the chroot directory, it can easily escape back to the host filesystem using `fchdir`.
+- **`pivot_root`**: An atomic Linux kernel system call that **swaps the entire mount namespace root**. It moves the old root mount point to a temporary path, binds the container's new rootfs as the master mount, and unmounts the old root. Processes inside a `pivot_root` jail have zero file descriptor links or mount paths back to the host operating system.
+
+**Q2: How does the Linux System Call boundary relate to container security?**
+
+Containers do not virtualize the CPU or hardware; they execute instructions directly on the host CPU in user-space (Ring 3). When an application needs to access the network, allocate memory, or write to disk, it executes a CPU trap to invoke a **System Call (`syscall`) in kernel-space (Ring 0)**. Because all containers share the single host kernel, a vulnerability in any of the ~450 Linux system calls can allow a container process to exploit kernel memory. Containers mitigate this by using **Seccomp filters** to block over 300 non-essential system calls.
+
+**Q3: What are the 5 layers of the Defense-in-Depth container isolation model?**
+
+1. **Filesystem Isolation**: `pivot_root` and OverlayFS provide an immutable, isolated root filesystem.
+2. **Namespace Virtualization**: 8 Linux namespaces virtualize visibility of PIDs, network interfaces, mount points, IPC queues, hostnames, and user IDs.
+3. **Linux Capabilities**: Stripping root privileges by dropping dangerous capabilities (e.g. `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`).
+4. **Syscall Filtering (Seccomp-BPF)**: Restricting allowed system calls to a safe whitelist.
+5. **Resource Quotas (cgroups v2)**: Enforcing strict CPU, memory, I/O, and PID limits to prevent host denial-of-service.
+
+**Q4: Can a container run a different Linux distribution than the host OS (e.g. Ubuntu container on Alpine host)?**
+
+**Yes**. A container can run any Linux distribution user-space (e.g. Debian, Ubuntu, Fedora, Alpine) regardless of the host OS distribution. This is because standard Linux distributions consist of **user-space binaries and libraries (`glibc`, `musl`, bash, package managers)** compiled against the standard **POSIX Linux System Call ABI**. As long as the container's user-space libraries can communicate with the host's Linux kernel version via system calls, the distribution runs flawlessly.
+
+**Q5: Can an x86_64 container image run natively on an ARM64 (Apple Silicon / AWS Graviton) host?**
+
+**No, not natively**. Container processes execute native machine code instructions directly on the physical CPU without a hypervisor. An x86_64 binary contains Intel/AMD CPU instructions that cannot be decoded by an ARM64 processor. To run an x86_64 container on ARM64, the host must use a software CPU emulation layer like **QEMU (via `binfmt_misc`)**, which translates x86 instructions to ARM instructions at runtime, incurring a 2x to 5x performance penalty.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that system calls cross the user-space (Ring 3) to kernel-space (Ring 0) boundary
+- [ ] Know the historical progression: `chroot` (1979) $\to$ Jails $\to$ Zones $\to$ cgroups $\to$ OCI
+- [ ] Know why `chroot` is insecure and why runtimes use `pivot_root` instead
+- [ ] Know that Seccomp-BPF blocks over 300 dangerous system calls
+- [ ] Know that any Linux distro can run on any host if the kernel syscall ABI is compatible
+- [ ] Can build a primitive container using `unshare --mount --pid --fork chroot`

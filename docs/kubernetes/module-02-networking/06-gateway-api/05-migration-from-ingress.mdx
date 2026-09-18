@@ -1,0 +1,397 @@
+---
+title: "Chapter 5 — Migration from Ingress to Gateway API"
+sidebar_position: 5
+module: "Module 2.6 — Gateway API"
+description: "A practical guide to migrating from Kubernetes Ingress to Gateway API — mapping Ingress concepts to GatewayClass/Gateway/HTTPRoute equivalents, migration strategies (gradual canary, parallel operation), common pitfalls, and tooling assistance."
+---
+
+# Chapter 5 — Migration from Ingress to Gateway API
+
+> **Goal:** Understand how to migrate existing Ingress-based routing to Gateway API with zero downtime, map each Ingress feature to its Gateway API equivalent, and know the common pitfalls that cause migration failures.
+>
+> By the end of this chapter, you will understand:
+> 1. The conceptual mapping from Ingress to GatewayClass + Gateway + HTTPRoute
+> 2. How to migrate host-based and path-based routing
+> 3. How to migrate TLS configuration (Ingress `spec.tls` → Gateway listeners + ReferenceGrant)
+> 4. How to migrate common NGINX annotations to HTTPRoute filters
+> 5. A safe parallel-running migration strategy with gradual traffic cutover
+> 6. Tooling: `ingress2gateway` — the official migration tool
+
+---
+
+## Real-Life Analogy
+
+Migrating from Ingress to Gateway API is like upgrading a **manual telephone switchboard to a digital PBX system**:
+
+The old switchboard (Ingress) works — operators (controllers) use sticky notes (annotations) to handle non-standard calls. It gets the job done but is fragile, manual, and operator-specific.
+
+The new PBX (Gateway API) has a structured system: extension directories (GatewayClass), floor directories (Gateway), and typed call-routing rules (HTTPRoute). You can run both systems simultaneously during migration — the old switchboard keeps working while the new system is configured and tested. Once tested, you redirect the main trunk line (DNS/LB) to the new system.
+
+---
+
+## Conceptual Mapping: Ingress → Gateway API
+
+```text
+  INGRESS CONCEPT              GATEWAY API EQUIVALENT
+  ──────────────────────────   ──────────────────────────────────────────
+  IngressClass (annotation)  → GatewayClass (cluster-scoped CRD)
+  Ingress (single object)    → Gateway (infra) + HTTPRoute (routing)
+  spec.rules[].host          → HTTPRoute.spec.hostnames[]
+  spec.rules[].http.paths[]  → HTTPRoute.spec.rules[].matches[].path
+  spec.tls[].hosts           → Gateway.spec.listeners[].hostname
+  spec.tls[].secretName      → Gateway.spec.listeners[].tls.certificateRefs
+  Annotations (controller-specific) → HTTPRoute.spec.rules[].filters (standard)
+  Canary (2 Ingress objects)  → HTTPRoute backendRefs with weights
+```
+
+---
+
+## Step-by-Step Migration Example
+
+### Before: Ingress Configuration
+
+```yaml
+# Existing Ingress (NGINX-based)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls-cert
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /api(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 8080
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 3000
+```
+
+### After: Gateway API Equivalents
+
+```yaml
+# 1. GatewayClass (usually auto-created by controller install)
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: nginx
+spec:
+  controllerName: gateway.nginx.org/nginx-gateway-controller
+---
+# 2. Gateway (replaces the Ingress infrastructure concern)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main-gateway
+  namespace: production
+spec:
+  gatewayClassName: nginx
+  listeners:
+  # HTTP listener with redirect to HTTPS
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+
+  # HTTPS listener (replaces spec.tls in Ingress)
+  - name: https
+    port: 443
+    protocol: HTTPS
+    hostname: "api.example.com"
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: api-tls-cert        # Same Secret as before
+    allowedRoutes:
+      namespaces:
+        from: Same
+---
+# 3. HTTPRoute for redirect HTTP→HTTPS (replaces force-ssl-redirect annotation)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: http-redirect
+  namespace: production
+spec:
+  parentRefs:
+  - name: main-gateway
+    sectionName: http
+  rules:
+  - filters:
+    - type: RequestRedirect
+      requestRedirect:
+        scheme: https
+        statusCode: 301
+---
+# 4. HTTPRoute for actual routing (replaces Ingress rules)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api-route
+  namespace: production
+spec:
+  parentRefs:
+  - name: main-gateway
+    sectionName: https
+  hostnames:
+  - "api.example.com"
+  rules:
+  # Route /api/* to api-service (replaces path + rewrite-target annotation)
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplacePrefixMatch
+          replacePrefixMatch: /    # Strip /api prefix → /
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        add:
+        - name: Access-Control-Allow-Origin
+          value: "https://app.example.com"
+    backendRefs:
+    - name: api-service
+      port: 8080
+
+  # Route everything else to frontend
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: frontend-service
+      port: 3000
+```
+
+---
+
+## Migrating Common Annotations
+
+| NGINX Annotation | Gateway API Equivalent |
+|-----------------|------------------------|
+| `rewrite-target: /$2` | `URLRewrite` filter with `ReplacePrefixMatch` |
+| `force-ssl-redirect: "true"` | Separate HTTPRoute on port 80 with `RequestRedirect` filter |
+| `proxy-read-timeout: "60"` | `spec.rules[].timeouts.backendRequest: "60s"` |
+| `enable-cors: "true"` + `cors-allow-origin` | `ResponseHeaderModifier` filter (or BackendLBPolicy when GA) |
+| `canary: "true"` + `canary-weight: "20"` | Multiple `backendRefs` with `weight` in one HTTPRoute rule |
+| `auth-url: ...` | ExtensionRef to controller-specific policy (not yet standard) |
+| `rate-limit: ...` | BackendLBPolicy or ExtensionRef (controller-specific, evolving) |
+| `backend-protocol: GRPC` | `GRPCRoute` (experimental channel) |
+| `upstream-keepalive-connections` | `BackendLBPolicy.spec.sessionPersistence` (evolving) |
+
+> [!WARNING]
+> Not all NGINX annotations have a direct Gateway API standard equivalent yet. `auth-url` and `rate-limit` are the biggest gaps — they require controller-specific extension policies or external solutions (OAuth2 proxy, Envoy rate limit service).
+
+---
+
+## Migration Strategy: Parallel Operation
+
+Running Ingress and Gateway API simultaneously is safe — both controllers can coexist:
+
+```text
+Phase 1: Install Gateway API controller alongside existing NGINX Ingress
+  - Both controllers running simultaneously
+  - DNS/LB still pointing to NGINX Ingress
+
+Phase 2: Create Gateway API resources
+  - Create GatewayClass, Gateway (gets a separate external IP)
+  - Create HTTPRoutes mirroring your Ingress rules
+  - Test via IP directly (curl -H "Host: api.example.com" http://<gateway-ip>/)
+
+Phase 3: Gradual traffic shift (weighted DNS or LB listener rules)
+  - Shift 10% → 50% → 100% of DNS traffic to Gateway IP
+  - Monitor error rates, latency
+  - Ready to roll back by shifting DNS back
+
+Phase 4: Remove Ingress resources
+  - Once 100% traffic on Gateway API and stable for 7+ days
+  - Delete old Ingress objects
+  - Remove old NGINX Ingress Controller
+```
+
+---
+
+## The `ingress2gateway` Tool
+
+The SIG-Network community provides an official migration tool:
+
+```bash
+# Install ingress2gateway
+go install sigs.k8s.io/ingress2gateway@latest
+
+# Convert all Ingress resources in a namespace
+ingress2gateway print \
+  --namespace production \
+  --providers nginx
+
+# Output: GatewayClass, Gateway, HTTPRoute YAML
+# Review and apply:
+ingress2gateway print \
+  --namespace production \
+  --providers nginx | kubectl apply -f -
+
+# Supported providers (as of 2024):
+# nginx, istio, ingress-gce (GKE), kong
+```
+
+> [!NOTE]
+> `ingress2gateway` generates a starting point — review the output before applying. Annotation migration is best-effort; complex annotations (auth, rate-limit) require manual handling.
+
+---
+
+## Common Migration Pitfalls
+
+### 1. Certificate Namespace Issues
+
+Ingress uses Secrets in the same namespace. Gateway can too, but:
+```yaml
+# If Gateway is in gateway-infra and Secret is in production:
+# REQUIRES a ReferenceGrant in 'production' namespace
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-certs
+  namespace: production
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    namespace: gateway-infra
+  to:
+  - group: ""
+    kind: Secret
+```
+
+### 2. `sectionName` Required for Multiple Listeners
+
+```yaml
+# Wrong: ambiguous which listener to attach to
+parentRefs:
+- name: main-gateway
+
+# Correct: specify the listener
+parentRefs:
+- name: main-gateway
+  sectionName: https
+```
+
+### 3. Weight Semantics Difference
+
+Ingress canary `canary-weight: 20` means "20% to canary". Gateway API weights are relative:
+```yaml
+# 80/20 split in Gateway API:
+backendRefs:
+- name: stable
+  weight: 80    # 80/(80+20) = 80%
+- name: canary
+  weight: 20    # 20/(80+20) = 20%
+```
+
+### 4. CORS — No Standard Filter Yet
+
+Gateway API v1 doesn't have a built-in CORS filter. Options:
+- Use controller-specific policy CRDs (if supported)
+- Add CORS headers in your backend application
+- Use a dedicated CORS sidecar
+- Use an ExtensionRef to a policy object (controller-specific)
+
+---
+
+## Hands-On: Migration Validation
+
+```bash
+# 1. Compare Ingress and HTTPRoute routing for the same hostname
+# Test via old Ingress:
+INGRESS_IP=$(kubectl get ingress api-ingress -n production \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+curl -H "Host: api.example.com" https://$INGRESS_IP/api/health -k
+
+# Test via new Gateway:
+GATEWAY_IP=$(kubectl get gateway main-gateway -n production \
+  -o jsonpath='{.status.addresses[0].value}')
+curl -H "Host: api.example.com" https://$GATEWAY_IP/api/health -k
+
+# Both should return the same response.
+
+# 2. Verify HTTPRoute attachment
+kubectl get httproute -n production -o wide
+# NAME        HOSTNAMES             PARENT REFS   AGE
+# api-route   ["api.example.com"]   main-gateway  5m
+
+# 3. Check all routes are accepted
+kubectl get httproute -A \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.status.parents[0].conditions[0].status}{"\n"}{end}'
+
+# 4. Validate canary traffic split with 100 requests
+for i in $(seq 100); do
+  curl -s https://api.example.com/api/version | grep -o '"version":"[^"]*"'
+done | sort | uniq -c
+# ~80 lines with "v1", ~20 lines with "v2"
+
+# 5. Remove Ingress after validation
+kubectl delete ingress api-ingress -n production
+# Gateway API takes over all traffic
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is it safe to run Ingress and Gateway API controllers simultaneously during migration?**
+
+Ingress and Gateway API use different API groups (`networking.k8s.io/v1` vs `gateway.networking.k8s.io/v1`) and different controllers — they don't interfere with each other. The old NGINX Ingress Controller watches only `Ingress` objects; the Gateway API controller watches only `Gateway`/`HTTPRoute` objects. Each gets its own external IP from its LoadBalancer Service. Traffic can be split between them via weighted DNS or cloud LB listener rules, enabling gradual cutover with easy rollback.
+
+**Q2: How do you migrate the NGINX `rewrite-target` annotation to Gateway API?**
+
+`rewrite-target: /$2` with path regex `(/api)(.*)` strips the `/api` prefix before forwarding. In HTTPRoute, use a `URLRewrite` filter with `path.type: ReplacePrefixMatch` and `replacePrefixMatch: /`. The matched path prefix (`/api`) is replaced by `/`, effectively stripping it. The rule's path match should be `PathPrefix: /api`. The result is the same: `/api/users` → `/users` reaches the backend.
+
+**Q3: What are the biggest feature gaps when migrating from NGINX Ingress to Gateway API standard channel?**
+
+The two most significant gaps: (1) **Authentication** — NGINX's `auth-url` (delegating to an external auth service) has no standard equivalent in Gateway API v1. Workarounds include controller-specific extension policies or using an OAuth2 proxy sidecar. (2) **Rate limiting** — NGINX's `limit-rps` annotation has no standard HTTPRoute filter. Rate limiting in Gateway API is being standardized in the BackendLBPolicy/BackendTrafficPolicy CRDs, but availability varies by controller. CORS headers also lack a native filter (must use ResponseHeaderModifier or controller-specific policy).
+
+**Q4: What does the `ingress2gateway` tool do and what are its limitations?**
+
+`ingress2gateway` is an official SIG-Network tool that reads Kubernetes Ingress resources and generates equivalent GatewayClass, Gateway, and HTTPRoute YAML. It supports major Ingress implementations (NGINX, Istio, GKE's ingress-gce). Limitations: (1) complex annotation translation is best-effort (some annotations may not have clean equivalents), (2) controller-specific annotations like `auth-url` and `rate-limit` may not be translated at all, (3) the output is a starting point requiring manual review before production use.
+
+**Q5: How do you handle a Kubernetes Secret (TLS cert) that's in a different namespace than the Gateway?**
+
+Create a `ReferenceGrant` in the namespace that owns the Secret. This resource grants specific Gateway (or HTTPRoute) objects in specified namespaces permission to reference resources in the Secret's namespace. Without `ReferenceGrant`, cross-namespace references are denied by default. The Gateway status will show `ResolvedRefs: False` with reason `RefNotPermitted` if the ReferenceGrant is missing.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the Ingress → Gateway API mapping: IngressClass→GatewayClass, Ingress→Gateway+HTTPRoute, spec.tls→Gateway listener TLS
+- [ ] Know how to migrate host/path routing: Ingress rules → HTTPRoute hostnames + path matches
+- [ ] Know how to migrate TLS: `spec.tls[].secretName` → Gateway listener `certificateRefs` + ReferenceGrant for cross-ns
+- [ ] Know annotation migration: `rewrite-target` → URLRewrite, `force-ssl-redirect` → RequestRedirect HTTPRoute
+- [ ] Know the gaps: `auth-url` and `rate-limit` have no standard HTTPRoute equivalent yet
+- [ ] Know the parallel migration strategy: both controllers run simultaneously, DNS shifted gradually
+- [ ] Know `ingress2gateway` tool generates migration YAML from existing Ingress resources

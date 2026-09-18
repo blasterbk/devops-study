@@ -1,0 +1,154 @@
+---
+title: "Chapter 4 — Kubernetes NetworkPolicies & CNI Comparison: Zero-Trust, Calico vs Cilium"
+sidebar_position: 1
+module: "Module 18.4 — NetworkPolicies & CNIs"
+description: "Master Kubernetes NetworkPolicies — Default-Deny-All Zero Trust architecture, Ingress/Egress CIDR/podSelector rules, Calico GlobalNetworkPolicies, and Cilium eBPF L7 NetworkPolicies."
+---
+
+# Chapter 4 — Kubernetes NetworkPolicies & CNI Comparison: Zero-Trust, Calico vs Cilium
+
+> **Goal:** Master Zero-Trust microsegmentation inside Kubernetes clusters using **NetworkPolicies** and enterprise CNI plugins. Understand how standard `networking.k8s.io/v1` `NetworkPolicy` resources enforce Layer 3/4 packet filtering, the mandatory **Default Deny All** production baseline, and an exhaustive architectural deep dive comparing **Project Calico (iptables / eBPF / BGP)** vs **Cilium (native eBPF / L7 API / ClusterMesh)** vs **Flannel (legacy overlay)**.
+>
+> By the end of this chapter, you will understand:
+> 1. The default open-flat network state of Kubernetes (all pods talk to all pods) and why Zero-Trust is mandatory
+> 2. `NetworkPolicy` spec mechanics: `podSelector`, `policyTypes` (`Ingress`, `Egress`), `namespaceSelector`, and `ipBlock`
+> 3. Production Security Baselines: Default-Deny-Ingress, Default-Deny-Egress, and allowing internal CoreDNS port 53
+> 4. Calico CNI deep dive: Felix agent, BIRD routing daemon, IP pool management, and `GlobalNetworkPolicy` CRDs
+> 5. Cilium CNI deep dive: eBPF in-kernel filtering, identity-based security (numeric security IDs), and Layer 7 HTTP/DNS/Kafka policies (`CiliumNetworkPolicy`)
+> 6. Master CNI comparison matrix: Calico vs Cilium vs Flannel vs AWS VPC CNI
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes NetworkPolicies as **electronic keycard access doors inside a corporate office**:
+
+- **Default Kubernetes (Open Hippie Commune):**
+  - All doors are wide open, zero locks. A compromised coffee machine pod in the break room can walk directly into the financial vault (**Database Pod**) and steal credit card data (**Open East-West Traffic**).
+- **Default Deny All (Locking All Interior Doors):**
+  - Every room door locks automatically (**Default Deny Ingress/Egress**).
+- **Explicit NetworkPolicy (The Programmed Keycard):**
+  - A specific security rule states: *"Only workers wearing a `role=frontend` badge are allowed to enter the `payment-service` door on Port 8080"*.
+- **Layer 7 Cilium Policy (The Conversation Inspector):**
+  - Even if the frontend employee is allowed through the door, the guard checks their spoken words: *"You are only allowed to speak the command `POST /pay`; if you ask for `GET /admin/secrets`, you are arrested on the spot"*.
+
+---
+
+## Architecture Diagram
+
+```text
+                  Kubernetes Zero-Trust NetworkPolicy Enforcement
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES NAMESPACE: `production`                                          │
+ │                                                                             │
+ │ ┌──────────────────────┐                     ┌────────────────────────────┐ │
+ │ │ [Frontend Web Pod]   │                     │ [Attacker Compromised Pod] │ │
+ │ │ Labels: role=frontend│                     │ Labels: role=untrusted     │ │
+ │ └──────────┬───────────┘                     └──────────────┬─────────────┘ │
+ │            │ (Matches podSelector)                          │ (Blocked!)    │
+ │            ▼ Allowed Port 5432                              ▼               │
+ │ ┌─────────────────────────────────────────────────────────────────────────┐ │
+ │ │ DATABASE POD (Labels: `role=database`)                                  │ │
+ │ │                                                                         │ │
+ │ │ NetworkPolicy: `allow-frontend-to-db`                                   │ │
+ │ │ - Target: `podSelector: {role: database}`                               │ │
+ │ │ - Ingress Allowed From: `podSelector: {role: frontend}` on Port 5432    │ │
+ │ │ - PolicyType: Ingress (All other non-matched ingress is SILENTLY DROPPED)│
+ │ └─────────────────────────────────────────────────────────────────────────┘ │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The Production "Default Deny All" Baseline
+
+Every secure Kubernetes namespace must begin with a **Default-Deny Ingress and Egress** policy:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {} # Matches ALL pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+*(Note: Once egress is denied, you must add an explicit policy allowing egress on UDP/TCP port 53 to `kube-system` CoreDNS, otherwise all DNS lookups will fail).*
+
+---
+
+### 2. Comprehensive CNI Comparison Matrix
+
+```text
+ ┌──────────────────────┬──────────────────────────┬──────────────────────────┬──────────────────────────┬──────────────────────────┐
+ │ Feature              │ Cilium                   │ Calico                   │ Flannel                  │ AWS VPC CNI              │
+ │──────────────────────┼──────────────────────────┼──────────────────────────┼──────────────────────────┼──────────────────────────┤
+ │ **Datapath Engine**  │ Native eBPF (Kernel)     │ iptables / eBPF / IPVS   │ Linux Bridge / VXLAN     │ AWS ENI / iptables       │
+ │ **Routing Mode**     │ Direct BGP / VXLAN / Gen │ Native BGP / IPIP / VXLAN│ VXLAN / Host-GW          │ Native AWS VPC Routing   │
+ │ **NetworkPolicies**  │ L3, L4, **Layer 7 (HTTP)│ L3, L4, GlobalNetPolicy  │ None (Requires Calico)   │ Basic K8s NetworkPolicy  │
+ │ **Service Proxy**    │ Complete kube-proxy repl │ Standard kube-proxy / eBP│ Standard kube-proxy      │ Standard kube-proxy      │
+ │ **Multi-Cluster**    │ Cilium ClusterMesh (eBPF)│ Calico Cluster Mesh (BGP)│ None                     │ VPC Peering / TGW        │
+ │ **Observability**    │ Hubble L3/L4/L7 flow logs│ Calico Enterprise flow   │ Zero observability       │ VPC Flow Logs            │
+ └──────────────────────┴──────────────────────────┴──────────────────────────┴──────────────────────────┴──────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Applying & Testing NetworkPolicies
+
+```bash
+# Step 1: Query all active NetworkPolicies in the cluster
+# kubectl get networkpolicies -A
+
+# Step 2: Test network reachability between two test pods using netshoot
+# kubectl run test-client --image=nicolaka/netshoot -it -- rm
+# Inside pod: nc -zv -w 2 database-service 5432
+
+# Step 3: Inspect active iptables rules created by Calico on the worker node
+sudo iptables -L -n -v | grep -i "cali" | head -n 15
+
+# Step 4: Inspect active eBPF policy maps in Cilium
+# cilium endpoint list
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the behavior of Kubernetes Pods if NO NetworkPolicy is created in a namespace?**
+
+By default, Kubernetes implements an **open-flat networking model (Non-Isolated)**. All pods in all namespaces can freely send and receive traffic to and from every other pod, node, and external internet endpoint with zero restrictions. A pod only becomes isolated once an active `NetworkPolicy` selects that pod in its `podSelector`.
+
+**Q2: What is the difference between a standard Kubernetes `NetworkPolicy` and a Calico `GlobalNetworkPolicy`?**
+
+- **Standard `NetworkPolicy`:** Strictly namespaced. It can only select and protect pods within its own specific namespace. Cluster administrators must duplicate policies across 100 namespaces manually.
+- **Calico `GlobalNetworkPolicy` (CRD):** Non-namespaced. It applies cluster-wide across all namespaces simultaneously and supports advanced rules: ordering priority (`order`), actions like `Log`, `Pass`, `Deny`, and host-level protection for the worker nodes themselves.
+
+**Q3: How does Cilium enforce Identity-Based NetworkPolicies without tracking changing Pod IPs?**
+
+In large Kubernetes clusters, Pods are frequently rescheduled, causing Pod IPs to change constantly and forcing iptables-based CNIs to rewrite thousands of rules per second. **Cilium assigns a 16-bit Numeric Security Identity (e.g. Identity `105`)** to all pods sharing the same labels (`role: frontend`). When packets leave a pod, Cilium stamps the identity into the packet metadata. The destination node checks its in-kernel BPF Map: *"Is Identity 105 allowed to talk to Identity 200 on port 80?"* If yes, the packet passes in **$O(1)$ constant time** regardless of Pod IP changes.
+
+**Q4: How does a Layer 7 NetworkPolicy in Cilium block specific HTTP methods (e.g. allowing `GET` but dropping `DELETE`)?**
+
+Cilium uses an eBPF `sockmap` to intercept the TCP stream. When an HTTP request arrives, the eBPF program redirects the payload to an embedded in-kernel **Envoy proxy**. Envoy inspects the HTTP request line; if the method is `GET /api/v1/data`, Envoy accepts it and passes it back to eBPF. If the method is `DELETE /api/v1/data`, Envoy immediately returns **HTTP 403 Forbidden** with zero execution on the backend pod.
+
+**Q5: Why does Flannel require pairing with Calico in production clusters?**
+
+Flannel is a pure overlay IP connectivity CNI (managing VXLAN tunnels); **Flannel implements 0% NetworkPolicy enforcement**. If you deploy Flannel alone, creating Kubernetes `NetworkPolicy` YAMLs has **zero effect** (traffic is never blocked). Organizations running Flannel must deploy the **Calico Network Policy Controller** on top of Flannel (Canal CNI) to enforce security rules.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Default-Deny-All production security baseline
+- [ ] Understand `podSelector`, `namespaceSelector`, and `ipBlock` CIDR rules
+- [ ] Compare Cilium (eBPF Identity), Calico (BGP/GlobalPolicy), and Flannel
+- [ ] Understand Cilium Layer 7 HTTP/gRPC policy enforcement
+- [ ] Know why CoreDNS port 53 egress must be explicitly allowed when egress is denied

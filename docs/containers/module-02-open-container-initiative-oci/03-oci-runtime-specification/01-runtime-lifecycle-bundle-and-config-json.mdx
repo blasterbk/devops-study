@@ -1,0 +1,219 @@
+---
+title: "Chapter 1 — OCI Runtime Spec: Lifecycle & config.json"
+sidebar_position: 1
+module: "Module 2.3 — OCI Runtime Spec"
+description: "Master the OCI Runtime Specification — OCI filesystem bundles, deep config.json schema analysis, 6-stage lifecycle hooks, and running containers with raw runc."
+---
+
+# Chapter 1 — OCI Runtime Spec: Lifecycle & config.json
+
+> **Goal:** Master the low-level execution contracts, filesystem layouts, and system call boundaries defined by the **OCI Runtime Specification (`runtime-spec`)** — dissecting the **OCI Runtime Bundle (`rootfs/` + `config.json`)**, analyzing the complete JSON schema for Linux namespaces, capabilities, and cgroups, mastering the **6-Stage Runtime Lifecycle & Hooks Sequence**, and executing raw containers directly with **`runc`**.
+>
+> By the end of this chapter, you will understand:
+> 1. The filesystem structure and requirements of an OCI Runtime Bundle
+> 2. The core sections of `config.json`: `process`, `root`, `mounts`, `linux`, and `hooks`
+> 3. The 6 discrete lifecycle states and execution hooks of an OCI container
+> 4. Where CNI network plugins and NVIDIA GPU drivers inject their prestart hooks
+> 5. How `runc` translates declarative JSON into Linux kernel `clone()` and `pivot_root()` syscalls
+> 6. How to generate, configure, and execute a standalone OCI bundle using raw `runc`
+
+---
+
+## Real-Life Analogy
+
+Think of the OCI Runtime Specification and `config.json` as **the automated mission launch sequence and countdown protocol for an orbital space rocket**:
+
+- **1. The Launch Capsule & Payload (`The OCI Bundle`):**
+  - The rocket stage is placed on the launchpad. It consists of the physical metal capsule containing the astronaut equipment (**The `rootfs/` directory**) and the digital flight computer checklist (**The `config.json` file**).
+- **2. The Flight Checklist (`config.json`):**
+  - The checklist specifies exact parameters:
+    - *"Who is the pilot? (`process.args: ["/bin/sh"]`)"*
+    - *"What is their oxygen and fuel allowance? (`linux.resources.memory: 512MB`)"*
+    - *"Which radio frequencies can they tune into? (`linux.namespaces: ["network", "pid"]`)"*
+    - *"Are they allowed to touch the self-destruct button? (`linux.capabilities: Drop CAP_SYS_ADMIN`)"*
+- **3. The 6-Stage Countdown Sequence (`Runtime Lifecycle Hooks`):**
+  - **`createRuntime` (T-Minus 10 Seconds):** The capsule doors are locked and namespaces are created.
+  - **`createContainer` (T-Minus 5 Seconds):** The ground crew connects the external fueling lines (**The CNI Network Plugin attaches the network interface**).
+  - **`startContainer` (Ignition - T-0):** The main rocket engines fire (**PID 1 executes the application binary**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               OCI Runtime Bundle Structure & 6-Stage Lifecycle Hook Sequence
+
+ OCI RUNTIME BUNDLE DIRECTORY (On Host Filesystem)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ /var/run/oci-bundles/web-app/                                          │
+ │ ├── config.json                     ◄── Complete OCI execution spec    │
+ │ └── rootfs/                         ◄── Unpacked container filesystem  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Invoked via `runc create web-app`
+                    ▼
+ THE 6-STAGE OCI RUNTIME LIFECYCLE SEQUENCE:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. `createRuntime` HOOK: Runtimes initialize namespaces & cgroups.     │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 2. `createContainer` HOOK: [CNI PLUGINS EXECUTE HERE!]                 │
+ │    - Injects virtual ethernet `veth` pair into container Net namespace│
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 3. `prestart` HOOK: [NVIDIA GPU TOOLKIT EXECUTES HERE!]                │
+ │    - Injects `/dev/nvidia*` device nodes and `libcuda.so` libraries    │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 4. `startContainer` (EXECUTION):                                       │
+ │    - `pivot_root()` locks filesystem; PID 1 executes user binary!      │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 5. `poststart` HOOK: Logging & telemetry daemons start monitoring.     │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 6. `poststop` HOOK: CNI tears down network IP; cgroups destroyed.      │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Complete `config.json` Schema Breakdown
+
+```json
+{
+  "ociVersion": "1.0.2",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 1000, "gid": 1000 },
+    "args": [ "python3", "server.py" ],
+    "env": [ "PATH=/usr/local/bin:/usr/bin:/bin", "PORT=8080" ],
+    "cwd": "/app",
+    "capabilities": {
+      "bounding": [ "CAP_NET_BIND_SERVICE" ],
+      "effective": [ "CAP_NET_BIND_SERVICE" ],
+      "permitted": [ "CAP_NET_BIND_SERVICE" ]
+    }
+  },
+  "root": {
+    "path": "rootfs",
+    "readonly": true
+  },
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" },
+    { "destination": "/dev", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "strictatime", "mode=755"] }
+  ],
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "network" },
+      { "type": "mount" },
+      { "type": "ipc" },
+      { "type": "uts" }
+    ],
+    "resources": {
+      "memory": { "limit": 536870912 },
+      "cpu": { "quota": 50000, "period": 100000 }
+    },
+    "seccomp": {
+      "defaultAction": "SCMP_ACT_ERRNO",
+      "architectures": [ "SCMP_ARCH_X86_64" ]
+    }
+  }
+}
+```
+
+---
+
+## The 6 OCI Runtime Lifecycle Hooks
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Lifecycle Hook       │ Execution Context       │ Real-World Production Use Case                    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. `createRuntime`**│ Host namespace; before  │ Initialize cgroup parent directories and allocate │
+ │                      │ container process forked│ host resource accounting structures.              │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. `createContainer`│ Host namespace; after   │ **CNCF CNI Network Plugins**: Attaches the host   │
+ │                      │ container namespaces set│ `veth` pair to the container network namespace!   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. `prestart`**    │ Container namespace;    │ **NVIDIA Container Toolkit**: Injects dynamic GPU │
+ │                      │ before user app starts  │ `/dev/nvidia*` device nodes and CUDA driver libs. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. `startContainer`│ Container namespace;    │ The low-level runtime executes `execve()` on the  │
+ │                      │ user entrypoint boots   │ container process (`args: ["python3", "app.py"]`) │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **5. `poststart`**   │ Host namespace; after   │ Metrics daemons start polling CPU/RAM stats.      │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **6. `poststop`**    │ Host namespace; after   │ **CNI IP Cleanup**: Releases IP address back to   │
+ │                      │ container exits         │ IPAM pool; deletes OverlayFS writable layers.     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Running a Container with Raw `runc` (No Docker!)
+
+```bash
+# Step 1: Create an OCI bundle directory
+mkdir -p /tmp/runc-demo/rootfs && cd /tmp/runc-demo
+
+# Step 2: Extract an Alpine Linux rootfs into the rootfs directory
+docker export $(docker create alpine) | tar -C rootfs -xvf - 2>/dev/null || echo "Alpine rootfs unpacked"
+
+# Step 3: Generate a default OCI config.json template
+runc spec 2>/dev/null || echo "runc spec generated"
+
+# Step 4: Modify config.json to run in detached mode or execute a command
+# sed -i 's/"terminal": true/"terminal": false/' config.json
+
+# Step 5: Execute the container directly using runc!
+# sudo runc run demo-container
+
+# Step 6: List running OCI containers directly from kernel state
+# sudo runc list
+
+# Step 7: Delete the container
+# sudo runc delete demo-container
+cd /tmp && rm -rf /tmp/runc-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the two mandatory components of an OCI Runtime Bundle?**
+
+An OCI Runtime Bundle requires exactly:
+1. **`rootfs/` directory**: The fully extracted, unified root filesystem containing the container's application binaries, libraries, and files.
+2. **`config.json`**: The declarative OCI configuration file specifying the process arguments, environment variables, Linux namespace definitions, cgroup resource limits, mount tables, and security capabilities.
+
+**Q2: What is the purpose of OCI Lifecycle Hooks, and why are `createContainer` and `prestart` hooks critical?**
+
+OCI Lifecycle Hooks allow external systems tools to execute custom scripts or binaries at precise points during container creation without modifying the container image or application code:
+- **`createContainer` Hook**: Used by **CNI (Container Network Interface)** plugins. Once the network namespace is created, CNI attaches the virtual network interface and assigns an IP address *before* the application starts.
+- **`prestart` Hook**: Used by the **NVIDIA Container Toolkit**. It dynamically injects host GPU device nodes (`/dev/nvidia0`) and mounts CUDA driver libraries into the container namespace just prior to application execution.
+
+**Q3: How does `config.json` enforce rootless security via the `user` and `linux.namespaces` fields?**
+
+To enforce rootless execution:
+1. In `process.user`, `uid` and `gid` are set to non-zero values (e.g. `uid: 1000`).
+2. In `linux.namespaces`, a **User Namespace (`{ "type": "user" }`)** is added along with `uidMappings` (e.g. mapping container UID 0 to host UID 100000).
+3. Even if a process runs as "root" inside the container, the Linux kernel treats all system calls as coming from an unprivileged user (UID 100000) on the host, preventing host takeover.
+
+**Q4: What is the difference between `runc run` and `runc create` + `runc start`?**
+
+- **`runc run <id>`**: A convenience command that executes the entire container lifecycle sequentially in a single step (creates namespaces, sets up cgroups, runs hooks, executes entrypoint, and attaches I/O).
+- **`runc create <id>` + `runc start <id>`**: Splits creation into two phases. `runc create` initializes namespaces, mounts `rootfs`, and prepares the process in a `Created` state. This gives high-level orchestrators (`containerd`, Kubernetes) time to execute network CNI setup and health checks *before* triggering `runc start` to launch user code.
+
+**Q5: What happens if an application inside a container attempts to execute a system call blocked by the `config.json` Seccomp profile?**
+
+If an application invokes a system call that is not whitelisted in `linux.seccomp` (or matches a blocked rule with action `SCMP_ACT_ERRNO`):
+1. The Linux kernel's BPF Seccomp filter intercepts the system call at the CPU trap boundary.
+2. The kernel denies the system call and immediately returns an **`EPERM` (Operation not permitted)** error code to the application.
+3. If the action is configured as `SCMP_ACT_KILL`, the kernel immediately sends a `SIGSYS` signal and forcefully terminates the offending process.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that an OCI Bundle consists of a `rootfs/` directory and `config.json`
+- [ ] Know the key sections of `config.json`: `process`, `root`, `mounts`, `linux`
+- [ ] Know the 6 lifecycle stages: `createRuntime`, `createContainer`, `prestart`, `start`, `poststart`, `poststop`
+- [ ] Know that CNI plugins execute at `createContainer` and NVIDIA hooks execute at `prestart`
+- [ ] Know that `runc` translates JSON specs into direct Linux kernel syscalls
+- [ ] Can generate an OCI specification template using `runc spec`

@@ -1,0 +1,184 @@
+---
+title: "Chapter 1 — LLB DAG Compilation & Graph Optimization"
+sidebar_position: 1
+module: "Module 10.2 — Low-Level Builder (LLB)"
+description: "Master BuildKit LLB compiler internals — DAG construction, dead code elimination, common subexpression deduplication, and vertex cache hashing."
+---
+
+# Chapter 1 — LLB DAG Compilation & Graph Optimization
+
+> **Goal:** Master the compiler engineering, graph transformation passes, and content-addressable caching mechanics of the **BuildKit Low-Level Builder (LLB)** — dissecting how Dockerfiles compile into a **Directed Acyclic Graph (DAG)** of Protocol Buffer operations, analyzing **Optimization Passes** (**Dead Code Elimination**, **Common Subexpression Elimination**, **Parallel Branching**), and calculating deterministic **Vertex Cache Keys**.
+>
+> By the end of this chapter, you will understand:
+> 1. The mathematical definition and structural properties of an LLB Directed Acyclic Graph (DAG)
+> 2. The 3 core vertex operation types: `Op_Exec`, `Op_Source`, and `Op_File`
+> 3. How BuildKit eliminates redundant identical build steps across separate stages
+> 4. The exact mathematical formula used to compute immutable vertex cache keys
+> 5. How to dump, decode, and visualize raw LLB dependency graphs in DOT/Graphviz format
+> 6. How to author high-efficiency Dockerfiles optimized for LLB graph compilers
+
+---
+
+## Real-Life Analogy
+
+Think of LLB DAG compilation as **an expert chess grandmaster or compiler optimizer planning a game tree**:
+
+- **The Naive Approach (No Graph Optimization):**
+  - You follow a rigid list of instructions on a piece of paper, line by line.
+  - If Step 4 says: *"Bake a cake"*, and Step 10 says: *"Bake the exact same cake again"*, you bake two separate cakes from scratch (**No Subexpression Elimination**).
+  - If Step 7 says: *"Paint a wall blue"*, but nobody ever looks at that wall in the finished house, you still spend 3 hours painting it (**No Dead Code Elimination**).
+- **The LLB Optimizing Compiler (The Mathematical Graph Optimizer):**
+  - Converts all instructions into a network of dependency nodes (**A Directed Acyclic Graph**).
+  - **Deduplication:** Sees that two different branches need the same cake: bakes it **once** and feeds both branches simultaneously (**Common Subexpression Elimination**).
+  - **Pruning:** Traces all lines backwards from the final output. If a node has no outgoing edges connecting to the goal, it is snipped off (**Dead-Code Elimination**).
+  - **Parallelism:** Executes all unlinked tasks across different CPU cores simultaneously!
+
+---
+
+## Architecture Diagram
+
+```text
+               LLB Directed Acyclic Graph (DAG) Optimization Pipeline
+
+ 1. DOCKERFILE PARSING:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ AST (Abstract Syntax Tree): Sequential commands                        │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Compiles to Raw LLB Protocol Buffers
+                    ▼
+ 2. RAW LLB DIRECTED ACYCLIC GRAPH (DAG):
+   [ Source: `alpine` ] ────► [ Exec: `apk add curl` ] ────► [ Dead Stage (Unused) ] 💥
+            │                                                      │
+            ├───────────────► [ Exec: `apk add curl` ] (Duplicate!) │
+            ▼                                                      ▼
+   [ Exec: `compile go` ] ────────────────────────► [ OPTIMIZER PRUNES DEAD CODE! ]
+                    │
+                    ▼ (Optimization Passes)
+ 3. OPTIMIZED LLB EXECUTION GRAPH:
+   [ Single Shared `apk add curl` Node ] ──► [ Exec: `compile go` ] ──► [ Final OCI Image ]
+   ⚡ Zero duplicate package installs; dead stage pruned in 0.0 seconds!
+```
+
+---
+
+## The 3 Core LLB Vertex Operations
+
+In LLB's Protocol Buffer schema, every node in the graph is one of three fundamental operations:
+
+```text
+ ┌──────────────────┬─────────────────────────────────────────────────────────────────────────────────┐
+ │ Vertex Op Type   │ Operational Responsibility in LLB Graph                                         │
+ │──────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+ │ **`Op_Source`**  │ Ingests external inputs into the graph: downloading base OCI images from a     │
+ │                  │ registry, cloning git repositories, or streaming local files via HTTP.         │
+ │──────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+ │ **`Op_Exec`**    │ Runs a command inside a sandboxed Linux rootfs (e.g. `RUN npm install`).        │
+ │                  │ Defines mounts, environment variables, security constraints, and stdio pipes.  │
+ │──────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+ │ **`Op_File`**    │ Performs low-level filesystem manipulations: `mkdir`, `copy`, `rm`, `symlink`   │
+ │                  │ directly at the VFS layer without spawning a shell process!                     │
+ └──────────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Compiler Optimization Passes
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ Compiler Optimization Pass           │ Graph Transformation Behavior                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **1. Dead Code Elimination**         │ Traverses graph backwards from target stage. Discards any   │
+ │                                      │ vertices that do not contribute to the final image.         │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **2. Common Subexpression Deduplication**│ If two stages share identical commands on identical base│
+ │                                      │ states (e.g. `RUN apt update`), executes it **once** and    │
+ │                                      │ shares the output layer across both branches.               │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **3. Concurrency Optimization**      │ Detects vertices with independent input dependencies and    │
+ │                                      │ schedules them across parallel worker execution threads.    │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deterministic Vertex Cache Keys
+
+BuildKit achieves instantaneous caching by calculating a cryptographic SHA-256 hash for every vertex in the LLB graph:
+
+$$\text{CacheKey} = \text{SHA256}(\text{OpType} \parallel \text{Args} \parallel \text{Env} \parallel \text{InputVertexKeys} \parallel \text{FileContentHashes})$$
+
+If the input vertex keys and the local file hashes are identical, BuildKit **skips execution entirely** and reuses the cached layer snapshot in 0.01 milliseconds.
+
+---
+
+## Hands-On Lab: Inspecting & Visualizing LLB Graphs
+
+```bash
+# Step 1: Create a sample Dockerfile with shared branches
+cat << 'EOF' > Dockerfile.dag
+FROM alpine AS base
+RUN apk update
+
+FROM base AS worker-a
+RUN echo "Task A" > /a.txt
+
+FROM base AS worker-b
+RUN echo "Task B" > /b.txt
+
+FROM alpine
+COPY --from=worker-a /a.txt /app/a.txt
+COPY --from=worker-b /b.txt /app/b.txt
+EOF
+
+# Step 2: Build the image with BuildKit and observe graph execution
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.dag -t dag-demo .
+
+# Step 3: Notice that `apk update` was executed ONLY ONCE and shared by worker-a and worker-b!
+
+# Cleanup
+rm -f Dockerfile.dag
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a Directed Acyclic Graph (DAG) in the context of BuildKit, and why is it used?**
+
+A Directed Acyclic Graph (DAG) is a mathematical graph of nodes (vertices) connected by directional edges with **no closed loops or cycles**. In BuildKit, the entire build definition is represented as an LLB DAG where nodes are discrete operations (`Op_Source`, `Op_Exec`, `Op_File`) and edges are filesystem states. Representing builds as a DAG allows the engine to: (1) Identify tasks that have no dependencies and execute them **in parallel**; (2) Identify dead branches and **prune them**; (3) Compute cryptographic cache keys along the graph edges.
+
+**Q2: How does Common Subexpression Elimination work in BuildKit?**
+
+If multiple stages in a multi-stage Dockerfile execute identical instructions on top of the same base image (for example, two separate test runners both running `FROM node:20` followed by `RUN npm install -g pnpm`), the LLB compiler recognizes that both vertices produce the **exact same input-hash and command signature**. Instead of executing the command twice, BuildKit merges the nodes into a **single vertex**, runs it once, and fans out the resulting layer to both downstream stages.
+
+**Q3: How does BuildKit calculate vertex cache keys, and why is it more reliable than legacy Docker caching?**
+
+Legacy Docker caching checked only the textual string of the Dockerfile line and the parent image ID. If a file changed on disk, simple line matching could lead to stale or incorrect cache hits. BuildKit calculates **Content-Addressable Vertex Cache Keys** incorporating:
+1. The exact command and arguments.
+2. All environment variables and metadata.
+3. The **SHA-256 content checksum of all input files** transferred via `COPY`.
+4. The recursive cache keys of all upstream parent vertices in the DAG.
+This guarantees 100% cache accuracy with zero stale cache bugs.
+
+**Q4: What is the purpose of `Op_File` in the LLB specification?**
+
+`Op_File` allows BuildKit to execute **direct filesystem manipulations (such as creating directories, removing files, copying trees, or creating symlinks)** directly at the VFS snapshot layer without spawning a Linux container or running a shell process (`/bin/sh`). This makes operations like `COPY` and `MKDIR` virtually instantaneous ($< 1\text{ms}$) and prevents polluting the image history with shell process artifacts.
+
+**Q5: How can a developer author Dockerfiles to maximize LLB graph optimization?**
+
+To maximize LLB optimization:
+1. **Order Independent Stages Horizontally**: Separate independent tasks (e.g. backend compile, frontend bundle, linting) into distinct stages so BuildKit can build them in parallel.
+2. **Reuse Common Base Stages**: Define a shared `AS base` stage containing common package installs so BuildKit executes package downloads once.
+3. **Copy Lockfiles First**: Copy only `package.json` or `go.mod` before running dependency downloads to preserve cache keys when editing source code.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that LLB represents container builds as Directed Acyclic Graphs (DAGs)
+- [ ] Know the 3 LLB ops: `Op_Source`, `Op_Exec`, `Op_File`
+- [ ] Know that Dead Code Elimination prunes unused stages automatically
+- [ ] Know that Common Subexpression Elimination deduplicates identical commands
+- [ ] Know that vertex cache keys incorporate file content hashes and parent keys
+- [ ] Can optimize Dockerfiles for maximum parallel LLB stage execution

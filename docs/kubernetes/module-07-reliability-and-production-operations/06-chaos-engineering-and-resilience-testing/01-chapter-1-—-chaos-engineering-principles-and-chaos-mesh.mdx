@@ -1,0 +1,211 @@
+---
+title: "Chapter 1 — Chaos Engineering & Chaos Mesh"
+sidebar_position: 1
+module: "Module 7.6 — Chaos Engineering"
+description: "Master Chaos Engineering in Kubernetes — steady-state hypotheses, blast radius containment, CNCF Chaos Mesh architecture, and kernel/cgroup fault injection mechanics."
+---
+
+# Chapter 1 — Chaos Engineering Principles & Chaos Mesh
+
+> **Goal:** Master the architectural principles and operational execution of Chaos Engineering in Kubernetes — understanding the 4 foundational principles (defining the **Steady-State Hypothesis**, simulating real-world failures, containing blast radiuses, and continuous automated testing), dissecting the distributed architecture of **CNCF Chaos Mesh** (Controller Manager, Chaos Daemon, and eBPF kernel hooks), and authoring declarative chaos experiment CRDs.
+>
+> By the end of this chapter, you will understand:
+> 1. The 4 core principles of Chaos Engineering and how they apply to microservices
+> 2. How to define measurable Steady-State metrics (p99 latency, error rate, SLIs)
+> 3. The architecture of Chaos Mesh: Chaos Controller vs Privileged Node Chaos Daemons
+> 4. How Chaos Daemon injects faults using Linux Traffic Control (`tc`), cgroups, and eBPF
+> 5. How to contain blast radius using namespace selectors, duration limits, and automated rollbacks
+> 6. How to schedule continuous chaos testing in CI/CD delivery pipelines
+
+---
+
+## Real-Life Analogy
+
+Think of Chaos Engineering as **an automated fire drill and seismic stress test conducted inside a modern earthquake-resistant skyscraper**:
+
+- **The Fragility Delusion (Hoping for the Best):** A developer writes microservice code on their laptop and assumes: *"The network will never drop packets, the database will never lag, and our pods will never crash."* This is like building a skyscraper and hoping it will never experience high winds or earthquakes.
+- **The Steady-State Hypothesis (The Building Sway Sensor):** Before conducting the drill, the structural engineer checks the building sensors: *"Under normal operation, 99.9% of elevators arrive within 30 seconds and the roof sways less than 1 inch (**Steady State: Error Rate $< 0.1\%$, p99 Latency $< 200\text{ms}$**)."*
+- **The Chaos Experiment (The Controlled Shake):** The engineer intentionally activates hydraulic pistons in the basement to simulate a 6.0-magnitude earthquake for 5 minutes (**Injecting 200ms network latency and killing 30% of pods**).
+- **The Fire Drill Coordinator (Chaos Mesh Architecture):**
+  - **The Safety Director (Chaos Controller Manager):** Watches the test schedule, monitors safety thresholds, and triggers an emergency abort if things get out of hand.
+  - **The On-Site Techs (Chaos Daemon on every floor):** The privileged agents that physically flip the test circuit breakers (**Linux kernel cgroup & `tc` network manipulators**).
+- **The Resilient Outcome:** If the building sways safely and elevators keep moving (**Circuit breakers and retries work!**), the team gains 100% confidence that a real disaster will not cause a customer-facing blackout.
+
+---
+
+## Architecture Diagram
+
+```text
+               CNCF Chaos Mesh Architecture & Fault Injection
+
+ KUBERNETES CONTROL PLANE
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Chaos Mesh Controller Manager                                          │
+ │ Watches: `PodChaos`, `NetworkChaos`, `IOChaos`, `StressChaos` CRDs     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 1. Discovers matching target Pods in `production`
+                    │ 2. Dispatches gRPC Fault Injection Instructions
+                    ▼
+ WORKER NODE HOST
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CHAOS DAEMON (Privileged DaemonSet Pod)                                │
+ │                                                                        │
+ │ Uses Linux Kernel Primitives to Inject Faults:                         │
+ │ ├── Linux Traffic Control (`tc` / `netem`) ──► Injects Network Delays  │
+ │ ├── Linux Cgroups (`cgroup.procs`)         ──► Injects CPU/RAM Stress  │
+ │ ├── eBPF & FUSE File System Driver         ──► Injects Disk I/O Errors │
+ │ └── Ptrace / Unix Signals                  ──► Kills Target Processes  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Intercepts Target Container Namespaces
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ TARGET APPLICATION POD: `payment-api-7b8f`                             │
+ │ Experiences 300ms packet latency + 20% packet loss!                    │
+ │ ──► Validates Application Circuit Breaker & Fallback Logic!           │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Principles of Chaos Engineering
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Principle            │ Real-World Application in Kubernetes                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Define Steady** │ Identify measurable baseline business and technical SLIs (e.g. Orders/sec,  │
+ │ **State**            │ HTTP error rate $< 0.1\%$, p99 latency $< 250\text{ms}$).                   │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Hypothesize**   │ Formulate an explicit hypothesis: *"If we kill 50% of the payment pods,     │
+ │ **Behavior**         │ the service mesh will reroute traffic with zero 500 errors."                │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Introduce Real-**│ Simulate realistic turbulent conditions: Random pod kills, network packet  │
+ │ **World Faults**     │ loss, corrupted disk I/O, DNS resolution drops, clock skew.                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **4. Automate &**    │ Run chaos experiments automatically in staging CI/CD pipelines and during   │
+ │ **Contain Blast**    │ scheduled production GameDays with automated abort criteria.                │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Chaos Mesh Component Hierarchy
+
+```text
+ ┌──────────────────────┬─────────────┬───────────────────────────────────────────────────────────────┐
+ │ Component            │ Scope       │ Responsibility & Execution Mechanics                          │
+ │──────────────────────┼─────────────┼───────────────────────────────────────────────────────────────┤
+ │ **Chaos Controller** │ Cluster     │ Validates Chaos CRDs, resolves target Pod selectors, enforces │
+ │ **Manager**          │ (Deployment)│ duration timeouts, and coordinates Chaos Daemons over gRPC.   │
+ │──────────────────────┼─────────────┼───────────────────────────────────────────────────────────────┤
+ │ **Chaos Daemon**     │ Node        │ Runs as a privileged DaemonSet with `hostPID: true`. Enters   │
+ │                      │ (DaemonSet) │ container Linux network/mount namespaces to inject faults.    │
+ │──────────────────────┼─────────────┼───────────────────────────────────────────────────────────────┤
+ │ **Chaos Dashboard**  │ Web UI      │ Visual management console for designing workflows, inspecting │
+ │                      │ (Deployment)│ active blast radiuses, and triggering one-click emergency stop│
+ └──────────────────────┴─────────────┴───────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production `PodChaos` Manifest
+
+This manifest randomly terminates 1 replica of `payment-api` every 60 seconds for a total duration of 5 minutes:
+
+```yaml
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: payment-api-pod-kill-drill
+  namespace: chaos-testing
+spec:
+  action: pod-kill                     # Randomly kills container processes
+  mode: fixed                          # Kill a fixed number of pods
+  value: "1"                           # Exactly 1 pod at a time
+  duration: "5m"                       # Total experiment duration
+  selector:
+    namespaces:
+      - production
+    labelSelectors:
+      app: payment-api
+  scheduler:
+    cron: "@every 1m"                  # Trigger kill every 60 seconds
+```
+
+---
+
+## Blast Radius Containment Best Practices
+
+> [!CAUTION]
+> **Chaos Safety Controls:** Uncontrolled chaos experiments can cause cascading production outages. Always enforce these 3 safety rules:
+
+```text
+ 1. Strict Target Selectors: Always scope experiments by namespace AND specific workload labels. 
+    Never use `namespaces: ["*"]` or empty label selectors!
+ 2. Hard Duration Limits: Always configure `duration: 5m` (Never leave chaos running indefinitely!).
+ 3. Automated Emergency Abort: Chaos Mesh supports automated rollbacks: if business SLIs breach 
+    critical safety thresholds (e.g. error rate > 5%), the controller cancels all active faults instantly.
+```
+
+---
+
+## Hands-On Lab: Deploying a Chaos Experiment
+
+```bash
+# Step 1: Check Chaos Mesh installation in the cluster
+kubectl get pods -n chaos-mesh 2>/dev/null || echo "Chaos Mesh simulated / active"
+
+# Step 2: Create a dedicated chaos namespace
+kubectl create namespace chaos-lab
+
+# Step 3: Deploy a test application with 3 replicas
+kubectl create deployment nginx-target --image=nginx:1.25-alpine --replicas=3 -n chaos-lab
+
+# Step 4: Verify target pods are Ready
+kubectl wait --for=condition=Ready pod -l app=nginx-target -n chaos-lab --timeout=30s
+
+# Step 5: Clean up lab
+kubectl delete namespace chaos-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the core definition and purpose of Chaos Engineering in Kubernetes?**
+
+Chaos Engineering is the discipline of experimenting on a distributed software system by deliberately introducing controlled failures (such as killing pods, corrupting disk I/O, or injecting network packet loss) in order to build confidence in the system's capability to withstand turbulent production outages. In Kubernetes, it verifies that architectural resilience patterns—such as Horizontal Pod Autoscaling, PodDisruptionBudgets, Service Mesh retries, and Circuit Breakers—actually function as designed before real outages occur.
+
+**Q2: How does Chaos Mesh inject network and CPU faults without modifying application container images?**
+
+Chaos Mesh runs a privileged **Chaos Daemon** on every worker node. When a `NetworkChaos` or `StressChaos` CRD is applied:
+1. Chaos Daemon identifies the target container's Linux Process ID (PID) via the container runtime.
+2. It enters the target container's Linux network namespace using `setns()` and attaches Linux **Traffic Control (`tc`) NetEm** queuing disciplines to the virtual ethernet interface (`veth`) to inject packet delay/loss.
+3. For CPU/memory stress, it injects worker threads directly into the container's cgroup slice, all without modifying application code or sidecars.
+
+**Q3: What is a "Steady-State Hypothesis", and why must it be defined before running a chaos experiment?**
+
+A Steady-State Hypothesis is a quantitative definition of normal system behavior measured through Service Level Indicators (SLIs)—such as *"HTTP error rate remains $< 0.1\%$ and p99 latency remains $< 300\text{ms}$"*. Defining this hypothesis upfront establishes a scientific baseline: during the chaos experiment, if the system deviates significantly from the steady state, the engineering team has successfully exposed an architectural vulnerability that requires remediation.
+
+**Q4: How do you safely contain the blast radius during production chaos experiments?**
+
+Blast radius containment is enforced by:
+1. **Granular Selection**: Targeting only specific canary pods using strict namespace, label, and percentage selectors (`mode: fixed-percent`, `value: "20%"`).
+2. **Time Windows**: Setting explicit experiment timeouts (`duration: 5m`).
+3. **Automated Abort Hooks**: Integrating Prometheus metrics so that if business error rates exceed an acceptable threshold (e.g. error rate $> 1\%$), Chaos Mesh immediately terminates the experiment and restores normal traffic.
+
+**Q5: What is the difference between a `PodChaos` action of `pod-kill` versus `pod-failure`?**
+
+- **`pod-kill`**: Sends `SIGKILL` to the container process. Kubelet notices the terminated process and immediately restarts the container in place or recreates the pod, testing rapid recovery and health probes.
+- **`pod-failure`**: Modifies the Linux cgroups and namespaces to prevent the container from communicating or executing for a prolonged duration (e.g. 5 minutes) without killing the process, simulating a deadlocked or frozen node.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 4 principles of Chaos Engineering: Steady State, Hypothesize, Real-World Faults, Automate
+- [ ] Know the architecture: Chaos Controller Manager (Control plane) vs Chaos Daemon (Privileged node agent)
+- [ ] Know that Chaos Daemon uses Linux `tc` NetEm, cgroups, and eBPF to inject faults
+- [ ] Know how to contain blast radius using label selectors, duration limits, and automated aborts
+- [ ] Know the difference between `pod-kill` (instant restart) and `pod-failure` (prolonged freeze)
+- [ ] Can inspect active chaos experiments using `kubectl get chaos -A`

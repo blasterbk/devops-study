@@ -1,0 +1,254 @@
+---
+title: "Chapter 1 — Velero Disaster Recovery Architecture"
+sidebar_position: 1
+module: "Module 4.10 — Disaster Recovery & Migration"
+description: "Master Kubernetes disaster recovery with Velero — BackupStorageLocation (S3/GCS), VolumeSnapshotLocation (CSI snapshots), Node Agent (Kopia/Restic), pre/post backup hooks, and full cluster restores."
+---
+
+# Chapter 1 — Velero Disaster Recovery Architecture
+
+> **Goal:** Master enterprise Kubernetes backup and disaster recovery using Velero — understanding the dual architecture of `BackupStorageLocation` (object storage for cluster metadata) and `VolumeSnapshotLocation` (cloud CSI volume snapshots), executing application-consistent backups with pre/post execution hooks, leveraging the Node Agent (Kopia/Restic) for file-level backups, and executing complete cross-cluster disaster recovery restorations.
+>
+> By the end of this chapter, you will understand:
+> 1. The core components of Velero: Server, Plugins, Node Agent DaemonSet, and Custom Resources
+> 2. The separation between `BackupStorageLocation` (BSL) and `VolumeSnapshotLocation` (VSL)
+> 3. How Velero coordinates with CSI snapshotters to capture persistent disk data
+> 4. How to execute application-consistent database backups using pre/post freeze hooks
+> 5. How to configure automated recurring cron schedules and retention TTLs
+> 6. How to execute a full cluster restore during a total control-plane disaster
+
+---
+
+## Real-Life Analogy
+
+Think of Velero as an **automated emergency insurance and architectural replication service for a high-rise office building**:
+
+- **The Building Blueprint Archive (`BackupStorageLocation` - BSL):** Every night, the insurance inspector scans every architectural blueprint, room assignment, electrical schematic, and security badge manifest (Kubernetes YAML metadata in `etcd`) and ships encrypted zip files to an off-site underground vault (Amazon S3 / Google Cloud Storage).
+- **The Heavy Equipment Photos (`VolumeSnapshotLocation` - VSL):** For heavy machinery and safes (PersistentVolumes), the inspector calls the hardware supplier (AWS EBS / GCP PD CSI driver) to snap an instantaneous point-in-time snapshot.
+- **The Pre-Photo Warning Whistle (Pre/Post Hooks):** Before snapping the photo of the database vault, the inspector blows a whistle (`pre-hook` -> `FLUSH TABLES;`). All workers freeze their pens and lock the drawers. The photo is snapped, and a second whistle blows (`post-hook` -> `UNLOCK TABLES;`), resuming business in 0.5 seconds.
+- **Total Disaster Reconstruction (`velero restore`):** An earthquake completely levels the building (Cluster Destroyed). The team flies to an empty plot of land in another state (New Kubernetes Cluster) and clicks **Restore**. Velero reads the blueprints from S3, rebuilds every wall, re-attaches the cloned safes from snapshots, and turns on the lights with **100% operational fidelity**.
+
+---
+
+## Architecture Diagram
+
+```text
+               Velero Backup & Disaster Recovery Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kubernetes Cluster: Production (prod-cluster-01)                       │
+ │                                                                        │
+ │ 1. Scheduled Backup Triggered ──► Velero Server (Controller Pod)       │
+ │                                                                        │
+ │ 2. Pre-Backup Hook:                                                    │
+ │    - Runs `fsync` / `pg_dump` inside `postgres-0` database container   │
+ └──────────────────┬─────────────────────────────────┬───────────────────┘
+                    │                                 │
+                    ▼ 3. Export YAML Metadata         ▼ 4. Trigger CSI Snapshot
+ ┌──────────────────────────────────────┐ ┌───────────────────────────────┐
+ │ BackupStorageLocation (BSL)          │ │ VolumeSnapshotLocation (VSL)  │
+ │                                      │ │                               │
+ │ Off-Site Object Storage (Amazon S3 / │ │ Cloud Block Storage Snapshots │
+ │ Google Cloud Storage / Azure Blob)   │ │ (AWS EBS / GCP PD Snapshots)  │
+ │                                      │ │                               │
+ │ Archives: `cluster-backup.tar.gz`    │ │ Snapshot ID: `snap-098765432` │
+ └──────────────────┬───────────────────┘ └───────────────┬───────────────┘
+                    │                                     │
+                    │ 5. Full Cluster Disaster Recovery   │
+                    ▼                                     ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Target Kubernetes Cluster: Disaster Recovery (dr-cluster-02)           │
+ │ `velero restore create --from-backup cluster-backup`                   │
+ │                                                                        │
+ │ - Recreates all Namespaces, Deployments, Secrets, ConfigMaps           │
+ │ - Provisions new PVCs restored from cloud snapshots                    │
+ │ - Pods start and resume business in under 5 minutes!                   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Core Velero Custom Resource Definitions (CRDs)
+
+Velero operates natively via declarative CRDs under `velero.io/v1`:
+
+```text
+ ┌──────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+ │ Custom Resource              │ Operational Responsibility                                          │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`Backup`**                 │ Represents a point-in-time backup request or completed archive.     │
+ │ **`Restore`**                │ Represents an active or completed cluster restoration operation.    │
+ │ **`Schedule`**               │ Configures recurring automated cron schedules for backups.          │
+ │ **`BackupStorageLocation`**  │ Defines object storage bucket endpoints (S3, GCS, MinIO, Azure Blob)│
+ │                              │ where metadata `.tar.gz` and log archives are saved.                │
+ │ **`VolumeSnapshotLocation`** │ Defines cloud provider storage infrastructure used to take block    │
+ │                              │ storage volume snapshots via CSI plugins.                           │
+ └──────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Application Consistency: Pre & Post Backup Hooks
+
+To ensure zero database corruption without stopping running pods, Velero executes **Pre-Backup and Post-Backup Hooks**:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-database
+  namespace: database
+spec:
+  template:
+    metadata:
+      annotations:
+        # Pre-Hook: Quiesce database and flush write-ahead log to disk
+        pre.hook.backup.velero.io/container: "postgres"
+        pre.hook.backup.velero.io/command: '["/bin/sh", "-c", "psql -U postgres -c \"CHECKPOINT;\"; psql -U postgres -c \"SELECT pg_backup_start(\x27velero\x27, true);\""]'
+        pre.hook.backup.velero.io/on-error: "Fail"
+        pre.hook.backup.velero.io/timeout: "30s"
+
+        # Post-Hook: Resume database transactions immediately after snapshot
+        post.hook.backup.velero.io/container: "postgres"
+        post.hook.backup.velero.io/command: '["/bin/sh", "-c", "psql -U postgres -c \"SELECT pg_backup_stop();\""]'
+        post.hook.backup.velero.io/timeout: "30s"
+```
+
+---
+
+## Complete Production Velero Schedule Manifest
+
+```yaml
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: daily-production-backup
+  namespace: velero
+spec:
+  # Standard 5-field cron: Every day at 02:00 AM UTC
+  schedule: "0 2 * * *"
+  # Retention TTL: Retain backup archives for 30 days
+  template:
+    ttl: "720h0m0s"
+    includedNamespaces:
+      - "production"
+      - "database"
+      - "security"
+    # Take CSI volume snapshots alongside metadata
+    snapshotVolumes: true
+    # Exclude ephemeral test namespaces
+    excludedNamespaces:
+      - "monitoring"
+      - "kube-system"
+    storageLocation: "default-aws-s3-bsl"
+    volumeSnapshotLocations:
+      - "default-aws-ebs-vsl"
+```
+
+---
+
+## The Disaster Recovery Restore Workflow
+
+When recovering from a cluster failure or migrating to a new cloud region:
+
+```bash
+# 1. Inspect available backups stored in object storage (S3)
+velero backup get
+
+# 2. Trigger full cluster restore from the latest healthy backup
+velero restore create disaster-recovery-restore \
+  --from-backup daily-production-backup-20260818020000 \
+  --restore-volumes=true
+
+# 3. Monitor restoration progress
+velero restore describe disaster-recovery-restore
+velero restore logs disaster-recovery-restore -f
+
+# 4. Verify restored namespaces and stateful workloads
+kubectl get pods,pvc -n production
+```
+
+---
+
+## Hands-On Lab: Simulating Velero Backup & Restore
+
+```bash
+# Step 1: Create a mock application namespace
+kubectl create namespace backup-demo
+
+# Step 2: Deploy a mock database with state
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-state
+  namespace: backup-demo
+data:
+  db.state: "TRANSACTION_ID_99482_COMMITTED"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-server
+  namespace: backup-demo
+spec:
+  containers:
+  - name: web
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Wait for Pod to become Ready
+kubectl wait --for=condition=Ready pod/app-server -n backup-demo --timeout=30s
+
+# Step 4: (Optional/Velero CLI) Execute a manual on-demand backup
+# velero backup create demo-backup --include-namespaces backup-demo --wait
+
+# Step 5: Simulate a catastrophic failure by deleting the namespace!
+echo "SIMULATING DISASTER: Deleting namespace backup-demo..."
+kubectl delete namespace backup-demo
+
+# Step 6: (Velero CLI) Restore the namespace from backup
+# velero restore create restore-demo --from-backup demo-backup --wait
+
+# Step 7: Verify all resources and state are restored!
+# kubectl get configmap app-state -n backup-demo -o yaml
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Velero, and what are its core architectural components?**
+
+Velero is an open-source, CNCF-supported backup, disaster recovery, and migration platform for Kubernetes. Its architecture consists of: (1) **Velero Server**: A controller pod managing backup and restore lifecycles; (2) **BackupStorageLocation (BSL)**: Object storage (S3, GCS, Azure Blob) where serialized Kubernetes API resource definitions (`.tar.gz`) are archived; (3) **VolumeSnapshotLocation (VSL)**: Cloud block storage infrastructure where CSI plugins take block storage snapshots; and (4) **Node Agent (Kopia/Restic)**: A DaemonSet that provides file-level volume backups for storage backends without native snapshot support.
+
+**Q2: What is the difference between `BackupStorageLocation` and `VolumeSnapshotLocation`?**
+
+- `BackupStorageLocation` (BSL): Targets **Object Storage** (Amazon S3, MinIO, Azure Blob) and stores Kubernetes API metadata, custom resources, secrets, configuration manifests, and backup execution logs.
+- `VolumeSnapshotLocation` (VSL): Targets **Block Storage Infrastructure** (AWS EBS, GCP Persistent Disk) and instructs cloud provider CSI drivers to create point-in-time virtual disk snapshots of active Persistent Volumes.
+
+**Q3: How do pre-backup and post-backup hooks ensure application consistency in Velero?**
+
+Pre-backup and post-backup hooks execute commands directly inside container namespaces before and after volume snapshots are captured. A pre-backup hook quiesces database operations (e.g. executing `CHECKPOINT` and `FLUSH TABLES WITH READ LOCK`), flushing dirty in-memory buffers to disk. After the CSI snapshotter captures the disk negative, the post-backup hook executes `UNLOCK TABLES`, resuming transactions with zero database corruption.
+
+**Q4: How does Velero handle cross-cluster and cross-region migration?**
+
+Because Velero stores both cluster manifests and storage snapshot references in a cloud object storage bucket, migrating to a new cluster is straightforward: (1) Install Velero in the new target cluster pointing to the **same BackupStorageLocation bucket**; (2) Velero discovers all available backups automatically; (3) Run `velero restore create --from-backup <name>`; Velero recreates all resources and provisions new volumes cloned from the cloud snapshots in the new cluster.
+
+**Q5: What is the difference between CSI Volume Snapshots and Velero Node Agent (Kopia/Restic) backups?**
+
+- **CSI Volume Snapshots**: Hardware-accelerated, point-in-time cloud snapshots taken at the block layer in seconds; requires CSI driver snapshot support.
+- **Node Agent (Kopia/Restic)**: File-level backup engine running as a DaemonSet on worker nodes. It reads files directly from the mounted container filesystem and streams deduplicated file chunks to object storage, supporting any volume type (including local storage, emptyDir, and legacy NFS) without requiring cloud snapshot plugins.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Velero backs up both Kubernetes `etcd` metadata and storage PVs
+- [ ] Know the difference between `BackupStorageLocation` (S3) and `VolumeSnapshotLocation` (CSI)
+- [ ] Know how pre/post backup hooks ensure application-consistent database snapshots
+- [ ] Know that `Schedule` CRDs automate recurring cron backups with retention TTLs
+- [ ] Know how to execute full cluster disaster recovery restores with `velero restore create`
+- [ ] Know that the Node Agent (Kopia/Restic) provides file-level backups for any volume
+- [ ] Can view backups using `velero backup get`

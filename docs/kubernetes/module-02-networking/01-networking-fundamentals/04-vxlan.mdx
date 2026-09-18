@@ -1,0 +1,259 @@
+---
+title: "Chapter 4 — VXLAN"
+sidebar_position: 4
+module: "Module 2.1 — Networking Fundamentals"
+description: "Deep dive into VXLAN (Virtual Extensible LAN) — how it encapsulates Layer 2 frames inside UDP packets, how VTEP endpoints work, the role of VNI, and how Flannel and Calico implement VXLAN for cross-node Pod networking."
+---
+
+# Chapter 4 — VXLAN (Virtual Extensible LAN)
+
+> **Goal:** Understand VXLAN's packet structure, how VTEP endpoints encapsulate and decapsulate frames, how the VNI separates networks, and how Kubernetes CNI plugins (Flannel, Calico) use VXLAN for cross-node Pod-to-Pod communication.
+>
+> By the end of this chapter, you will understand:
+> 1. What VXLAN is and why it was invented (VLAN scalability problem)
+> 2. The full VXLAN packet structure — outer Ethernet, IP, UDP, VXLAN header, inner frame
+> 3. What a VTEP is and how it performs encapsulation/decapsulation
+> 4. What the VNI (VXLAN Network Identifier) is and how it creates isolation
+> 5. How Flannel uses VXLAN for cross-node Pod networking
+> 6. How to inspect VXLAN tunnels and debug packet flow on a node
+
+---
+
+## Real-Life Analogy
+
+VXLAN is like **shipping containers at a port**:
+
+You need to ship a crate (Layer 2 frame / Pod packet) across the ocean (IP network) to another port. The original crate has labels for the final destination warehouse (Pod IP, inner packet). But ocean shipping companies only know about port addresses (node IPs), not warehouse addresses.
+
+So a **packing crew (VTEP)** at Port A puts the original crate inside a **standardized shipping container** (VXLAN outer packet). The container is labeled with Port A → Port B (node IPs). When it arrives at Port B, the **unpacking crew (VTEP)** opens the container, retrieves the original crate, and delivers it to the warehouse.
+
+The ocean shipping company never sees the inner crate's labels. It only routes the container.
+
+---
+
+## Why VXLAN Exists: The VLAN Scalability Problem
+
+Traditional **VLANs** use a 12-bit VLAN ID — maximum 4,096 VLANs. In large cloud environments with millions of tenants, 4,096 VLANs is completely insufficient.
+
+**VXLAN** solves this by using a **24-bit VNI (VXLAN Network Identifier)** — supporting up to **16 million** virtual networks. Additionally, VXLAN tunnels travel over IP/UDP, meaning they work across Layer 3 boundaries (routed networks), not just Layer 2 segments.
+
+```text
+VLAN:  2^12 = 4,096 networks max
+VXLAN: 2^24 = 16,777,216 networks max
+```
+
+---
+
+## Architecture Diagram
+
+```text
+                    VXLAN Packet Structure
+┌──────────────────────────────────────────────────────────────────┐
+│ Outer Ethernet Header         (14 bytes)                         │
+│   Src MAC: Node A NIC         Dst MAC: Router/Gateway            │
+├──────────────────────────────────────────────────────────────────┤
+│ Outer IPv4 Header             (20 bytes)                         │
+│   Src IP: 192.168.1.10 (Node A)  Dst IP: 192.168.1.11 (Node B)  │
+│   Protocol: UDP                                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ UDP Header                    (8 bytes)                          │
+│   Src Port: ephemeral         Dst Port: 4789 (VXLAN)             │
+├──────────────────────────────────────────────────────────────────┤
+│ VXLAN Header                  (8 bytes)                          │
+│   Flags: 0x08 (VNI present)   VNI: 1 (network ID)               │
+├──────────────────────────────────────────────────────────────────┤
+│ Inner Ethernet Header         (14 bytes) ← original Layer 2      │
+│   Src MAC: Pod A eth0         Dst MAC: Pod B eth0                │
+├──────────────────────────────────────────────────────────────────┤
+│ Inner IPv4 Header             (20 bytes) ← original Layer 3      │
+│   Src IP: 10.244.1.5 (Pod A)  Dst IP: 10.244.2.7 (Pod B)        │
+├──────────────────────────────────────────────────────────────────┤
+│ TCP/UDP Payload               (up to 1450 bytes)                 │
+│   Original application data                                      │
+└──────────────────────────────────────────────────────────────────┘
+Total overhead: 14 + 20 + 8 + 8 + 14 = 64 bytes (inner eth included)
+Effective overhead vs raw IP: 50 bytes (UDP + VXLAN + outer IP/ETH)
+```
+
+---
+
+## VTEP: The Encapsulation Engine
+
+A **VTEP (VXLAN Tunnel Endpoint)** is the component that performs encapsulation and decapsulation. In Kubernetes, the VTEP is a virtual network interface on each node (created by the CNI plugin).
+
+```bash
+# Flannel creates a VTEP interface called flannel.1
+ip link show flannel.1
+ip addr show flannel.1
+# Output:
+# 5: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue
+#     inet 10.244.1.0/32 scope global flannel.1
+
+# Calico creates a VTEP for VXLAN mode called vxlan.calico
+ip link show vxlan.calico
+```
+
+When a packet destined for Pod B (on Node B) arrives at the VTEP on Node A:
+
+```text
+1. Kernel recognizes: destination IP 10.244.2.7 is in Node B's subnet
+   (learned via VXLAN FDB — Forwarding Database — or ARP)
+
+2. VTEP encapsulates the inner packet:
+   - Wraps it in VXLAN header with VNI
+   - Wraps in UDP header with dst port 4789
+   - Wraps in IP header: src=Node A IP, dst=Node B IP
+
+3. Sends encapsulated packet via physical NIC
+
+On Node B:
+4. Physical NIC receives UDP packet on port 4789
+5. Kernel passes to VXLAN module/flannel.1
+6. VTEP decapsulates: strips outer Ethernet, IP, UDP, VXLAN headers
+7. Delivers inner packet to Pod B via its veth pair
+```
+
+### The VXLAN Forwarding Database (FDB)
+
+The VTEP needs to know **which node's VTEP IP** owns which Pod subnet. This is stored in the **FDB (Forwarding Database)**:
+
+```bash
+# View VXLAN FDB entries (who owns which MAC/subnet)
+bridge fdb show dev flannel.1
+# Output:
+# 82:14:51:25:94:fc dev flannel.1 dst 192.168.1.11 self permanent
+# → MAC 82:14... is reachable via VTEP at 192.168.1.11 (Node B)
+
+# Flannel keeps this table updated via its own etcd-backed control plane
+```
+
+---
+
+## How Flannel Implements VXLAN
+
+Flannel is the simplest CNI plugin to understand VXLAN with:
+
+```text
+Flannel Architecture:
+┌─────────────────────────────────────────────────────┐
+│ Node A                                              │
+│                                                     │
+│  Pod A (10.244.1.5)                                 │
+│       ↓                                             │
+│  cni0 bridge (10.244.1.1)                           │
+│       ↓                                             │
+│  flannel.1 VTEP (10.244.1.0)                        │
+│       ↓                                             │
+│  eth0 (192.168.1.10) ──────────────────────────────▶│
+└─────────────────────────────────────────────────────┘
+         Physical network (UDP port 4789)
+┌─────────────────────────────────────────────────────┐
+│ Node B                                              │
+│  eth0 (192.168.1.11) ◀──────────────────────────── │
+│       ↓                                             │
+│  flannel.1 VTEP (10.244.2.0) — decapsulates         │
+│       ↓                                             │
+│  cni0 bridge (10.244.2.1)                           │
+│       ↓                                             │
+│  Pod B (10.244.2.7)                                 │
+└─────────────────────────────────────────────────────┘
+```
+
+Flannel's `flanneld` daemon:
+1. Reads each node's `spec.podCIDR` from the Kubernetes API
+2. Writes routes and FDB entries so each node knows how to reach every other node's Pod subnet via VXLAN
+3. Updates entries when nodes join or leave the cluster
+
+```bash
+# Flannel config on a node
+cat /run/flannel/subnet.env
+# FLANNEL_NETWORK=10.244.0.0/16
+# FLANNEL_SUBNET=10.244.1.1/24
+# FLANNEL_MTU=1450
+# FLANNEL_IPMASQ=true
+
+# Routes added by Flannel
+ip route show
+# 10.244.0.0/16 dev flannel.1 proto kernel scope link src 10.244.1.0
+# 10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink
+```
+
+---
+
+## Hands-On: Debugging VXLAN
+
+```bash
+# 1. Capture raw VXLAN traffic (outer packets, UDP 4789)
+tcpdump -i eth0 -nn port 4789 -X
+
+# 2. Decode inner packets (requires kernel 4.7+ and -v flag)
+tcpdump -i flannel.1 -nn
+
+# 3. Check VXLAN interface statistics
+ip -s link show flannel.1
+
+# 4. Check FDB entries (VTEP → remote node mapping)
+bridge fdb show dev flannel.1
+
+# 5. Check ARP entries (Pod IP → MAC mapping inside tunnel)
+arp -n | grep 10.244
+
+# 6. Test connectivity step by step
+# From Pod A:
+kubectl exec -it pod-a -- ping 10.244.2.7 -c 3  # Can we reach Pod B?
+
+# From Node A host:
+ping 10.244.2.0  # Can we reach Node B's VTEP?
+```
+
+---
+
+## Performance Considerations
+
+```bash
+# VXLAN can use hardware offloading if NIC supports it
+# Check if VXLAN offload is enabled
+ethtool -k eth0 | grep -i vxlan
+# tx-udp_tnl-segmentation: on  ← hardware handles encapsulation
+
+# Check if TSO (TCP Segmentation Offload) works with VXLAN
+ethtool -k eth0 | grep -i tx-checksum
+```
+
+Modern NICs (10GbE+) support **VXLAN offloading** — the NIC hardware performs encapsulation/decapsulation in firmware, removing CPU overhead entirely. This makes VXLAN performance nearly equivalent to underlay in terms of CPU cost (though MTU overhead remains).
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the VXLAN VNI and what problem does it solve?**
+
+VNI (VXLAN Network Identifier) is a 24-bit field in the VXLAN header that identifies which virtual network a packet belongs to. It solves the VLAN scalability problem — traditional VLANs only support 4,096 IDs, while VXLAN supports 16.7 million virtual networks. In Kubernetes, CNI plugins typically use a single VNI for all cluster traffic (e.g., VNI=1 in Flannel).
+
+**Q2: What port does VXLAN use and why UDP?**
+
+VXLAN uses UDP port 4789 (IANA assigned). UDP is chosen because VXLAN already has its own inner Layer 2 framing — it doesn't need TCP's reliability guarantees since the encapsulated protocols (TCP) handle retransmission themselves. Using UDP also allows load balancers to use the source port for ECMP (Equal Cost Multi-Path) hashing.
+
+**Q3: What is a VTEP and where does it run in Kubernetes?**
+
+VTEP (VXLAN Tunnel Endpoint) is the component that encapsulates outgoing packets and decapsulates incoming VXLAN packets. In Kubernetes, the CNI plugin creates a virtual VTEP interface on each node (e.g., `flannel.1` for Flannel, `vxlan.calico` for Calico in VXLAN mode). The Linux kernel's VXLAN driver or eBPF programs perform the actual encapsulation.
+
+**Q4: How does a node learn which VTEP owns which Pod subnet?**
+
+Via the VXLAN FDB (Forwarding Database). Flannel updates the FDB by watching the Kubernetes API for node assignments (`spec.podCIDR`). When a new node joins, Flannel adds an FDB entry mapping the remote node's VTEP MAC to the remote node's IP. Calico uses its own datastore (etcd or Kubernetes CRDs) for the same purpose.
+
+**Q5: What is the total byte overhead of VXLAN and how does it affect applications?**
+
+VXLAN adds 50 bytes: outer Ethernet (14) + outer IP (20) + UDP (8) + VXLAN header (8). On a 1500 byte MTU network, this reduces the payload capacity of each packet to 1450 bytes. Applications sending large messages (e.g., database replication, file transfers) will have packets fragmented or encounter Path MTU Discovery issues. CNI plugins must configure Pod MTU to 1450 to prevent this.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know what problem VXLAN solves (VLAN scalability: 4,096 → 16.7M networks)
+- [ ] Can draw and explain the full VXLAN packet structure (outer ETH/IP/UDP/VXLAN + inner ETH/IP/payload)
+- [ ] Understand what a VTEP is and that CNI plugins create one on each node
+- [ ] Know the VXLAN port (UDP 4789) and why UDP is used
+- [ ] Understand the MTU overhead (50 bytes → effective MTU 1450)
+- [ ] Know how Flannel uses VXLAN (flanneld → API watch → FDB entries → flannel.1 interface)
+- [ ] Can use `bridge fdb`, `tcpdump`, and `ip route` to debug VXLAN connectivity

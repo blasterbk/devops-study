@@ -1,0 +1,411 @@
+---
+title: "Chapter 5 — Traffic Splitting"
+sidebar_position: 5
+module: "Module 2.9 — Service Mesh"
+description: "Deep dive into traffic splitting with service meshes — canary deployments, blue/green rollouts, A/B testing by header, fault injection for chaos engineering, and mirroring (shadowing) traffic. Covers both Istio VirtualService weights and Flagger for automated progressive delivery."
+---
+
+# Chapter 5 — Traffic Splitting
+
+> **Goal:** Master traffic splitting patterns in service meshes — percentage-based canary rollouts, header-based A/B testing, fault injection for resilience testing, and traffic mirroring. Understand how these patterns work with Istio VirtualService and how Flagger automates progressive delivery using mesh metrics.
+>
+> By the end of this chapter, you will understand:
+> 1. Weighted traffic splitting for canary deployments (90/10, 80/20, etc.)
+> 2. Header-based routing for A/B testing and internal preview
+> 3. Fault injection — testing resilience by injecting delays and errors
+> 4. Traffic mirroring (shadowing) — testing with production traffic safely
+> 5. Flagger — automated canary analysis using Prometheus metrics
+> 6. Blue/green deployments via instant 0/100 weight switching
+
+---
+
+## Real-Life Analogy
+
+Traffic splitting is like a **restaurant running a new menu test**:
+
+**Canary (weighted):** 90% of customers get the standard menu (v1), 10% get the new experimental menu (v2). If complaints about v2 spike, roll back immediately. If happy, gradually shift more customers to v2.
+
+**A/B Testing (header-based):** Customers who ask for the "VIP menu" (specific header) always get the new menu. Everyone else gets the standard. Perfect for letting beta testers preview features without random routing.
+
+**Fault Injection:** Deliberately give a random 5% of customers spoiled food (500 error) or make them wait 10 minutes (delay). Tests whether your kitchen recovery process (application retry logic) actually works before it happens in real life.
+
+**Traffic Mirroring:** Every customer order is cooked twice — once by the standard kitchen (real response) and once by the new kitchen (v2, discarded response). The customer gets the standard meal, but you're watching how the new kitchen performs on real orders.
+
+---
+
+## Architecture Diagram
+
+```text
+              Traffic Splitting — VirtualService Routing
+
+  Incoming traffic to "api-service"
+        │
+        ▼
+  VirtualService (api-virtual-service)
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Rules evaluated in order:                                   │
+  │                                                              │
+  │  1. Header match: x-canary: true → 100% to v2               │
+  │  2. Weight split: 90% → v1 subset / 10% → v2 subset         │
+  │  3. Fault injection: 5% of v1 requests get 503 error         │
+  │  4. Mirror: all v1 traffic also sent to v2-shadow (silent)   │
+  └──────────────────────────────────────────────────────────────┘
+           │                    │
+           ▼                    ▼
+  DestinationRule subsets:
+  "v1" → Pods with label version=v1
+  "v2" → Pods with label version=v2
+```
+
+---
+
+## Weighted Canary Rollout
+
+```yaml
+# Phase 1: 90/10 canary split
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-canary
+  namespace: production
+spec:
+  hosts:
+  - api-service
+  http:
+  - route:
+    - destination:
+        host: api-service
+        subset: v1
+      weight: 90
+    - destination:
+        host: api-service
+        subset: v2
+      weight: 10
+---
+# Phase 2: 50/50
+# Edit weights: v1=50, v2=50
+# Phase 3: 0/100 (complete rollout)
+# Edit weights: v1=0, v2=100
+# Phase 4: Remove v1 Deployment, simplify VirtualService
+```
+
+```yaml
+# DestinationRule defining subsets
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: api-destination-rule
+  namespace: production
+spec:
+  host: api-service
+  subsets:
+  - name: v1
+    labels:
+      version: v1    # Selects Pods with this label
+  - name: v2
+    labels:
+      version: v2
+```
+
+---
+
+## Header-Based Routing (A/B Testing)
+
+```yaml
+# Route based on HTTP headers — internal users get v2, everyone else gets v1
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-ab-test
+  namespace: production
+spec:
+  hosts:
+  - api-service
+  http:
+  # Rule 1: Internal/beta users (header-based)
+  - match:
+    - headers:
+        x-user-group:
+          exact: "beta"
+    - headers:
+        x-canary:
+          exact: "true"
+    route:
+    - destination:
+        host: api-service
+        subset: v2
+
+  # Rule 2: Specific user IDs
+  - match:
+    - headers:
+        x-user-id:
+          regex: "^(user-001|user-002|user-003)$"
+    route:
+    - destination:
+        host: api-service
+        subset: v2
+
+  # Default: everyone else gets v1
+  - route:
+    - destination:
+        host: api-service
+        subset: v1
+```
+
+---
+
+## Fault Injection
+
+Fault injection deliberately introduces errors or delays to test application resilience:
+
+```yaml
+# Inject delays and errors for chaos engineering
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-fault-injection
+  namespace: production
+spec:
+  hosts:
+  - downstream-service    # Inject faults on calls TO this service
+  http:
+  - fault:
+      # Delay: 5% of requests get a 3-second delay
+      delay:
+        percentage:
+          value: 5.0
+        fixedDelay: 3s
+
+      # Abort: 1% of requests return HTTP 503
+      abort:
+        percentage:
+          value: 1.0
+        httpStatus: 503
+
+    route:
+    - destination:
+        host: downstream-service
+        subset: v1
+
+  # Per-user fault injection (only for test users)
+  - match:
+    - headers:
+        x-test-fault:
+          exact: "true"
+    fault:
+      delay:
+        percentage:
+          value: 100.0    # 100% of test requests get delayed
+        fixedDelay: 10s
+    route:
+    - destination:
+        host: downstream-service
+```
+
+> [!TIP]
+> Fault injection with `x-test-fault` header lets QA engineers trigger failures on demand without affecting other users — invaluable for testing circuit breakers, retry logic, and timeout handling.
+
+---
+
+## Traffic Mirroring (Shadowing)
+
+Send a copy of production traffic to a new version **without affecting the real response**:
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-with-mirror
+  namespace: production
+spec:
+  hosts:
+  - api-service
+  http:
+  - route:
+    - destination:
+        host: api-service
+        subset: v1        # Real traffic goes to v1 (response returned to client)
+      weight: 100
+
+    # Mirror 100% of traffic to v2 (response DISCARDED, not returned to client)
+    mirror:
+      host: api-service
+      subset: v2
+    mirrorPercentage:
+      value: 100.0       # Can mirror partial: 10.0 = 10% of traffic
+```
+
+```text
+Traffic Mirroring Behaviour:
+  Client request → api-service
+  Envoy: forwards to v1 AND copies to v2 simultaneously
+  v1 response → returned to client (real response)
+  v2 response → DISCARDED (v2 never sees the client)
+
+  v2 receives real production traffic but is isolated:
+  - Responses don't affect client experience
+  - v2 database writes DO happen — use read-only or shadow DB
+  - v2 latency doesn't affect client (async copy)
+
+Use cases:
+  - Validate v2 handles production traffic shapes before cutover
+  - Test new DB schema with production query patterns
+  - Performance benchmarking of v2 under real load
+```
+
+---
+
+## Automated Canary: Flagger
+
+Flagger automates the canary rollout process using mesh metrics:
+
+```bash
+# Install Flagger with Istio
+helm repo add flagger https://flagger.app
+helm install flagger flagger/flagger \
+  --set meshProvider=istio \
+  --set metricsServer=http://prometheus:9090 \
+  -n istio-system
+```
+
+```yaml
+# Flagger Canary resource — automates the VirtualService weight adjustment
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: api-canary
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-deployment
+
+  service:
+    port: 8080
+    targetPort: 8080
+
+  # Canary analysis configuration
+  analysis:
+    interval: 1m         # Check metrics every 1 minute
+    threshold: 5         # Max 5 failed checks before rollback
+    maxWeight: 50        # Shift at most 50% to canary
+    stepWeight: 10       # Increase by 10% each interval
+
+    # Success criteria (using Prometheus metrics from Istio)
+    metrics:
+    - name: request-success-rate
+      # If success rate drops below 99%: fail
+      thresholdRange:
+        min: 99
+      interval: 1m
+
+    - name: request-duration
+      # If P99 latency exceeds 500ms: fail
+      thresholdRange:
+        max: 500
+      interval: 1m
+
+    # Optional: run load test during canary
+    webhooks:
+    - name: load-test
+      url: http://flagger-loadtester/
+      timeout: 5s
+      metadata:
+        cmd: "hey -z 1m -q 10 http://api-canary-canary:8080/api/health"
+```
+
+```text
+Flagger Canary Workflow:
+  1. Developer updates Deployment image → Flagger detects change
+  2. Flagger creates canary Deployment (api-deployment-canary)
+  3. Adjusts VirtualService: v1=90, canary=10
+  4. After 1min: checks Prometheus metrics
+     - Success rate >99%? OK → shift to 80/20
+     - Latency P99 <500ms? OK → continue
+  5. After 5 steps: 50/50 → metrics OK → 0/100 → promotes canary
+  6. If ANY metric fails: immediately rollback to 100% v1
+     → Deletes canary Deployment
+     → Sends alert (Slack, PagerDuty)
+```
+
+---
+
+## Hands-On: Traffic Splitting Verification
+
+```bash
+# 1. Test weighted split manually (run 100 requests, count responses)
+for i in $(seq 100); do
+  curl -s http://api-service.production/api/version | grep version
+done | sort | uniq -c
+# Expect: ~90 with "v1", ~10 with "v2"
+
+# 2. Test header-based routing
+curl -H "x-user-group: beta" http://api-service.production/api/version
+# Should return v2
+
+curl http://api-service.production/api/version
+# Should return v1
+
+# 3. Test fault injection
+kubectl exec -n production test-pod -- \
+  curl -o /dev/null -w "%{http_code} %{time_total}s\n" \
+  http://downstream-service:8080/api
+# Run 100 times and observe ~5% with >3s latency, ~1% with 503
+
+# 4. Verify mirroring (check v2 logs for mirrored requests)
+kubectl logs -n production -l version=v2 -c api | tail -20
+# Should see production request patterns even though v2 gets 0% weight
+
+# 5. Watch Flagger canary progress
+watch kubectl get canary -n production
+# NAME          STATUS        WEIGHT   LASTTRANSITIONTIME
+# api-canary    Progressing   30       2m
+
+# 6. Check VirtualService weights set by Flagger
+kubectl get virtualservice api-canary -n production -o yaml | \
+  grep -A5 "weight"
+
+# 7. Simulate Flagger rollback (introduce errors in canary)
+kubectl exec -n production test-pod -- \
+  for i in $(seq 10); do
+    curl http://api-canary-canary:8080/api/data
+  done
+# If canary returns errors → Flagger detects → automatic rollback
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does weighted traffic splitting in Istio differ from Kubernetes Deployment rolling updates?**
+
+Kubernetes rolling updates gradually replace old Pods with new Pods — at 50% progress, 50% of Pods are v1, 50% are v2, and kube-proxy round-robins across all of them. You can't control the percentage precisely or route specific users to specific versions. Istio's weighted traffic splitting is independent of Pod count — you can have 10 v1 Pods and 1 v2 Pod, but route 90/10 precisely via VirtualService weights. You can also combine with header-based routing, running both versions indefinitely until confidence is gained.
+
+**Q2: What is traffic mirroring and what are its limitations?**
+
+Traffic mirroring (shadowing) sends a copy of every request to a shadow service simultaneously. The real request goes to the primary backend, and its response is returned to the client. The mirror response is discarded. This lets you test a new version with production traffic patterns without affecting users. **Limitations**: (1) the mirror service executes any side effects (DB writes, external API calls, emails) — test doubles or read-only replicas should be used for the shadow; (2) the mirror gets a copy of the response too — only suitable if mirroring isn't confidential; (3) doubles your backend load during mirroring.
+
+**Q3: How does fault injection help with resilience testing?**
+
+Fault injection deliberately introduces errors (HTTP 5xx responses) and delays into specific traffic paths without modifying any application code. This verifies that: retries actually retry (not just fail fast), circuit breakers trip at the right thresholds, timeouts are configured correctly, and cascading failure is prevented. A common pattern is to inject a 5s delay into a downstream service call — if the upstream application doesn't have a timeout shorter than 5s, it hangs indefinitely, revealing a configuration gap. Fault injection is the "chaos engineering" of service meshes.
+
+**Q4: What is Flagger and how does it automate canary deployments?**
+
+Flagger is a progressive delivery operator that automates the canary rollout process. It watches for Deployment image changes, creates a canary Deployment, and then continuously adjusts VirtualService traffic weights (e.g., 10% → 20% → 30%) at a configurable interval. After each shift, it queries Prometheus metrics (error rate, latency from Istio's automatic metrics) and compares against defined thresholds. If metrics are healthy, it promotes; if they degrade below threshold, it immediately rolls back by setting canary weight to 0% and deleting the canary Deployment. This automates what would otherwise be a manual, error-prone process.
+
+**Q5: How do you implement A/B testing where only specific users see a new feature?**
+
+Use header-based VirtualService routing. The client (frontend app) adds a header (e.g., `x-user-group: beta`) based on user group membership (looked up from a feature flag service or user database). The VirtualService matches on this header and routes to the v2 subset. Users without the header get v1. This is deterministic — the same user always goes to the same version (as long as the header is correctly set). Combine with a feature flag system for granular control: the feature flag service decides the header value, the mesh enforces the routing.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know weighted split: `weight` in VirtualService backendRefs (90/10, 50/50, 0/100)
+- [ ] Know header-based routing: `match.headers` with exact/regex for A/B testing
+- [ ] Know fault injection: `fault.delay` (adds latency) and `fault.abort` (returns error status)
+- [ ] Know traffic mirroring: `mirror` + `mirrorPercentage` — real response from primary, copy to shadow discarded
+- [ ] Know Flagger: watches Deployment changes, adjusts VirtualService weights, queries Prometheus, auto-rollbacks
+- [ ] Know blue/green: v1=100→v1=0, v2=0→v2=100 instant switch via VirtualService weight edit
+- [ ] Can verify with 100-request curl loop counting versions, check Flagger `kubectl get canary`

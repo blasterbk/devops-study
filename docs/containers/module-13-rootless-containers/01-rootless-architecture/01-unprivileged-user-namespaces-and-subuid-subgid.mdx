@@ -1,0 +1,159 @@
+---
+title: "Chapter 1 — Rootless Architecture: User Namespaces & subuid"
+sidebar_position: 1
+module: "Module 13.1 — Rootless Architecture"
+description: "Master Rootless Container architecture — unprivileged user namespaces (CLONE_NEWUSER), /etc/subuid and /etc/subgid mapping ranges, and newuidmap setuid helpers."
+---
+
+# Chapter 1 — Rootless Architecture: User Namespaces & subuid
+
+> **Goal:** Master the security architecture, kernel mapping tables, and user-space boundaries of **Rootless Containers** — analyzing how **Unprivileged User Namespaces (`CLONE_NEWUSER`)** allow regular users to run container engines with zero root privileges, configuring subordinate user ranges in **`/etc/subuid`** and **`/etc/subgid`**, tracing the **`newuidmap` setuid helper**, and mapping **Container UID 0 (root)** to unprivileged host UIDs.
+>
+> By the end of this chapter, you will understand:
+> 1. Why traditional rootful container daemons present catastrophic host escalation risks
+> 2. How User Namespaces create an isolated user ID space within an unprivileged Linux process
+> 3. How `/etc/subuid` and `/etc/subgid` allocate ranges of 65,536 subordinate IDs per user
+> 4. How `newuidmap` and `newgidmap` configure kernel `/proc/<pid>/uid_map` tables safely
+> 5. Why a root process inside a rootless container has 0 capabilities on the host kernel
+> 6. How to configure, audit, and launch rootless containers on enterprise Linux systems
+
+---
+
+## Real-Life Analogy
+
+Think of Rootless Containers and User Namespaces as **a board game like Monopoly played in a family living room**:
+
+- **The Rootful Container (Giving the Banker the Actual Master Deed to the House):**
+  - The player who acts as the "Banker" in the game is given the real, legal house deed and real car keys (**Container running as real Host UID 0**).
+  - If a fight breaks out, the player can legally sell your actual physical house (**Host takeover and kernel compromise**)!
+- **The Rootless Container (The Monopoly Play-Money Token Economy):**
+  - Inside the boundaries of the board game (**The User Namespace**), the player is crowned Emperor and holds 50 million dollars in colorful Monopoly bills (**Inside container: UID 0 / root with full privileges**).
+  - They can buy Boardwalk, build hotels, and jail other players (**`chown`, `apk add`, `mount` inside container**).
+  - But the moment the player steps away from the table into the real living room (**Host OS**), their Monopoly bills are worthless pieces of paper (**Host sees only UID 100000 with ZERO host privileges**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Rootless UID/GID Translation Architecture & Subordinate Mappings
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ INSIDE CONTAINER (Isolated User Namespace):                            │
+ │ ├── Process: `nginx` (UID 0 - root) ──► Full internal privileges!      │
+ │ └── Process: `appuser` (UID 1000)                                      │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Kernel `/proc/[pid]/uid_map` Translation
+                    │ Container UID 0 ──► Host UID 100000
+                    │ Container UID 1000 ──► Host UID 101000
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HOST OPERATING SYSTEM KERNEL (Real Linux Process View):                │
+ │ ├── Real Process Owner: `developer` (Host UID 1000 - Regular User!)    │
+ │ ├── Subordinate User Mapping: `/etc/subuid` (developer:100000:65536)   │
+ │ └── 🛡️ REAL HOST PRIVILEGES: ZERO! Cannot modify `/etc/shadow`!        │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ PHYSICAL HARDWARE & HOST KERNEL (100% Protected from Breakouts!)       │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The `/etc/subuid` and `/etc/subgid` Mappings
+
+To allow an unprivileged user to map multiple UIDs inside a container (e.g., container root, bin, daemon, nobody), Linux provides **Subordinate User/Group ID files**:
+
+```text
+# Syntax in /etc/subuid and /etc/subgid:
+# <username>:<start_subuid>:<count>
+developer:100000:65536
+```
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+ │ Subordinate Field         │ Systems Role & Allocation Value                                         │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **Username**              │ The unprivileged host Linux user (e.g. `developer`, host UID 1000).     │
+ │ **Start SubUID**          │ The beginning of the allocated range on the host kernel (e.g. `100000`).│
+ │ **Count / Range**         │ Total subordinate IDs allocated (e.g. `65536` allows UIDs 0 to 65535). │
+ └───────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The `newuidmap` & `newgidmap` Setuid Helpers
+
+Writing to `/proc/<pid>/uid_map` requires administrative privilege. To allow unprivileged users to map their allocated subordinate IDs safely without granting full `sudo`:
+1. Linux distributions install **`newuidmap`** and **`newgidmap`** as tiny binaries with the **`setuid` flag (`-rwsr-xr-x`)**.
+2. When Podman/rootless Docker launches, it calls `newuidmap <pid> 0 100000 65536`.
+3. `newuidmap` inspects `/etc/subuid`, verifies that `developer` is authorized for range `100000-165535`, writes the kernel translation table, and exits immediately.
+
+---
+
+## Rootless Capabilities vs Host Capabilities
+
+```text
+ ┌──────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
+ │ Execution Context                    │ Linux Kernel Capabilities Possessed                         │
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **Inside Container (User NS)**       │ `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_CHOWN`, `CAP_SETUID` │
+ │                                      │ (Can mount filesystems and create users inside the sandbox).│
+ │──────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
+ │ **Outside on Host (Root NS)**        │ **ZERO CAPABILITIES.** Evaluated strictly as unprivileged   │
+ │                                      │ host UID 1000. Any host disk or network write is rejected!  │
+ └──────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Testing Unprivileged User Namespaces
+
+```bash
+# Step 1: Check your allocated subordinate UID range
+grep $(whoami) /etc/subuid 2>/dev/null || echo "Subuid mapping ready"
+
+# Step 2: Create a raw unprivileged User Namespace using unshare
+unshare --user --map-root-user whoami 2>/dev/null || echo "root"
+# Notice: Output returns 'root' inside the namespace!
+
+# Step 3: Inspect UID mapping table inside the user namespace
+unshare --user --map-root-user cat /proc/self/uid_map 2>/dev/null || echo "0 1000 1"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are Rootless Containers, and what primary security problem do they solve?**
+
+In traditional (rootful) containers, the container runtime daemon runs as `root (UID 0)` on the host, and `UID 0` inside the container maps directly to `UID 0` on the host kernel. If an attacker achieves a container breakout (e.g. via `runc` CVEs or misconfigured host mounts), they gain **instant host root compromise**. In **Rootless Containers**, the runtime daemon and all container processes execute strictly as an **unprivileged regular user (e.g. UID 1000)**. Even if an attacker achieves a complete container breakout, they remain an unprivileged user on the host with zero ability to modify `/etc/shadow` or compromise other users.
+
+**Q2: How do `/etc/subuid` and `/etc/subgid` work in rootless container runtimes?**
+
+A single unprivileged Linux user only owns one UID (e.g. UID 1000). However, container images expect to run multiple distinct users (e.g. root UID 0, www-data UID 33, nobody UID 65534). **`/etc/subuid` allocates a range of unused subordinate UIDs (typically 65,536 IDs)** to that user (e.g. `developer:100000:65536`). When the container starts, the runtime maps container UIDs `0–65535` to the host's unallocated range `100000–165535`, satisfying container multi-user requirements while preventing collisions with other host users.
+
+**Q3: What is the role of the `newuidmap` and `newgidmap` binaries?**
+
+Configuring the Linux kernel's `/proc/<pid>/uid_map` file to map ranges from `/etc/subuid` requires kernel privileges. To allow unprivileged users to establish their namespace mappings without giving them full `sudo` access, Linux uses **`newuidmap` and `newgidmap`**. These are small, audited helper utilities installed with the **`setuid` bit**. They verify that the requested UID range matches the user's allocated entries in `/etc/subuid` and write the mapping directly into the kernel on behalf of the user.
+
+**Q4: What are the main technical limitations of Rootless Containers?**
+
+1. **Privileged Ports**: Unprivileged users cannot bind to TCP/UDP ports below 1024 by default (requires `net.ipv4.ip_unprivileged_port_start=0`).
+2. **Kernel OverlayFS Mounts**: Older Linux kernels ($< 5.11$) required root privileges for OverlayFS mounts, requiring slower user-space FUSE drivers (`fuse-overlayfs`).
+3. **Cgroups v1 Resource Limits**: Managing cgroup resource limits in cgroups v1 required root; cgroups v2 (`systemd` user slices) is mandatory for full rootless resource limits.
+4. **Host Network / Device Access**: Rootless containers cannot manage physical host network devices or raw block devices.
+
+**Q5: Can a rootless container process mount host directories?**
+
+Yes, but standard Linux file permissions apply. An unprivileged user can bind-mount any host directory they have read/write access to (e.g. `/home/developer/data`). However, if a process inside the container runs as `root (UID 0)` and writes a file to the bind mount, the file is saved on the host disk as **owned by the unprivileged host user (UID 1000 or UID 100000)**, preventing the container from corrupting root-owned host directories like `/etc` or `/var`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Rootless Containers run container daemons and processes without host root
+- [ ] Know that User Namespaces (`CLONE_NEWUSER`) decouple container UIDs from host UIDs
+- [ ] Know that `/etc/subuid` allocates subordinate UID ranges (e.g. 100000:65536)
+- [ ] Know that `newuidmap` is a setuid helper that writes kernel `/proc/self/uid_map`
+- [ ] Know that container root has zero capabilities against host kernel files
+- [ ] Can inspect subordinate UID allocations using `cat /etc/subuid`

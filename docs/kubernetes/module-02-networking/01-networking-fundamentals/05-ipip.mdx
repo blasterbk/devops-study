@@ -1,0 +1,239 @@
+---
+title: "Chapter 5 — IPIP (IP-in-IP)"
+sidebar_position: 5
+module: "Module 2.1 — Networking Fundamentals"
+description: "Deep dive into IPIP (IP-in-IP) encapsulation — how it wraps Pod IP packets inside a node-IP outer header, its 20-byte overhead advantage over VXLAN, and how Calico uses IPIP mode for cross-node Pod routing."
+---
+
+# Chapter 5 — IPIP (IP-in-IP) Encapsulation
+
+> **Goal:** Understand how IP-in-IP encapsulation works, why it's lighter than VXLAN, when Calico uses it versus BGP native routing, and how to inspect and debug IPIP tunnels on Kubernetes nodes.
+>
+> By the end of this chapter, you will understand:
+> 1. What IP-in-IP encapsulation is and how it differs from VXLAN
+> 2. The exact IPIP packet structure and its 20-byte overhead
+> 3. How Calico uses IPIP to route cross-node Pod traffic
+> 4. The `tunl0` interface — what it is and how to inspect it
+> 5. When to choose IPIP vs VXLAN vs BGP
+> 6. How to debug IPIP tunnels with `ip tunnel`, `tcpdump`, and routing tables
+
+---
+
+## Real-Life Analogy
+
+Imagine **Russian nesting dolls (Matryoshka)**:
+
+You have a small doll (the original Pod packet with Pod IPs). You put it directly inside a slightly larger doll (the outer IP packet with Node IPs). That's it — one level of nesting. Unlike VXLAN, which adds Ethernet + UDP + VXLAN headers (like putting the doll in a box, then in bubble wrap, then in another box), IPIP is the minimum possible wrapping: just one extra IP header.
+
+It's simpler, it's lighter, but it still works across any routed IP network.
+
+---
+
+## Architecture Diagram
+
+```text
+VXLAN vs IPIP Packet Structure:
+
+VXLAN (50 bytes overhead):
+┌──────────────────────────────────────────────────┐
+│ Outer ETH  │ Outer IP │ UDP Port 4789 │ VXLAN HDR │
+│  (14 B)    │  (20 B)  │    (8 B)     │   (8 B)   │
+├──────────────────────────────────────────────────┤
+│ Inner ETH  │ Inner IP │    Pod Payload            │
+│  (14 B)    │  (20 B)  │                           │
+└──────────────────────────────────────────────────┘
+
+IPIP (20 bytes overhead):
+┌────────────────────────────────────────────────┐
+│ Outer IP Header                (20 bytes)      │
+│   Src: 192.168.1.10 (Node A)                   │
+│   Dst: 192.168.1.11 (Node B)                   │
+│   Protocol: 4 (IPIP)                           │
+├────────────────────────────────────────────────┤
+│ Inner IP Header                (20 bytes)      │
+│   Src: 10.244.1.5 (Pod A)                      │
+│   Dst: 10.244.2.7 (Pod B)                      │
+├────────────────────────────────────────────────┤
+│ TCP/UDP Payload                                │
+│   (up to 1480 bytes with 1500 byte MTU)        │
+└────────────────────────────────────────────────┘
+
+IPIP effective MTU: 1500 - 20 = 1480 bytes (vs VXLAN's 1450)
+```
+
+---
+
+## How IPIP Works
+
+IPIP (IP Protocol number 4) simply places one IP packet inside another:
+
+```text
+Original Pod packet (10.244.1.5 → 10.244.2.7):
+  Src: 10.244.1.5  Dst: 10.244.2.7  Protocol: TCP
+
+After IPIP encapsulation on Node A's tunl0 interface:
+  Outer Src: 192.168.1.10  Outer Dst: 192.168.1.11  Protocol: 4 (IPIP)
+  [Inner IP: 10.244.1.5 → 10.244.2.7  TCP payload]
+
+Physical routers forward using Node IPs (they see Protocol 4).
+Node B's kernel receives it, sees Protocol 4, strips outer header,
+delivers inner packet to Pod B.
+```
+
+**Key differences from VXLAN:**
+- No Ethernet header in the tunnel (IPIP works at Layer 3 only, not Layer 2)
+- No UDP header — IPIP is its own IP protocol (protocol number 4)
+- Cannot tunnel Layer 2 broadcasts (no ARP flooding through IPIP tunnels)
+- Simpler and more efficient — but requires more careful FDB/routing management
+
+---
+
+## The `tunl0` Interface: Calico's IPIP Endpoint
+
+When Calico is configured in IPIP mode, it creates a `tunl0` virtual interface on each node:
+
+```bash
+# Inspect the Calico IPIP tunnel interface
+ip link show tunl0
+# 6: tunl0@NONE: <NOARP> mtu 1480 qdisc noop
+#     link/ipip 0.0.0.0 brd 0.0.0.0
+
+ip addr show tunl0
+# inet 10.244.1.1/32 scope global tunl0  ← Node A's tunnel endpoint IP
+
+# Check IPIP routes (Calico adds per-node routes through tunl0)
+ip route show
+# 10.244.2.0/24 via 192.168.1.11 dev tunl0 proto bird
+# → Traffic for Node B's Pod subnet goes through the IPIP tunnel to 192.168.1.11
+```
+
+Calico's `BIRD` routing daemon manages these routes. When a new node joins:
+1. BIRD learns Node B's Pod CIDR (`10.244.2.0/24`) via BGP
+2. Calico adds route: `10.244.2.0/24 via 192.168.1.11 dev tunl0`
+3. Traffic for Pod B now automatically encapsulates via `tunl0`
+
+---
+
+## Calico IPIP Modes
+
+Calico supports three encapsulation behaviors, configurable per `IPPool`:
+
+```yaml
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: default-ipv4-ippool
+spec:
+  cidr: 10.244.0.0/16
+  ipipMode: Always    # Options: Always | CrossSubnet | Never
+  natOutgoing: true
+```
+
+| Mode | Behavior |
+|------|----------|
+| `Always` | Always use IPIP encapsulation for all cross-node traffic |
+| `CrossSubnet` | Use IPIP only when nodes are on different subnets; use BGP direct routing within the same subnet |
+| `Never` | Never use IPIP — requires BGP-capable network infrastructure |
+
+**`CrossSubnet` mode** is particularly clever — it optimizes for cloud environments where nodes in the same availability zone (same subnet) can route directly, but nodes across AZs (different subnets) need IPIP:
+
+```text
+Same AZ (same subnet: 192.168.1.0/24):
+Node A (192.168.1.10) → Node B (192.168.1.11)
+→ BGP direct routing (no encapsulation, full 1500 MTU)
+
+Cross-AZ (different subnets):
+Node A (192.168.1.10) → Node C (192.168.2.10)
+→ IPIP encapsulation (outer src/dst are node IPs)
+```
+
+---
+
+## Hands-On: Inspecting and Debugging IPIP
+
+```bash
+# 1. Verify IPIP tunnel exists and is up
+ip tunnel show
+# tunl0: ip/ip  remote any  local any  ttl inherit  nopmtudisc
+
+# 2. Inspect Calico routing table entries for IPIP routes
+ip route show | grep tunl0
+# 10.244.2.0/24 via 192.168.1.11 dev tunl0 proto bird onlink
+
+# 3. Capture raw IPIP traffic (Protocol 4)
+tcpdump -i eth0 -nn "ip proto 4" -X
+# You'll see the outer IP header with Protocol 4, inner IP inside
+
+# 4. Capture decoded inner packets on tunl0
+tcpdump -i tunl0 -nn
+# Shows inner Pod-to-Pod traffic without outer wrapping
+
+# 5. Check that Calico Felix is healthy
+kubectl get pods -n kube-system -l k8s-app=calico-node
+kubectl exec -n kube-system calico-node-<id> -- calico-node -bird-live
+
+# 6. Trace connectivity
+kubectl exec -it pod-a -- traceroute 10.244.2.7
+# Should show: pod-a → (one hop) → pod-b
+# (IPIP appears as a single hop because the tunnel hides intermediate hops)
+```
+
+---
+
+## IPIP vs VXLAN: Choosing the Right Protocol
+
+| Aspect | IPIP | VXLAN |
+|--------|------|-------|
+| **Overhead** | 20 bytes (outer IP only) | 50 bytes (ETH + IP + UDP + VXLAN) |
+| **Effective MTU** | 1480 bytes | 1450 bytes |
+| **Layer** | Layer 3 (IP only) | Layer 2 (Ethernet frames) |
+| **Protocol** | IP Protocol 4 | UDP Port 4789 |
+| **ARP/broadcast** | Not supported through tunnel | Supported (tunnels Ethernet frames) |
+| **Firewall compatibility** | May be blocked (GRE/IPIP rules) | UDP 4789 easy to allow |
+| **CPU overhead** | Slightly less (no UDP) | Slightly more |
+| **NIC offload support** | Less common | Widely supported on modern NICs |
+
+**Prefer IPIP when:**
+- You're using Calico and need slight MTU improvement over VXLAN
+- Your firewall allows IP Protocol 4 packets
+- You're in CrossSubnet mode for AZ-aware optimization
+
+**Prefer VXLAN when:**
+- Firewall blocks raw IP encapsulation protocols
+- You need Layer 2 adjacency between Pods (rare use cases)
+- Your NIC supports VXLAN offloading
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the overhead of IPIP compared to VXLAN and why?**
+
+IPIP adds only 20 bytes (a single outer IP header). VXLAN adds 50 bytes (outer Ethernet 14 + outer IP 20 + UDP 8 + VXLAN header 8). IPIP is lighter because it operates at Layer 3 only — it wraps an IP packet inside another IP packet using IP Protocol number 4, without needing Ethernet framing or UDP headers.
+
+**Q2: What is Calico's `CrossSubnet` IPIP mode and why is it useful?**
+
+`CrossSubnet` mode tells Calico to use IPIP only when pods are on different IP subnets (e.g., different cloud availability zones). Within the same subnet, Calico uses BGP direct routing with no encapsulation overhead. This is optimal for cloud environments where intra-AZ traffic can route natively but cross-AZ traffic crosses router hops that require encapsulation.
+
+**Q3: What IP protocol number does IPIP use and how does that differ from VXLAN?**
+
+IPIP uses IP Protocol number 4. VXLAN uses UDP (IP Protocol 17) with destination port 4789. The difference matters for firewalls — Protocol 4 is less commonly allowed than UDP, so VXLAN tends to have fewer firewall compatibility issues in enterprise environments.
+
+**Q4: What happens to the source IP in an IPIP-encapsulated packet at the destination?**
+
+The outer IP header's source IP is the sending node's IP (e.g., 192.168.1.10). The destination node strips the outer header. The inner packet's source IP is the originating Pod's IP (e.g., 10.244.1.5). So at the receiving Pod, the source IP seen is the Pod's IP — no NAT, preserving Kubernetes networking model compliance.
+
+**Q5: How does the `tunl0` interface on a node know which remote node to send to?**
+
+Calico uses BGP (via the BIRD daemon) to distribute Pod CIDR routes across nodes. Each node's BIRD daemon learns all other nodes' Pod CIDRs and which node IP owns them. Calico translates these BGP routes into Linux kernel routes via the `tunl0` interface: `10.244.2.0/24 via 192.168.1.11 dev tunl0`. The kernel automatically IPIP-encapsulates packets matching this route.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know IPIP overhead is 20 bytes (outer IP header only) vs VXLAN's 50 bytes
+- [ ] Understand IPIP works at Layer 3 (no Ethernet framing in the tunnel)
+- [ ] Know Calico uses `tunl0` as the IPIP virtual interface
+- [ ] Understand Calico's three IPIP modes: `Always`, `CrossSubnet`, `Never`
+- [ ] Can inspect IPIP routes, tunnel stats, and capture IPIP traffic with `tcpdump`
+- [ ] Know when to choose IPIP vs VXLAN (MTU vs firewall vs NIC offload)

@@ -1,0 +1,220 @@
+---
+title: "Chapter 1 — Container State Machine: create, start, pause & stop"
+sidebar_position: 1
+module: "Module 6.3 — Container Lifecycle"
+description: "Master the Docker Container State Machine — transitions (created, running, paused, exited, dead), restart policies, HEALTHCHECK lifecycles, and exit codes (137, 143)."
+---
+
+# Chapter 1 — Container State Machine: create, start, pause & stop
+
+> **Goal:** Master the complete state transitions, restart automation, and healthcheck telemetry of the **Docker Container State Machine** — analyzing the 7 operational states (**`created`**, **`running`**, **`paused`**, **`restarting`**, **`removing`**, **`exited`**, and **`dead`**), configuring enterprise **Restart Policies** (`unless-stopped`, `on-failure`), mastering **Docker Healthchecks** (`starting` $\to$ `healthy` $\to$ `unhealthy`), and decoding standard Linux **Container Exit Codes (0, 137, 143)**.
+>
+> By the end of this chapter, you will understand:
+> 1. The 7 formal states of a Docker container and their exact transition triggers
+> 2. The behavioral differences between `always`, `unless-stopped`, and `on-failure` restart policies
+> 3. How Docker executes `HEALTHCHECK` probes and updates container status
+> 4. Why Exit Code 137 indicates a `SIGKILL` or kernel Out-of-Memory (OOM) termination
+> 5. How to handle graceful shutdown timeouts with custom `--stop-timeout` settings
+> 6. How to author and test active container healthchecks in production Dockerfiles
+
+---
+
+## Real-Life Analogy
+
+Think of the Docker Container State Machine as **an automated robotic manufacturing assembly unit in an aerospace factory**:
+
+- **1. Pre-Assembly Standby (`Created`):**
+  - The robotic arm is mounted on the factory floor, connected to power cables, and loaded with metal parts (**Namespaces and storage mounted**). The motor is off (**Zero CPU/RAM usage**).
+- **2. Active Manufacturing (`Running`):**
+  - The factory manager presses the green power switch (**`docker start`**). The robot begins welding parts at full speed (**PID 1 executes**).
+- **3. The Time-Freeze Inspection Chamber (`Paused`):**
+  - An inspector steps into the welding bay to check a measurement. The master controller instantly freezes the robot's mechanical joints in mid-air (**cgroup freezer**). The robot doesn't shut down; it simply halts all motion (**0% CPU**). Once the inspector leaves, motion resumes instantaneously (**`docker unpause`**).
+- **4. Emergency Stop vs Graceful Shift End (`Stopped` / `Exited`):**
+  - At shift end, the manager signals the robot to finish its current weld, park its arm, and power down (**`SIGTERM` - Exit Code 143**).
+  - If the robot malfunctions and swings erratically, the master safety breaker drops the power line instantly (**`SIGKILL` - Exit Code 137**)!
+- **5. The Self-Diagnosing Health Sensor (`Healthcheck`):**
+  - The robot has an internal temperature probe. If the welding torch overheats 3 times in a row (**3 failed health probes**), the robot flags itself as **`unhealthy`**, signaling the dispatch manager to spin up a backup robot!
+
+---
+
+## Architecture Diagram
+
+```text
+               The Comprehensive Docker Container State Machine
+
+                          ┌────────────────────────────────┐
+                          │ 1. `docker create` / `runc`    │
+                          └───────────────┬────────────────┘
+                                          ▼
+                               ┌─────────────────────┐
+                               │ STATE: `created`    │
+                               └──────────┬──────────┘
+                                          │ `docker start`
+                                          ▼
+ ┌────────────────────────────────────────────────────────────────────────────────┐
+ │ STATE: `running`                                                               │
+ │ ├── Sub-State: `health: starting` ──► `health: healthy`                        │
+ │ └── Sub-State: (If probe fails 3x) ──► `health: unhealthy`                     │
+ └──────────────┬───────────────────▲─────────────────────────────┬───────────────┘
+                │ `docker pause`    │ `docker unpause`            │ Process Exits
+                │ (cgroup freeze)   │ (SIGCONT)                   │ or `docker stop`
+                ▼                   │                             ▼
+ ┌──────────────────────────────────┴─────┐         ┌─────────────────────────────┐
+ │ STATE: `paused`                        │         │ STATE: `exited`             │
+ │ - 0% CPU; RAM preserved in memory      │         │ - Exit Code 0: Clean Exit   │
+ └────────────────────────────────────────┘         │ - Exit Code 137: SIGKILL/OOM│
+                                                    │ - Exit Code 143: SIGTERM    │
+                                                    └──────┬───────────────┬──────┘
+                                                           │               │
+                            `Restart Policy: always` ──────┘               │ `docker rm`
+                            (Transitions to `restarting` ──► `running`)    ▼
+                                                    ┌─────────────────────────────┐
+                                                    │ STATE: `removing` ──► `dead`│
+                                                    │ (Destroyed & Disk Freed)    │
+                                                    └─────────────────────────────┘
+```
+
+---
+
+## The 7 Docker Container States
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Container State      │ State Definition & System Status                                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. `created`**     │ Namespaces & OverlayFS mounted; process has NOT yet executed `execve()`.    │
+ │ **2. `running`**     │ Primary process (PID 1) is active and executing in user space.              │
+ │ **3. `paused`**      │ Processes frozen by Linux cgroup freezer; 0% CPU; memory retained in RAM.   │
+ │ **4. `restarting`**  │ Container process died; Docker daemon is actively re-spawning it per policy.│
+ │ **5. `removing`**    │ Docker is unmounting filesystems and terminating shims during `docker rm`.  │
+ │ **6. `exited`**      │ Container process terminated; exit code recorded; writable layer preserved. │
+ │ **7. `dead`**        │ Unrecoverable zombie state (e.g. host disk unmount error during deletion).  │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Container Restart Policies
+
+```text
+ ┌──────────────────────────────┬─────────────────────────────────────────────────────────────────────┐
+ │ Restart Policy Flag          │ Operational Behavior Across Container Crashes & Host Reboots        │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`--restart no`**           │ **Default.** Never restart the container automatically.             │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`--restart always`**       │ Always restart if the container stops, crashes, OR if the host      │
+ │                              │ system/daemon reboots (even if manually stopped prior to reboot!).  │
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`--restart unless-stopped`│ **Recommended.** Restarts on crash or host reboot, UNLESS the user  │
+ │                              │ manually stopped the container (`docker stop`) before daemon reboot.│
+ │──────────────────────────────┼─────────────────────────────────────────────────────────────────────┤
+ │ **`--restart on-failure:5`** │ Restarts only if process exits with a **non-zero exit code**; caps  │
+ │                              │ maximum consecutive restart attempts at 5 to avoid infinite loops.  │
+ └──────────────────────────────┴─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Docker Healthchecks (`HEALTHCHECK`)
+
+A container whose PID 1 is running may still be deadlocked, experiencing thread exhaustion, or unable to connect to the database. Docker Healthchecks provide **application-level readiness verification**:
+
+```dockerfile
+FROM nginx:alpine
+
+# Configure active application healthcheck probe
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost/ || exit 1
+```
+
+### Healthcheck Lifecycle:
+1. **`starting`**: Container is booting; failures during `--start-period` (5s) do not count against retry limits.
+2. **`healthy`**: The healthcheck command succeeded (`exit 0`).
+3. **`unhealthy`**: The healthcheck command failed (`exit 1`) 3 consecutive times (`--retries=3`).
+
+---
+
+## Decoding Linux Container Exit Codes
+
+```text
+ ┌──────────────┬─────────────────────────────┬───────────────────────────────────────────────────────┐
+ │ Exit Code    │ Meaning                     │ Primary Root Cause & Diagnosis                        │
+ │──────────────┼─────────────────────────────┼───────────────────────────────────────────────────────┤
+ │ **`0`**      │ Success / Clean Exit        │ Application finished task (e.g. Batch job completed). │
+ │ **`1`**      │ General Application Error   │ Uncaught exception in code (Python syntax, Node error)│
+ │ **`137`**    │ **$128 + 9$ (`SIGKILL`)**   │ Process killed by `docker kill` OR **Killed by kernel │
+ │              │                             │ Out-of-Memory (OOM) Killer due to memory limit!**     │
+ │ **`143`**    │ **$128 + 15$ (`SIGTERM`)**  │ Graceful termination triggered by `docker stop`.      │
+ └──────────────┴─────────────────────────────┴───────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Testing Healthcheck State Transitions
+
+```bash
+# Step 1: Run an NGINX container with an inline dynamic healthcheck
+docker run -d --name health-demo -p 8089:80 \
+  --health-cmd="wget -q --spider http://localhost/ || exit 1" \
+  --health-interval=2s \
+  --health-retries=2 \
+  --health-start-period=1s \
+  nginx:alpine
+
+# Step 2: Observe the health status transition from 'starting' to 'healthy'!
+sleep 3
+docker inspect health-demo --format '{{.State.Health.Status}}'
+
+# Step 3: Intentionally break the application by deleting the NGINX web root
+docker exec health-demo rm -f /usr/share/nginx/html/index.html
+
+# Step 4: Watch the status transition from 'healthy' to 'unhealthy'!
+sleep 5
+docker inspect health-demo --format '{{.State.Health.Status}} (FailingStreak: {{.State.Health.FailingStreak}})'
+
+# Cleanup
+docker rm -f health-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the 7 states of the Docker container state machine, and how does `paused` differ from `stopped`?**
+
+The 7 states are **`created`**, **`running`**, **`paused`**, **`restarting`**, **`removing`**, **`exited`**, and **`dead`**:
+- **`paused`**: The container's process threads are suspended in-place using the Linux **cgroup Freezer subsystem**. The process remains resident in host RAM, all open file descriptors and TCP network sockets remain open, and it consumes **0% CPU**. It resumes in microseconds via `docker unpause`.
+- **`stopped` (`exited`)**: The container's primary process (PID 1) is **completely terminated** by `SIGTERM` / `SIGKILL`. All memory is released back to the host OS, and network sockets are closed. Only the ephemeral rootfs writable layer remains on disk.
+
+**Q2: What is the difference between `--restart always` and `--restart unless-stopped`?**
+
+- **`--restart always`**: If the Docker daemon or host reboots, Docker **will automatically restart the container regardless of what state it was in before the reboot**, even if an engineer explicitly executed `docker stop` prior to the reboot.
+- **`--restart unless-stopped`**: If an engineer explicitly stops the container (`docker stop`), Docker remembers this decision. When the host reboots, **it will NOT restart the stopped container**. It restarts only containers that were actively running at the time of reboot.
+
+**Q3: What does Exit Code 137 mean in container troubleshooting, and how do you diagnose if it was an OOMKill?**
+
+Exit Code 137 represents **$128 + 9$ (Signal 9: `SIGKILL`)**. It means the process was forcefully aborted by an uncatchable kill signal. This happens in two scenarios: (1) An administrator or script ran `docker kill`; or (2) **The Linux kernel Out-of-Memory (OOM) Killer terminated the container for exceeding its `memory.max` limit**. To verify an OOMKill, run `docker inspect <container> --format '{{.State.OOMKilled}}'`. If it returns `true`, the container was terminated by the kernel OOM killer.
+
+**Q4: How does Docker Healthcheck differ from standard container process monitoring?**
+
+Standard container process monitoring checks only whether **PID 1 is alive in the process table**. However, an application can suffer from database connection pool lockups, infinite deadlock loops, or web server crashes while PID 1 remains active. A **`HEALTHCHECK` runs an active in-container probe** (e.g. `curl http://localhost:8080/healthz`) at periodic intervals. If the probe fails, Docker marks the container as **`unhealthy`**, allowing orchestrators or load balancers to remove it from routing tables.
+
+**Q5: What happens when you run `docker stop --time 30 <container>`?**
+
+`docker stop --time 30` configures a **custom 30-second graceful termination grace period**:
+1. Docker sends a **`SIGTERM` (Signal 15)** to the container's PID 1 process.
+2. The application begins graceful shutdown: draining active HTTP requests, finishing database transactions, and closing files.
+3. Docker starts a 30-second timer.
+4. If the process exits cleanly within 30 seconds, the container terminates with **Exit Code 0 or 143**.
+5. If the application hangs and is still running after 30 seconds, Docker forcefully sends **`SIGKILL` (Signal 9)**, terminating the container with **Exit Code 137**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 7 states: created, running, paused, restarting, removing, exited, dead
+- [ ] Know that `paused` freezes CPU via cgroups while preserving RAM and sockets
+- [ ] Know the difference: `--restart always` vs `--restart unless-stopped`
+- [ ] Know that Exit Code 137 indicates `SIGKILL` (often kernel OOMKill!)
+- [ ] Know that Exit Code 143 indicates graceful `SIGTERM` termination
+- [ ] Can configure healthchecks with `--interval`, `--timeout`, and `--retries`

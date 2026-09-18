@@ -1,0 +1,228 @@
+---
+title: "Chapter 1 — KubeRay Architecture & Head/Worker Topology"
+sidebar_position: 1
+module: "Module 10.3 — KubeRay Operator & Ray Clusters"
+description: "Master KubeRay Operator architecture — RayCluster CRD, Ray Head Node Global Control Store (GCS), CPU/GPU Worker Groups, and autoscaling distributed Python compute."
+---
+
+# Chapter 1 — KubeRay Architecture & Head/Worker Topology
+
+> **Goal:** Master distributed Python compute, scalable machine learning execution, and cluster lifecycle orchestration in Kubernetes using the **KubeRay Operator** — understanding how the **`RayCluster`** Custom Resource manages distributed Ray topologies, dissecting the internal components of the **Ray Head Node** (Global Control Store GCS, API Server, Dashboard on port 8265), configuring heterogeneous **CPU & GPU Worker Groups**, and orchestrating automated worker autoscaling down to zero when idle.
+>
+> By the end of this chapter, you will understand:
+> 1. The architecture of the Ray distributed Python execution framework on Kubernetes
+> 2. How the KubeRay Operator bridges Kubernetes Pod lifecycles with Ray actor scheduling
+> 3. The structural responsibilities of the Ray Head Node (GCS, Dashboard, Autoscaler)
+> 4. How to partition heterogeneous worker pools using `workerGroupSpecs` (CPU vs GPU)
+> 5. How in-tree Ray autoscaling scales GPU worker pods dynamically based on Python workload queue depth
+> 6. How to author production `RayCluster` Custom Resources with dedicated GPU resource limits
+
+---
+
+## Real-Life Analogy
+
+Think of KubeRay as **a high-powered academic university research laboratory managed by a brilliant professor and a team of specialized post-doctoral researchers**:
+
+- **The Standalone Python Bottleneck (The Single Overworked Scientist):** A data scientist writes a Python script that tries to train an LLM on a single laptop. The script runs out of RAM and crashes after 30 seconds (**Python is single-process and memory-constrained**).
+- **The Ray Framework (The Distributed Task Blackboard):** Ray allows Python code to be broken into thousands of parallel mathematical micro-tasks (**Ray Tasks & Actors**) and distributed across a network of 100 computers simultaneously.
+- **The KubeRay Operator (The University Department Dean):** The dean (**The KubeRay Operator**) builds and tears down custom research labs inside the university building (**Kubernetes Cluster**) using a standardized blueprint (**`RayCluster` CRD**).
+- **The Professor's Office (The Ray Head Node):**
+  - The professor sits in the central office (**Ray Head Node Pod**).
+  - The professor maintains the master filing cabinet of all experiment state (**Global Control Store - GCS**).
+  - The professor watches the live CCTV camera monitors (**Ray Dashboard on Port 8265**).
+- **The Specialized Lab Rooms (CPU vs GPU Worker Groups):**
+  - Room A has 10 cheap desks with calculators (**CPU Worker Group for data preprocessing**).
+  - Room B has 8 supercomputing workstations with liquid-cooled NVIDIA H100 GPUs (**GPU Worker Group for deep learning training**).
+  - When the experiment is finished, the dean sends the GPU researchers home to save electricity (**Autoscaling GPU pods down to zero**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               KubeRay Operator: Distributed RayCluster Architecture
+
+ KUBERAY OPERATOR (Watches `RayCluster` CRD in `kuberay-system` namespace)
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Reconciles Head Pod and Worker Group Pods
+                    ▼
+ RAYCLUSTER (`kind: RayCluster`, Name: `llama3-distributed-trainer`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ RAY HEAD NODE POD (Port 8265 Dashboard | Port 10001 Ray Client)        │
+ │ ├── Global Control Store (GCS): Metadata, actor state & object tables  │
+ │ ├── Ray API Server & Dashboard: Telemetry & real-time monitoring       │
+ │ └── Ray Autoscaler Daemon: Monitors task backlog & scales worker pods  │
+ └──────┬───────────────────────────────────────────────────────┬─────────┘
+        │ gRPC Task Scheduling & Plasma Memory Bus              │ gRPC Task Scheduling
+        ▼                                                       ▼
+ ┌──────────────────────────────────────┐             ┌───────────────────────────────────┐
+ │ CPU WORKER GROUP (Data Preprocessing)│             │ GPU WORKER GROUP (Deep Learning)  │
+ │ ┌──────────────────────────────────┐ │             │ ┌───────────────────────────────┐ │
+ │ │ Worker Pod 01 (16 CPU / 64GB RAM)│ │             │ │ Worker Pod 01 (8x NVIDIA H100)│ │
+ │ │ - Tokenization & Data Cleansing  │ │             │ │ - Distributed Tensor Parallel │ │
+ │ └──────────────────────────────────┘ │             │ └───────────────────────────────┘ │
+ │ ┌──────────────────────────────────┐ │             │ ┌───────────────────────────────┐ │
+ │ │ Worker Pod 02 (16 CPU / 64GB RAM)│ │             │ │ Worker Pod 02 (8x NVIDIA H100)│ │
+ │ └──────────────────────────────────┘ │             │ └───────────────────────────────┘ │
+ └──────────────────────────────────────┘             └───────────────────────────────────┘
+```
+
+---
+
+## Ray Head Node vs Ray Worker Nodes
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Node Role            │ Key Internal Daemons    │ Primary Responsibility in Ray Cluster             │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **Ray Head Node**    │ GCS, Raylet, Dashboard, │ Central coordinator. Manages cluster metadata,    │
+ │                      │ Ray Client, Autoscaler  │ schedules tasks, tracks object store locations,   │
+ │                      │                         │ and monitors cluster health via Port 8265.        │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **CPU Worker Node**  │ Raylet, Plasma Object   │ Executes non-GPU Python tasks (data extraction,   │
+ │                      │ Store (Shared Memory)   │ tokenization, embedding chunking, feature scaling)│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **GPU Worker Node**  │ Raylet, Plasma Store,   │ Executes CUDA/PyTorch distributed tensor training,│
+ │                      │ CUDA Driver Interface   │ matrix multiplications, and deep learning models. │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Production `RayCluster` Manifest with GPU Autoscaling
+
+```yaml
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: distributed-training-cluster
+  namespace: ai-workloads
+spec:
+  rayVersion: "2.30.0"
+  # 1. RAY HEAD NODE SPECIFICATION
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"                     # Head node does not execute user tasks!
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          image: rayproject/ray-ml:2.30.0-gpu
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+          ports:
+          - name: gcs
+            containerPort: 6379
+          - name: dashboard
+            containerPort: 8265
+          - name: client
+            containerPort: 10001
+
+  # 2. HETEROGENEOUS WORKER GROUP SPECIFICATIONS
+  workerGroupSpecs:
+    # Worker Pool A: General CPU Preprocessing
+    - groupName: cpu-preprocessors
+      replicas: 2
+      minReplicas: 1
+      maxReplicas: 10
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+          - name: ray-worker-cpu
+            image: rayproject/ray-ml:2.30.0
+            resources:
+              limits:
+                cpu: "8"
+                memory: "32Gi"
+
+    # Worker Pool B: High-End GPU Training (Scales to Zero when Idle!)
+    - groupName: gpu-trainers
+      replicas: 0                      # Default: 0 replicas when no training jobs run!
+      minReplicas: 0                   # Cost optimization: Scale to Zero!
+      maxReplicas: 4
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+          - name: ray-worker-gpu
+            image: rayproject/ray-ml:2.30.0-gpu
+            resources:
+              limits:
+                nvidia.com/gpu: 8      # 8x GPUs per worker node!
+                cpu: "64"
+                memory: "256Gi"
+```
+
+---
+
+## Plasma Object Store & Shared Memory Mechanics
+
+```text
+ How Ray Achieves Ultra-Fast Zero-Copy Data Sharing:
+ 1. Each worker pod allocates a portion of RAM to the `Plasma Shared Memory Object Store` (`/dev/shm`).
+ 2. When Worker A produces a large 10GB NumPy array, it writes the array directly to `/dev/shm`.
+ 3. Worker B on the same physical node reads the 10GB array in 0.0 milliseconds via Zero-Copy pointer
+    sharing without serializing or copying bytes over network sockets!
+```
+
+---
+
+## Hands-On Lab: Querying Ray Clusters & Accessing the Dashboard
+
+```bash
+# Step 1: Query active RayClusters in the ai-workloads namespace
+kubectl get rayclusters.ray.io -n ai-workloads 2>/dev/null || echo "RayCluster CRDs active / simulated"
+
+# Step 2: Query active Ray Head and Worker pods
+kubectl get pods -n ai-workloads -l ray.io/cluster=distributed-training-cluster -o custom-columns=NAME:.metadata.name,NODE_TYPE:.metadata.labels.ray\.io/node-type,GROUP:.metadata.labels.ray\.io/group
+
+# Step 3: Forward the Ray Dashboard port to your local machine
+# kubectl port-forward -n ai-workloads svc/distributed-training-cluster-head-svc 8265:8265
+# (Open http://localhost:8265 in browser to view live GPU telemetry and Python actors!)
+
+# Step 4: Submit a test Python Ray job to the cluster
+# ray job submit --address http://localhost:8265 -- python -c "import ray; ray.init(); print(ray.cluster_resources())"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the KubeRay Operator, and why is Ray deployed on Kubernetes rather than standalone VMs?**
+
+Ray is an open-source unified compute framework for distributed Python and AI/ML workloads. Deploying Ray on Kubernetes via the **KubeRay Operator** provides enterprise platform benefits: (1) **Automated Lifecycle**: Declarative `RayCluster` CRDs manage multi-node head and worker provisioning; (2) **Heterogeneous Worker Pools**: Easily mixing CPU worker groups for preprocessing with high-cost GPU worker groups for training; (3) **Cost Optimization**: In-tree autoscaling scales expensive GPU worker pods down to zero when idle; and (4) **Unified Infrastructure**: Managing AI training within the same GitOps, observability, and networking stack as web services.
+
+**Q2: What is the role of the Global Control Store (GCS) on the Ray Head Node?**
+
+The **Global Control Store (GCS)** is the central metadata database running inside the Ray Head Node. It manages cluster-wide state, including: (1) Active worker node registrations and health heartbeats; (2) Placement and locations of distributed Python **Actors** and **Objects** in the Plasma memory store; (3) Task lineage graphs; and (4) Cluster resource availability. If the GCS crashes, worker nodes lose synchronization, which is why production KubeRay deploys HA GCS with Redis/etcd backends.
+
+**Q3: How does the Plasma Shared Memory Object Store achieve zero-copy data transfer in Ray?**
+
+In traditional distributed Python, passing a 10GB tensor between processes requires expensive pickle serialization, TCP socket writes, and deserialization. Ray runs the **Plasma Object Store** mounted as shared memory (`/dev/shm`) on each node. When a task outputs an object, it writes raw immutable bytes into `/dev/shm`. All sibling worker processes on that node read the object using **Zero-Copy memory-mapped pointers**, bypassing serialization and achieving microsecond data access speeds.
+
+**Q4: How does KubeRay autoscaling work, and how does it differ from standard Kubernetes HPA?**
+
+- **Kubernetes HPA**: Evaluates external system metrics (CPU % or Memory %). It cannot see internal Python task queues and struggles to scale batch AI workloads correctly.
+- **KubeRay Autoscaler**: An in-tree daemon running inside the Ray Head Node that inspects the **internal Ray task backlog**. If a Python script requests 100 `@ray.remote(num_gpus=1)` tasks, the Ray Autoscaler requests the KubeRay operator to scale up the `gpu-trainers` worker group to 10 pods, and scales them back down when the task queue drains.
+
+**Q5: Why should `headGroupSpec.rayStartParams.num-cpus` be set to `"0"` in production?**
+
+Setting `num-cpus: "0"` on the Head Node instructs the Ray scheduler **never to assign compute-heavy user tasks or training actors to the Head Node pod**. This guarantees that the Head Node's CPU and memory remain 100% dedicated to critical control-plane services (GCS metadata, API server, and Autoscaler daemon), preventing heavy training jobs from causing Head Node OOM kills that would crash the entire cluster.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that KubeRay manages distributed Ray clusters via `RayCluster` CRDs
+- [ ] Know that the Ray Head Node runs GCS, Dashboard (:8265), and the Autoscaler
+- [ ] Know how `workerGroupSpecs` separate CPU preprocessing from GPU training
+- [ ] Know that KubeRay autoscaling scales GPU worker pods down to 0 when idle
+- [ ] Know how the Plasma Object Store uses `/dev/shm` for zero-copy memory sharing
+- [ ] Can view active Ray nodes using `kubectl get rayclusters -A`

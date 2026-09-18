@@ -1,0 +1,334 @@
+---
+title: "Chapter 4 — mTLS"
+sidebar_position: 4
+module: "Module 2.9 — Service Mesh"
+description: "Deep dive into mutual TLS (mTLS) in service meshes — how SPIFFE identity works, certificate lifecycle, Istio PeerAuthentication and AuthorizationPolicy, strict vs permissive mTLS modes, and how to audit and debug mTLS in production."
+---
+
+# Chapter 4 — mTLS (Mutual TLS)
+
+> **Goal:** Understand how mutual TLS secures all inter-service communication in a service mesh — the SPIFFE identity standard, certificate issuance and rotation, Istio's PeerAuthentication and AuthorizationPolicy CRDs, and how to audit, troubleshoot, and enforce mTLS in production clusters.
+>
+> By the end of this chapter, you will understand:
+> 1. What mTLS is and how it differs from standard one-way TLS
+> 2. SPIFFE (Secure Production Identity Framework for Everyone) and SVID format
+> 3. How Istio's identity CA issues and rotates certificates automatically
+> 4. PeerAuthentication — controlling mTLS mode (STRICT vs PERMISSIVE)
+> 5. AuthorizationPolicy — allowing/denying based on peer identity
+> 6. How to verify mTLS is active and debug certificate issues
+
+---
+
+## Real-Life Analogy
+
+Standard TLS (one-way): you verify your bank's identity (certificate) when connecting to their website, but the bank doesn't verify who YOU are at the TLS layer — it relies on username/password after the connection.
+
+**mTLS (Mutual TLS)**: both sides present certificates. Like a **corporate badge access system where both the employee AND the building verify each other** — the employee shows their badge (client certificate = service identity), and the building's electronic lock proves it's the real building (server certificate). A fake building can't impersonate the real one, and an unauthorised person can't enter even if they know the door code.
+
+In a service mesh: every service has a cryptographic identity. When Service A calls Service B, both sides exchange and verify certificates. A compromised Pod cannot impersonate another service because it doesn't have the right SPIFFE certificate.
+
+---
+
+## Architecture Diagram
+
+```text
+              mTLS in Istio — Certificate Flow
+
+  istiod (Citadel CA)
+  ┌──────────────────────────────────────────────────────────┐
+  │  Root CA: cluster.local                                  │
+  │  Issues certs for each workload identity (SPIFFE SVID)  │
+  │  Rotates certs every 24h by default                      │
+  └───────────────────────────┬──────────────────────────────┘
+                              │ CSR (Certificate Signing Request)
+                              │ via Kubernetes Token Projection
+                    ┌─────────┴──────────┐
+                    ▼                    ▼
+  Pod A (frontend)                Pod B (api)
+  ┌──────────────────────┐  ┌──────────────────────┐
+  │ Envoy sidecar        │  │ Envoy sidecar        │
+  │ SVID:                │  │ SVID:                │
+  │ spiffe://cluster.    │  │ spiffe://cluster.    │
+  │ local/ns/prod/       │  │ local/ns/prod/       │
+  │ sa/frontend-sa       │  │ sa/api-sa            │
+  │                      │──│                      │
+  │ Presents cert →      │  │ ← Presents cert      │
+  │ Verifies B's cert    │  │ Verifies A's cert    │
+  └──────────────────────┘  └──────────────────────┘
+  Both verified → mTLS connection established
+  Either fails → connection rejected
+```
+
+---
+
+## SPIFFE Identity Standard
+
+SPIFFE (Secure Production Identity Framework for Everyone) is the identity standard Istio uses for service identity:
+
+```text
+SPIFFE SVID (SPIFFE Verifiable Identity Document):
+  Format: spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>
+  Example: spiffe://cluster.local/ns/production/sa/api-service-account
+
+  Encoded in: X.509 certificate Subject Alternative Name (SAN) field
+  Issued by: istiod acting as a Certificate Authority
+  Verified by: Envoy proxy on both sides of every connection
+
+Trust domain: "cluster.local" (configurable per cluster)
+  - All identities in a cluster share the same trust domain
+  - Cross-cluster mTLS requires federation of trust domains
+
+Certificate lifetime: 24 hours (default), auto-rotated by sidecar
+  - Envoy requests renewal at 80% of lifetime (before expiry)
+  - Application code never sees certificates — Envoy handles everything
+```
+
+---
+
+## PeerAuthentication: Controlling mTLS Mode
+
+PeerAuthentication configures what mTLS mode Envoy uses when receiving connections:
+
+```yaml
+# STRICT mode: only mTLS connections accepted (plaintext rejected)
+# Apply to the entire mesh (istio-system namespace = global)
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system   # Mesh-wide default
+spec:
+  mtls:
+    mode: STRICT    # Reject all plaintext connections to meshed services
+---
+# Override for a specific namespace (PERMISSIVE during migration)
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: namespace-permissive
+  namespace: legacy-app     # Only applies here
+spec:
+  mtls:
+    mode: PERMISSIVE  # Accept both mTLS AND plaintext (migration phase)
+---
+# Per-workload override with per-port exceptions
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: api-mtls
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    8080:
+      mode: PERMISSIVE  # Port 8080 accepts plaintext (e.g., health checks from LB)
+    9090:
+      mode: STRICT      # Metrics port: strict mTLS only
+```
+
+| Mode | Description |
+|------|-------------|
+| `STRICT` | Only mTLS connections accepted. Plaintext rejected. |
+| `PERMISSIVE` | Both mTLS and plaintext accepted. Migration mode. |
+| `DISABLE` | No mTLS. Plaintext only. |
+| `UNSET` | Inherit from parent (namespace → mesh-wide). |
+
+---
+
+## AuthorizationPolicy: Identity-Based Access Control
+
+AuthorizationPolicy goes beyond mTLS verification — it controls which verified identities are allowed to call which services:
+
+```yaml
+# Allow only frontend service account to call api service
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: api-authorization
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api
+
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        # SPIFFE-based identity check
+        principals:
+        - "cluster.local/ns/production/sa/frontend-service-account"
+        - "cluster.local/ns/production/sa/batch-worker-sa"
+    to:
+    - operation:
+        methods: ["GET", "POST"]
+        paths: ["/api/*"]
+    when:
+    - key: request.headers[x-request-id]
+      notValues: [""]    # Must have a request ID header
+---
+# Deny all, then selectively allow (zero-trust baseline)
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: production
+spec:
+  {}    # Empty spec = deny all (no rules = deny everything)
+```
+
+---
+
+## Certificate Rotation and Lifetime
+
+```bash
+# Default certificate lifetime: 24 hours
+# Envoy requests renewal at ~19 hours (80% of 24h)
+
+# Check current certificate expiry for a Pod's proxy
+istioctl proxy-config secret api-pod.production
+
+# Output:
+# RESOURCE NAME            TYPE           STATUS     VALID CERT     SERIAL NUMBER   NOT AFTER                NOT BEFORE
+# default                  Cert Chain     ACTIVE     true           ...             2024-01-15T14:32:00Z    2024-01-14T14:32:00Z
+
+# Change certificate lifetime (per-mesh setting):
+kubectl edit configmap istio -n istio-system
+# Add/change:
+# defaultConfig:
+#   proxyMetadata:
+#     SECRET_TTL: "12h"   # Shorten for higher security
+
+# Check certificate details
+kubectl exec api-pod -n production -c istio-proxy -- \
+  openssl s_client -connect backend-service:8080 -showcerts 2>/dev/null | \
+  openssl x509 -noout -text | grep -A2 "Subject Alternative Name"
+# URI:spiffe://cluster.local/ns/production/sa/api-sa
+```
+
+---
+
+## Migration to STRICT Mode
+
+The safe migration path from plaintext to full mTLS:
+
+```bash
+# Step 1: Verify all Pods are meshed (have sidecars)
+kubectl get pods -n production -o jsonpath='{range .items[*]}{.metadata.name}: {.spec.containers[*].name}{"\n"}{end}'
+# api-pod: api istio-proxy   ← Good
+# legacy-pod: legacy         ← Not meshed yet!
+
+# Step 2: Set PERMISSIVE mode (accept both mTLS and plaintext)
+kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: PERMISSIVE
+EOF
+
+# Step 3: Verify mTLS connections from already-meshed services
+istioctl x describe pod api-pod.production | grep mTLS
+
+# Step 4: Migrate remaining services (inject sidecar, restart Pods)
+kubectl label namespace production istio-injection=enabled
+kubectl rollout restart deployment legacy-deployment -n production
+
+# Step 5: Verify all traffic is now using mTLS
+istioctl authn tls-check api-pod.production api-service.production.svc.cluster.local
+
+# Step 6: Switch to STRICT mode
+kubectl apply -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT
+EOF
+
+# Step 7: Verify nothing broke (no plaintext traffic)
+kubectl logs -n production -l app=api -c istio-proxy | grep "CERTIFICATE_VERIFY_FAILED"
+```
+
+---
+
+## Hands-On: Verifying mTLS
+
+```bash
+# 1. Check mTLS status for all services in a namespace
+istioctl x authz check api-pod.production
+
+# 2. Verify mTLS between specific pods
+istioctl authn tls-check \
+  $(kubectl get pod -n production -l app=api -o jsonpath='{.items[0].metadata.name}').production \
+  backend-service.production.svc.cluster.local
+
+# Output:
+# HOST:PORT           STATUS   SERVER   CLIENT   AUTHN POLICY    DESTINATION RULE
+# backend-svc:8080   OK       mTLS     mTLS     default/prod    default/prod
+
+# 3. View Envoy secret (certificate) status
+istioctl proxy-config secret $(kubectl get pod -n production -l app=api \
+  -o jsonpath='{.items[0].metadata.name}').production
+
+# 4. Attempt plaintext connection to STRICT service (should fail)
+kubectl run test --image=curlimages/curl --rm -it --restart=Never -- \
+  curl -v http://api-service.production:8080/health
+# Should see: connection reset or RBAC denied
+
+# 5. Use Kiali to visualize mTLS (lock icons on service connections)
+istioctl dashboard kiali
+
+# 6. Check PeerAuthentication policies
+kubectl get peerauthentication -A
+kubectl describe peerauthentication -n production
+
+# 7. Check AuthorizationPolicy
+kubectl get authorizationpolicy -n production
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between TLS and mTLS?**
+
+Standard TLS (one-way TLS): only the server presents a certificate; the client verifies the server's identity. The client is not authenticated at the TLS layer. mTLS (mutual TLS): both server AND client present X.509 certificates; both sides verify each other's identity. In a service mesh, mTLS means every service call is mutually authenticated — a compromised Pod cannot impersonate another service because it doesn't have the right SPIFFE certificate signed by the cluster's CA.
+
+**Q2: What is SPIFFE and how does it define service identity in Kubernetes?**
+
+SPIFFE (Secure Production Identity Framework for Everyone) is an open standard for workload identity. In Kubernetes with Istio, each workload's identity is encoded as a SPIFFE Verifiable Identity Document (SVID) in the form: `spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>`. This SVID is embedded in the X.509 certificate's Subject Alternative Name (SAN) field. istiod acts as the CA, signing certificates containing these SVIDs. Envoy proxies use these certificates for mTLS authentication — verifying the peer's SPIFFE identity before allowing connections.
+
+**Q3: What is the difference between PERMISSIVE and STRICT PeerAuthentication?**
+
+PERMISSIVE mode: the Envoy sidecar accepts both mTLS-encrypted connections (from other meshed services) and plaintext connections (from non-meshed services or external clients). Useful during mesh migration when not all services are yet enrolled. STRICT mode: only mTLS connections are accepted; plaintext connections are rejected. This is the zero-trust baseline. Migration path: enable PERMISSIVE → enroll all services → switch to STRICT. The mesh-wide default is set in `istio-system` namespace; individual namespaces can override.
+
+**Q4: What is the relationship between PeerAuthentication and AuthorizationPolicy?**
+
+PeerAuthentication controls the **transport layer** — whether connections must use mTLS, PERMISSIVE, or plaintext. It answers: "How must the connection be encrypted?" AuthorizationPolicy controls **access** — given that the connection is mTLS and the peer's identity is verified, is this specific identity (SPIFFE principal) allowed to call this specific service/method/path? PeerAuthentication verifies WHO is calling (via certificate). AuthorizationPolicy decides if they're ALLOWED. Both are needed for zero-trust: mTLS ensures identity, AuthorizationPolicy enforces least-privilege access.
+
+**Q5: How does Istio rotate certificates without downtime?**
+
+Istio issues certificates with a 24-hour default lifetime. Each Envoy proxy requests certificate renewal at 80% of the lifetime (~19.2 hours) — well before expiry. The renewal request uses the Pod's Kubernetes ServiceAccount token (via token projection) to authenticate to istiod. istiod validates the token, issues a new certificate, and the proxy immediately starts using the new certificate for new connections. Existing connections continue using the old certificate until they close. This rolling renewal ensures zero-downtime certificate rotation with no application involvement.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know mTLS: both sides present and verify X.509 certificates (vs one-way TLS)
+- [ ] Know SPIFFE SVID format: `spiffe://<trust-domain>/ns/<ns>/sa/<sa>`
+- [ ] Know istiod is the Certificate Authority — issues and rotates certs every 24h
+- [ ] Know PeerAuthentication modes: STRICT (mTLS only), PERMISSIVE (both), DISABLE
+- [ ] Know PeerAuthentication scope: istio-system = mesh-wide, namespace, or per-workload
+- [ ] Know AuthorizationPolicy controls identity-based access (which SPIFFE principal can call what)
+- [ ] Can audit with `istioctl authn tls-check`, `istioctl proxy-config secret`, `istioctl x authz check`

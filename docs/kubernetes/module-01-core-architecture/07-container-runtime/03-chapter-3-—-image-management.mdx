@@ -1,0 +1,1434 @@
+---
+title: "Chapter 3 — Image Management"
+sidebar_position: 3
+module: "Module 1.7 — Container Runtime Internals"
+description: "> **Goal:** Understand how Kubernetes and the container runtime manage container images, including the complete **Image Pull Workflow**, **Image Pull Policies**..."
+---
+
+# Module 1.7 — Container Runtime Internals
+
+# Chapter 3 — Image Management
+
+> **Goal:** Understand how Kubernetes and the container runtime manage container images, including the complete **Image Pull Workflow**, **Image Pull Policies**, **Image Cache**, **Image Pull Secrets**, **Private Registries**, and **Image Garbage Collection**.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Image pull workflow: CRI ImageService -> containerd -> registry
+> 2. Image layers: how OCI image layers are downloaded and deduped
+> 3. imagePullPolicy: Always, IfNotPresent, Never
+> 4. Image cache: containerd's content store and snapshotter
+> 5. Image Pull Secrets: pulling from private registries
+> 6. Image digest vs tag: why digest pins an exact image version
+> 7. Image Garbage Collection: thresholds for reclaiming disk space
+> 8. Image pull backoff and failure handling
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of Image Management like an app store with a local install cache.
+
+```text
+App Store Cache Analogy:
+
+App store (container registry) hosts application packages (images)
+Phone (Node) has local storage for installed apps (containerd image cache)
+Installing an app: download layers from store, extract to local storage
+Next time: check if app is already installed (IfNotPresent: skip download)
+Always re-check: ask store if there's a newer version (Always: check digest)
+Private app (private registry): need a password/token (imagePullSecret)
+Phone storage full: OS removes least-used apps (Image GC)
+```
+
+| App Store | Image Management |
+| :--- | :--- |
+| App store | Container registry (Docker Hub, ECR, GCR) |
+| Application package | Container image |
+| App version number | Image tag (e.g., `nginx:1.25`) |
+| App fingerprint/checksum | Image digest (sha256 hash) |
+| Local storage | containerd content store (image cache) |
+| Private app password | `imagePullSecret` |
+| Removing unused apps | Image Garbage Collection |
+
+> **Important:** `imagePullPolicy: Always` does **NOT** always re-pull the full image data. It checks the registry for the **current digest** of the tag and only downloads layers that are not already in the local cache. If the digest matches, no data is transferred. This is why `Always` has minimal overhead when the image hasn't changed, but still fails if the registry is unreachable.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- CRI (Container Runtime Interface)
+- OCI Image Specification
+- containerd Architecture
+- Pod Lifecycle
+- Basic Container Images
+
+---
+
+# Where This Chapter Fits
+
+In the previous chapter we learned:
+
+```text
+kubelet
+  |
+  v
+containerd
+  |
+  v
+runc
+```
+
+But before a container can be started, one question must be answered:
+
+> **Where does the container filesystem come from?**
+
+The answer is:
+
+```text
+Container Image
+```
+
+Every container begins with an image.
+
+---
+
+# What is a Container Image?
+
+A container image is an immutable package containing everything required to run an application.
+
+It typically contains:
+
+```text
+Application Binary
+
+Libraries
+
+Runtime
+
+Configuration
+
+Metadata
+
+Filesystem Layers
+```
+
+An image is **read-only**.
+
+Containers never modify the original image.
+
+---
+
+# High-Level Image Workflow
+
+```text
+Pod Created
+  |
+  v
+Image Required
+  |
+  v
+Image Exists Locally?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Use Cached Image
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Pull Image
+  |
+  v
+Store Image
+  |
+  v
+Create Container
+```
+
+---
+
+# Why Images are Needed
+
+Suppose Kubernetes only received:
+
+```yaml
+image: nginx:1.27
+```
+
+The kubelet doesn't know:
+
+- Where nginx binaries exist
+- Which libraries are needed
+- Which filesystem to mount
+
+The container runtime solves this by downloading the image.
+
+---
+
+# OCI Image
+
+Modern Kubernetes uses OCI-compliant images.
+
+Example:
+
+```text
+nginx:latest
+
+redis:8
+
+ubuntu:24.04
+```
+
+OCI guarantees every compliant runtime understands the image format.
+
+---
+
+# Image Structure
+
+Conceptually:
+
+```text
+Image
+
++-- Manifest
+
++-- Config
+
++-- Layers
+```
+
+---
+
+# Layers
+
+Images consist of multiple read-only layers.
+
+Example:
+
+```text
+Ubuntu Base Layer
+  |
+  v
+Python Layer
+  |
+  v
+Application Layer
+  |
+  v
+Configuration Layer
+```
+
+These layers are stacked together.
+
+---
+
+# Why Layers Exist
+
+Without layers:
+
+```text
+Every Image
+  |
+  v
+Complete Copy
+  |
+  v
+Huge Storage Usage
+```
+
+With layers:
+
+```text
+Ubuntu Layer
+  |
+  v
+Shared
+  |
+  v
+Multiple Images
+```
+
+Storage is saved through reuse.
+
+---
+
+# Example
+
+```text
+Image A
+
+Ubuntu
+  |
+  v
+Python
+  |
+  v
+App A
+
+────────────
+
+Image B
+
+Ubuntu
+  |
+  v
+Python
+  |
+  v
+App B
+```
+
+Ubuntu and Python layers are shared.
+
+---
+
+# Image Pull Workflow
+
+Suppose a Pod is scheduled.
+
+```yaml
+image: nginx:latest
+```
+
+Workflow begins.
+
+---
+
+# Step 1
+
+Scheduler assigns Pod.
+
+---
+
+# Step 2
+
+kubelet receives Pod.
+
+---
+
+# Step 3
+
+SyncPod() executes.
+
+---
+
+# Step 4
+
+kubelet sends:
+
+```text
+PullImage()
+```
+
+through CRI.
+
+---
+
+# Step 5
+
+containerd checks local cache.
+
+```text
+Image Found?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Skip Download
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Download Image
+```
+
+---
+
+# Step 6
+
+Registry responds.
+
+```text
+Manifest
+  |
+  v
+Layer List
+  |
+  v
+Layer Downloads
+```
+
+---
+
+# Step 7
+
+containerd verifies:
+
+- Digests
+- Checksums
+- Metadata
+
+---
+
+# Step 8
+
+Layers stored locally.
+
+---
+
+# Step 9
+
+Container created using cached layers.
+
+---
+
+# Complete Workflow
+
+```text
+Pod
+  |
+  v
+kubelet
+  |
+  v
+CRI PullImage()
+  |
+  v
+containerd
+  |
+  v
+Registry
+  |
+  v
+Download Layers
+  |
+  v
+Store Locally
+  |
+  v
+Create Snapshot
+  |
+  v
+Start Container
+```
+
+---
+
+# Image Registry
+
+Images are stored in registries.
+
+Examples:
+
+```text
+Docker Hub
+
+GHCR
+
+Quay
+
+Harbor
+
+Amazon ECR
+
+Google Artifact Registry
+
+Azure Container Registry
+```
+
+The runtime communicates directly with the registry.
+
+---
+
+# Registry Architecture
+
+```text
+Container Runtime
+  |
+  v
+Registry API
+  |
+  v
+Manifest
+  |
+  v
+Layer Download
+  |
+  v
+Local Cache
+```
+
+---
+
+# Manifest Download
+
+The runtime first downloads:
+
+```text
+Manifest
+```
+
+The manifest contains:
+
+- Layer digests
+- Image configuration
+- Architecture
+- Platform
+
+Only after reading the manifest does the runtime know which layers to fetch.
+
+---
+
+# Layer Download
+
+Each layer is downloaded independently.
+
+```text
+Layer 1
+  |
+  v
+Layer 2
+  |
+  v
+Layer 3
+  |
+  v
+Layer 4
+```
+
+Previously downloaded layers are reused.
+
+---
+
+# Image Verification
+
+Before storing an image,
+
+containerd verifies:
+
+```text
+SHA256 Digest
+  |
+  v
+Integrity Check
+```
+
+Corrupted downloads are rejected.
+
+---
+
+# Image Cache
+
+Downloaded images remain on the Node.
+
+```text
+Registry
+  |
+  v
+Download
+  |
+  v
+Local Cache
+  |
+  v
+Future Pods
+  |
+  v
+Reuse
+```
+
+This dramatically reduces startup time.
+
+---
+
+# Cache Example
+
+First Pod:
+
+```text
+Image Missing
+  |
+  v
+Download
+  |
+  v
+45 Seconds
+```
+
+Second Pod:
+
+```text
+Image Cached
+  |
+  v
+2 Seconds
+```
+
+---
+
+# Local Storage
+
+containerd stores:
+
+```text
+Image Layers
+  |
+  v
+Content Store
+  |
+  v
+Snapshots
+  |
+  v
+Metadata
+```
+
+Images persist until removed.
+
+---
+
+# Image Pull Policy
+
+Image Pull Policy controls when Kubernetes requests an image pull.
+
+Three values exist:
+
+```text
+Always
+
+IfNotPresent
+
+Never
+```
+
+---
+
+# IfNotPresent
+
+Default for most tagged images.
+
+Workflow:
+
+```text
+Image Cached?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Use Cache
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Pull Image
+```
+
+Most production workloads use this behavior.
+
+---
+
+# Always
+
+Workflow:
+
+```text
+Pod Starts
+  |
+  v
+Check Registry
+  |
+  v
+Pull If Needed
+  |
+  v
+Run Container
+```
+
+The runtime still avoids downloading unchanged layers because it compares image digests.
+
+---
+
+# Never
+
+Workflow:
+
+```text
+Image Cached?
+
+|
+
++-- Yes
+
+|
+
+▼
+
+Run
+
+|
+
++-- No
+
+     |
+
+     ▼
+
+Fail
+```
+
+Useful for air-gapped environments or preloaded images.
+
+---
+
+# Pull Policy Comparison
+
+| Policy | Behavior |
+|----------|----------|
+| Always | Always checks the registry before starting the container |
+| IfNotPresent | Uses cached image if available |
+| Never | Never contacts a registry |
+
+---
+
+# Default Behavior
+
+Important interview question.
+
+```text
+Image
+
+nginx:latest
+  |
+  v
+Default
+
+Always
+```
+
+```text
+Image
+
+nginx:1.27
+  |
+  v
+Default
+
+IfNotPresent
+```
+
+The special `:latest` tag defaults to `Always`; other tagged images default to `IfNotPresent` if no pull policy is specified.
+
+---
+
+# Why Avoid :latest?
+
+Production deployments should avoid:
+
+```text
+latest
+```
+
+Because:
+
+```text
+Today
+  |
+  v
+Version A
+
+────────────
+
+Tomorrow
+  |
+  v
+Version B
+```
+
+Deployments become non-reproducible.
+
+Prefer immutable version tags or image digests.
+
+---
+
+# Private Registries
+
+Many organizations use private registries.
+
+Example:
+
+```text
+registry.company.com
+```
+
+Access requires authentication.
+
+---
+
+# Authentication Flow
+
+```text
+Container Runtime
+  |
+  v
+Registry
+  |
+  v
+Authentication Required
+  |
+  v
+Credentials
+  |
+  v
+Image Download
+```
+
+---
+
+# Image Pull Secrets
+
+Kubernetes stores registry credentials in:
+
+```text
+Secret
+  |
+  v
+type:
+
+kubernetes.io/dockerconfigjson
+```
+
+The Secret is referenced by the Pod.
+
+---
+
+# Pod Example
+
+Conceptually:
+
+```yaml
+imagePullSecrets:
+
+- name: registry-secret
+```
+
+The kubelet passes authentication information to the runtime.
+
+---
+
+# Authentication Workflow
+
+```text
+Pod
+  |
+  v
+imagePullSecrets
+  |
+  v
+kubelet
+  |
+  v
+CRI PullImage()
+  |
+  v
+containerd
+  |
+  v
+Registry Login
+  |
+  v
+Download Image
+```
+
+---
+
+# What Happens Without Credentials?
+
+Suppose:
+
+```text
+Private Registry
+  |
+  v
+No Credentials
+```
+
+Result:
+
+```text
+401 Unauthorized
+  |
+  v
+ImagePullBackOff
+```
+
+The container never starts.
+
+---
+
+# ImagePullBackOff
+
+One of the most common Kubernetes errors.
+
+Workflow:
+
+```text
+Pull Image
+  |
+  v
+Failure
+  |
+  v
+Retry
+  |
+  v
+Backoff
+  |
+  v
+Retry Again
+```
+
+The retry interval gradually increases to avoid overwhelming the registry.
+
+---
+
+# Image Cache Reuse
+
+Suppose:
+
+```text
+10 Pods
+  |
+  v
+Same Image
+```
+
+containerd downloads the image once.
+
+```text
+Image
+  |
+  v
+Cache
+  |
+  v
+Shared
+  |
+  v
+10 Containers
+```
+
+---
+
+# Image Updates
+
+Suppose:
+
+```text
+Image
+
+Version 1
+```
+
+Later:
+
+```text
+Version 2
+```
+
+The runtime downloads only new layers.
+
+Shared layers remain cached.
+
+---
+
+# Image Garbage Collection
+
+Nodes have limited disk space.
+
+Eventually:
+
+```text
+Images
+  |
+  v
+Grow
+  |
+  v
+Disk Full
+```
+
+The kubelet manages image garbage collection to reclaim storage.
+
+---
+
+# Why Garbage Collection?
+
+Suppose:
+
+```text
+Daily Deployments
+  |
+  v
+New Images
+  |
+  v
+Old Images
+  |
+  v
+Disk Usage
+  |
+  v
+100%
+```
+
+Eventually new images cannot be pulled.
+
+---
+
+# Garbage Collection Workflow
+
+```text
+Disk Usage
+  |
+  v
+Threshold Crossed
+  |
+  v
+kubelet
+  |
+  v
+Identify Unused Images
+  |
+  v
+Delete Old Images
+  |
+  v
+Free Space
+```
+
+---
+
+# Which Images are Removed?
+
+The kubelet removes:
+
+```text
+Unused Images
+  |
+  v
+Old Images
+  |
+  v
+No Running Containers
+```
+
+Images currently used by running containers are not removed.
+
+---
+
+# Image vs Snapshot
+
+Do not confuse:
+
+```text
+Image
+  |
+  v
+Read-Only
+
+────────────
+
+Snapshot
+  |
+  v
+Writable Layer
+```
+
+Deleting an unused image does not affect running containers that are actively using their existing snapshots.
+
+---
+
+# Complete Image Lifecycle
+
+```text
+Registry
+  |
+  v
+Manifest
+  |
+  v
+Download Layers
+  |
+  v
+Verify Digest
+  |
+  v
+Content Store
+  |
+  v
+Image Cache
+  |
+  v
+Snapshot
+  |
+  v
+Container
+  |
+  v
+Unused
+  |
+  v
+Garbage Collection
+```
+
+---
+
+# Complete Internal Workflow
+
+```text
+Pod
+  |
+  v
+kubelet
+  |
+  v
+PullImage()
+  |
+  v
+containerd
+  |
+  v
+Cache Check
+  |
+  v
+Registry
+  |
+  v
+Download
+  |
+  v
+Verify
+  |
+  v
+Store Layers
+  |
+  v
+Create Snapshot
+  |
+  v
+Start Container
+  |
+  v
+Later
+  |
+  v
+Unused Image
+  |
+  v
+Image Garbage Collection
+```
+
+---
+
+# Production Example 1
+
+Large Cluster
+
+```text
+500 Pods
+  |
+  v
+nginx:1.27
+  |
+  v
+Downloaded Once Per Node
+  |
+  v
+Shared Locally
+```
+
+Bandwidth usage remains low.
+
+---
+
+# Production Example 2
+
+Private Registry
+
+```text
+Pod
+  |
+  v
+imagePullSecrets
+  |
+  v
+Registry Authentication
+  |
+  v
+Download Image
+  |
+  v
+Container Starts
+```
+
+---
+
+# Production Example 3
+
+Air-Gapped Cluster
+
+```text
+Preloaded Images
+  |
+  v
+imagePullPolicy=Never
+  |
+  v
+No Internet Required
+```
+
+---
+
+# Production Example 4
+
+Rolling Deployment
+
+```text
+Version 1
+  |
+  v
+Version 2
+  |
+  v
+Download Changed Layers
+  |
+  v
+Reuse Existing Layers
+  |
+  v
+Fast Rollout
+```
+
+---
+
+# Production Best Practices
+
+✔ Use immutable version tags or image digests instead of `latest`.
+
+✔ Keep frequently used images cached on Nodes where practical.
+
+✔ Use private registries for proprietary applications.
+
+✔ Store registry credentials in `imagePullSecrets`.
+
+✔ Rotate registry credentials regularly.
+
+✔ Monitor image pull latency.
+
+✔ Enable image garbage collection to prevent disk exhaustion.
+
+✔ Remove unused images from build and test Nodes.
+
+✔ Sign and verify images as part of your software supply chain (covered in the Security module).
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Every Pod downloads its own image.
+
+**Correct:** Images are cached per Node and shared among containers on that Node.
+
+---
+
+### ❌ Misconception 2
+
+`imagePullPolicy: Always` always downloads the full image.
+
+**Correct:** The runtime checks the registry and only downloads layers that are missing or have changed.
+
+---
+
+### ❌ Misconception 3
+
+The kubelet downloads images directly.
+
+**Correct:** The kubelet requests `PullImage()` through CRI; the container runtime performs the download.
+
+---
+
+### ❌ Misconception 4
+
+Deleting an image immediately stops running containers.
+
+**Correct:** Running containers continue using their existing snapshots. Image garbage collection targets unused images.
+
+---
+
+### ❌ Misconception 5
+
+Private registries work automatically.
+
+**Correct:** Authentication credentials must be supplied, commonly using `imagePullSecrets`.
+
+---
+
+### ❌ Misconception 6
+
+`:latest` is recommended for production.
+
+**Correct:** Immutable version tags or image digests provide reproducible deployments and should be preferred.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the image pull workflow?
+
+kubelet requests `PullImage()` through CRI, the runtime checks its cache, downloads missing layers from the registry if necessary, stores them locally, and then creates the container.
+
+---
+
+### Q2. What are the three image pull policies?
+
+Always, IfNotPresent, and Never.
+
+---
+
+### Q3. What is the purpose of the local image cache?
+
+To reuse previously downloaded images and reduce startup time and network traffic.
+
+---
+
+### Q4. How are private registry credentials supplied?
+
+Using a Kubernetes Secret of type `kubernetes.io/dockerconfigjson`, referenced through `imagePullSecrets`.
+
+---
+
+### Q5. What causes `ImagePullBackOff`?
+
+Repeated failures to pull an image, such as authentication failures, nonexistent images, or registry connectivity issues.
+
+---
+
+### Q6. Does `imagePullPolicy: Always` always download every layer?
+
+No. The runtime checks the registry but reuses unchanged cached layers.
+
+---
+
+### Q7. What is the purpose of image garbage collection?
+
+To reclaim disk space by removing unused images when storage thresholds are reached.
+
+---
+
+### Q8. Why should production workloads avoid the `latest` tag?
+
+Because it is mutable and can lead to inconsistent, non-reproducible deployments.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| `ImagePullBackOff` | Authentication failure, image not found, or registry unavailable |
+| `ErrImagePull` | Incorrect image name, network issue, or registry error |
+| Slow container startup | Large image download or cache miss |
+| Disk usage continuously increasing | Image garbage collection not reclaiming enough space or many unused images |
+| Private image cannot be pulled | Missing or incorrect `imagePullSecrets` |
+| Image updates not appearing | Cached image with `IfNotPresent` or unchanged image tag |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is a container image?
+2. How does the image pull workflow operate?
+3. What information is stored in an image manifest?
+4. Why are image layers shared?
+5. What is the purpose of the local image cache?
+6. What are the three image pull policies?
+7. Why should production avoid the `latest` tag?
+8. How do `imagePullSecrets` work?
+9. What causes `ImagePullBackOff`?
+10. How does image garbage collection reclaim disk space?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes and the container runtime manage the complete lifecycle of container images.
+
+You learned:
+
+- How OCI images are structured using manifests and layered filesystems
+- The complete image pull workflow from kubelet to registry
+- How image caching improves startup performance and reduces bandwidth
+- The behavior of `Always`, `IfNotPresent`, and `Never` image pull policies
+- How private registries authenticate using `imagePullSecrets`
+- Why `ImagePullBackOff` occurs and how retries are handled
+- How image garbage collection prevents Nodes from running out of disk space
+
+Image management is a critical part of Kubernetes because every container ultimately depends on an OCI image. Efficient caching, secure authentication, immutable versioning, and automatic garbage collection together provide fast, reliable, and reproducible container deployments.
+
+---
+
+# Next Chapter
+
+**Chapter 4 — Pod Sandbox**
+
+Topics include:
+
+- What is a Pod Sandbox?
+- Pause Container
+- Sandbox Creation Workflow
+- Network Namespace
+- Shared Namespaces
+- Sandbox Lifecycle
+- Pod Deletion Workflow
+
+You'll learn why Kubernetes creates a Pod Sandbox before any application containers, how the pause container owns shared namespaces, and how multiple containers cooperate inside a single Pod.
+```

@@ -1,0 +1,353 @@
+---
+title: "Chapter 3 — LoadBalancer Services"
+sidebar_position: 3
+module: "Module 2.4 — Services"
+description: "Deep dive into LoadBalancer Services — how cloud controller managers provision external load balancers, the relationship between LoadBalancer and NodePort, annotations for cloud-specific behavior, and bare-metal alternatives like MetalLB."
+---
+
+# Chapter 3 — LoadBalancer Services
+
+> **Goal:** Understand how LoadBalancer Services provision a real external IP via cloud infrastructure, how the cloud controller manager integrates with cloud provider APIs, and how to get LoadBalancer-equivalent functionality on bare-metal with MetalLB.
+>
+> By the end of this chapter, you will understand:
+> 1. How `type: LoadBalancer` triggers cloud provider provisioning
+> 2. The relationship: LoadBalancer → NodePort → ClusterIP (layered)
+> 3. How the Cloud Controller Manager works
+> 4. Key cloud-specific annotations (AWS ALB, GCP, Azure)
+> 5. MetalLB for bare-metal LoadBalancer Services
+> 6. `loadBalancerSourceRanges` for IP allowlisting
+
+---
+
+## Real-Life Analogy
+
+A LoadBalancer Service is like **calling the post office to set up a dedicated PO Box for your business**:
+
+You tell Kubernetes "I need an external address" (type: LoadBalancer). Kubernetes calls the post office (cloud controller manager), which provisions a dedicated PO Box number (external IP). The post office handles all incoming mail (external traffic), sorts it (load balancing), and routes it to your mailroom (NodePort on cluster nodes). You get a permanent, stable external address without managing the post office infrastructure yourself.
+
+On bare-metal (no post office), MetalLB is like **setting up your own mailroom** — you announce the PO Box address directly from your building using BGP or ARP.
+
+---
+
+## Architecture Diagram
+
+```text
+              LoadBalancer Service — Complete Stack
+
+Internet Traffic
+      │
+      ▼
+  Cloud Load Balancer (203.0.113.100)
+  [AWS ALB / GCP LB / Azure LB]
+      │
+      │  Health checks: node:30080 → alive/dead
+      ▼
+  Node A (192.168.1.10:30080) ─────── NodePort Layer
+  Node B (192.168.1.11:30080)         (all nodes)
+  Node C (192.168.1.12:30080)
+      │
+      ▼
+  iptables NodePort rules ──────────── ClusterIP Layer
+      │  DNAT → backend Pod IP
+      ▼
+  Pod (10.244.x.x:8080)
+
+  Kubernetes side:
+  ┌─────────────────────────────────────────────────────┐
+  │ Service type: LoadBalancer                          │
+  │ status.loadBalancer.ingress.ip: 203.0.113.100       │
+  │ spec.ports[0].nodePort: 30080 (auto-allocated)      │
+  │ spec.clusterIP: 10.96.120.45 (auto-allocated)       │
+  └─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Creating a LoadBalancer Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-lb
+  namespace: production
+  annotations:
+    # Cloud-specific annotations (examples below)
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  selector:
+    app: web
+  ports:
+  - name: http
+    protocol: TCP
+    port: 80
+    targetPort: 8080
+  loadBalancerSourceRanges:
+  - "203.0.113.0/24"    # Only allow traffic from this CIDR
+  externalTrafficPolicy: Local  # Preserve client IP
+```
+
+```bash
+kubectl apply -f web-lb.yaml
+
+# Watch for external IP assignment (takes 30-120s on cloud)
+kubectl get svc web-lb --watch
+# NAME    TYPE           CLUSTER-IP     EXTERNAL-IP     PORT(S)        AGE
+# web-lb  LoadBalancer   10.96.120.45   <pending>       80:30080/TCP   10s
+# web-lb  LoadBalancer   10.96.120.45   203.0.113.100   80:30080/TCP   45s
+
+# Test external access
+curl http://203.0.113.100:80/
+```
+
+---
+
+## The Cloud Controller Manager (CCM)
+
+The Cloud Controller Manager (CCM) is the bridge between Kubernetes and cloud provider APIs. For LoadBalancer Services it:
+
+1. **Watches** Service objects with `type: LoadBalancer`
+2. **Provisions** a cloud load balancer via the cloud API (e.g., AWS ELB API)
+3. **Configures** the load balancer:
+   - Target group: all cluster nodes on the NodePort
+   - Health check: HTTP probe or TCP on NodePort
+   - SSL termination (if configured via annotations)
+4. **Updates** `service.status.loadBalancer.ingress.ip/hostname` with the LB endpoint
+5. **Cleans up** the load balancer when the Service is deleted
+
+```bash
+# Check cloud controller manager logs
+kubectl logs -n kube-system -l component=cloud-controller-manager -f
+
+# On AWS (kube-controller-manager integrations pre-CCM):
+kubectl logs -n kube-system kube-controller-manager-* | grep LoadBalancer
+
+# Describe Service to see provisioning events
+kubectl describe svc web-lb -n production
+# Events:
+#   Ensured load balancer
+#   Updated load balancer with new hosts
+```
+
+---
+
+## Cloud-Specific Annotations
+
+### AWS
+
+```yaml
+metadata:
+  annotations:
+    # Load balancer type
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"   # Network LB (L4)
+    # or use ALB (Application LB) with AWS Load Balancer Controller:
+    # kubernetes.io/ingress.class: alb
+
+    # Internal vs external
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+
+    # Cross-zone load balancing
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+    # SSL certificate (for HTTPS)
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:..."
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+
+    # Access logging
+    service.beta.kubernetes.io/aws-load-balancer-access-log-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-name: "my-logs-bucket"
+```
+
+### GCP
+
+```yaml
+metadata:
+  annotations:
+    # Internal load balancer (only reachable from VPC)
+    cloud.google.com/load-balancer-type: "Internal"
+
+    # Backend config for health checks, CDN, etc.
+    cloud.google.com/backend-config: '{"default": "my-backend-config"}'
+
+    # Static IP name (pre-allocated GCP static IP)
+    kubernetes.io/ingress.global-static-ip-name: "my-static-ip"
+```
+
+### Azure
+
+```yaml
+metadata:
+  annotations:
+    # Internal load balancer
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "my-subnet"
+
+    # DNS label (creates <label>.<region>.cloudapp.azure.com)
+    service.beta.kubernetes.io/azure-dns-label-name: "my-service"
+```
+
+---
+
+## MetalLB: LoadBalancer on Bare-Metal
+
+On bare-metal clusters (no cloud provider), `type: LoadBalancer` Services stay in `<pending>` forever — there's no cloud controller to provision an LB. MetalLB fills this gap:
+
+```text
+MetalLB Architecture:
+┌────────────────────────────────────────────────────────────┐
+│  MetalLB (runs as DaemonSet + Controller)                  │
+│                                                            │
+│  Controller:                                               │
+│  - Watches for LoadBalancer Services                        │
+│  - Allocates IP from configured pool                       │
+│  - Assigns IP to Service status                            │
+│                                                            │
+│  Speaker (DaemonSet on all nodes):                         │
+│  - BGP mode: announces allocated IP to routers via BGP     │
+│  - L2 mode: responds to ARP requests for allocated IP      │
+└────────────────────────────────────────────────────────────┘
+```
+
+### MetalLB Installation
+
+```bash
+# Install MetalLB
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+
+# Wait for MetalLB to be ready
+kubectl wait --namespace metallb-system \
+  --for=condition=ready pod \
+  --selector=app=metallb \
+  --timeout=90s
+```
+
+### MetalLB L2 Mode (simple, no BGP required)
+
+```yaml
+# Configure IP address pool
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: first-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 192.168.1.200-192.168.1.250   # Range available for Services
+---
+# Enable L2 advertisements
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: example
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - first-pool
+```
+
+With L2 mode: MetalLB's speaker on the node hosting the Service responds to ARP requests for the allocated IP. The node "owns" the IP on the local network. Limitation: single node is the ARP responder — no true HA, but MetalLB will failover to another node on leader change.
+
+### MetalLB BGP Mode (production-grade)
+
+```yaml
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: router
+  namespace: metallb-system
+spec:
+  myASN: 64512         # Cluster's BGP AS number
+  peerASN: 65000       # Router's AS number
+  peerAddress: 192.168.1.1  # Router IP
+---
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: example
+  namespace: metallb-system
+```
+
+With BGP mode: MetalLB announces Service IPs to routers via BGP. All nodes can announce the same IP (ECMP routing). Router load-balances across all nodes. True HA — no single ARP responder.
+
+---
+
+## `loadBalancerSourceRanges`: IP Allowlisting
+
+```yaml
+spec:
+  type: LoadBalancer
+  loadBalancerSourceRanges:
+  - "10.0.0.0/8"       # Internal RFC 1918
+  - "203.0.113.0/24"   # Specific partner CIDR
+  - "198.51.100.5/32"  # Single allowed IP
+```
+
+Traffic from IPs not in this list is dropped by the cloud LB (if supported) or by iptables rules added by kube-proxy on each node.
+
+---
+
+## Hands-On: Debugging LoadBalancer Services
+
+```bash
+# 1. Check if external IP was assigned
+kubectl get svc web-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+# 2. Check cloud controller manager for provisioning errors
+kubectl logs -n kube-system -l component=cloud-controller-manager | grep -i error
+
+# 3. Verify NodePort is open (LoadBalancer uses NodePort internally)
+kubectl get svc web-lb -o jsonpath='{.spec.ports[0].nodePort}'
+nc -zv 192.168.1.10 <node-port>
+
+# 4. Test directly to ClusterIP (skip LB)
+CLUSTER_IP=$(kubectl get svc web-lb -o jsonpath='{.spec.clusterIP}')
+kubectl run curl-test --image=curlimages/curl --restart=Never \
+  -- curl http://$CLUSTER_IP:80
+
+# 5. For MetalLB: check speaker logs
+kubectl logs -n metallb-system -l app=metallb,component=speaker -f
+
+# 6. For MetalLB BGP: check BGP session status
+kubectl exec -n metallb-system -it metallb-speaker-<id> -- \
+  metallb-frr bgp summary
+
+# 7. Check loadBalancerSourceRanges iptables rules
+iptables -t filter -L -n | grep REJECT | head -20
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the relationship between LoadBalancer, NodePort, and ClusterIP?**
+
+They are **nested layers**: a LoadBalancer Service automatically creates a NodePort Service, which automatically creates a ClusterIP Service. External traffic hits the cloud load balancer → routes to any node on the NodePort → iptables/IPVS DNAT to the ClusterIP → routes to the backend Pod. You can verify this by looking at a LoadBalancer Service — it shows both a ClusterIP and a NodePort in addition to the external IP.
+
+**Q2: What is the Cloud Controller Manager and what does it do for LoadBalancer Services?**
+
+The CCM is a Kubernetes control plane component that integrates with cloud provider APIs. For LoadBalancer Services, it watches for new Service objects of type LoadBalancer, calls the cloud API (e.g., AWS ELB API, GCP Compute API) to provision a load balancer, configures the LB to target all cluster nodes on the Service's NodePort, and updates the Service's `status.loadBalancer.ingress` field with the external IP/hostname. When the Service is deleted, CCM cleans up the cloud LB.
+
+**Q3: What happens on a bare-metal cluster when you create a `type: LoadBalancer` Service without MetalLB?**
+
+The Service is created but the `EXTERNAL-IP` field stays in `<pending>` state forever. There's no cloud controller to provision an LB or assign an IP. The Service is still functional as a ClusterIP and NodePort within the cluster — just no external IP is assigned. MetalLB or another bare-metal LB controller is needed to provide this functionality on bare-metal.
+
+**Q4: What is the difference between MetalLB L2 mode and BGP mode?**
+
+L2 mode uses ARP — MetalLB's speaker on one node responds to ARP requests for the allocated Service IP, making that node the ARP owner. It's simple (no BGP infrastructure needed) but has a single-node bottleneck and slower failover. BGP mode announces Service IPs to physical routers via BGP. All nodes advertise the same IP — the router does ECMP load balancing across all nodes. True HA, no single bottleneck, faster convergence. BGP mode requires BGP-capable routers.
+
+**Q5: What does `loadBalancerSourceRanges` do and where is it enforced?**
+
+It restricts which source IPs can access the LoadBalancer Service. Enforcement depends on cloud provider support: AWS/GCP/Azure LBs can enforce security groups/firewall rules based on this field. Additionally, kube-proxy adds iptables rules on each node to drop packets from non-allowlisted CIDRs (as a second line of defense). This is useful for restricting a Service to internal corporate IPs or specific partner CIDRs.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the three-layer stack: LoadBalancer → NodePort → ClusterIP
+- [ ] Understand the CCM provisions cloud LBs and updates Service status
+- [ ] Know key AWS/GCP/Azure annotations for LB behavior (internal, SSL, cross-zone)
+- [ ] Know MetalLB fills the LoadBalancer gap on bare-metal (L2/ARP mode, BGP mode)
+- [ ] Understand `loadBalancerSourceRanges` restricts source IPs at LB and iptables level
+- [ ] Know that `externalTrafficPolicy: Local` with LB provides real client IPs and avoids cross-node hops
+- [ ] Can debug with `kubectl describe svc`, CCM logs, and `nc -zv <node>:<nodeport>`

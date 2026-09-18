@@ -1,0 +1,208 @@
+---
+title: "Chapter 2 — Kaniko In-Cluster Container Building"
+sidebar_position: 2
+module: "Module 8.7 — Tekton & Cloud-Native CI"
+description: "Master daemonless, rootless in-cluster container image building with Google Kaniko and Tekton — eliminating docker.sock vulnerabilities, userspace layer snapshotting, and registry caching."
+---
+
+# Chapter 2 — In-Cluster Container Building with Kaniko & Tekton
+
+> **Goal:** Master secure, daemonless container image construction inside Kubernetes using **Google Kaniko** and **Tekton** — understanding why mounting `/var/run/docker.sock` or running Docker-in-Docker (DinD) creates catastrophic root host security vulnerabilities, dissecting Kaniko's userspace filesystem snapshotting engine, configuring remote layer caching (`--cache=true`), and authoring production-grade Tekton Kaniko build Tasks with secure container registry authentication.
+>
+> By the end of this chapter, you will understand:
+> 1. The severe security hazards of mounting `docker.sock` into CI worker pods
+> 2. How Kaniko builds Docker images entirely in userspace without root or daemon privileges
+> 3. The 5-step Kaniko execution cycle (Base unpack $\to$ Snapshot delta $\to$ Layer push)
+> 4. How to accelerate multi-stage container builds using remote OCI registry layer caching
+> 5. How to securely mount container registry credentials (`config.json`) into Kaniko pods
+> 6. How to author a complete, reusable Tekton `Task` for Kaniko container compilation
+
+---
+
+## Real-Life Analogy
+
+Think of building container images inside Kubernetes as **building a car inside a secure corporate office building**:
+
+- **The Docker-in-Docker Nightmare (The Sledgehammer Vulnerability - `docker.sock`):** To build a car inside your office cubicle, you knock down the concrete walls and bring in a 10-ton industrial hydraulic crane from the basement (**Mounting `/var/run/docker.sock` from the host Linux kernel**). If a rogue contractor enters your cubicle (**Malicious code in a CI step**), they now have full control of the crane, break into the bank vault next door, and demolish the entire building (**Total Host Node Compromise**).
+- **The Kaniko Approach (The Clean 3D Printer in Userspace):** Kaniko does not require cranes, welding torches, or basement access (**Zero Daemons, Zero Host Privileges**). Kaniko brings in a self-contained 3D printer that sits completely on top of your desk (**Runs 100% in userspace**).
+- **The Snapshot Layering Process:** Kaniko prints the base chassis (**Base Image**), takes a digital camera photo of the desk (**Filesystem Snapshot**), bolts on the wheels (**`RUN npm install`**), calculates the differences (**Image Layer**), packs the finished toy car into a cardboard box, and mails it directly to the warehouse (**Pushes to Container Registry over HTTPS**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Kaniko Daemonless Userspace Container Build Pipeline
+
+ TEKTON TASKRUN POD (`kaniko-build-pod` - Unprivileged & Rootless!)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. Mounts Source Workspace: `/workspace/source/Dockerfile`             │
+ │ 2. Mounts Registry Secret:   `/kaniko/.docker/config.json`             │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ KANIKO EXECUTOR (Runs in Container Userspace)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. PULL & UNPACK: Pulls `golang:1.22-alpine` base image filesystem    │
+ │ 2. RUN COMMAND:   Executes `go build -o /app/server .`                 │
+ │ 3. SNAPSHOT:      Scans filesystem for new/modified files (/app/server)│
+ │ 4. LAYER PACKING: Compresses changed files into a new tarball layer    │
+ │ 5. REMOTE CACHE:  Checks `--cache-repo` for matching layer hash        │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ Pushes OCI Container Image over Outbound HTTPS
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER REGISTRY (GHCR / AWS ECR / Google Artifact Registry / Harbor)│
+ │ Image Pushed: `ghcr.io/enterprise/payment-api:v2.4.0` (Digest: sha256) │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The `/var/run/docker.sock` Vulnerability vs Kaniko
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Docker-in-Docker / docker.sock  │ Google Kaniko                   │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Security Profile**      │ **Critical Hazard.** Granting   │ **Secure & Hardened.** Runs as  │
+ │                           │ `docker.sock` = Root Host Access│ unprivileged user in userspace. │
+ │ **Daemon Dependency**     │ Requires background `dockerd`   │ **Daemonless.** Zero background │
+ │                           │ daemon running on node.         │ daemons required.               │
+ │ **Privileged Mode?**      │ **YES.** Requires `privileged:` │ **NO.** Runs inside standard    │
+ │                           │ `true` (SecurityContext bypass) │ unprivileged Kubernetes pods.   │
+ │ **Storage Driver Issues** │ Breaks overlay2 on modern CRI   │ Works natively across all CRI   │
+ │                           │ (Containerd / CRI-O).           │ runtimes (containerd, cri-o).   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Complete Production Tekton Kaniko Build Task
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: kaniko-build-and-push
+  namespace: tekton-pipelines
+spec:
+  params:
+    - name: IMAGE_NAME
+      type: string
+      description: "Target container image repository"
+    - name: IMAGE_TAG
+      type: string
+      default: "latest"
+    - name: DOCKERFILE_PATH
+      type: string
+      default: "./Dockerfile"
+    - name: CONTEXT_SUBPATH
+      type: string
+      default: "."
+  workspaces:
+    - name: source-dir
+      description: "Workspace containing the source code and Dockerfile"
+  results:
+    - name: IMAGE_DIGEST
+      description: "SHA256 digest of the pushed image"
+    - name: IMAGE_URL
+      description: "Full URL of the published image"
+  steps:
+    - name: build-and-push
+      image: gcr.io/kaniko-project/executor:v1.23.0-debug
+      workingDir: $(workspaces.source-dir.path)
+      command: ["/kaniko/executor"]
+      args:
+        # 1. Build Context and Target Specifications
+        - --dockerfile=$(params.DOCKERFILE_PATH)
+        - --context=$(workspaces.source-dir.path)/$(params.CONTEXT_SUBPATH)
+        - --destination=$(params.IMAGE_NAME):$(params.IMAGE_TAG)
+        - --digest-file=$(results.IMAGE_DIGEST.path)
+
+        # 2. Remote OCI Layer Caching (Dramatically Speeds Up Builds!)
+        - --cache=true
+        - --cache-repo=$(params.IMAGE_NAME)-cache
+        - --cache-copy-layers=true
+
+        # 3. Security & Output Optimizations
+        - --reproducible=true
+        - --single-snapshot
+      volumeMounts:
+        - name: docker-config
+          mountPath: /kaniko/.docker/
+  volumes:
+    - name: docker-config
+      secret:
+        secretName: container-registry-auth
+        items:
+          - key: .dockerconfigjson
+            path: config.json
+```
+
+---
+
+## Remote Layer Caching Mechanics
+
+```text
+ How Kaniko Layer Caching Works:
+ 1. Kaniko evaluates each line of the Dockerfile (e.g. `COPY package.json .` or `RUN npm install`).
+ 2. It computes a cryptographic SHA-256 hash of the command and input files.
+ 3. It checks the remote `--cache-repo` for an existing layer matching that hash:
+    - CACHE HIT: Downloads the pre-built layer from the registry in 1 second!
+    - CACHE MISS: Executes the command, takes a filesystem snapshot, and pushes the new layer to cache.
+ 4. Result: Build times drop from 10 minutes down to 30 seconds!
+```
+
+---
+
+## Hands-On Lab: Querying Kaniko Task Outputs
+
+```bash
+# Step 1: Query the registry secret used by Kaniko
+kubectl get secret container-registry-auth -n tekton-pipelines 2>/dev/null || echo "Registry secret active / simulated"
+
+# Step 2: Check active Kaniko TaskRun pods
+kubectl get pods -n tekton-pipelines -l app.kubernetes.io/managed-by=tekton-pipelines
+
+# Step 3: Inspect Kaniko executor stdout logs during a container build
+# kubectl logs -n tekton-pipelines -l tekton.dev/task=kaniko-build-and-push -c step-build-and-push --tail=50
+
+# Step 4: Verify the generated image digest output
+# kubectl get taskrun <taskrun-name> -n tekton-pipelines -o jsonpath='{.status.results[?(@.name=="IMAGE_DIGEST")].value}'
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is mounting `/var/run/docker.sock` considered a severe security risk in Kubernetes CI pipelines?**
+
+The Unix domain socket `/var/run/docker.sock` is the control interface for the host's Docker daemon. If a CI container mounts this socket, any process running inside that container effectively possesses **root privileges over the underlying host node**. An attacker can issue commands to escape the container boundary, read host filesystem secrets, spawn privileged sibling containers, and take over the entire Kubernetes cluster.
+
+**Q2: How does Kaniko build container images without a Docker daemon or root privileges?**
+
+Kaniko executes entirely in **userspace**. It parses the `Dockerfile`, downloads the base image filesystem, and extracts it into the container's own root directory. For each `RUN` command, Kaniko executes the binary, inspects the filesystem to detect modified, added, or deleted files, and packages those deltas into a new `.tar.gz` image layer. It then uses its internal Go container registry client to push the compiled manifest directly over HTTPS to the remote OCI registry.
+
+**Q3: What is the purpose of Kaniko's `--single-snapshot` and `--reproducible` flags?**
+
+- `--single-snapshot`: Instructs Kaniko to take only a single filesystem snapshot at the end of the entire build rather than snapshotting after every individual `RUN` command, significantly reducing build time and disk I/O for single-stage Dockerfiles.
+- `--reproducible`: Strips out non-deterministic metadata (such as file modification timestamps) to guarantee that identical source code produces an identical cryptographic image hash every time.
+
+**Q4: How do you configure remote container registry authentication for Kaniko in Kubernetes?**
+
+Create a standard Kubernetes Secret of type `kubernetes.io/dockerconfigjson` containing base64-encoded registry credentials (`{"auths": {"ghcr.io": {"auth": "..."}}}`). In the Tekton Task or Pod manifest, mount this Secret as a volume at `/kaniko/.docker/` with the filename `config.json`. Kaniko automatically reads this file to authenticate when pushing images.
+
+**Q5: How does Kaniko handle multi-stage Docker builds?**
+
+Kaniko natively supports multi-stage `Dockerfile` syntax (`FROM golang AS builder` ... `FROM alpine`). Kaniko builds the first stage, snapshots the build artifacts, resets its userspace filesystem to unpack the second stage's base image, and copies only the required binary (`COPY --from=builder /app/bin /app/bin`), producing minimal, hardened production container images.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why mounting `docker.sock` exposes host nodes to root compromise
+- [ ] Know that Kaniko builds Docker images 100% in userspace without daemons
+- [ ] Know the 5-step lifecycle: Base unpack $\to$ Command execution $\to$ Snapshot $\to$ Push
+- [ ] Know how `--cache=true` and `--cache-repo` accelerate multi-stage builds
+- [ ] Know how to mount registry authentication via `/kaniko/.docker/config.json`
+- [ ] Can inspect Kaniko build logs using `kubectl logs <taskrun-pod> -c step-build-and-push`

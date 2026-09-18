@@ -1,0 +1,233 @@
+---
+title: "Chapter 2 — CUDA Driver Injection & Container Toolkit"
+sidebar_position: 2
+module: "Module 10.1 — GPU Operator & CUDA"
+description: "Master NVIDIA Container Toolkit architecture — OCI runtime prestart hooks, dynamic libcuda.so injection, Container Device Interface (CDI), and driver compatibility."
+---
+
+# Chapter 2 — CUDA Driver Injection & Container Toolkit
+
+> **Goal:** Master low-level GPU virtualization, OCI runtime mechanics, and driver injection inside Kubernetes using the **NVIDIA Container Toolkit** and the **Container Device Interface (CDI)** — understanding how containers access physical GPU hardware without bundling 500MB+ driver binaries into Docker images, dissecting the **OCI Prestart Hook** execution flow, mounting `/dev/nvidia*` character devices and `libcuda.so` user-space libraries dynamically into container namespaces, and mastering **CUDA Forward/Backward Compatibility**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why bundling NVIDIA kernel drivers inside container images is an anti-pattern
+> 2. The structural pipeline: `containerd` $\to$ `nvidia-container-runtime` $\to$ `nvidia-container-cli`
+> 3. How the OCI prestart hook injects `/dev/nvidia*` device nodes and `libcuda.so` into namespaces
+> 4. How the **Container Device Interface (CDI)** specification modernizes GPU passthrough
+> 5. How CUDA Enhanced Compatibility allows newer CUDA applications to run on older host drivers
+> 6. How to author production GPU-enabled Pods using environment variables and CDI device selectors
+
+---
+
+## Real-Life Analogy
+
+Think of CUDA Driver Injection and the NVIDIA Container Toolkit as **an international high-voltage appliance adapter system in a luxury hotel**:
+
+- **The Monolithic Anti-Pattern (Shipping the Power Plant inside the Laptop):** Imagine every time you travel to a foreign country, you must pack a 500-pound diesel generator in your suitcase just to charge your phone (**Hardcoding 500MB of host Linux kernel drivers inside your Docker image**). If the hotel uses 220V and your generator produces 110V, your suitcase explodes (**Kernel Driver Version Mismatch Crash**).
+- **The Container Toolkit Approach (The Smart Universal Wall Socket - OCI Hook):**
+  - Your Docker image contains **only your Python AI application and the CUDA user-space math libraries** (`libtorch.so`, `cublas.so`).
+  - When the container boots up, the hotel manager (**The OCI Prestart Hook - `nvidia-container-cli`**) inspects the wall socket.
+  - The manager quickly drills a temporary pipe through the wall directly to the hotel's central power grid (**Mounting `/dev/nvidia0` and `/dev/nvidia-uvm` into the container**).
+  - The manager slides the exact matching driver cable into the room (**Injecting host `libcuda.so.1` into `/usr/lib64/`**).
+  - Your Python script begins running matrix multiplications instantly without ever knowing or caring what brand of power generator sits in the basement!
+
+---
+
+## Architecture Diagram
+
+```text
+               NVIDIA Container Toolkit: Dynamic CUDA Driver Injection Pipeline
+
+ 1. DEVELOPER POD MANIFEST: `resources: limits: nvidia.com/gpu: 1`
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES KUBELET (Assigns GPU Device: GPU-7b8f9k2)                   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Calls CRI Container Runtime
+                    ▼
+ 2. OCI RUNTIME ENGINE (`containerd` / `CRI-O`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Intercepts OCI Spec ──► Triggers `nvidia-container-runtime-hook`       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Invokes `nvidia-container-cli configure`
+                    ▼
+ 3. NVIDIA CONTAINER CLI (Runs with Host Privileges during Prestart Phase)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. INJECTS DEVICE NODES into Container `/dev/`:                        │
+ │    - `/dev/nvidia0` (Assigned physical GPU)                            │
+ │    - `/dev/nvidiactl` (Control socket)                                 │
+ │    - `/dev/nvidia-uvm` (Unified Virtual Memory for CUDA memory access) │
+ │                                                                        │
+ │ 2. BIND-MOUNTS DRIVER LIBRARIES into Container `/usr/lib64/`:          │
+ │    - `libcuda.so.1` (CUDA Driver API)                                  │
+ │    - `libnvidia-ml.so.1` (Management Library)                          │
+ │    - `libcuda_compat.so` (Forward Compatibility Shim)                 │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Launches Isolated Application Container
+                    ▼
+ 4. APPLICATION CONTAINER RUNNING PYTORCH / TENSORFLOW
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PyTorch Application: Calls `torch.cuda.is_available()` ──► TRUE!       │
+ │ Executes tensor matrix computations at full hardware line rate!        │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Dynamic Injection Step-by-Step Sequence
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Phase & Step         │ Executing Component     │ Technical Action Performed                        │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. Admission**     │ Kubelet & Device Plugin │ Device Plugin assigns GPU UUID (e.g. `GPU-0a1b2`).│
+ │                      │                         │ Passes device ID to CRI runtime in container spec.│
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. OCI Hook**      │ `containerd`            │ Reads `config.json`; executes prestart hook       │
+ │                      │                         │ `/usr/bin/nvidia-container-runtime-hook`.         │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. Device Bind**   │ `nvidia-container-cli`  │ Creates device cgroup rules; creates character    │
+ │                      │                         │ nodes `/dev/nvidia0`, `/dev/nvidiactl`, `uvm`.    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **4. Library Mount** │ `nvidia-container-cli`  │ Locates host driver libraries in `/usr/lib64/`;   │
+ │                      │                         │ bind-mounts `libcuda.so` into container rootfs.   │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **5. Entrypoint**    │ Container Process       │ Application boots; dynamically links against      │
+ │                      │ (Python/C++)            │ injected `libcuda.so` without driver compilation. │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Modern Container Device Interface (CDI) Specification
+
+Starting in Kubernetes 1.28+, **CDI (`cdi.k8s.io`)** provides a vendor-neutral, declarative JSON specification replacing proprietary OCI runtime hooks:
+
+```json
+{
+  "cdiVersion": "0.5.0",
+  "kind": "nvidia.com/gpu",
+  "devices": [
+    {
+      "name": "gpu0",
+      "containerEdits": {
+        "deviceNodes": [
+          {"path": "/dev/nvidia0", "hostPath": "/dev/nvidia0"},
+          {"path": "/dev/nvidiactl", "hostPath": "/dev/nvidiactl"},
+          {"path": "/dev/nvidia-uvm", "hostPath": "/dev/nvidia-uvm"}
+        ],
+        "mounts": [
+          {
+            "hostPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.550.54.14",
+            "containerPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "options": ["ro", "nosuid", "bind"]
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+---
+
+## CUDA Forward & Backward Compatibility Matrix
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ The Two CUDA Layers:                                                                               │
+ │ 1. CUDA Toolkit (User-Space in Container): `cudart`, `cublas`, `cudnn` (Compiled into Docker image)│
+ │ 2. CUDA Driver (Kernel-Space on Host): `libcuda.so`, `nvidia.ko` (Installed on Host Worker Node)   │
+ ├────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Compatibility Rules:                                                                               │
+ │ - Rule 1 (Backward Compatibility): Newer Host Drivers ALWAYS support older container CUDA versions.│
+ │   Example: Host Driver 550 (CUDA 12.4) can run Docker images built with CUDA 11.8 or CUDA 10.2!   │
+ │ - Rule 2 (Forward Compatibility / Minor Version Compatibility):                                    │
+ │   Containers can run a newer CUDA minor release on an older enterprise LTS host driver using the   │
+ │   NVIDIA Forward Compatibility package (`cuda-compat`).                                            │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Production GPU Pod Manifest using Environment Variables
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pytorch-training-pod
+  namespace: ml-workloads
+spec:
+  restartPolicy: OnFailure
+  containers:
+  - name: pytorch
+    image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+    command: ["python", "-c", "import torch; print(f'CUDA Devices: {torch.cuda.device_count()}, Device Name: {torch.cuda.get_device_name(0)}')"]
+    env:
+      # 1. Instructs Container Toolkit which capabilities to inject!
+      - name: NVIDIA_VISIBLE_DEVICES
+        value: "all"                   # Or specify GPU UUIDs: "GPU-0a1b2c3d"
+      - name: NVIDIA_DRIVER_CAPABILITIES
+        value: "compute,utility"       # Injects CUDA compute + nvidia-smi utility
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+        memory: "32Gi"
+        cpu: "8"
+```
+
+---
+
+## Hands-On Lab: Verifying In-Container GPU Passthrough
+
+```bash
+# Step 1: Run an ephemeral CUDA verification container
+kubectl run cuda-test --rm -it --restart=Never \
+  --image=nvidia/cuda:12.4.1-base-ubuntu22.04 \
+  --limits='nvidia.com/gpu=1' \
+  -- nvidia-smi
+
+# Expected Output: Displays full GPU model (e.g. A100-SXM4-80GB), Driver Version (550.x), and VRAM!
+
+# Step 2: Verify injected device nodes inside a running GPU pod
+# kubectl exec -it <gpu-pod-name> -- ls -la /dev/nvidia*
+
+# Step 3: Verify dynamic shared library linking in container
+# kubectl exec -it <gpu-pod-name> -- ldconfig -p | grep "libcuda"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does a Docker container access a physical NVIDIA GPU without having GPU drivers installed inside the container image?**
+
+A container accesses the host GPU via the **NVIDIA Container Toolkit and dynamic OCI prestart hooks**. The container image contains only user-space CUDA runtime libraries (`libcudart.so`, PyTorch). When the container is created, `containerd` triggers the `nvidia-container-runtime-hook`. The hook executes `nvidia-container-cli`, which reads the host's driver installation and **bind-mounts the host's `/dev/nvidia*` character devices and `libcuda.so` user-space libraries directly into the container's isolated mount namespace**, providing full hardware access with zero driver bloat.
+
+**Q2: What is the Container Device Interface (CDI), and why is it replacing vendor-specific OCI runtime hooks?**
+
+The **Container Device Interface (CDI)** is an open CNCF standard specification for container runtimes to interact with third-party accelerator devices (GPUs, FPGAs, NPUs). Prior to CDI, NVIDIA, Intel, and AMD each implemented proprietary OCI runtime hooks that modified container specs via custom binaries. CDI replaces this with a standardized JSON descriptor format (`/etc/cdi/nvidia.yaml`), enabling standard `containerd` and `CRI-O` runtimes to inject devices and libraries natively without vendor-specific runtime shims.
+
+**Q3: What are the `NVIDIA_VISIBLE_DEVICES` and `NVIDIA_DRIVER_CAPABILITIES` environment variables?**
+
+- **`NVIDIA_VISIBLE_DEVICES`**: Controls which physical GPUs or MIG instances are mapped into the container namespace (e.g. `all`, `none`, `0,1`, or `GPU-UUID`). When using the K8s Device Plugin, this is populated automatically based on `resources.limits.nvidia.com/gpu`.
+- **`NVIDIA_DRIVER_CAPABILITIES`**: Controls which driver libraries are mounted into the container (e.g. `compute` injects `libcuda.so` and OpenCL; `utility` injects `nvidia-smi`; `video` injects NVENC/NVDEC hardware video codecs).
+
+**Q4: How does NVIDIA CUDA Forward Compatibility work in enterprise Kubernetes clusters?**
+
+Traditionally, running an application built with CUDA 12 required upgrading the host Linux kernel driver to version 525+. In enterprise environments where host OS drivers cannot be updated frequently (LTS stability), NVIDIA provides **CUDA Forward Compatibility (`cuda-compat`)**. By mounting a forward compatibility shim library inside the container, an application compiled with a newer CUDA minor version (e.g. CUDA 12.2) can run on an older enterprise host driver (e.g. Driver 525 for CUDA 12.0) without upgrading host kernel modules.
+
+**Q5: What happens if a container process attempts to call `torch.cuda.init()` when `/dev/nvidia-uvm` is not mounted?**
+
+`/dev/nvidia-uvm` is the character device for **NVIDIA Unified Virtual Memory**, which manages virtual memory address space translation between host system RAM and GPU VRAM. If `/dev/nvidia-uvm` is missing or permissions are denied, the CUDA initialization will fail immediately with the runtime error `CUDA error: unknown error` or `cudaErrorDevicesUnavailable`, preventing any tensor allocations or kernel launches.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that containers do NOT include kernel drivers; drivers are injected via OCI hooks
+- [ ] Know the execution pipeline: `containerd` $\to$ OCI Hook $\to$ `nvidia-container-cli`
+- [ ] Know that `/dev/nvidia*` and `libcuda.so` are bind-mounted into container namespaces
+- [ ] Know that the Container Device Interface (CDI) standardizes device passthrough
+- [ ] Know that Host Driver 550 can run any older CUDA container (Backward Compatibility)
+- [ ] Can verify GPU passthrough using `kubectl run --limits='nvidia.com/gpu=1' -- nvidia-smi`

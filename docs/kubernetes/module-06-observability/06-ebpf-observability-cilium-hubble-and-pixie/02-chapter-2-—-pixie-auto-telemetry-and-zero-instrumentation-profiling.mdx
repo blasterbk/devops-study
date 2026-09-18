@@ -1,0 +1,211 @@
+---
+title: "Chapter 2 — Pixie Auto-Telemetry & Continuous Profiling"
+sidebar_position: 2
+module: "Module 6.6 — eBPF Observability"
+description: "Master CNCF Pixie zero-instrumentation eBPF telemetry — in-kernel HTTP/gRPC/SQL tracing, unencrypted TLS inspection via uprobes, edge-compute RAM tables, and continuous CPU flame graphs."
+---
+
+# Chapter 2 — Pixie Auto-Telemetry & Zero-Instrumentation Profiling
+
+> **Goal:** Master zero-instrumentation observability in Kubernetes using **CNCF Pixie** — understanding how in-kernel eBPF kprobes and uprobes capture full-body HTTP, gRPC, and SQL payloads (including decrypted TLS streams) with zero application code changes, analyzing the **Pixie Edge** in-memory architecture that slashes cloud data egress bills, generating real-time continuous CPU flame graphs, and authoring **PxL (Pixie Query Language)** data scripts.
+>
+> By the end of this chapter, you will understand:
+> 1. How Pixie uses eBPF uprobes to capture decrypted OpenSSL TLS traffic in user space
+> 2. How Pixie traces SQL database statements (PostgreSQL, MySQL) with zero SDK modifications
+> 3. The Pixie Vizier architecture and edge-computed in-memory data tables
+> 4. How continuous eBPF CPU stack sampling generates production flame graphs ($\le 2\%$ CPU overhead)
+> 5. How to author and execute PxL (Pixie Query Language) data analysis scripts
+> 6. When to choose Pixie vs OpenTelemetry vs Hubble for cloud-native observability
+
+---
+
+## Real-Life Analogy
+
+Think of Pixie as **a non-invasive medical MRI scanner with an on-board real-time diagnostic computer**:
+
+- **Traditional Observability (Surgical Implants - Manual SDK Instrumentation):** To monitor a patient's blood pressure and heart rate, you surgically implant 10 different electronic probes into their veins and muscles (Embedding OTel/Prometheus libraries in every microservice). If you forget one vein, that organ is completely unmonitored.
+- **Pixie eBPF Auto-Telemetry (The Non-Invasive MRI Scanner):** You place the patient inside an advanced MRI scanner (**Linux Kernel eBPF Probes**). The scanner watches every red blood cell flow through the body in real time (**Traces all HTTP, gRPC, and SQL queries**) without making a single cut (**Zero Code Changes**).
+- **The Decrypted TLS Magic (Reading the Letter Before It Enters the Envelope):** When an app encrypts data with HTTPS, traditional network sniffers only see unreadable gibberish. Pixie attaches a sensor directly to the application's pen (**OpenSSL `SSL_write` Uprobe**), reading the plaintext letter *the millisecond before* it gets sealed in the cryptographic envelope!
+- **Edge Computing (The Doctor's Local Memory vs Shipping 500 Terabytes to the Cloud):** Instead of spending \$50,000/month mailing 500 TB of MRI video tapes to a remote cloud datacenter, Pixie buffers the last 24 hours of telemetry in the hospital's local RAM (**Pixie Edge Architecture**). The data is only queried on-demand when a doctor asks a specific question (**PxL Script**).
+
+---
+
+## Architecture Diagram
+
+```text
+               CNCF Pixie In-Kernel Auto-Telemetry & Edge Architecture
+
+ WORKER NODE (Node-Local Edge Computation)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Container Process: billing-app (Uninstrumented Go/Java/Python)         │
+ │ 1. Calls `libssl.so` to send HTTPS Request (TLS)                       │
+ │ 2. Executes PostgreSQL Query: `SELECT * FROM invoices WHERE id = 10`   │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │
+                    ▼ eBPF Probes Attached in Kernel & User Space:
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX HOST KERNEL & USERSPACE UPROBES:                                 │
+ │                                                                        │
+ │ [ Uprobe: `SSL_write` / `SSL_read` ] ──► Captures DECRYPTED TLS data!  │
+ │ [ Kprobe: `sys_enter_write` ]         ──► Captures raw database SQL    │
+ │ [ In-Kernel Stack Profiler ]          ──► Samples CPU stacks at 100Hz  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ High-Speed Ring Buffer (Zero packet copies!)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PIXIE VIZIER (Node-Local DaemonSet Pod)                                │
+ │ Stores live telemetry in Local Node RAM Tables:                        │
+ │   - `http_events` Table (Full request/response payload, latency)       │
+ │   - `pgsql_events` Table (Decoded SQL queries & execution time)        │
+ │   - `cpu_flamegraph` Table (Stack traces & function symbols)           │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                                    │ On-Demand PxL Script Execution
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PIXIE CLI / CLOUD UI: Real-Time CPU Flame Graphs & Live SQL Traces     │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Pixie Edge Computing vs Centralized APM Architecture
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ Dimension                 │ Centralized APM (Datadog/Dynat) │ CNCF Pixie Edge Architecture    │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Data Storage Location** │ 100% of telemetry streamed to   │ **Buffered strictly in Node RAM**│
+ │                           │ remote cloud vendor datacenters.│ for a rolling window (24 hrs).  │
+ │ **Cloud Egress Costs**    │ Extremely high bandwidth bills. │ **$0 Egress Cost.** Data stays  │
+ │                           │                                 │ local until queried on-demand!  │
+ │ **Payload Inspection**    │ Metadata only (Payloads dropped)│ **Full Body Payload Capture**   │
+ │                           │ to control costs.               │ (Headers, JSON bodies, SQL).    │
+ │ **Instrumentation**       │ Manual SDK import & recompiles. │ **100% Zero-Code eBPF Auto.**   │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## Decrypted TLS Inspection via Uprobes
+
+Traditional network taps cannot inspect HTTPS traffic because payloads are encrypted by TLS.
+
+```text
+ How Pixie Intercepts Plaintext TLS:
+ 1. Pixie attaches a User-Space Probe (Uprobe) to the `libssl.so` / `libcrypto.so` shared libraries 
+    loaded by container processes.
+ 2. Pixie intercepts the `SSL_read()` and `SSL_write()` functions.
+ 3. The payload is captured IN MEMORY in plaintext BEFORE encryption or AFTER decryption!
+ 4. Delivers full HTTP payload visibility over HTTPS without managing custom TLS CA certs!
+```
+
+---
+
+## Continuous In-Kernel CPU Flame Graphs
+
+Pixie uses a high-frequency kernel timer (typically 100Hz) to sample the instruction pointers and call stacks of all running container processes on the host.
+
+```text
+ The Zero-Overhead Profiler:
+ - Resolves kernel and userspace function symbols (DWARF symbols) dynamically.
+ - Aggregates call stacks in kernel eBPF maps with < 2% total CPU overhead.
+ - Instantly renders interactive SVG Flame Graphs in the Pixie UI:
+   Identify exactly which internal Go function, Java class, or regular expression 
+   is burning 80% of your cluster CPU!
+```
+
+---
+
+## PxL: The Pixie Query Language Deep Dive
+
+Pixie is queried using **PxL**, a fully featured data analysis language with syntax modeled after Python and Pandas:
+
+```python
+# pxl_script: trace_slow_sql_queries.pxl
+import px
+
+# 1. Ingest Postgres events table from the local edge node
+df = px.DataFrame(table='pgsql_events')
+
+# 2. Filter queries taking longer than 100 milliseconds
+df = df[df.latency >= 100 * px.ms]
+
+# 3. Project specific fields
+df = df[['time_', 'pod', 'req', 'resp', 'latency']]
+
+# 4. Output results to terminal / UI
+px.display(df)
+```
+
+---
+
+## Observability Decision Matrix: Pixie vs OTel vs Hubble
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Observability Tool   │ Primary Focus & When to Use                                                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **CNCF Pixie**       │ **Instant Zero-Code Debugging & Profiling.** Use for immediate live incident│
+ │                      │ triage, CPU flame graphs, and full-body HTTP/SQL payload inspection.        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **OpenTelemetry**    │ **Standard Distributed Tracing & Metrics.** Use for cross-cluster long-term │
+ │                      │ transaction tracing, custom business metrics, and multi-year APM retention. │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **Cilium Hubble**    │ **Network Security & Flow Visibility.** Use for Layer 3/4/7 packet routing, │
+ │                      │ NetworkPolicy drop auditing, DNS diagnostics, and service dependency maps.  │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Querying Cluster Telemetry with Pixie CLI
+
+```bash
+# Step 1: Check if Pixie CLI (`px`) is installed or available
+which px 2>/dev/null || echo "Pixie CLI simulation active"
+
+# Step 2: Query cluster-wide live HTTP traffic using Pixie PxL
+# px run px/http_data
+
+# Step 3: Generate a live cluster-wide CPU flame graph in terminal
+# px run px/cpu_flamegraph -p pod=payment-api
+
+# Step 4: Trace all active PostgreSQL queries across all namespaces
+# px run px/pgsql_data
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does CNCF Pixie achieve full-body HTTP and SQL tracing with zero application code changes?**
+
+Pixie attaches Extended Berkeley Packet Filter (eBPF) kprobes to Linux kernel system call boundaries (such as `sys_enter_write`, `sys_enter_read`, `sys_enter_sendto`) and uprobes to user-space cryptography libraries (such as OpenSSL `SSL_read` and `SSL_write`). As microservices make HTTP requests or execute database queries, the eBPF probes copy the protocol bytes into high-speed kernel ring buffers. Pixie's local parser parses the wire protocols (HTTP/1, HTTP/2, gRPC, PostgreSQL, MySQL) in real time without requiring SDKs or sidecars.
+
+**Q2: What is the Pixie Edge architecture, and why does it drastically reduce monitoring costs?**
+
+In traditional APM solutions, 100% of collected traces and logs are continuously streamed over the public internet to centralized SaaS providers, generating massive cloud network egress fees and high ingestion storage costs. Pixie stores all captured telemetry in **local node RAM tables (the Vizier agent)** for a rolling 24-hour retention window. Telemetry is processed and queried at the edge; data is only transmitted out of the node when an engineer actively runs an on-demand PxL script.
+
+**Q3: How does Pixie inspect HTTPS traffic without requiring custom TLS CA certificates?**
+
+Network packet sniffers fail on HTTPS because the data is encrypted before it reaches the network interface. Pixie bypasses this limitation by placing **Uprobes (User-Space Probes)** directly on the `SSL_read` and `SSL_write` functions inside the shared OpenSSL/BoringSSL libraries loaded into the application's memory space. Pixie intercepts the buffer payload *immediately before* the application encrypts it (on outbound write) or *immediately after* the library decrypts it (on inbound read), capturing plaintext payloads cleanly.
+
+**Q4: How does Pixie perform continuous CPU profiling without degrading application performance?**
+
+Pixie attaches a high-frequency kernel timer interrupt (e.g. 100Hz) to every CPU core on the host. When the interrupt fires, the eBPF program walks the execution stack trace of the currently active thread, recording the instruction pointers and function symbols in an in-kernel BPF map. Because the stack sampling occurs directly in kernel space without context switching or stopping the application process, it captures production CPU flame graphs with **less than 2% total CPU overhead**.
+
+**Q5: When should an enterprise choose OpenTelemetry over Pixie?**
+
+While Pixie excels at instant zero-code live debugging, short-term rolling retention, and CPU profiling, it is not designed for permanent multi-year compliance storage or custom business transaction metrics. **OpenTelemetry** is preferred when organizations need: (1) Long-term historical metric and trace retention in data lakes; (2) Tail-based sampling across distributed cloud regions; and (3) Explicit custom business telemetry (e.g. logging custom shopping cart values).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Pixie uses eBPF kprobes and uprobes for 100% zero-code auto-telemetry
+- [ ] Know that Pixie captures plaintext HTTPS traffic by probing OpenSSL `SSL_read/write`
+- [ ] Know that Pixie stores telemetry in local node RAM tables (Edge Architecture)
+- [ ] Know that Pixie generates continuous CPU flame graphs with $\le 2\%$ CPU overhead
+- [ ] Know that PxL (Pixie Query Language) uses Python/Pandas-like DataFrame syntax
+- [ ] Know the distinct roles of Pixie (Edge Debugging) vs OTel (Long-term APM) vs Hubble (Network)
+- [ ] Can run live Pixie queries using `px run px/http_data`

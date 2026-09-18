@@ -1,0 +1,202 @@
+---
+title: "Chapter 1 — Namespace Fundamentals & Lifecycle"
+sidebar_position: 1
+module: "Module 3.1 — Namespace Fundamentals"
+description: "Master Linux Namespace fundamentals — task_struct and nsproxy kernel structures, /proc/[pid]/ns/ descriptors, clone(), unshare(), and setns() syscalls."
+---
+
+# Chapter 1 — Linux Namespace Fundamentals & Lifecycle
+
+> **Goal:** Master the internal Linux kernel data structures, system call interfaces, and lifecycle mechanics of **Linux Namespaces** — dissecting how the kernel partitions global operating system resources via **`struct task_struct`** and **`struct nsproxy`**, inspecting magic symlinks in **`/proc/[pid]/ns/`**, mastering the 3 fundamental system calls (**`clone()`**, **`unshare()`**, and **`setns()`**), and analyzing namespace reference counting and persistence.
+>
+> By the end of this chapter, you will understand:
+> 1. How Linux Namespaces virtualize kernel global state without CPU virtualization overhead
+> 2. How the kernel `task_struct` references namespaces via the `nsproxy` struct
+> 3. The role and inode semantics of the `/proc/[pid]/ns/` filesystem descriptors
+> 4. How `clone()`, `unshare()`, and `setns()` create, detach, and enter namespaces
+> 5. How bind-mounting a `/proc/[pid]/ns/` file descriptor prevents namespace garbage collection
+> 6. How to inspect, create, and attach to raw namespaces using native Linux tools
+
+---
+
+## Real-Life Analogy
+
+Think of Linux Namespaces as **custom digital augmented-reality (AR) smart glasses given to different workers in the same office building**:
+
+- **The Shared Building (The Linux Kernel):**
+  - All workers walk on the same concrete floor, breathe the same air, and use the same electricity (**Hardware CPU, RAM, and Kernel**).
+- **The AR Smart Glasses (The Linux Namespace):**
+  - Worker A puts on Glass Model #1 (**Container A's Namespaces**).
+  - When Worker A looks at the employee roster, the display shows only 1 person in the building: Worker A (**PID Namespace: PID 1**).
+  - When Worker A looks at the desk phone, the screen displays a private extension: `10.244.1.5` (**Network Namespace**).
+  - When Worker A opens the storage closet, they see only their private tools (**Mount Namespace**).
+- **The 3 Key Controls:**
+  - **`clone()` (Spawning a Clone):** Worker A presses a button on their glasses, creating a twin worker who is born wearing the exact same AR glasses.
+  - **`unshare()` (Changing the Lens):** Worker A presses a button that instantly swaps their glasses for a brand-new, private AR lens.
+  - **`setns()` (Joining Another Room):** A manager takes off their glasses and plugs into Worker A's glasses feed to see exactly what Worker A is seeing (**`nsenter` / `docker exec`**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Linux Kernel Namespace Architecture: `task_struct` ──► `nsproxy`
+
+ LINUX PROCESS IN KERNEL SPACE (`struct task_struct`)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ PID: 48921 | Name: "python3" | State: TASK_RUNNING                     │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ Pointer: `struct nsproxy *nsproxy`                                     │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Points to active namespace proxy structure
+                    ▼
+ LINUX KERNEL `struct nsproxy` (Shared or Dedicated Namespace Pointers)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ ├── `pid_ns_for_children` ──► struct pid_namespace    (Inode: 4026532840)│
+ │ ├── `net_ns`              ──► struct net              (Inode: 4026532841)│
+ │ ├── `mnt_ns`              ──► struct mnt_namespace    (Inode: 4026532842)│
+ │ ├── `uts_ns`              ──► struct uts_namespace    (Inode: 4026532843)│
+ │ ├── `ipc_ns`              ──► struct ipc_namespace    (Inode: 4026532844)│
+ │ ├── `cgroup_ns`           ──► struct cgroup_namespace (Inode: 4026532845)│
+ │ └── `time_ns`             ──► struct time_namespace   (Inode: 4026532846)│
+ └────────────────────────────────────────────────────────────────────────┘
+                    ▲
+                    │ Exposed to User Space via `/proc`
+                    ▼
+ USER-SPACE DESCRIPTORS: `/proc/48921/ns/` (Magic Symlinks with Inode IDs)
+```
+
+---
+
+## The Namespace Filesystem Interface: `/proc/[pid]/ns/`
+
+Every process on a Linux machine exposes its currently assigned namespaces as special symlinks inside `/proc/[pid]/ns/`:
+
+```bash
+ls -la /proc/$$/ns/
+# Output:
+# cgroup -> cgroup:[4026531835]
+# ipc    -> ipc:[4026531839]
+# mnt    -> mnt:[4026531840]
+# net    -> net:[4026531992]
+# pid    -> pid:[4026531836]
+# pid_for_children -> pid:[4026531836]
+# time   -> time:[4026531834]
+# user   -> user:[4026531837]
+# uts    -> uts:[4026531838]
+```
+
+### Inode Rule of Thumb:
+- If Process A and Process B have the **same inode number** for `net:[4026531992]`, they share the **exact same network interfaces, IP addresses, and routing tables** (e.g. containers in the same Kubernetes Pod).
+- If they have **different inode numbers**, they are completely isolated from each other.
+
+---
+
+## The 3 Core Namespace System Calls
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ System Call (C ABI)  │ Invocation Behavior     │ Container Lifecycle Responsibility                │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **1. `clone()`**     │ `clone(flags, ...)`     │ **Process Spawning**: Creates a new child process │
+ │                      │ with `CLONE_NEW*` flags │ and instantly places it inside brand-new isolated │
+ │                      │                         │ namespaces. Used by `runc create`.                │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **2. `unshare()`**   │ `unshare(flags)`        │ **Self-Isolation**: Detaches the calling process  │
+ │                      │ with `CLONE_NEW*` flags │ from its current namespace and moves it into a new│
+ │                      │                         │ private namespace without spawning a child.       │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **3. `setns()`**     │ `setns(fd, nstype)`     │ **Namespace Joining**: Attaches the calling       │
+ │                      │ takes open `/proc` fd   │ process to an already existing namespace. Used by │
+ │                      │                         │ `docker exec`, `kubectl exec`, and `nsenter`.     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Namespace Reference Counting & Lifetime
+
+A Linux namespace remains alive in kernel memory as long as its **reference counter is greater than zero ($> 0$)**.
+
+### What increments the reference counter?
+1. An active running process whose `task_struct->nsproxy` points to the namespace.
+2. An open file descriptor pointing to `/proc/[pid]/ns/<type>`.
+3. A **Bind Mount** pinning `/proc/[pid]/ns/<type>` to a path on disk (e.g. `/var/run/netns/my-net`).
+
+```text
+ How to Keep a Network Namespace Alive with ZERO Running Processes:
+ 1. Create namespace: `ip netns add custom-net`
+ 2. Linux kernel internally executes: `mount --bind /proc/self/ns/net /var/run/netns/custom-net`
+ 3. The bind mount holds a reference count of 1! The network namespace persists indefinitely!
+```
+
+---
+
+## Hands-On Lab: Persisting and Entering Namespaces Manually
+
+```bash
+# Step 1: Create a directory to hold persistent namespace bind mounts
+sudo mkdir -p /var/run/netns
+
+# Step 2: Create a detached network namespace using Linux 'ip netns'
+sudo ip netns add isolated-net
+
+# Step 3: Inspect the persistent namespace bind mount on disk
+ls -l /var/run/netns/isolated-net
+# (Points directly to the kernel network namespace inode!)
+
+# Step 4: Execute a command inside the isolated network namespace
+sudo ip netns exec isolated-net ip link list
+# Notice: Only the loopback 'lo' interface exists, in DOWN state!
+
+# Step 5: Join the persistent namespace using raw 'nsenter'
+sudo nsenter --net=/var/run/netns/isolated-net ip addr
+
+# Step 6: Delete the persistent namespace (Unbinds mount and triggers kernel GC)
+sudo ip netns del isolated-net
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a Linux Namespace, and how does the kernel manage it internally?**
+
+A Linux Namespace is a kernel-level virtualization mechanism that partitions global operating system resources (PIDs, network devices, mount points, IPC queues, hostnames, user IDs) so that processes within a namespace believe they possess their own dedicated instance of that resource. Internally, each process's `struct task_struct` contains a pointer to a **`struct nsproxy`**, which holds pointers to individual namespace structs (such as `struct net` or `struct pid_namespace`). When a kernel subsystem resolves a resource (e.g. finding a process by PID), it queries the namespace pointed to by the caller's `nsproxy`.
+
+**Q2: What is the difference between `clone()`, `unshare()`, and `setns()`?**
+
+- **`clone()`**: Creates a **new child process** and optionally places it into newly created namespaces if flags like `CLONE_NEWPID` or `CLONE_NEWNET` are passed.
+- **`unshare()`**: Allows an **already existing process** to disassociate itself from its shared namespaces and create new private namespaces without spawning a child.
+- **`setns()`**: Allows a process to **join an existing namespace** by passing an open file descriptor pointing to a `/proc/[pid]/ns/<type>` file.
+
+**Q3: How does `docker exec` or `kubectl exec` attach to a running container?**
+
+When you run `docker exec -it <container> sh`:
+1. The container engine inspects the container's main host PID (e.g. PID 48921).
+2. It opens file descriptors to `/proc/48921/ns/mnt`, `/proc/48921/ns/net`, `/proc/48921/ns/pid`, etc.
+3. The engine forks a new process and invokes the **`setns(2)`** system call for each file descriptor.
+4. The new process enters the container's namespaces and executes `/bin/sh`, running alongside the container's processes.
+
+**Q4: How do you determine if two processes on a Linux host are running in the same Network Namespace?**
+
+Inspect the inode numbers of their network namespace descriptors in `/proc`:
+```bash
+ls -l /proc/<PID_A>/ns/net /proc/<PID_B>/ns/net
+```
+If both symlinks point to the exact same inode string (e.g. `net:[4026532841]`), both processes share the **exact same network stack**, IP addresses, listening ports, and routing tables. If the numbers differ, they are in isolated network namespaces.
+
+**Q5: What happens to a Linux namespace when the last process inside it terminates?**
+
+By default, the Linux kernel uses **reference counting** for namespaces. When the last process in a namespace terminates and its `task_struct` is freed, the reference count drops to zero ($0$). The kernel's garbage collector immediately frees the namespace's memory and tears down associated resources (e.g. deleting virtual network interfaces). However, if the namespace file descriptor was **bind-mounted to disk (e.g. `/var/run/netns/<name>`)**, the mount holds a reference count of 1, preserving the namespace even with zero running processes.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Linux namespaces partition global kernel resources without VM overhead
+- [ ] Know that `task_struct` points to namespaces via the `nsproxy` struct
+- [ ] Know that `/proc/[pid]/ns/` lists active namespace inode descriptors
+- [ ] Know the 3 syscalls: `clone()` (spawn), `unshare()` (detach), `setns()` (join)
+- [ ] Know that matching `/proc/[pid]/ns/` inode numbers mean shared namespaces
+- [ ] Know how bind mounts prevent kernel namespace garbage collection

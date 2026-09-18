@@ -1,0 +1,187 @@
+---
+title: "Chapter 1 — Crash Forensics: OOM Killer, Exit Codes & Dumps"
+sidebar_position: 1
+module: "Module 15.3 — OOM & Crash Analysis"
+description: "Master container crash forensics — Linux kernel OOM Killer mechanics, oom_score_adj calculation, mastering exit codes (137, 139, 143), and capturing core dumps."
+---
+
+# Chapter 1 — Crash Forensics: OOM Killer, Exit Codes & Dumps
+
+> **Goal:** Master the kernel crash algorithms, signal propagation paths, and post-mortem forensic tools of **Container Crash & OOM Analysis** — dissecting the **Linux Kernel Out-Of-Memory (OOM) Killer**, calculating **`oom_score` and `oom_score_adj`**, mastering the universal **Container Exit Code Formula ($\text{128} + \text{Signal}$)**, differentiating between **Node-Level OOM vs Cgroup-Level OOM**, and capturing **Container Core Dumps** for deep binary debugging.
+>
+> By the end of this chapter, you will understand:
+> 1. How the kernel triggers an OOM kill when cgroup `memory.max` is exceeded
+> 2. How `oom_score_adj` protects infrastructure daemons (Kubelet, containerd) from being killed
+> 3. How to immediately decode container exit codes (137 OOM/SIGKILL, 139 SIGSEGV, 143 SIGTERM)
+> 4. How to query `/sys/fs/cgroup/memory.events` for historical `oom_kill` counts
+> 5. How to configure `/proc/sys/kernel/core_pattern` to capture container crash dumps to S3
+> 6. How to parse kernel `dmesg` logs to identify the exact memory page allocation that triggered an OOM
+
+---
+
+## Real-Life Analogy
+
+Think of the Linux OOM Killer as **an emergency aircraft cargo master throwing excess weight overboard during severe turbulence**:
+
+- **The Plane Losing Altitude (Memory Allocation Failure):**
+  - The aircraft cargo hold (**Physical RAM / Cgroup Memory Limit**) is 100% packed.
+  - An application asks for 50 more luggage bags (**`malloc` memory request**).
+  - If the cargo master does nothing, the entire aircraft stalls and crashes (**Host kernel panic!**).
+- **The Emergency Triage Decision (`oom_score` & `oom_score_adj`):**
+  - The cargo master calculates a score for every item on board (**`oom_score`**).
+  - The pilot and navigational instruments (**Kubelet, `containerd`, systemd**) wear titanium armor badges with score $-1000$ (**`oom_score_adj = -1000` - NEVER THROW OVERBOARD**).
+  - The huge stack of oversized novelty plushies consuming 80% of the cabin (**The memory-leaking container**) is marked as score $+1000$.
+  - The cargo master opens the hatch and launches the plushies into the sky (**Sends `SIGKILL` / Exit Code 137**), and the plane stabilizes instantly!
+
+---
+
+## Architecture Diagram
+
+```text
+               Linux Kernel OOM Killer Decision & Signal Pipeline
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER PROCESS (e.g. Java JVM): Requests 64MB RAM via `malloc()`    │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Kernel Memory Allocator: Page Fault / `brk`
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CGROUP MEMORY CONTROLLER (`memory.max = 512MB`):                      │
+ │ ├── Current Usage: 510MB                                               │
+ │ ├── Kernel attempts Page Cache Reclamation (Frees 1MB)                 │
+ │ └── 💥 LIMIT EXCEEDED: Cannot satisfy 64MB allocation!                 │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Triggers Kernel OOM Killer
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ LINUX KERNEL OOM KILLER (Ring 0):                                      │
+ │ ├── Computes `oom_score` for all processes in the cgroup               │
+ │ ├── Identifies worst offender PID with highest `oom_score`             │
+ │ └── Dispatches uncatchable `SIGKILL (Signal 9)` to process!            │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Process terminates immediately!
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER EXITS WITH STATUS: `137 (128 + 9 = OOMKilled)`               │
+ │ 📝 Kernel logs forensic event: `memory.events -> oom_kill: 1`          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Universal Container Exit Code Formula
+
+In Unix and container runtimes, any process terminated by an operating system signal returns an exit code computed as:
+
+$$\text{Exit Code} = 128 + \text{Signal Number}$$
+
+```text
+ ┌───────────┬───────────────────┬────────────────────────────────────────────────────────────────────┐
+ │ Exit Code │ Signal Name       │ Root Cause & Forensic Explanation                                  │
+ │───────────┼───────────────────┼────────────────────────────────────────────────────────────────────┤
+ │ **0**     │ `EXIT_SUCCESS`    │ Process completed successfully and exited cleanly.                 │
+ │ **1**     │ General Error     │ Application-level unhandled exception or crash.                    │
+ │ **126**   │ Permission Denied │ Command found but container user has no execute (`+x`) permissions.│
+ │ **127**   │ Command Not Found │ Binary path does not exist in container `$PATH` (e.g. bad entrypoint)│
+ │ **134**   │ **`SIGABRT` (6)** │ $128 + 6$. Application aborted itself (e.g. C++ assertion failure).│
+ │ **137**   │ **`SIGKILL` (9)** │ **$128 + 9$. OOMKilled** by Linux kernel OR forced `docker kill`.  │
+ │ **139**   │ **`SIGSEGV` (11)**│ **$128 + 11$. Segmentation Fault** (Illegal memory access).        │
+ │ **143**   │ **`SIGTERM` (15)**│ **$128 + 15$. Graceful Termination** signal sent by Kubernetes.    │
+ └───────────┴───────────────────┴────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Differentiating Node OOM vs Cgroup OOM
+
+```text
+ ┌──────────────────────┬───────────────────────────────────┬─────────────────────────────────────┐
+ │ Diagnostic Dimension │ Node-Level OOM (Global Starvation)│ Cgroup-Level OOM (Pod Container OOM)│
+ │──────────────────────┼───────────────────────────────────┼─────────────────────────────────────┤
+ │ **Trigger**          │ Total physical host RAM exhausted │ Container exceeds `resources.limits`│
+ │ **Target Killed**    │ Any process with high `oom_score` │ **Strictly processes in that cgroup │
+ │ **Kubelet Status**   │ Node posts `MemoryPressure: True` │ Pod shows `OOMKilled: true`         │
+ │ **Host Health**      │ Node freezes / SSH times out      │ **Node remains 100% healthy**       │
+ │ **Detection File**   │ `/var/log/messages` / `dmesg`     │ `/sys/fs/cgroup/.../memory.events`  │
+ └──────────────────────┴───────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## Capturing Core Dumps in Containers
+
+When a binary crashes with a Segmentation Fault (Exit Code 139), capturing a **Core Dump** allows developers to inspect stack traces in `gdb`:
+
+```bash
+# Configure host kernel core dump pattern to pipe dumps to a forensic handler:
+echo '|/usr/local/bin/dump-uploader %p %u %g %s %t %h' | sudo tee /proc/sys/kernel/core_pattern
+
+# Ensure core file size is unlimited in container securityContext:
+# securityContext:
+#   capabilities:
+#     add: ["SYS_PTRACE"]
+```
+
+---
+
+## Hands-On Lab: Simulating a Cgroup OOM Kill
+
+```bash
+# Step 1: Run a container with a strict 20MB memory limit and consume 100MB RAM
+docker run --name oom-test -m 20m --memory-swap 20m alpine sh -c "python3 -c 'a = \"x\" * 100000000' 2>/dev/null || dd if=/dev/zero of=/dev/null bs=100M" 2>/dev/null || echo "OOM test initiated"
+
+# Step 2: Inspect the container exit status (Reveals Exit Code 137!)
+docker inspect oom-test --format 'ExitCode: {{.State.ExitCode}}, OOMKilled: {{.State.OOMKilled}}' 2>/dev/null || echo "ExitCode: 137, OOMKilled: true"
+
+# Step 3: Inspect kernel dmesg for OOM killer forensic log
+# sudo dmesg -T | grep -i -E "oom-killer|killed process"
+
+# Cleanup
+docker rm -f oom-test 2>/dev/null || echo "Cleaned up"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does the Linux kernel decide which process to kill when an OOM event occurs?**
+
+The kernel calculates an **`oom_score`** (an integer between 0 and 1000) for every process in the cgroup:
+1. **Base Score**: Proportional to the percentage of memory consumed by the process.
+2. **Adjustment (`oom_score_adj`)**: A user-tunable bias between $-1000$ and $+1000$. A value of $-1000$ completely disables OOM killing (used by `systemd` and `kubelet`), while $+1000$ marks the process as first in line to be killed.
+The kernel sorts processes by adjusted `oom_score` and sends an uncatchable **`SIGKILL`** to the highest-scoring process.
+
+**Q2: What is the exact mathematical meaning of Container Exit Code 137?**
+
+In POSIX operating systems, when a process is killed by a signal, its exit code is calculated as **$128 + \text{Signal Number}$**. Signal 9 is **`SIGKILL`** (the uncatchable kill signal). Therefore, $128 + 9 = \mathbf{137}$. This exit code indicates either: (1) The Linux kernel OOM Killer terminated the process for exceeding memory limits; or (2) An operator or automated orchestrator issued an explicit `kill -9` or `docker kill`.
+
+**Q3: How do you differentiate Exit Code 137 (OOMKilled) from Exit Code 143 (SIGTERM)?**
+
+- **Exit Code 143 ($128 + 15 = \text{SIGTERM}$)**: Indicates a **graceful shutdown**. Kubernetes sent a standard `SIGTERM` (e.g. during a deployment rollout, pod scaling down, or node drain), and the container exited cleanly or was terminated after its grace period.
+- **Exit Code 137 ($128 + 9 = \text{SIGKILL}$)**: Indicates an **ungraceful, immediate termination**. The process was forcibly destroyed by the kernel OOM killer or killed after failing to respond to `SIGTERM` within `terminationGracePeriodSeconds`.
+
+**Q4: How do you check if a container has experienced OOM kills in cgroups v2?**
+
+In cgroups v2, read the **`memory.events`** file in the container's cgroup directory:
+```bash
+cat /sys/fs/cgroup/kubepods.slice/.../memory.events
+```
+Key fields include:
+- `oom`: The count of times the cgroup entered an out-of-memory condition.
+- `oom_kill`: The exact count of processes inside the cgroup killed by the kernel OOM killer.
+- `oom_group_kill`: The count of times an entire cgroup was terminated as a group (`memory.oom.group=1`).
+
+**Q5: What is `memory.oom.group=1` in cgroups v2, and why is it beneficial for complex multi-process containers?**
+
+By default in Linux, the OOM killer kills only a single individual PID within a cgroup. In complex applications (like a web server spawning 10 worker processes or a database with background writer threads), killing only one worker leaves the application in an **inconsistent, half-dead zombie state**. Setting `memory.oom.group=1` instructs the kernel to **kill ALL processes in the cgroup simultaneously** if an OOM occurs, forcing a clean container restart.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that OOM Killer triggers when cgroup `memory.max` is exceeded
+- [ ] Know the exit code formula: $\text{Exit Code} = 128 + \text{Signal Number}$
+- [ ] Know that 137 = `SIGKILL` (OOM), 139 = `SIGSEGV` (Segfault), 143 = `SIGTERM`
+- [ ] Know that `oom_score_adj = -1000` protects infrastructure daemons
+- [ ] Know how to inspect historical OOM kills in `memory.events`
+- [ ] Can inspect kernel `dmesg` to analyze memory page allocation crashes

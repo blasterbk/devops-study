@@ -1,0 +1,293 @@
+---
+title: "Chapter 2 — Event Exporter & Alert Streaming"
+sidebar_position: 2
+module: "Module 6.7 — Kubernetes Events & Exporters"
+description: "Master Kubernetes Event Exporter — streaming ephemeral events to Slack, Elasticsearch, AWS S3, and Kafka, writing routing filter rules, and preserving long-term audit trails."
+---
+
+# Chapter 2 — Kubernetes Event Exporter & Alert Streaming
+
+> **Goal:** Master the architecture and deployment of the **Kubernetes Event Exporter** — understanding how to stream ephemeral Kubernetes events to persistent external sinks (Slack, Elasticsearch, OpenSearch, AWS S3, and Kafka), authoring precision routing filter rules to discard high-frequency noise while capturing high-severity `Warning` failures, and guaranteeing permanent compliance auditability for post-incident root cause analysis (RCA).
+>
+> By the end of this chapter, you will understand:
+> 1. How the Kubernetes Event Exporter maintains a continuous watch stream on the API server
+> 2. How to configure multi-destination streaming sinks (Slack, Elasticsearch, S3, Kafka)
+> 3. How to author routing filters to isolate critical failure reasons (`OOMKilled`, `FailedScheduling`)
+> 4. How to drop informational noise (`LeaderElection`, `Normal: Pulled`) to prevent alert fatigue
+> 5. How to structure JSON event payloads for enterprise SIEM ingestion
+> 6. How to deploy a production Event Exporter DaemonSet/Deployment
+
+---
+
+## Real-Life Analogy
+
+Think of the Kubernetes Event Exporter as **an automated court reporter stationed in the apartment building lobby who immediately copies and faxes important incidents to the police and fire departments**:
+
+- **The Problem (The 60-Minute Memory Loss):** The building lobby whiteboard (**`etcd`**) erases all event notes every 60 minutes (**1-Hour Event TTL**).
+- **The Event Exporter (The 24/7 Transcriber):** The Event Exporter sits in the lobby, watching the whiteboard with an optical camera (**Kubernetes API Watch Stream**).
+- **The Noise Filter (The Spam Squelch):** When someone buzzes the intercom to say hello (**`Normal: Pulled` or `LeaderElection Lease`**), the transcriber ignores it.
+- **The Priority Alerting Route (The Emergency Fax Machine - Slack & PagerDuty):** The moment someone types: *"Fire in Boiler Room 3! (**`Warning: FailedMount / OOMKilled`**)"*, the transcriber instantly faxes a high-priority alert to the Fire Chief's mobile phone (**Slack `#k8s-prod-alerts` channel**).
+- **The Permanent Cold Storage Archive (The Bank Safety Deposit Box - AWS S3 / Elasticsearch):** Every single incident note is microfilmed, encrypted, and mailed to a permanent salt-mine archive (**AWS S3 / Elasticsearch**), ensuring that when corporate lawyers investigate a lawsuit 3 years later (**Post-Mortem RCA / SOC2 Audit**), every historical record is preserved perfectly.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes Event Exporter Pipeline Architecture
+
+ KUBERNETES CONTROL PLANE                              EVENT EXPORTER DEPLOYMENT
+ ┌──────────────────────────────────────┐             ┌──────────────────────────────────────┐
+ │ Kube-APIServer: Events Stream        │             │ Kubernetes Event Exporter Pod        │
+ │ API: `/api/v1/events?watch=true`     │────────────►│ (Maintains persistent HTTP Watch)    │
+ └──────────────────────────────────────┘             └──────────────────┬───────────────────┘
+                                                                         │
+                                                                         ▼ Evaluates Routing Rules
+                                                      ┌──────────────────────────────────────┐
+                                                      │ ROUTING & FILTERING ENGINE:          │
+                                                      │                                      │
+                                                      │ 1. Drop: Type == "Normal"            │
+                                                      │ 2. Match: Type == "Warning" AND      │
+                                                      │    Reason in [FailedMount, OOMKilled]│
+                                                      └──────────────────┬───────────────────┘
+                                                                         │
+           ┌────────────────────────┬────────────────────────────────────┼────────────────────────────────────┐
+           ▼                        ▼                                    ▼                                    ▼
+ ┌──────────────────┐     ┌──────────────────┐                 ┌──────────────────┐                 ┌──────────────────┐
+ │ SINK 1: Slack    │     │ SINK 2: Opsgenie │                 │ SINK 3: OpenSearch│                 │ SINK 4: AWS S3   │
+ │ Real-Time Alert  │     │ PagerDuty On-Call│                 │ Queryable Search │                 │ Cold Compliance  │
+ │ #k8s-prod-alerts │     │ Urgent Incident  │                 │ 90-Day Retention │                 │ 7-Year Archive   │
+ └──────────────────┘     └──────────────────┘                 └──────────────────┘                 └──────────────────┘
+```
+
+---
+
+## The Event Exporter Routing & Filtering Engine
+
+The Event Exporter uses a declarative YAML configuration divided into **`receivers`** (the destination endpoints) and **`route`** (the filtering rules):
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Routing Field        │ Purpose & Filtering Capabilities                                            │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`match`**          │ Whitelist criteria: `type`, `reason`, `namespace`, `component`, `kind`.     │
+ │                      │ (e.g. `type: Warning` matches only error and warning events).               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`drop`**           │ Blacklist criteria: Excludes specific high-volume noise.                     │
+ │                      │ (e.g. drops `reason: LeaderElection` or `namespace: kube-system`).         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`receivers`**      │ Array of target destinations to send matched events to                      │
+ │                      │ (e.g. `["slack", "elasticsearch", "s3"]`).                                  │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Complete Production Event Exporter Configuration
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: event-exporter-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    logLevel: info
+    logFormat: json
+    route:
+      # Top-Level Route Rules
+      routes:
+        # Route 1: Forward ALL Warning Events to Elasticsearch for Long-Term Storage
+        - match:
+            - type: "Warning"
+          receivers:
+            - "elasticsearch"
+
+        # Route 2: Forward Critical Infrastructure Failures to Slack
+        - match:
+            - type: "Warning"
+              reason: "FailedMount|FailedScheduling|BackOff|Unhealthy|OOMKilled|Evicted"
+          drop:
+            - namespace: "kube-system" # Ignore non-production noise
+          receivers:
+            - "slack"
+
+    # Destination Receivers Configuration
+    receivers:
+      # SINK 1: Slack Webhook Channel
+      - name: "slack"
+        slack:
+          token: "xoxb-YOUR-SLACK-BOT-TOKEN"
+          channel: "#k8s-prod-alerts"
+          message: |
+            🚨 *Kubernetes Warning Event* 🚨
+            *Cluster:* `production-us-east-1`
+            *Namespace:* `{{ .Namespace }}` | *Kind:* `{{ .InvolvedObject.Kind }}`
+            *Resource:* `{{ .InvolvedObject.Name }}`
+            *Reason:* `{{ .Reason }}` (Count: {{ .Count }})
+            *Message:* ```{{ .Message }}```
+
+      # SINK 2: Elasticsearch / OpenSearch Storage
+      - name: "elasticsearch"
+        elasticsearch:
+          hosts:
+            - "http://opensearch-cluster.monitoring.svc:9200"
+          index: "k8s-events"
+          indexFormat: "k8s-events-{2006.01.02}"
+          useV7: true
+```
+
+---
+
+## Production Event Exporter Deployment Manifest
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: event-exporter
+spec:
+  replicas: 1                          # Single replica avoids duplicate stream sends!
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: event-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: event-exporter
+    spec:
+      serviceAccountName: event-exporter-sa
+      containers:
+      - name: event-exporter
+        image: ghcr.io/resmoio/kubernetes-event-exporter:v1.6
+        args:
+          - -conf=/data/config.yaml
+        volumeMounts:
+        - name: cfg
+          mountPath: /data
+          readOnly: true
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 10001
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
+      volumes:
+      - name: cfg
+        configMap:
+          name: event-exporter-config
+```
+
+---
+
+## Hands-On Lab: Deploying and Testing Event Streaming
+
+```bash
+# Step 1: Create a test namespace
+kubectl create namespace event-lab
+
+# Step 2: Deploy a mock Event Exporter using a simulated stdout sink
+cat <<EOF | kubectl apply -f - -n event-lab
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-event-exporter-cfg
+data:
+  config.yaml: |
+    logLevel: debug
+    logFormat: json
+    route:
+      routes:
+        - match:
+            - type: "Warning"
+          receivers:
+            - "stdout"
+    receivers:
+      - name: "stdout"
+        stdout: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-event-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-event-exporter
+  template:
+    metadata:
+      labels:
+        app: test-event-exporter
+    spec:
+      containers:
+      - name: exporter
+        image: ghcr.io/resmoio/kubernetes-event-exporter:v1.6
+        args: ["-conf=/data/config.yaml"]
+        volumeMounts:
+        - name: cfg
+          mountPath: /data
+      volumes:
+      - name: cfg
+        configMap:
+          name: test-event-exporter-cfg
+EOF
+
+# Step 3: Trigger a Warning Event by launching a Pod that fails to schedule
+kubectl run unschedulable-pod -n event-lab --image=alpine:latest --overrides='{"spec":{"nodeSelector":{"disk":"nonexistent"}}}'
+
+# Step 4: Verify that Event Exporter captured and processed the FailedScheduling event!
+kubectl logs -n event-lab -l app=test-event-exporter --tail=20
+
+# Step 5: Clean up lab
+kubectl delete namespace event-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Kubernetes Event Exporter, and why is it considered a mandatory production add-on?**
+
+The Kubernetes Event Exporter is an open-source controller that maintains a persistent watch stream on the Kubernetes Events API (`/api/v1/events?watch=true`). It is considered mandatory in production because native Kubernetes Events have an **ephemeral 1-hour retention TTL in `etcd`**. Without an external event exporter, critical incident records (such as OOMKills, node disk pressure, and volume mount failures) are permanently purged after 60 minutes, making next-day post-mortem root cause analysis (RCA) and long-term compliance audits impossible.
+
+**Q2: How does the Event Exporter prevent alert fatigue when sending notifications to Slack or PagerDuty?**
+
+The Event Exporter features a multi-tiered routing and filtering engine. To prevent alert fatigue: (1) It drops all `Normal` informational events (like image pulls and container starts); (2) It applies regex match filters to forward only critical `Warning` reasons (`FailedMount`, `FailedScheduling`, `OOMKilled`, `CrashLoopBackOff`); and (3) It excludes noisy background namespaces (such as `kube-system` or ephemeral test namespaces) from human alert channels.
+
+**Q3: How does the Event Exporter stream events to multiple independent sinks simultaneously?**
+
+The Event Exporter decouples routing logic from output destinations. A single matching rule can define multiple receivers simultaneously (e.g. `receivers: ["slack", "opensearch", "s3"]`). When an event occurs, the Exporter formats the event payload into customized formats (e.g. rich Block Kit markdown for Slack, structured JSON documents for OpenSearch, and raw compressed JSON lines for S3 buckets) and dispatches them in parallel.
+
+**Q4: What RBAC permissions are required for the Event Exporter ServiceAccount?**
+
+The Event Exporter requires read-only cluster-wide access to Events. It needs a `ClusterRole` granting `get`, `list`, and `watch` permissions on `events` resources in both the core `""` API group and the `events.k8s.io` API group, bound to its `ServiceAccount` via a `ClusterRoleBinding`.
+
+**Q5: What is the impact of running multiple replicas of the Event Exporter?**
+
+Because the Event Exporter reads from a stateless HTTP watch stream without leader election coordination, running multiple replicas will cause **duplicate alerts** to be sent to external sinks (e.g. two identical Slack notifications and duplicate Elasticsearch documents for every single cluster event). Therefore, the Event Exporter is intentionally deployed with **`replicas: 1`**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Event Exporter preserves ephemeral 1-hour events permanently
+- [ ] Know how the Event Exporter maintains a continuous `/api/v1/events?watch=true` stream
+- [ ] Know the supported sinks: Slack, Elasticsearch, OpenSearch, AWS S3, Kafka
+- [ ] Know how `route.routes[].match` and `drop` rules filter out noise
+- [ ] Know why Event Exporter runs with `replicas: 1` to prevent duplicate alerts
+- [ ] Can inspect Event Exporter logs using `kubectl logs -l app.kubernetes.io/name=event-exporter`

@@ -1,0 +1,251 @@
+---
+title: "Chapter 2 — GCP Persistent Disk & Filestore CSI"
+sidebar_position: 2
+module: "Module 4.9 — Cloud Storage Integrations"
+description: "Master Google Cloud GKE storage — Compute Engine Persistent Disk CSI (pd-balanced, pd-ssd, Regional PD multi-zone replication), GCP Filestore CSI for RWX NFS, and Workload Identity."
+---
+
+# Chapter 2 — GCP Persistent Disk & Filestore CSI Drivers
+
+> **Goal:** Master Google Cloud storage integrations in Google Kubernetes Engine (GKE) — configuring the Compute Engine Persistent Disk CSI Driver (`pd.csi.storage.gke.io`), deploying **Regional Persistent Disks** with synchronous cross-zone replication ($RPO=0$), selecting performance tiers (`pd-balanced`, `pd-ssd`, `hyperdisk`), deploying Google Cloud Filestore for enterprise `ReadWriteMany` shared filesystems, and securing volumes with Customer-Managed Encryption Keys (CMEK).
+>
+> By the end of this chapter, you will understand:
+> 1. The GKE storage landscape: Compute Engine Persistent Disk vs Google Cloud Filestore
+> 2. The performance and cost profiles of `pd-standard`, `pd-balanced`, `pd-ssd`, and `hyperdisk`
+> 3. How **Regional Persistent Disks (`regional-pd`)** synchronously replicate data across 2 zones
+> 4. How Google Cloud Filestore CSI provisions managed NFS for multi-zone `ReadWriteMany`
+> 5. How to configure Customer-Managed Encryption Keys (CMEK) with Cloud KMS
+> 6. How to troubleshoot GKE volume attachment timeouts and regional failovers
+
+---
+
+## Real-Life Analogy
+
+Think of GCP Persistent Disk and Filestore as **different real estate security setups for a financial bank**:
+
+- **Zonal Persistent Disk (`pd-balanced` in `us-central1-a`):** A physical cash safe installed inside a bank branch in Downtown District A. It has high security and great performance. But if a hurricane shuts down power in Downtown District A (zone outage), nobody can access the safe until the power returns.
+- **Regional Persistent Disk (`replication-type: regional-pd`):** Two identical twin safes: one in Downtown District A and one in Uptown District B. A fiber-optic tunnel links the safes together. Every time a teller drops a dollar bill into Safe A, a laser beam instantly duplicates the bill into Safe B (**Synchronous Cross-Zone Replication**). If District A floods, the bank opens Safe B in District B in 10 seconds with **zero pennies lost ($RPO=0$)**.
+- **GCP Filestore Enterprise (A Cloud-Connected Multi-Branch Pneumatic System):** A central high-throughput storage hub connected to all branches across the entire state (`ReadWriteMany`). Hundreds of bank tellers across all zones read and deposit checks concurrently.
+
+---
+
+## Architecture Diagram
+
+```text
+               GCP Regional Persistent Disk vs Filestore CSI
+
+ 1. GCP Regional Persistent Disk (Synchronous 2-Zone Block Replication):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GCP Region: us-central1                                                │
+ │                                                                        │
+ │ ┌──────────────────────────────────┐  ┌──────────────────────────────┐ │
+ │ │ Zone: us-central1-a (PRIMARY)    │  │ Zone: us-central1-b (STANDBY)│ │
+ │ │ Worker Node A                    │  │ Worker Node B                │ │
+ │ │ [ Pod: postgres-primary ]        │  │                              │ │
+ │ │       ▲                          │  │                              │ │
+ │ │       │ Read/Write I/O           │  │                              │ │
+ │ │       ▼                          │  │                              │ │
+ │ │ Primary Block Replica ───────────┼──┼──► Synchronous Block Sync    │ │
+ │ │ (pd-balanced)                    │  │    Standby Block Replica     │ │
+ │ └──────────────────────────────────┘  └──────────────────────────────┘ │
+ └────────────────────────────────────────────────────────────────────────┘
+ (If Zone A dies ──► Pod fails over to Node B & mounts Standby Replica instantly!)
+
+ ──────────────────────────────────────────────────────────────────────────
+
+ 2. GCP Filestore CSI (Managed Cloud NFS - ReadWriteMany):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Google Cloud Filestore Instance (Enterprise NFS Tier)                  │
+ └───────┬────────────────────────────┬────────────────────────────┬──────┘
+         │                            │                            │
+         ▼                            ▼                            ▼
+ ┌───────────────────┐        ┌───────────────────┐        ┌───────────────────┐
+ │ Zone: 1a          │        │ Zone: 1b          │        │ Zone: 1c          │
+ │ [ Pod: worker-1 ] │        │ [ Pod: worker-2 ] │        │ [ Pod: worker-3 ] │
+ └───────────────────┘        └───────────────────┘        └───────────────────┘
+ (Result: True multi-zone RWX shared storage managed by Google Cloud!)
+```
+
+---
+
+## GCP Persistent Disk Tiers
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Disk Type            │ CSI Parameter Value     │ Performance Profile & Use Case                    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **pd-standard**      │ `pd-standard`           │ Standard spinning HDD. Cost-effective for large   │
+ │                      │                         │ sequential cold data, logs, and batch processing. │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **pd-balanced**      │ `pd-balanced`           │ **GKE Default Standard.** Slower than pure SSD    │
+ │                      │                         │ but significantly cheaper. Great for web apps.    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **pd-ssd**           │ `pd-ssd`                │ High-performance NVMe/SSD storage for transactional│
+ │                      │                         │ databases (PostgreSQL, MySQL, Redis, MongoDB).    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **hyperdisk-extreme**│ `hyperdisk-extreme`     │ Extreme enterprise I/O: Up to 500,000 IOPS and    │
+ │                      │                         │ 10,000 MB/s throughput for massive analytics.     │
+ └──────────────────────┴─────────────────────────┴───────────────────────────────────────────────────┘
+```
+
+---
+
+## Regional Persistent Disks: Multi-Zone High Availability
+
+Standard cloud block storage is limited to one Availability Zone. **GCP Regional Persistent Disks (`regional-pd`)** solve this by replicating block data synchronously across two distinct zones within the same GCP region:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gcp-regional-ssd-sc
+provisioner: pd.csi.storage.gke.io
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  type: pd-ssd
+  # Enables synchronous 2-zone replication!
+  replication-type: regional-pd
+```
+
+```text
+ Key High-Availability Guarantees:
+ 1. Zero Recovery Point Objective (RPO = 0): Every write syscall is acknowledged ONLY after 
+    being written to both zones simultaneously.
+ 2. Fast Recovery Time Objective (RTO < 60s): If the primary worker node's zone crashes, 
+    Kubernetes re-schedules the StatefulSet Pod to the secondary zone. The secondary replica 
+    attaches instantly with ZERO data restore procedures!
+```
+
+---
+
+## Google Cloud Filestore CSI Driver (RWX)
+
+For workloads requiring shared multi-node file access (`ReadWriteMany`), GKE provides the managed **Filestore CSI Driver (`filestore.csi.storage.gke.io`)**:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gcp-filestore-rwx-sc
+provisioner: filestore.csi.storage.gke.io
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+parameters:
+  tier: enterprise          # Options: basic-ssd, enterprise, regional
+  network: default
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-analytics-pvc
+  namespace: data-science
+spec:
+  accessModes:
+    - ReadWriteMany         # Shared across all GKE nodes!
+  storageClassName: gcp-filestore-rwx-sc
+  resources:
+    requests:
+      storage: 1Ti          # Filestore Enterprise minimum allocation
+```
+
+---
+
+## Customer-Managed Encryption Keys (CMEK)
+
+To comply with HIPAA, SOC2, or PCI-DSS regulations, storage can be encrypted using keys stored in **Google Cloud KMS**:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gcp-cmek-encrypted-sc
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-balanced
+  # Google Cloud KMS Key Resource ID
+  disk-encryption-kms-key: "projects/my-company-prod/locations/us-central1/keyRings/db-keyring/cryptoKeys/postgres-key"
+```
+
+---
+
+## Hands-On Lab: Deploying a GCP StorageClass & PVC
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace gcp-storage-lab
+
+# Step 2: Create a GCP Regional Persistent Disk StorageClass
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lab-gcp-regional
+provisioner: pd.csi.storage.gke.io
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+parameters:
+  type: pd-balanced
+  replication-type: regional-pd
+EOF
+
+# Step 3: Create a matching PVC
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gcp-claim
+  namespace: gcp-storage-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lab-gcp-regional
+  resources:
+    requests:
+      storage: 50Gi
+EOF
+
+# Step 4: Inspect PVC status (Awaiting pod scheduling via WaitForFirstConsumer)
+kubectl get pvc -n gcp-storage-lab
+
+# Step 5: Clean up lab
+kubectl delete namespace gcp-storage-lab
+kubectl delete storageclass lab-gcp-regional
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are GCP Regional Persistent Disks, and how do they achieve zero data loss ($RPO=0$)?**
+
+GCP Regional Persistent Disks (`replication-type: regional-pd`) are block storage devices that synchronously replicate data across **two separate Availability Zones** in the same region at the storage virtualization layer. Whenever a database executes a write operation, the write is not acknowledged until it has been safely committed to storage in both zones. If an entire cloud zone experiences a power or network failure, Kubernetes can immediately attach the replica in the secondary zone with zero data loss.
+
+**Q2: What is the difference between `pd-balanced` and `pd-ssd` in Google Cloud?**
+
+- `pd-balanced`: A cost-optimized SSD storage tier designed as the general-purpose default for GKE. It balances price and performance, delivering solid IOPS and throughput at roughly half the cost of `pd-ssd`.
+- `pd-ssd`: A premium solid-state storage tier designed for enterprise high-transaction databases (PostgreSQL, Cassandra, Elasticsearch) requiring consistent single-digit millisecond latency and maximum sustained IOPS.
+
+**Q3: When should you use Google Cloud Filestore in GKE?**
+
+Use Google Cloud Filestore when applications require a fully managed, POSIX-compliant NFS filesystem supporting concurrent read and write access across multiple worker nodes and multiple Availability Zones (`ReadWriteMany`). Common use cases include shared web application content management systems (WordPress, Drupal), shared machine learning datasets, and legacy multi-instance file processing pipelines.
+
+**Q4: How does GKE manage CSI driver lifecycle and updates?**
+
+On Google Kubernetes Engine (GKE), the Compute Engine Persistent Disk CSI driver and Filestore CSI driver are managed **automatically as native GKE control plane add-ons**. Google Cloud handles driver version upgrades, security patches, CSI sidecar maintenance, and IAM permission bindings with zero manual intervention from cluster administrators.
+
+**Q5: What is Customer-Managed Encryption Keys (CMEK) in GKE storage?**
+
+CMEK allows organizations to encrypt Persistent Volumes using their own cryptographic keys managed inside Google Cloud KMS, rather than relying on Google-managed default encryption keys. By specifying `disk-encryption-kms-key` in a `StorageClass`, administrators maintain complete control over key rotation, revocation, and compliance audit trails.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that GCP Compute Engine PD provides block storage via `pd.csi.storage.gke.io`
+- [ ] Know that `pd-balanced` is the cost-effective enterprise default in GKE
+- [ ] Know how Regional PD (`replication-type: regional-pd`) achieves $RPO=0$ across 2 zones
+- [ ] Know that Google Cloud Filestore provides managed NFS for `ReadWriteMany` (RWX)
+- [ ] Know how to configure Customer-Managed Encryption Keys (CMEK) via Cloud KMS
+- [ ] Can view GKE storage classes using `kubectl get sc`

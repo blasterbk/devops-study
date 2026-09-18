@@ -1,0 +1,163 @@
+---
+title: "Chapter 1 — Rootless Networking: slirp4netns & pasta"
+sidebar_position: 1
+module: "Module 13.2 — Rootless Networking"
+description: "Master rootless container networking — comparing slirp4netns user-mode TCP/IP emulation with pasta (passt) zero-copy socket forwarding and port 80 binding rules."
+---
+
+# Chapter 1 — Rootless Networking: slirp4netns & pasta
+
+> **Goal:** Master the packet flow mechanics, user-space TCP/IP emulators, and socket proxy drivers of **Rootless Container Networking** — analyzing why unprivileged users cannot create kernel `veth` pairs, dissecting **`slirp4netns` (User-Mode Network Emulation)**, evaluating the high-performance **`pasta` (passt) Direct Socket Forwarder**, and resolving the **Privileged Port ($< 1024$) Binding Restriction**.
+>
+> By the end of this chapter, you will understand:
+> 1. Why standard Linux bridge and `veth` device creation requires root `CAP_NET_ADMIN`
+> 2. How `slirp4netns` translates container TAP frames into unprivileged host `socket()` calls
+> 3. How `pasta` achieves near-native wire speeds by eliminating user-space TCP/IP emulation
+> 4. Why rootless containers cannot bind to port 80/443 without kernel sysctl tuning
+> 5. How port forwarding works across unprivileged network namespace boundaries
+> 6. How to benchmark and configure rootless network drivers in production Podman clusters
+
+---
+
+## Real-Life Analogy
+
+Think of Rootless Networking as **a hotel guest connecting a private multi-device entertainment system inside their room**:
+
+- **The Rootful Approach (Drilling Holes in the Hotel Concrete Walls):**
+  - The guest uses heavy industrial drills to bore a hole through the hallway wall into the hotel's main telecommunications shaft (**Creates a kernel `veth` pair and attaches to host `cbr0` bridge**).
+  - Only the hotel master engineer has the legal authority to drill holes (**Requires host `CAP_NET_ADMIN`**).
+- **1. The `slirp4netns` Approach (The Software Travel Wi-Fi Hotspot):**
+  - The guest cannot touch the physical hotel wiring.
+  - They set up a software router on their laptop desk (**User-space TAP device**).
+  - When the TV wants to load a video, the software router translates the packet and makes a regular unprivileged web request over the hotel Wi-Fi (**Standard unprivileged `connect()` socket call**). It works, but the laptop CPU works double-time!
+- **2. The Modern `pasta` Approach (The Direct Plug Adapter):**
+  - Instead of running a complex virtual router, `pasta` directly bridges the socket connections between the room and the hotel router with zero translation delay (**Direct kernel socket mapping**)!
+
+---
+
+## Architecture Diagram
+
+```text
+               Rootless Networking: slirp4netns vs pasta Architecture
+
+ 1. `slirp4netns` (User-Space TCP/IP Emulation):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CONTAINER NETWORK NAMESPACE: `tap0` (10.0.2.100)                       │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Raw Ethernet Frames over UNIX Socket
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ `slirp4netns` DAEMON (Runs as unprivileged Host User):                 │
+ │ ├── Decodes Ethernet / IP / TCP headers in user space (High CPU!)      │
+ │ └── Translates into standard `connect()` / `send()` syscalls on host!  │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Standard User Socket
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ HOST NETWORK STACK & INTERNET (`eth0` on Host)                         │
+ └────────────────────────────────────────────────────────────────────────┘
+
+ ──────────────────────────────────────────────────────────────────────────────────
+
+ 2. `pasta` / `passt` (Modern Zero-Copy Direct Socket Mapping):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Direct 1-to-1 socket translation between Container NetNS and Host NetNS│
+ │ ⚡ 5x HIGHER THROUGHPUT! Zero full TCP/IP emulation overhead!          │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## `slirp4netns` vs `pasta` Performance Matrix
+
+```text
+ ┌──────────────────────┬───────────────────────────────────┬─────────────────────────────────────┐
+ │ Network Feature      │ `slirp4netns`                     │ `pasta` (passt)                     │
+ │──────────────────────┼───────────────────────────────────┼─────────────────────────────────────┤
+ │ **Architecture**     │ Full TCP/IP stack in user space   │ Direct kernel socket forwarding     │
+ │ **Throughput**       │ ~1.5 - 2.5 Gbps (CPU throttled)   │ **~10 - 25 Gbps (Near wire-speed)** │
+ │ **CPU Utilization**  │ High (Heavy user-space parsing)   │ **Low (Kernel socket splice)**      │
+ │ **Default In**       │ Legacy Podman / Docker Rootless   │ **Modern Podman 4.4+**              │
+ │ **IPv6 Support**     │ Yes                               │ **Yes (Seamless dual-stack)**       │
+ └──────────────────────┴───────────────────────────────────┴─────────────────────────────────────┘
+```
+
+---
+
+## Binding to Privileged Ports ($< 1024$)
+
+By default in Linux, binding to ports below 1024 (e.g. port 80 for HTTP or port 443 for HTTPS) requires `CAP_NET_BIND_SERVICE`, which unprivileged users do not possess.
+
+### 1. The Container Rootless Port Mapping Workaround:
+Map a high unprivileged host port (e.g. 8080) to container port 80:
+```bash
+podman run -d -p 8080:80 nginx
+```
+
+### 2. The Linux Kernel Sysctl Permanent Fix:
+To allow unprivileged users and rootless containers to bind directly to port 80/443 on the host:
+```bash
+# Allow unprivileged users to bind from port 0 upwards:
+sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+
+# Make persistent across reboots:
+echo "net.ipv4.ip_unprivileged_port_start = 0" | sudo tee -a /etc/sysctl.d/99-rootless.conf
+```
+
+---
+
+## Hands-On Lab: Benchmarking Rootless Network Drivers
+
+```bash
+# Step 1: Check the active unprivileged port start value on your system
+cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo "1024"
+
+# Step 2: Run a rootless container with pasta networking (Podman default)
+# podman run --network=pasta --rm alpine ping -c 3 8.8.8.8
+
+# Step 3: Run a rootless container with slirp4netns networking
+# podman run --network=slirp4netns --rm alpine ping -c 3 8.8.8.8
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why can't rootless containers use standard Linux `veth` pairs and bridge networking?**
+
+Creating a virtual Ethernet pair (`veth`) and attaching one end to a host bridge (like `cbr0` or `docker0`) requires modifying the **host's root Network Namespace**, which strictly mandates the `CAP_NET_ADMIN` capability on the host. Because rootless container runtimes execute as unprivileged regular users (e.g. UID 1000), the Linux kernel rejects any attempt to create host network interfaces with `EPERM (Operation not permitted)`.
+
+**Q2: How does `slirp4netns` enable internet connectivity for rootless containers?**
+
+`slirp4netns` creates a virtual **TAP device (`tap0`)** inside the container's unprivileged Network Namespace. A background `slirp4netns` process running in user space on the host connects to this TAP device via a UNIX socket:
+1. When the container sends an IP packet, it writes to `tap0`.
+2. `slirp4netns` reads the raw packet in user space and extracts the destination IP and payload.
+3. It opens a standard unprivileged POSIX socket (`connect()`) from the host user account to the destination server.
+4. When the response arrives, `slirp4netns` repackages it into an Ethernet frame and writes it back into `tap0`.
+
+**Q3: Why is `pasta` (passt) significantly faster than `slirp4netns`?**
+
+`slirp4netns` implements a complete virtual TCP/IP stack in user space, which requires parsing and reassembling every individual TCP segment, resulting in severe CPU overhead and packet serialization bottlenecks. **`pasta` (Pack A Socket To An Address)** bypasses user-space TCP/IP re-implementation: it maps container socket events directly to corresponding host sockets using Linux zero-copy mechanisms (`splice`), achieving **$5\times$ to $10\times$ higher network throughput** with minimal CPU utilization.
+
+**Q4: Why does running `podman run -p 80:80 nginx` fail for regular users, and how is it resolved?**
+
+The Linux kernel reserves ports `1–1023` as "privileged ports" to prevent unprivileged users from spoofing system services. When an unprivileged user requests port 80, the `bind()` syscall fails with `EACCES (Permission denied)`. This is resolved by adjusting the kernel sysctl:
+```bash
+sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+```
+This lowers the privileged port threshold to 0, allowing rootless containers to bind directly to ports 80 and 443.
+
+**Q5: How does source IP preservation behave in rootless container networking?**
+
+In `slirp4netns`, because packets from external clients are received by the user-space daemon and re-sent into the container via a local socket proxy, the container application sees all incoming traffic as originating from the gateway IP (`10.0.2.2`), **losing the client's real source IP**. In modern `pasta`, direct socket translation preserves the original client source IP address, which is critical for HTTP logging, rate limiting, and GeoIP routing.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that unprivileged users cannot create host `veth` pairs without `CAP_NET_ADMIN`
+- [ ] Know that `slirp4netns` emulates a full TCP/IP stack in user space via a TAP device
+- [ ] Know that `pasta` provides zero-copy high-performance rootless networking
+- [ ] Know that `pasta` is the default rootless network driver in modern Podman
+- [ ] Know that `net.ipv4.ip_unprivileged_port_start=0` allows binding to port 80/443
+- [ ] Can configure rootless port publishing using `-p 8080:80`

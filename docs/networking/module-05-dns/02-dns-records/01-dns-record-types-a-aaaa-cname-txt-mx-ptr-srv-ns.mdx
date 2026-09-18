@@ -1,0 +1,164 @@
+---
+title: "Chapter 2 — DNS Record Types: A, AAAA, CNAME, TXT, MX, PTR, SRV, NS & SOA"
+sidebar_position: 1
+module: "Module 5.2 — DNS Records"
+description: "Master DNS Resource Record (RR) specifications — IPv4 (A), IPv6 (AAAA), Canonical Name (CNAME), Mail Exchange (MX), Text/SPF/DKIM (TXT), Reverse DNS (PTR), Service Discovery (SRV), and SOA."
+---
+
+# Chapter 2 — DNS Record Types: A, AAAA, CNAME, TXT, MX, PTR, SRV, NS & SOA
+
+> **Goal:** Master the syntax, wire format, and operational mechanics of core DNS Resource Records (RRs). Understand when and how to configure forward mapping, reverse DNS lookups, mail routing priorities, CNAME flattening at zone apex, cryptographic email authentication (SPF, DKIM, DMARC via TXT), and Kubernetes service discovery with SRV records.
+>
+> By the end of this chapter, you will understand:
+> 1. Master zone file syntax: Owner Name, TTL, Class (`IN`), Record Type, and RDATA
+> 2. Forward IP mapping: `A` (32-bit IPv4) and `AAAA` (128-bit IPv6) records
+> 3. Alias mapping: `CNAME` mechanics, CNAME at Zone Apex limitations, and ALIAS/ANAME solutions
+> 4. Mail Routing (`MX` with preference priorities) and Reverse DNS (`PTR` in `in-addr.arpa` / `ip6.arpa`)
+> 5. Service Discovery (`SRV` with Priority, Weight, Port, Target) in Kubernetes and Consul
+> 6. Identity & Security records: `TXT` (SPF, DKIM, DMARC), `CAA` (Certificate Authority Authorization), and `SOA`
+
+---
+
+## Real-Life Analogy
+
+Think of DNS Record Types as **different specialized sections inside a municipal phone directory**:
+
+- **A / AAAA Records (Direct Residential Phone Numbers):**
+  - *"Alice Smith lives at House #93 (IPv4) or Interplanetary GPS #2001:db8::1 (IPv6)"*.
+- **CNAME Record (Nickname / Forwarding Alias):**
+  - *"Bob's Bakery is an alias for Robert Miller Enterprises"*.
+- **MX Record (Designated Postal Mailroom):**
+  - *"Send all paper mail for Smith Corp to Mailroom Post Office Box 10, Priority 10"*.
+- **SRV Record (Office Extension Directory with Department Weights):**
+  - *"Customer Support is on Port 8080. If Reception Desk 1 is busy (Weight 50), try Reception Desk 2 (Weight 50)"*.
+- **TXT Record (Notarized Identity Verification & Watermarks):**
+  - A legally stamped affidavit on the back of the envelope proving the sender is authorized to represent Smith Corp (**SPF / DKIM**).
+
+---
+
+## Architecture Diagram
+
+```text
+                     Comprehensive DNS Resource Record (RR) Map
+                     
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ DNS ZONE FILE: "example.com"                                                │
+ │                                                                             │
+ │ ┌────────┬──────┬────┬────────┬───────────────────────────────────────────┐ │
+ │ │ Name   │ TTL  │Cls │ Type   │ Resource Data (RDATA)                     │ │
+ │ ├────────┼──────┼────┼────────┼───────────────────────────────────────────┤ │
+ │ │ @      │ 3600 │ IN │ SOA    │ ns1.example.com. admin.example.com. (...) │ │
+ │ │ @      │ 3600 │ IN │ NS     │ ns1.example.com.                          │ │
+ │ │ @      │ 300  │ IN │ A      │ 93.184.216.34                             │ │
+ │ │ @      │ 300  │ IN │ AAAA   │ 2606:2800:220:1:248:1893:25c8:1946        │ │
+ │ │ @      │ 600  │ IN │ MX     │ 10 mail.example.com.                      │ │
+ │ │ @      │ 3600 │ IN │ TXT    │ "v=spf1 include:_spf.google.com ~all"     │ │
+ │ │ www    │ 300  │ IN │ CNAME  │ example.com.                              │ │
+ │ │ _sip   │ 300  │ IN │ SRV    │ 10 60 5060 sipserver.example.com.         │ │
+ │ └────────┴──────┴────┴────────┴───────────────────────────────────────────┘ │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The Core DNS Record Types Matrix
+
+```text
+ ┌──────────┬──────────────────────────┬──────────────────────────────────────────────────────────────┐
+ │ Type     │ Name                     │ Function & RFC Reference                                     │
+ │──────────┼──────────────────────────┼──────────────────────────────────────────────────────────────┤
+ │ **A**    │ Address (IPv4)           │ Maps hostname to 32-bit IPv4 address (RFC 1035)              │
+ │ **AAAA** │ Address (IPv6)           │ Maps hostname to 128-bit IPv6 address (RFC 3596)             │
+ │ **CNAME**│ Canonical Name           │ Maps alias to another canonical hostname (RFC 1034)          │
+ │ **MX**   │ Mail Exchange            │ Specifies SMTP mail server with numeric preference priority  │
+ │ **TXT**  │ Text String              │ Carries SPF email validation, DKIM keys, DMARC, site verify  │
+ │ **PTR**  │ Pointer (Reverse DNS)    │ Maps IP address back to canonical hostname (`in-addr.arpa`)  │
+ │ **SRV**  │ Service Locator          │ Specifies Host, Port, Priority, and Weight for a service     │
+ │ **NS**   │ Name Server              │ Delegates a DNS zone to authoritative nameservers            │
+ │ **SOA**  │ Start of Authority       │ Zone serial number, primary NS, admin email, refresh timers  │
+ │ **CAA**  │ CA Authorization         │ Restricts which Certificate Authorities can issue TLS certs  │
+ └──────────┴──────────────────────────┴──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Deep Dive: CNAME at Zone Apex Restriction & Flattening
+
+According to RFC 1034 (Section 3.6.2): **If a CNAME record is present for a node, no other data may be present for that node**.
+- If `example.com` (Zone Apex / Naked Domain) has a `CNAME`, it **cannot** have `SOA`, `NS`, or `MX` records (which are strictly mandatory for the zone).
+- **The Solution (CNAME Flattening / ALIAS / ANAME):** Modern DNS providers (Cloudflare, AWS Route 53 ALIAS) intercept queries for `example.com`, resolve the target CNAME dynamically in real-time, and return an **A/AAAA record** to the client, bypassing the RFC restriction.
+
+---
+
+### 3. SRV Record Anatomy (RFC 2782)
+
+```text
+_service._proto.name.  TTL  Class  SRV  Priority  Weight  Port  Target
+_http._tcp.example.com. 300  IN    SRV  10        50      8080  web1.example.com.
+_http._tcp.example.com. 300  IN    SRV  10        50      8080  web2.example.com.
+_http._tcp.example.com. 300  IN    SRV  20        100     8080  backup.example.com.
+```
+
+- **Priority (10 vs 20):** Lowest number has highest precedence. `backup` is only used if both priority 10 servers fail.
+- **Weight (50 / 50):** Load balances traffic evenly between `web1` and `web2`.
+
+---
+
+## Hands-On Lab: Querying & Inspecting DNS Record Types
+
+```bash
+# Step 1: Query standard A and AAAA records for a domain
+dig +short A google.com
+dig +short AAAA google.com
+
+# Step 2: Query MX records and view mail priority numbers
+dig +short MX github.com
+
+# Step 3: Query TXT records to inspect SPF and DMARC security policies
+dig +short TXT google.com
+dig +short TXT _dmarc.google.com
+
+# Step 4: Perform a Reverse DNS lookup (PTR query)
+dig -x 8.8.8.8 +short
+
+# Step 5: Query CAA records to inspect allowed Certificate Authorities
+dig +short CAA google.com
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is an ALIAS or ANAME record used instead of a CNAME at the root domain (`example.com`)?**
+
+RFC 1034 mandates that if a `CNAME` record exists for a name, no other record type (including `SOA` and `NS`) can exist for that same name. Because a root domain (`example.com`) strictly requires `SOA` and `NS` records to function, creating a CNAME at the apex breaks the DNS zone. An **ALIAS record** solves this by dynamically resolving the target endpoint to its underlying `A` / `AAAA` IP addresses at query time and returning an address record directly to the client.
+
+**Q2: What is the purpose of the Serial Number in a DNS SOA record?**
+
+The Serial Number is an unsigned 32-bit integer (often formatted as date `YYYYMMDDNN`) in the SOA record. Secondary (slave) nameservers query the primary nameserver's SOA record periodically. When the primary's serial number increases, the secondary knows the zone has been updated and triggers an **AXFR / IXFR Zone Transfer** to synchronize its local database.
+
+**Q3: How do SPF, DKIM, and DMARC use DNS TXT records to prevent email spoofing?**
+
+- **SPF (Sender Policy Framework):** A TXT record listing all IP addresses authorized to send emails on behalf of the domain (e.g. `v=spf1 include:_spf.google.com ~all`).
+- **DKIM (DomainKeys Identified Mail):** A TXT record storing the domain's public cryptographic key. The recipient mail server verifies the digital signature in the email header against this public key.
+- **DMARC:** A TXT record at `_dmarc.domain.com` instructing receiving mail servers how to treat emails that fail SPF/DKIM (e.g. `p=reject` or `p=quarantine`).
+
+**Q4: How does a Reverse DNS (PTR) query resolve in the `in-addr.arpa` tree?**
+
+For an IPv4 address `192.0.2.1`, the octets are reversed, and `.in-addr.arpa` is appended: `1.2.0.192.in-addr.arpa`. The recursive resolver queries the special `in-addr.arpa` delegated zone to locate the `PTR` record pointing back to the canonical FQDN (e.g. `mail.example.com`). This is heavily used by email servers to reject spam from unrecognized IP blocks.
+
+**Q5: What happens if an MX record points to a CNAME instead of an A record?**
+
+RFC 2181 and RFC 5321 strictly forbid MX records from pointing to a CNAME alias. Doing so causes extra DNS lookups, breaks mail delivery loops on strict MTAs (like Postfix or Sendmail), and frequently results in emails bouncing with "loops back to myself" or "CNAME lookup failed" errors.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master forward records (`A`, `AAAA`) vs alias records (`CNAME`)
+- [ ] Understand why CNAME at Zone Apex is prohibited and how ALIAS solves it
+- [ ] Know the structure of an `SRV` record: Priority, Weight, Port, Target
+- [ ] Understand email authentication via `TXT`: SPF, DKIM, DMARC
+- [ ] Know Reverse DNS lookup format: `in-addr.arpa` and `PTR` records

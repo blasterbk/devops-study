@@ -1,0 +1,159 @@
+---
+title: "Chapter 1 — Load Balancing Algorithms: Round Robin, Weighted, Least Connections & Consistent Hashing"
+sidebar_position: 1
+module: "Module 14.1 — Load Balancing Algorithms"
+description: "Master load balancing scheduling algorithms — Round Robin, Weighted Round Robin, Least Connections, Weighted Least Connections, IP Hash, and Consistent Hashing (Ketama ring & Maglev)."
+---
+
+# Chapter 1 — Load Balancing Algorithms: Round Robin, Weighted, Least Connections & Consistent Hashing
+
+> **Goal:** Master the mathematical, algorithmic, and operational mechanics of load balancing traffic distribution algorithms. Understand static algorithms (Round Robin, Weighted Round Robin, Random), dynamic load-aware algorithms (Least Connections, Weighted Least Connections, Peak EWMA, Least Response Time), and state-preserving algorithms (IP Hash, Consistent Hashing ring, Google Maglev).
+>
+> By the end of this chapter, you will understand:
+> 1. Static scheduling algorithms: Round Robin ($O(1)$) and Weighted Round Robin (Smooth WRR / NGINX algorithm)
+> 2. Dynamic stateful algorithms: Least Connections and Weighted Least Connections ($W_i \times C_i$)
+> 3. Latency-aware scheduling: Peak EWMA (Exponentially Weighted Moving Average) and Power of Two Random Choices (P2C)
+> 4. Session Affinity / Sticky Sessions: Cookie-based vs IP Hash-based trade-offs
+> 5. Consistent Hashing: Hash Rings (Ketama), Virtual Nodes ($V_n$), and Google Maglev Lookup Tables
+> 6. Algorithm selection matrix for stateless APIs, stateful databases, and distributed caching systems
+
+---
+
+## Real-Life Analogy
+
+Think of load balancing algorithms as **a head doctor assigning incoming patients to hospital emergency room doctors**:
+
+- **Round Robin (Taking Turns in Line):**
+  - Patient 1 goes to Dr. Alice, Patient 2 to Dr. Bob, Patient 3 to Dr. Charlie (**Simple sequential turn-taking**). If Patient 1 has a broken fingernail (takes 10 seconds) and Patient 2 has open-heart surgery (takes 6 hours), Dr. Bob gets crushed with work while Dr. Alice sits idle.
+- **Least Connections (Assigning to Whoever Has the Fewest Patients):**
+  - The head doctor checks: *"Dr. Alice has 0 active patients; Dr. Bob has 5 active patients. Send Patient 3 to Dr. Alice!"*
+- **Consistent Hashing (Assigned Family Doctor by File ID):**
+  - A patient's file ID (`#94821`) always maps to Dr. Bob. If Dr. Bob goes on vacation, only Dr. Bob's patients are reassigned to Dr. Charlie; nobody else's doctor changes (**Minimal Cache Invalidation**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  Consistent Hashing Ring vs Modulo Hashing on Node Churn
+                  
+ 1. NAIVE MODULO HASHING ($\text{Hash}(Key) \pmod N$):
+    - When 1 server is added or removed ($N \to N-1$), 100% of all keys shift!
+    - Massive cache avalanche / thundering herd crash.
+ 
+ 2. CONSISTENT HASHING RING WITH VIRTUAL NODES (Ketama):
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │                           [Server A (vNode 1)] (0°)                         │
+ │                                    │                                        │
+ │     [Server C (vNode 2)] (300°)   ╱ ╲   [Key: "user:101"] (45° -> Server B) │
+ │              │                   │   │               │                      │
+ │              │                   │   │               ▼                      │
+ │     [Key: "user:205"] (240°)     │   │   [Server B (vNode 1)] (90°)         │
+ │              │                   │   │                                      │
+ │              ▼                    \ ╱                                       │
+ │     [Server C (vNode 1)] (180°) ───┴─── [Server A (vNode 2)] (135°)         │
+ └─────────────────────────────────────────────────────────────────────────────┘
+  *If Server B fails: ONLY Keys mapped to Server B shift to Server A.*
+  *All other 80% of cached keys remain completely undisturbed!*
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Algorithm Comparison Matrix
+
+```text
+ ┌──────────────────────────┬──────────────┬──────────────────┬────────────────────────────────────────────────────────┐
+ │ Algorithm                │ Type         │ Time Complexity  │ Best Production Use Case                               │
+ │──────────────────────────┼──────────────┼──────────────────┼────────────────────────────────────────────────────────┤
+ │ **Round Robin (RR)**     │ Static       │ $O(1)$           │ Identical stateless API servers, equal request duration│
+ │ **Weighted Round Robin** │ Static       │ $O(1)$           │ Heterogeneous servers (e.g. 16-core vs 4-core servers) │
+ │ **Least Connections**    │ Dynamic      │ $O(1) / O(N)$    │ Long-lived sessions (WebSockets, Database SQL, gRPC)   │
+ │ **Peak EWMA / P2C**      │ Dynamic      │ $O(1)$           │ Microservices with variable latency (Envoy / Finagle)  │
+ │ **IP Hash**              │ Hash-Based   │ $O(1)$           │ Simple session persistence without cookies             │
+ │ **Consistent Hashing**   │ Hash-Based   │ $O(\log V_n)$    │ Distributed Caching (Memcached, Redis), Sharded DBs    │
+ └──────────────────────────┴──────────────┴──────────────────┴────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Smooth Weighted Round Robin (NGINX Algorithm)
+
+Standard WRR with weights $A=5, B=1, C=1$ would send: `A, A, A, A, A, B, C` (creating a burst surge on Server A).
+- **Smooth Weighted Round Robin:** Interleaves requests smoothly: `A, A, B, A, C, A, A`, preventing CPU spikes on high-weight nodes.
+
+---
+
+### 3. Power of Two Random Choices (P2C / Envoy Algorithm)
+
+To pick the least-loaded backend without expensive global locks across all threads:
+1. Pick **2 random servers** from the healthy pool ($S_1, S_2$).
+2. Compare their active load (active connection count $\times$ latency).
+3. Send the request to the less-loaded of the two.
+
+*(Mathematically proven by Mitzenmacher to achieve load balance near global $O(N)$ scanning with ultra-fast $O(1)$ computation)*.
+
+---
+
+## Hands-On Lab: Simulating Load Balancing Algorithms in NGINX
+
+```nginx
+# /etc/nginx/conf.d/load_balancer.conf
+
+# 1. Weighted Round Robin
+upstream backend_wrr {
+    server 10.0.0.1:8080 weight=3;
+    server 10.0.0.2:8080 weight=1;
+}
+
+# 2. Least Connections
+upstream backend_leastconn {
+    least_conn;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+}
+
+# 3. Consistent Hashing based on Client IP (or HTTP Header)
+upstream backend_consistent_hash {
+    hash $remote_addr consistent;
+    server 10.0.0.1:8080;
+    server 10.0.0.2:8080;
+    server 10.0.0.3:8080;
+}
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why is Consistent Hashing essential for distributed caching architectures (like Redis or Memcached clusters)?**
+
+In standard modulo hashing ($\text{Server} = \text{Hash}(Key) \pmod N$), if a caching cluster of 10 nodes scales up to 11 nodes or 1 node crashes ($N \to 9$), **$100\%$ of all cached keys hash to completely different servers**. This causes a massive global cache miss (**Thundering Herd / Cache Avalanche**) that crashes backend databases. With **Consistent Hashing (Ketama)**, adding or removing a node only migrates **$1/N$ of the total keys** (e.g. only 10% of cache items), while 90% remain cached and valid.
+
+**Q2: What is the purpose of Virtual Nodes (vNodes) in a Consistent Hashing ring?**
+
+Without virtual nodes, servers might be spaced unevenly on the 360-degree hash ring, causing severe **Hot Spotting** (Server A receiving 70% of traffic while Server B receives 5%). By creating **100 to 256 Virtual Nodes per physical server** (e.g., `ServerA#1`, `ServerA#2` hashed around the circle), keys are distributed with near-perfect statistical uniformity across all physical servers.
+
+**Q3: How does the "Power of Two Random Choices" (P2C) algorithm work in Envoy Proxy?**
+
+In high-concurrency multi-threaded load balancers, scanning the entire list of 1,000 backend servers to find the absolute least-loaded server requires expensive cross-thread locking. **P2C (Power of Two Random Choices)** picks two random backend endpoints and selects the one with the lowest active request count. This avoids global lock contention while providing exponentially better load distribution than random or round-robin selection.
+
+**Q4: What is the difference between Sticky Sessions (Session Affinity) and Consistent Hashing?**
+
+- **Sticky Sessions (Cookie-Based):** The load balancer sets an HTTP cookie (e.g. `Set-Cookie: SERVERID=backend_1`) or inspects existing session IDs to force all requests from a specific browser user to land on the same backend server (used for legacy stateful session storage in server RAM).
+- **Consistent Hashing:** Uses a mathematical algorithm on a request property (IP, URL, header, or user ID) to determine backend placement without setting cookies, supporting cache distribution and stateless scaling.
+
+**Q5: Why is Round Robin unsuitable for long-lived WebSocket or gRPC connections?**
+
+Round Robin only balances the **number of new connection attempts**, with zero awareness of connection duration. If 1,000 WebSocket users connect, Round Robin gives 500 connections to Server 1 and 500 to Server 2. If Server 1's users stay connected for 24 hours while Server 2's users disconnect after 1 minute, Server 1 eventually holds 99% of all active traffic. **Least Connections** must be used for long-lived sockets.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master Round Robin, Weighted RR, Least Connections, and P2C
+- [ ] Understand Smooth WRR interleaving to prevent traffic bursts
+- [ ] Master Consistent Hashing (Ketama ring & $1/N$ churn formula)
+- [ ] Understand Virtual Nodes (vNodes) and hot-spot prevention
+- [ ] Know why Least Connections is required for WebSockets and gRPC

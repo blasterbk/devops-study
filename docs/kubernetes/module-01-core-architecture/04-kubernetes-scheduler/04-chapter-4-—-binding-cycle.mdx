@@ -1,0 +1,1451 @@
+---
+title: "Chapter 4 — Binding Cycle"
+sidebar_position: 4
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand how Kubernetes converts a scheduling decision into an actual Pod placement. Learn how the Scheduler performs binding, how the API Server ..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 4 — Binding Cycle
+
+> **Goal:** Understand how Kubernetes converts a scheduling decision into an actual Pod placement. Learn how the Scheduler performs binding, how the API Server processes binding requests, how kubelet detects newly assigned Pods, how binding failures are handled, how Bind plugins work, and how Kubernetes guarantees reliable Pod assignment.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. What binding is and why it is a separate cycle
+> 2. The Binding object and the API Server binding subresource
+> 3. Default Binder: how spec.nodeName is written
+> 4. Bind plugins: extending the binding step
+> 5. How kubelet detects the newly bound Pod via Watch
+> 6. Binding failures and retry logic
+> 7. PreBind and PostBind extension points
+> 8. Complete binding lifecycle from scheduler to running Pod
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Binding Cycle like a property lease signing ceremony.
+
+```text
+Lease Signing Analogy:
+
+Scheduling cycle = choosing the apartment (Filter + Score)
+Binding cycle = signing the actual lease document
+Lease document = Binding object (Pod + Node name)
+Landlord signs their copy = API Server writes spec.nodeName
+Tenant gets keys = kubelet detects Pod via Watch and starts it
+Lease office notified = PostBind plugins called
+```
+
+| Lease Signing | Binding Cycle |
+| :--- | :--- |
+| Choosing the apartment | Scheduling Cycle (Filter + Score) |
+| Signing the lease | Binding Cycle |
+| Lease document | Binding object (`target.name: worker-2`) |
+| Landlord recording the tenancy | API Server writing `spec.nodeName` |
+| Tenant getting keys | kubelet Watch detects nodeName, starts Pod |
+| Completion notification | PostBind plugin called |
+
+> **Important:** The Binding Cycle runs **asynchronously** from the Scheduling Cycle. Once a Pod is sent to the Binding Cycle, the Scheduler's Scheduling Cycle thread is **freed to schedule the next Pod immediately**. This parallelism is why Kubernetes can schedule many Pods per second even if individual binding operations take time.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should already understand:
+
+- Scheduler Architecture
+- Scheduling Framework
+- Scheduling Cycle
+- API Server
+- etcd
+- Informers
+- Scheduler Cache
+
+---
+
+# Where We Left Off
+
+At the end of the previous chapter, the Scheduler had already completed:
+
+```text
+Scheduling Queue
+
+v
+
+Snapshot
+
+v
+
+Filter
+
+v
+
+Score
+
+v
+
+Reserve
+
+v
+
+Permit
+```
+
+The Scheduler now knows:
+
+```text
+Pod
+
+v
+
+Best Node
+```
+
+Example:
+
+```text
+Pod
+
+v
+
+nginx
+
+v
+
+worker-node-3
+```
+
+However...
+
+Nothing has been written to Kubernetes yet.
+
+The cluster still thinks:
+
+```text
+Pod
+
+v
+
+Pending
+```
+
+The Scheduling Cycle has made a decision.
+
+Now Kubernetes must make that decision official.
+
+That is the purpose of the **Binding Cycle**.
+
+---
+
+# What is Binding?
+
+Binding is:
+
+> **The process of assigning a Pod to a selected Node by updating Kubernetes through the API Server.**
+
+Scheduling decides:
+
+```text
+Which Node?
+```
+
+Binding records:
+
+```text
+This Pod
+
+Runs Here
+```
+
+---
+
+# Simple Analogy
+
+Imagine booking an airline ticket.
+
+Finding a seat:
+
+```text
+Seat 18A
+
+v
+
+Decision
+```
+
+Printing the boarding pass:
+
+```text
+Seat Reserved
+
+v
+
+Official
+```
+
+Scheduling is choosing the seat.
+
+Binding is printing the boarding pass.
+
+---
+
+# Scheduling vs Binding
+
+| Scheduling Cycle | Binding Cycle |
+|------------------|---------------|
+| Selects Node | Assigns Node |
+| Uses Scheduler Cache | Updates API Server |
+| Internal decision | Persistent cluster state |
+| No API modification | API object changes |
+| Ends with selected Node | Ends with assigned Pod |
+
+---
+
+# High-Level Binding Flow
+
+```text
+Scheduling Cycle
+
+v
+
+Best Node Selected
+
+v
+
+Binding Cycle
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+kubelet
+
+v
+
+Container Runtime
+
+v
+
+Running Pod
+```
+
+---
+
+# Why Separate Binding?
+
+Imagine Kubernetes performed:
+
+```text
+Filter
+
+v
+
+API Update
+
+v
+
+Score
+
+v
+
+API Update
+```
+
+Thousands of unnecessary writes.
+
+Instead:
+
+```text
+Complete Scheduling
+
+v
+
+One API Write
+```
+
+This reduces:
+
+- API Server load
+- etcd writes
+- Network traffic
+- Lock contention
+
+---
+
+# Beginning of the Binding Cycle
+
+Suppose the Scheduler has selected:
+
+```text
+Pod
+
+v
+
+frontend
+
+v
+
+worker-02
+```
+
+Binding starts immediately.
+
+---
+
+# Internal Binding Workflow
+
+```text
+Selected Node
+
+v
+
+PreBind Plugins
+
+v
+
+Bind Plugins
+
+v
+
+API Server Binding Request
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+kubelet
+```
+
+---
+
+# Step 1 — PreBind Plugins
+
+Before Kubernetes binds the Pod,
+
+the Scheduler executes:
+
+```text
+PreBind
+```
+
+Purpose:
+
+Perform final validation or preparation.
+
+Examples:
+
+- Volume checks
+- Network reservation
+- External integrations
+- Custom validation
+
+Runs:
+
+```text
+Once
+
+Per Pod
+```
+
+---
+
+# Why PreBind Exists
+
+Imagine a storage plugin.
+
+The Node was selected successfully.
+
+But:
+
+```text
+Persistent Volume
+
+v
+
+Not Ready
+```
+
+PreBind can stop the bind before cluster state changes.
+
+---
+
+# Example
+
+```text
+Pod
+
+v
+
+worker-5
+
+v
+
+PreBind
+
+v
+
+Volume Available?
+
+v
+
+Yes
+
+v
+
+Continue
+```
+
+Otherwise:
+
+```text
+Binding Failed
+```
+
+---
+
+# Step 2 — Bind Plugins
+
+Now the Scheduler asks:
+
+> **Who will perform the binding?**
+
+Normally:
+
+```text
+Default Binder
+```
+
+But custom Bind plugins may override this behavior.
+
+---
+
+# Default Binder
+
+Most clusters use the built-in binder.
+
+Its responsibility:
+
+```text
+Selected Node
+
+v
+
+API Server
+
+v
+
+Bind Pod
+```
+
+Very simple.
+
+---
+
+# Bind Plugins
+
+A Bind Plugin implements the logic that performs the final Pod-to-Node assignment.
+
+Examples:
+
+```text
+DefaultBinder
+
+Custom Cloud Binder
+
+Research Scheduler
+
+Experimental Scheduler
+```
+
+Only one Bind plugin performs the actual binding.
+
+---
+
+# Why Custom Bind Plugins?
+
+Some platforms require:
+
+- External resource reservation
+- Bare-metal provisioning
+- HPC systems
+- AI clusters
+- Specialized hardware
+
+A custom binder can integrate with these systems before completing the assignment.
+
+---
+
+# API Server Binding Request
+
+After the Bind plugin succeeds,
+
+the Scheduler sends a request to the API Server.
+
+Conceptually:
+
+```text
+Scheduler
+
+v
+
+Bind Request
+
+v
+
+API Server
+```
+
+The Scheduler **does not** communicate directly with etcd.
+
+Exactly like every other Kubernetes control-plane component,
+
+everything goes through:
+
+```text
+API Server
+```
+
+---
+
+# Binding Object
+
+Historically,
+
+Kubernetes exposed a Binding object used to represent this operation.
+
+Conceptually:
+
+```yaml
+kind: Binding
+
+Target:
+
+worker-node-3
+
+Object:
+
+frontend-pod
+```
+
+The API Server processes this binding request and records the assignment.
+
+Although the internal implementation has evolved over Kubernetes releases, the concept remains the same:
+
+> **Associate this Pod with this Node.**
+
+---
+
+# What Actually Changes?
+
+Before binding:
+
+```yaml
+spec:
+  nodeName: ""
+```
+
+After binding:
+
+```yaml
+spec:
+  nodeName: worker-node-3
+```
+
+This single field changes everything.
+
+---
+
+# API Server Processing
+
+The API Server receives:
+
+```text
+Bind Request
+
+v
+
+Authentication
+
+v
+
+Authorization
+
+v
+
+Admission
+
+v
+
+Validation
+
+v
+
+Storage Layer
+
+v
+
+etcd
+```
+
+Notice how this matches the API request lifecycle studied in Module 1.1.
+
+---
+
+# etcd Update
+
+After validation,
+
+the API Server stores:
+
+```text
+Pod
+
+v
+
+nodeName=worker-node-3
+```
+
+in:
+
+```text
+etcd
+```
+
+Now the cluster officially knows where the Pod belongs.
+
+---
+
+# Watch Event
+
+The update generates:
+
+```text
+Watch Event
+```
+
+Every interested component receives it.
+
+Including:
+
+- kubelet
+- Controllers
+- Scheduler Cache
+- Informers
+
+---
+
+# kubelet Integration
+
+Every kubelet watches the API Server.
+
+But each kubelet only cares about:
+
+```text
+Pods
+
+Assigned
+
+To Me
+```
+
+---
+
+# Example
+
+Worker Node:
+
+```text
+worker-node-3
+```
+
+kubelet receives:
+
+```text
+Pod
+
+v
+
+nodeName=worker-node-3
+```
+
+The kubelet immediately recognizes:
+
+```text
+This Is My Pod
+```
+
+---
+
+# kubelet Workflow
+
+```text
+Watch Event
+
+v
+
+Download Spec
+
+v
+
+Create Pod Sandbox
+
+v
+
+Pull Images
+
+v
+
+Mount Volumes
+
+v
+
+Configure Networking
+
+v
+
+Start Containers
+
+v
+
+Running
+```
+
+Notice:
+
+The Scheduler is no longer involved.
+
+Its job is finished.
+
+---
+
+# Complete End-to-End Flow
+
+```text
+User
+
+v
+
+kubectl apply
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Scheduler Queue
+
+v
+
+Scheduling Cycle
+
+v
+
+Binding Cycle
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+kubelet
+
+v
+
+CRI
+
+v
+
+Container Runtime
+
+v
+
+Running Pod
+```
+
+---
+
+# What if Binding Fails?
+
+Failures happen.
+
+Example:
+
+```text
+API Server
+
+Unavailable
+```
+
+or
+
+```text
+Node Deleted
+```
+
+or
+
+```text
+PreBind Failed
+```
+
+or
+
+```text
+Permission Error
+```
+
+Binding must not silently fail.
+
+---
+
+# Failure Scenario 1
+
+Scheduler selected:
+
+```text
+worker-7
+```
+
+Before binding:
+
+```text
+worker-7
+
+v
+
+Deleted
+```
+
+Binding cannot continue.
+
+The scheduling attempt fails.
+
+---
+
+# Failure Scenario 2
+
+API Server timeout.
+
+```text
+Scheduler
+
+v
+
+Bind Request
+
+v
+
+Timeout
+```
+
+No successful assignment occurs.
+
+---
+
+# Failure Scenario 3
+
+Storage validation fails.
+
+```text
+PreBind
+
+v
+
+Volume Missing
+```
+
+Binding stops immediately.
+
+---
+
+# Failure Scenario 4
+
+Custom Bind Plugin rejects the request.
+
+Example:
+
+```text
+GPU License
+
+Unavailable
+```
+
+Result:
+
+```text
+Binding Failed
+```
+
+---
+
+# Bind Retry Logic
+
+Kubernetes does not immediately give up.
+
+Typical flow:
+
+```text
+Binding Failed
+
+v
+
+Release Reservation
+
+v
+
+Update Scheduler State
+
+v
+
+Requeue Pod
+
+v
+
+Retry Scheduling
+```
+
+The next scheduling attempt starts from the beginning.
+
+---
+
+# Why Re-run Scheduling?
+
+Imagine:
+
+Node selected:
+
+```text
+worker-5
+```
+
+Five seconds later:
+
+```text
+Resources Changed
+```
+
+The previous decision may no longer be valid.
+
+Therefore Kubernetes performs:
+
+```text
+Fresh Scheduling Cycle
+```
+
+instead of blindly retrying the old binding.
+
+---
+
+# Reservation Cleanup
+
+Suppose Reserve completed.
+
+Binding fails.
+
+Scheduler performs:
+
+```text
+Unreserve
+
+v
+
+Release Resources
+```
+
+This prevents stale reservations.
+
+---
+
+# Bind Success
+
+Successful flow:
+
+```text
+Best Node
+
+v
+
+Bind
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+kubelet
+
+v
+
+Running
+```
+
+The Scheduling Cycle is now complete.
+
+---
+
+# Internal Scheduler Workflow
+
+```text
+Scheduling Finished
+
+v
+
+PreBind
+
+v
+
+Bind Plugin
+
+v
+
+API Server
+
+v
+
+Validation
+
+v
+
+Storage
+
+v
+
+etcd
+
+v
+
+Watch Event
+
+v
+
+kubelet
+
+v
+
+Containers Start
+```
+
+---
+
+# Scheduler's Responsibility Ends Here
+
+After binding:
+
+```text
+Scheduler
+
+Done
+```
+
+Everything afterwards belongs to:
+
+- kubelet
+- CRI
+- Container Runtime
+- CNI
+- CSI
+
+We'll study those components in later modules.
+
+---
+
+# Production Flow
+
+Consider a production cluster.
+
+```text
+3 Scheduler Replicas
+
+v
+
+Leader Scheduler
+
+v
+
+Bind Request
+
+v
+
+Highly Available API Servers
+
+v
+
+etcd Cluster
+
+v
+
+Worker Node
+
+v
+
+kubelet
+
+v
+
+containerd
+```
+
+Even in highly available environments,
+
+binding always flows through the API Server.
+
+---
+
+# Relationship with Previous Modules
+
+```text
+API Machinery
+
+v
+
+Authentication
+
+v
+
+Authorization
+
+v
+
+Admission
+
+v
+
+Storage
+
+v
+
+etcd
+
+v
+
+Watch
+
+v
+
+Informer
+
+v
+
+Scheduler
+
+v
+
+Binding
+
+v
+
+Watch
+
+v
+
+kubelet
+```
+
+This demonstrates how all previous modules connect.
+
+---
+
+# Real Production Example
+
+A deployment creates:
+
+```text
+500 Pods
+```
+
+The Scheduler:
+
+```text
+Schedules
+
+v
+
+Binds
+
+v
+
+API Server Persists
+
+v
+
+500 Watch Events
+
+v
+
+500 kubelets React
+
+v
+
+Containers Start
+```
+
+Each Pod goes through its own independent Binding Cycle.
+
+---
+
+# Performance Considerations
+
+Binding is generally much faster than scheduling.
+
+Why?
+
+Because:
+
+- The hard work (node selection) is already complete.
+- Only one Node is involved.
+- One API update is required.
+
+However, API Server latency directly affects binding throughput.
+
+---
+
+# Production Best Practices
+
+✔ Keep API Server highly available.
+
+✔ Minimize API latency between Scheduler and API Server.
+
+✔ Avoid long-running PreBind plugins.
+
+✔ Ensure custom Bind plugins are idempotent.
+
+✔ Always release reservations on failure.
+
+✔ Monitor binding latency separately from scheduling latency.
+
+✔ Monitor Scheduler error events for repeated bind failures.
+
+✔ Test custom bind logic under production-scale workloads.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Binding chooses the Node.
+
+Wrong.
+
+Scheduling chooses the Node.
+
+Binding records the decision.
+
+---
+
+### ❌ Misconception 2
+
+The Scheduler talks directly to etcd.
+
+Wrong.
+
+All writes go through the API Server.
+
+---
+
+### ❌ Misconception 3
+
+kubelet asks the Scheduler for work.
+
+Wrong.
+
+kubelet watches the API Server for Pods assigned to its own Node.
+
+---
+
+### ❌ Misconception 4
+
+A successful scheduling decision guarantees a running Pod.
+
+Wrong.
+
+Binding, kubelet startup, image pulls, networking, and storage can still fail.
+
+---
+
+### ❌ Misconception 5
+
+Binding failures always retry the same Node.
+
+Wrong.
+
+Kubernetes usually performs a new scheduling attempt so the latest cluster state is considered.
+
+---
+
+### ❌ Misconception 6
+
+Bind plugins replace the entire Scheduler.
+
+Wrong.
+
+Bind plugins participate only in the binding stage of the scheduling framework.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is Binding in Kubernetes?
+
+Binding is the process of assigning a selected Node to a Pod by updating the Pod through the API Server.
+
+---
+
+### Q2. What is the difference between Scheduling and Binding?
+
+Scheduling selects the best Node. Binding persists that decision in Kubernetes.
+
+---
+
+### Q3. Does the Scheduler write directly to etcd?
+
+No. The Scheduler communicates only with the API Server, which validates and stores the update in etcd.
+
+---
+
+### Q4. What is the purpose of PreBind plugins?
+
+They perform final validation or preparation before the Pod assignment is committed.
+
+---
+
+### Q5. What is the role of the Default Binder?
+
+It performs the standard Pod-to-Node binding through the API Server.
+
+---
+
+### Q6. How does kubelet know a Pod has been assigned?
+
+The kubelet watches the API Server and reacts when a Pod's `spec.nodeName` matches its own Node.
+
+---
+
+### Q7. What happens if binding fails?
+
+The Scheduler cleans up temporary reservations, updates its internal state, and retries scheduling.
+
+---
+
+### Q8. Why is binding separated from scheduling?
+
+To isolate decision-making from persistence, improving performance, concurrency, and reliability.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Pod stuck in Pending after scheduling | Binding failed, API Server unavailable, or PreBind rejected the request |
+| Repeated binding failures | Custom Bind plugin issues, node removal, or API Server errors |
+| kubelet never starts Pod | Pod not successfully bound, kubelet disconnected, or watch problems |
+| High binding latency | API Server overload, network latency, or admission processing delays |
+| Reservation never released | Scheduler bug or failed cleanup after unsuccessful binding |
+| Pod assigned to unexpected Node | Scheduler selected a different Node during a retry after an earlier bind failure |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is Binding?
+2. Why is Binding separate from Scheduling?
+3. What changes in the Pod object during binding?
+4. Why does the Scheduler communicate through the API Server?
+5. What is the purpose of the Binding object?
+6. What do PreBind plugins do?
+7. What is the role of the Default Binder?
+8. How does kubelet discover newly assigned Pods?
+9. What happens if the API Server cannot process a bind request?
+10. Why does Kubernetes usually perform a new scheduling cycle after a bind failure?
+11. Why must reservations be released when binding fails?
+12. When does the Scheduler's responsibility end?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how Kubernetes transforms a scheduling decision into an official Pod assignment.
+
+You learned:
+
+- What Binding is and why it exists
+- How the Scheduler performs the Binding Cycle
+- The purpose of PreBind and Bind plugins
+- How the API Server processes binding requests
+- How the Pod's `spec.nodeName` becomes the source of truth
+- How kubelet detects newly assigned Pods through watch events
+- How Kubernetes handles binding failures and retries
+- Why the Scheduler's responsibility ends after a successful bind
+
+The Binding Cycle is the bridge between **decision** and **execution**. Once it completes successfully, the kubelet takes over and turns the scheduled Pod into a running workload.
+
+---
+
+# Next Chapter
+
+**Chapter 5 — Scheduler Cache**
+
+In the next chapter, we'll dive into one of the Scheduler's most important performance optimizations:
+
+- Why the Scheduler Cache Exists
+- Cache Architecture
+- NodeInfo
+- PodInfo
+- Snapshot Creation
+- Cache Updates
+- Informer Integration
+- Resource Accounting
+- Image Tracking
+- Cache Consistency
+- Performance Optimizations
+- Production Cache Workflow
+
+You'll learn why Kubernetes can schedule thousands of Pods per second without querying the API Server for every scheduling decision.
+```

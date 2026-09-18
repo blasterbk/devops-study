@@ -1,0 +1,324 @@
+---
+title: "Chapter 1 — NetworkPolicy API & Ingress/Egress Rules"
+sidebar_position: 1
+module: "Module 5.5 — Network Security & Policies"
+description: "Master Kubernetes NetworkPolicies — Ingress and Egress rule mechanics, podSelector vs namespaceSelector, AND vs OR logic, ipBlock CIDR filtering, and CNI enforcement requirements."
+---
+
+# Chapter 1 — NetworkPolicy API Spec & Ingress/Egress Rules
+
+> **Goal:** Master the Kubernetes NetworkPolicy API specification — understanding how declarative packet filtering isolates container workloads, analyzing the mechanics of Ingress and Egress rule engines, mastering the critical difference between `AND` and `OR` selector evaluations across `podSelector` and `namespaceSelector`, configuring `ipBlock` CIDR exceptions, and understanding why CNI plugin policy enforcement is mandatory.
+>
+> By the end of this chapter, you will understand:
+> 1. The default non-isolated networking model of Kubernetes vs policy-driven isolation
+> 2. The structural anatomy of the `networking.k8s.io/v1` `NetworkPolicy` resource
+> 3. The 3 traffic selector types: `podSelector`, `namespaceSelector`, and `ipBlock`
+> 4. The syntax rules for `AND` vs `OR` multi-selector evaluations
+> 5. How port restrictions filter Layer 4 TCP, UDP, and SCTP traffic
+> 6. Why standard cloud-provider CNIs require dedicated policy engines (Calico / Cilium)
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes NetworkPolicies as **access control security gates inside an open-plan office building**:
+
+- **Default Kubernetes Networking (Open-Plan Bullpen):** By default, every worker in every department can walk up to any desk in any room across the entire corporate campus (Every Pod can talk to every Pod across all namespaces with zero firewalls).
+- **NetworkPolicy (The Badge-Locked Department Door):** You install a biometric security door on the **Payment Department (`podSelector: app=payments`)**. The moment the door is installed, the room becomes **Isolated**: all open foot traffic is blocked immediately.
+- **Ingress Rules (Who can walk INTO the room?):** The door scanner checks incoming visitors: *"Only employees wearing Badges from the Frontend Team (`podSelector: app=frontend`) on Port 8080 are allowed inside."*
+- **Egress Rules (Where can people INSIDE the room go?):** The exit turnstile restricts payment employees: *"You may ONLY walk into the Master Database Vault (`podSelector: app=database`) on Port 5432 and the Corporate DNS Server (`CoreDNS port 53`). All other outside doors are locked."*
+- **The Security Guard (`CNI Plugin`):** Writing a building rule on a piece of paper (Kubernetes YAML) is useless unless physical security guards (**Calico / Cilium / eBPF**) are physically standing at the doors to enforce the lock.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kubernetes NetworkPolicy Ingress & Egress Filtering
+
+ INGRESS TRAFFIC                                       TARGET POD (Isolated)
+ ┌──────────────────────────────────────┐             ┌──────────────────────────────────────┐
+ │ Frontend Pod (app=frontend)          │             │ Payment API Pod (app=payments)       │
+ │ Namespace: default                   │             │ Namespace: default                   │
+ └──────────────────┬───────────────────┘             │                                      │
+                    │ Ingress Allowed (Port 8080 TCP) │ Ingress Rule:                        │
+                    ├────────────────────────────────►│   from: podSelector: app=frontend    │
+                    │                                 │   ports: 8080/TCP                    │
+ ┌──────────────────┴───────────────────┐             │                                      │
+ │ Rogue Hacker Pod (app=rogue)         │             │ Egress Rule:                         │
+ │ Namespace: staging                   │             │   to: podSelector: app=database      │
+ └──────────────────┬───────────────────┘             │   ports: 5432/TCP                    │
+                    │ BLOCKED (Dropped by CNI!)       └──────────────────┬───────────────────┘
+                    ▼                                                    │
+                 [ X ]                                                   │ Egress Allowed (Port 5432)
+                                                                         ▼
+                                                      ┌──────────────────────────────────────┐
+                                                      │ Postgres Database (app=database)     │
+                                                      │ Namespace: default                   │
+                                                      └──────────────────────────────────────┘
+```
+
+---
+
+## Default Network Behavior vs Policy Isolation
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────┬─────────────────────────────────┐
+ │ State                     │ Ingress / Egress Behavior       │ Security Posture                │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Non-Isolated**          │ **All traffic is ALLOWED.**     │ Permissive. Any pod can probe   │
+ │ (No matching policies)    │ Pods can talk to any IP/port.   │ any other pod across cluster.   │
+ │───────────────────────────┼─────────────────────────────────┼─────────────────────────────────┤
+ │ **Isolated**              │ **Default-Deny for active type**│ Hardened. Only explicitly       │
+ │ (Selected by $\ge 1$ pol) │ Unmatched packets are dropped.  │ allow-listed traffic passes.    │
+ └───────────────────────────┴─────────────────────────────────┴─────────────────────────────────┘
+```
+
+---
+
+## The 3 Traffic Selector Mechanisms
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Selector Type        │ Description & Syntax                                                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. `podSelector`** │ Filters Pods residing **in the SAME namespace** as the NetworkPolicy.       │
+ │                      │ `podSelector: { matchLabels: { role: "frontend" } }`                        │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. `namespace-**   │ Filters all Pods residing inside **other namespaces** matching the label.   │
+ │      **Selector`**   │ `namespaceSelector: { matchLabels: { environment: "production" } }`         │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. `ipBlock`**     │ Filters traffic by IP CIDR ranges for external traffic outside cluster.     │
+ │                      │ `ipBlock: { cidr: "192.168.0.0/16", except: ["192.168.1.0/24"] }`          │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Critical Logic: `AND` vs `OR` Multi-Selector Evaluation
+
+A common source of production security vulnerabilities is confusing `AND` and `OR` syntax in NetworkPolicy YAML:
+
+### 1. The `OR` Evaluation (Separate List Items):
+Allows traffic from **any pod matching `role: frontend` in the current namespace** OR **any pod in any namespace labeled `stage: prod`**:
+
+```yaml
+from:
+- podSelector:
+    matchLabels:
+      role: frontend
+- namespaceSelector:
+    matchLabels:
+      stage: prod
+```
+
+### 2. The `AND` Evaluation (Single Combined List Item):
+Allows traffic **ONLY from pods matching `role: frontend` THAT ALSO LIVE inside namespaces labeled `stage: prod`**:
+
+```yaml
+from:
+- namespaceSelector:
+    matchLabels:
+      stage: prod
+  podSelector:             # Notice: Nested under the same dash `-`!
+    matchLabels:
+      role: frontend
+```
+
+---
+
+## Complete Production Manifest: Tiered Microsegmentation
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-microservice-policy
+  namespace: production
+spec:
+  # Target Pods isolated by this policy
+  podSelector:
+    matchLabels:
+      app: payment-api
+  policyTypes:
+    - Ingress
+    - Egress
+
+  # 1. INGRESS RULES: Inbound traffic control
+  ingress:
+  - from:
+    # Rule A: Allow traffic ONLY from Frontend pods in the 'public-web' namespace (AND logic!)
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: public-web
+      podSelector:
+        matchLabels:
+          app: web-frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+
+  # 2. EGRESS RULES: Outbound traffic control
+  egress:
+  # Rule B: Allow outbound SQL traffic ONLY to database pods in same namespace
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres-db
+    ports:
+    - protocol: TCP
+      port: 5432
+
+  # Rule C: Allow outbound DNS queries to CoreDNS in kube-system (MANDATORY!)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+```
+
+---
+
+## CNI Enforcement Requirement
+
+> [!WARNING]
+> **NetworkPolicies have ZERO effect without a Policy-Enforcing CNI.**
+> Standard basic cloud CNIs (like legacy AWS VPC CNI without Network Policy Agent or basic flannel) completely ignore NetworkPolicy resources. To enforce policies at the Linux kernel packet layer, you **must** deploy an advanced CNI like **Cilium (eBPF)**, **Calico (iptables/eBPF)**, or **Antrea (OVS)**.
+
+---
+
+## Hands-On Lab: Testing NetworkPolicy Ingress Isolation
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace netpol-lab
+
+# Step 2: Deploy a Target Web Service and a Client Pod
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-backend
+  namespace: netpol-lab
+  labels:
+    app: backend
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25-alpine
+    ports:
+    - containerPort: 80
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: authorized-client
+  namespace: netpol-lab
+  labels:
+    app: authorized
+spec:
+  containers:
+  - name: client
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: unauthorized-client
+  namespace: netpol-lab
+  labels:
+    app: unauthorized
+spec:
+  containers:
+  - name: rogue
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Wait for Pods to become Ready
+kubectl wait --for=condition=Ready pod --all -n netpol-lab --timeout=30s
+BACKEND_IP=$(kubectl get pod secure-backend -n netpol-lab -o jsonpath='{.status.podIP}')
+
+# Step 4: Verify that before policy creation, ALL pods can access backend
+kubectl exec -n netpol-lab unauthorized-client -- wget -qO- --timeout=2 http://$BACKEND_IP || true
+
+# Step 5: Apply NetworkPolicy allowing ONLY app=authorized
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-isolation-policy
+  namespace: netpol-lab
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: authorized
+    ports:
+    - protocol: TCP
+      port: 80
+  egress:
+  - {}    # Allow all outbound
+EOF
+
+# Step 6: Test authorized client (SUCCESS)
+kubectl exec -n netpol-lab authorized-client -- wget -qO- --timeout=2 http://$BACKEND_IP
+
+# Step 7: Test unauthorized client (BLOCKED / TIMEOUT)
+kubectl exec -n netpol-lab unauthorized-client -- wget -qO- --timeout=2 http://$BACKEND_IP 2>&1 || echo "SUCCESS: NetworkPolicy dropped unauthorized traffic!"
+
+# Step 8: Clean up lab
+kubectl delete namespace netpol-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the default networking behavior in a Kubernetes cluster before NetworkPolicies are applied?**
+
+By default, Kubernetes implements an **open, non-isolated flat network model**. Any Pod in any namespace can initiate direct TCP, UDP, or ICMP network connections to any other Pod across the entire cluster without any firewall restrictions. Once a Pod is selected by at least one `NetworkPolicy` targeting Ingress or Egress, it transitions to an **Isolated** state, dropping all traffic that is not explicitly allowed.
+
+**Q2: What is the syntax difference between `AND` and `OR` logic when combining `namespaceSelector` and `podSelector`?**
+
+- **`OR` Logic**: Specified as separate items in the `from` list (with two separate leading hyphens `-`). Allows traffic matching either condition independently (e.g. any pod in the namespace OR any pod with that label anywhere).
+- **`AND` Logic**: Specified within the **same single list item** (nested under one single hyphen `-`). Traffic is permitted **only** if the source pod has the specified `podSelector` label **and** is physically located inside a namespace matching the `namespaceSelector`.
+
+**Q3: Why must every Pod with an Egress NetworkPolicy explicitly include a rule for CoreDNS?**
+
+When an Egress policy is applied to a Pod without explicit CoreDNS rules, the Pod enters Default-Deny Egress mode. This blocks all outbound traffic, including UDP/TCP port 53 queries to the cluster's CoreDNS service. Because the Pod cannot resolve domain names (e.g. `mysql.production.svc.cluster.local` or external APIs), all network calls fail with DNS resolution timeouts. An explicit Egress rule allowing port 53 to `kube-system` is mandatory.
+
+**Q4: Can Kubernetes NetworkPolicies filter traffic by domain names (FQDNs like `api.github.com`)?**
+
+No. Native Kubernetes `networking.k8s.io/v1` `NetworkPolicies` operate strictly at Layer 3 (IP CIDRs via `ipBlock`) and Layer 4 (TCP/UDP/SCTP ports). They cannot inspect DNS hostnames or Layer 7 HTTP paths. To enforce FQDN-based egress filtering (e.g. allow only `api.stripe.com`), organizations must use advanced eBPF network security engines like **Cilium** (`CiliumNetworkPolicy`) or Service Meshes (Istio).
+
+**Q5: What happens if a NetworkPolicy is deployed in a cluster where the CNI plugin does not support policies?**
+
+The Kubernetes API server will accept and store the `NetworkPolicy` YAML object in `etcd` without errors. However, the underlying CNI plugin (such as basic flannel) will completely ignore the object. Packets will continue to flow unrestricted between all pods, creating a false sense of security. Clusters must use policy-aware CNIs like Calico, Cilium, or Amazon VPC CNI with network policy controller enabled.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Pods are non-isolated by default until selected by a NetworkPolicy
+- [ ] Know the 3 selector types: `podSelector`, `namespaceSelector`, and `ipBlock`
+- [ ] Know the syntax difference between `AND` (single dash) and `OR` (multiple dashes)
+- [ ] Know that restricting Egress strictly requires explicit CoreDNS rules (Port 53 UDP/TCP)
+- [ ] Know that native NetworkPolicies operate strictly at Layer 3/Layer 4 (IP/Port)
+- [ ] Know that NetworkPolicies require a policy-enforcing CNI (Calico, Cilium)
+- [ ] Can verify active network policies using `kubectl get networkpolicies -A`

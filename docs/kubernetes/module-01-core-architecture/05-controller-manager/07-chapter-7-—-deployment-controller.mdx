@@ -1,0 +1,1704 @@
+---
+title: "Chapter 7 — Deployment Controller"
+sidebar_position: 7
+module: "Module 1.5 — Controller Manager Internals"
+description: "> **Goal:** Understand how the Kubernetes **Deployment Controller** manages application rollouts by orchestrating ReplicaSets. Learn how Deployments perform rol..."
+---
+
+# Module 1.5 — Kubernetes Controller Manager Internals
+
+# Chapter 7 — Deployment Controller
+
+> **Goal:** Understand how the Kubernetes **Deployment Controller** manages application rollouts by orchestrating ReplicaSets. Learn how Deployments perform rolling updates, support zero-downtime deployments, maintain revision history, perform rollbacks, and safely upgrade applications in production clusters.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Deployment position in the ownership chain: Deployment -> ReplicaSet -> Pod
+> 2. How a Deployment reconciles: desired ReplicaSet vs current ReplicaSets
+> 3. Rolling update strategy: maxSurge and maxUnavailable
+> 4. How new ReplicaSets are created on image change
+> 5. How old ReplicaSets are scaled down during rollout
+> 6. Revision history: revisionHistoryLimit and rollback mechanism
+> 7. Paused Deployments: halting rollout mid-flight
+> 8. ProgressDeadlineSeconds: detecting stuck rollouts
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Deployment Controller like a project manager overseeing team leads.
+
+```text
+Project Manager Analogy:
+
+You tell the project manager: "Deploy version 2 of our product"
+PM (Deployment Controller) never writes a single line of code directly
+PM creates a new team (new ReplicaSet) to build v2
+PM gradually moves engineers from the old team (old RS) to new team
+PM watches progress: if new team struggles, PM can pause or roll back
+Old team is kept on standby during rollout (scaled to 0, not deleted)
+Revision history is kept so PM can reinstate the old team instantly
+```
+
+| Project Manager | Deployment Controller |
+| :--- | :--- |
+| Project manager | Deployment Controller |
+| Engineering team lead | ReplicaSet |
+| Engineers (workers) | Pods |
+| Assigning engineers to teams | Scaling ReplicaSets up/down |
+| New version rollout | Rolling update: new RS scales up, old RS scales down |
+| Rollback to previous version | Scale old RS back up, scale new RS to 0 |
+
+> **Important:** The Deployment Controller **never creates Pods directly**. It only creates and scales ReplicaSets. All Pod creation is delegated to the ReplicaSet Controller. This layered ownership is why `kubectl get pods` shows `ownerReference` pointing to a ReplicaSet, not the Deployment.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- ReplicaSet Controller
+- Reconciliation Loop
+- Shared Informers
+- WorkQueues
+- Labels and Selectors
+- OwnerReferences
+- Pods
+- Scheduler
+
+---
+
+# Where Does the Deployment Controller Fit?
+
+So far we have learned:
+
+```text
+ReplicaSet
+
+v
+
+Maintains
+
+Pods
+```
+
+The next question is:
+
+> **Who manages ReplicaSets?**
+
+The answer is:
+
+```text
+Deployment Controller
+```
+
+Deployment Controller sits one level above ReplicaSets.
+
+---
+
+# Kubernetes Workload Hierarchy
+
+```text
+Deployment
+
+v
+
+Deployment Controller
+
+v
+
+ReplicaSet
+
+v
+
+ReplicaSet Controller
+
+v
+
+Pods
+
+v
+
+Scheduler
+
+v
+
+kubelet
+
+v
+
+Containers
+```
+
+Every layer has a single responsibility.
+
+---
+
+# Why Deployments Exist
+
+Imagine using ReplicaSets directly.
+
+Version 1:
+
+```text
+ReplicaSet
+
+v
+
+nginx:1.29
+```
+
+Now you want:
+
+```text
+nginx:1.30
+```
+
+Questions:
+
+- How do you upgrade?
+- How do you rollback?
+- How do you avoid downtime?
+
+ReplicaSets alone do not provide rollout management.
+
+Deployment solves these problems.
+
+---
+
+# What is a Deployment?
+
+A Deployment is:
+
+> **A higher-level Kubernetes resource that manages ReplicaSets and provides declarative application updates, rollbacks, scaling, and rollout strategies.**
+
+A Deployment **never creates Pods directly.**
+
+Instead:
+
+```text
+Deployment
+
+v
+
+ReplicaSet
+
+v
+
+Pods
+```
+
+---
+
+# Example Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: nginx
+
+spec:
+  replicas: 3
+
+  selector:
+    matchLabels:
+      app: nginx
+
+  template:
+    metadata:
+      labels:
+        app: nginx
+
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.30
+```
+
+---
+
+# Deployment Responsibilities
+
+Deployment Controller is responsible for:
+
+- Creating ReplicaSets
+- Updating ReplicaSets
+- Scaling ReplicaSets
+- Rolling updates
+- Rollbacks
+- Revision history
+- Deployment status
+- Monitoring rollout progress
+
+It is **not** responsible for creating Pods directly.
+
+---
+
+# Deployment Architecture
+
+```text
+                 Deployment
+
+                      |
+
+          Deployment Controller
+
+                      |
+
+        ┌─────────────┼─────────────┐
+
+        ▼                           ▼
+
+ Old ReplicaSet              New ReplicaSet
+
+        |                           |
+
+ ReplicaSet Controller     ReplicaSet Controller
+
+        |                           |
+
+       Pods                       Pods
+```
+
+Deployment orchestrates multiple ReplicaSets.
+
+---
+
+# Relationship with ReplicaSets
+
+A Deployment owns one or more ReplicaSets.
+
+Example:
+
+```text
+Deployment
+
+v
+
+ReplicaSet v1
+
+v
+
+Pods
+```
+
+Later:
+
+```text
+Deployment
+
+v
+
+ReplicaSet v1
+
+ReplicaSet v2
+
+v
+
+Pods
+```
+
+Old ReplicaSets are retained for rollback.
+
+---
+
+# OwnerReference Chain
+
+```text
+Deployment
+
+v
+
+OwnerReference
+
+v
+
+ReplicaSet
+
+v
+
+OwnerReference
+
+v
+
+Pod
+```
+
+Ownership is hierarchical.
+
+---
+
+# ReplicaSet Management
+
+The Deployment Controller watches:
+
+- Deployments
+- ReplicaSets
+
+Whenever the Pod Template changes,
+
+it creates a **new ReplicaSet**.
+
+---
+
+# Example
+
+Version 1:
+
+```yaml
+image: nginx:1.29
+```
+
+ReplicaSet:
+
+```text
+ReplicaSet A
+```
+
+Later:
+
+```yaml
+image: nginx:1.30
+```
+
+Deployment Controller:
+
+```text
+Create
+
+ReplicaSet B
+```
+
+The old ReplicaSet remains until the rollout completes (and may remain afterward for rollback history).
+
+---
+
+# Why Create a New ReplicaSet?
+
+Question:
+
+Why not simply modify the existing ReplicaSet?
+
+Because Kubernetes wants:
+
+- Safe upgrades
+- Rollbacks
+- Version history
+- Controlled transitions
+
+Each Pod template revision gets its own ReplicaSet.
+
+---
+
+# Deployment Revision
+
+Every Pod template change creates:
+
+```text
+New Revision
+
+v
+
+New ReplicaSet
+```
+
+Example:
+
+```text
+Revision 1
+
+v
+
+nginx:1.29
+
+Revision 2
+
+v
+
+nginx:1.30
+
+Revision 3
+
+v
+
+nginx:1.31
+```
+
+---
+
+# Rolling Updates
+
+One of the most important Deployment features is:
+
+```text
+Rolling Update
+```
+
+---
+
+# What is a Rolling Update?
+
+Instead of:
+
+```text
+Delete Everything
+
+v
+
+Create Everything
+```
+
+Deployment performs:
+
+```text
+Replace Pods
+
+Gradually
+```
+
+Users continue accessing the application during the rollout.
+
+---
+
+# Why Rolling Updates?
+
+Without rolling updates:
+
+```text
+Delete
+
+10 Pods
+
+v
+
+Application Offline
+
+v
+
+Create
+
+10 New Pods
+```
+
+Downtime occurs.
+
+---
+
+# With Rolling Updates
+
+Instead:
+
+```text
+Old Pod
+
+v
+
+New Pod
+
+v
+
+Old Pod
+
+v
+
+New Pod
+```
+
+The replacement happens incrementally.
+
+---
+
+# High-Level Workflow
+
+```text
+Deployment Updated
+
+v
+
+New ReplicaSet
+
+v
+
+Scale Up New ReplicaSet
+
+v
+
+Scale Down Old ReplicaSet
+
+v
+
+Repeat
+
+v
+
+Rollout Complete
+```
+
+---
+
+# Rolling Update Example
+
+Before:
+
+```text
+ReplicaSet A
+
+10 Pods
+```
+
+After image update:
+
+```text
+ReplicaSet A
+
+9 Pods
+
+ReplicaSet B
+
+1 Pod
+```
+
+Later:
+
+```text
+ReplicaSet A
+
+8 Pods
+
+ReplicaSet B
+
+2 Pods
+```
+
+Eventually:
+
+```text
+ReplicaSet A
+
+0 Pods
+
+ReplicaSet B
+
+10 Pods
+```
+
+---
+
+# Rolling Update Timeline
+
+```text
+Time 0
+
+Old
+
+10
+
+New
+
+0
+
+v
+
+Time 1
+
+Old
+
+9
+
+New
+
+1
+
+v
+
+Time 2
+
+Old
+
+8
+
+New
+
+2
+
+v
+
+...
+
+v
+
+Complete
+
+Old
+
+0
+
+New
+
+10
+```
+
+Traffic continues throughout the rollout if enough healthy Pods remain.
+
+---
+
+# Deployment Reconciliation
+
+Deployment Controller continuously performs:
+
+```text
+Observe Deployment
+
+v
+
+Observe ReplicaSets
+
+v
+
+Compare Desired Template
+
+v
+
+Need New ReplicaSet?
+
+v
+
+Scale ReplicaSets
+
+v
+
+Update Status
+
+v
+
+Repeat
+```
+
+---
+
+# Rollbacks
+
+Suppose:
+
+New version:
+
+```text
+nginx:1.30
+```
+
+contains a bug.
+
+Deployment can return to:
+
+```text
+nginx:1.29
+```
+
+using a rollback.
+
+---
+
+# Why Rollbacks Matter
+
+Production deployments sometimes fail because of:
+
+- Software bugs
+- Configuration errors
+- Missing dependencies
+- Performance regressions
+- Security issues
+
+Rollback provides rapid recovery.
+
+---
+
+# Rollback Workflow
+
+```text
+Deployment
+
+v
+
+Previous Revision
+
+v
+
+Scale Previous ReplicaSet Up
+
+v
+
+Scale Current ReplicaSet Down
+
+v
+
+Rollback Complete
+```
+
+---
+
+# Example
+
+Current:
+
+```text
+Revision 3
+
+Broken
+```
+
+Rollback:
+
+```text
+Revision 2
+
+Healthy
+```
+
+Deployment Controller adjusts ReplicaSet sizes until the previous revision becomes active again.
+
+---
+
+# Revision History
+
+Deployments keep:
+
+```text
+Revision History
+```
+
+through ReplicaSets.
+
+---
+
+# Example
+
+```text
+Revision 1
+
+v
+
+ReplicaSet A
+
+Revision 2
+
+v
+
+ReplicaSet B
+
+Revision 3
+
+v
+
+ReplicaSet C
+```
+
+Each ReplicaSet represents one Pod template revision.
+
+---
+
+# Why Keep Old ReplicaSets?
+
+Benefits:
+
+- Rollback
+- Audit trail
+- Deployment history
+- Version tracking
+
+Without history,
+
+rollback would be impossible.
+
+---
+
+# revisionHistoryLimit
+
+Deployments allow limiting retained revisions.
+
+Example:
+
+```yaml
+revisionHistoryLimit: 5
+```
+
+Conceptually:
+
+```text
+Keep
+
+Latest
+
+5 ReplicaSets
+```
+
+Older unused ReplicaSets may be cleaned up after successful rollouts.
+
+---
+
+# Max Surge
+
+During rolling updates,
+
+Deployments may temporarily create extra Pods.
+
+This is controlled by:
+
+```text
+maxSurge
+```
+
+---
+
+# What is Max Surge?
+
+Max Surge defines:
+
+> **The maximum number of additional Pods that may exist above the desired replica count during a rolling update.**
+
+---
+
+# Example
+
+Desired:
+
+```text
+10 Pods
+```
+
+Configuration:
+
+```yaml
+maxSurge: 2
+```
+
+Maximum temporary Pods:
+
+```text
+12
+```
+
+The Deployment can create up to two extra Pods before removing old ones.
+
+---
+
+# Rolling Update with Max Surge
+
+```text
+Desired
+
+10
+
+v
+
+Create
+
+2 New Pods
+
+v
+
+Total
+
+12
+
+v
+
+Delete
+
+2 Old Pods
+
+v
+
+Back To
+
+10
+```
+
+Extra capacity helps reduce downtime.
+
+---
+
+# Percentage Example
+
+```yaml
+maxSurge: 25%
+```
+
+Desired:
+
+```text
+20 Pods
+```
+
+Maximum surge:
+
+```text
+5 Additional Pods
+```
+
+Total during rollout:
+
+```text
+25 Pods
+```
+
+Percentages are calculated relative to the desired replica count.
+
+---
+
+# Max Unavailable
+
+The second rollout parameter is:
+
+```text
+maxUnavailable
+```
+
+---
+
+# What is Max Unavailable?
+
+Max Unavailable defines:
+
+> **The maximum number of desired Pods that may be unavailable during a rolling update.**
+
+---
+
+# Example
+
+Desired:
+
+```text
+10 Pods
+```
+
+Configuration:
+
+```yaml
+maxUnavailable: 2
+```
+
+Minimum available Pods during rollout:
+
+```text
+8
+```
+
+---
+
+# Why Max Unavailable?
+
+It balances:
+
+- Deployment speed
+- Application availability
+
+Smaller values:
+
+```text
+Higher Availability
+
+v
+
+Slower Rollout
+```
+
+Larger values:
+
+```text
+Faster Rollout
+
+v
+
+Potentially Lower Availability
+```
+
+---
+
+# Max Surge + Max Unavailable
+
+These two parameters work together.
+
+Example:
+
+```yaml
+replicas: 10
+
+maxSurge: 2
+
+maxUnavailable: 1
+```
+
+Possible state:
+
+```text
+Desired
+
+10
+
+Current
+
+11
+
+Available
+
+10
+```
+
+or later:
+
+```text
+Current
+
+10
+
+Available
+
+9
+```
+
+The Deployment Controller ensures the rollout remains within both configured limits.
+
+---
+
+# Rolling Update Visualization
+
+```text
+Desired Replicas
+
+10
+
+────────────────────────────
+
+Old ReplicaSet
+
+██████████
+
+New ReplicaSet
+
+□□□□□□□□□□
+
+v
+
+Old
+
+█████████□
+
+New
+
+■□□□□□□□□□
+
+v
+
+Old
+
+████████□□
+
+New
+
+■■□□□□□□□□
+
+v
+
+Old
+
+□□□□□□□□□□
+
+New
+
+■■■■■■■■■■
+```
+
+---
+
+# Progress Deadline
+
+Deployments monitor rollout progress.
+
+---
+
+# What is Progress Deadline?
+
+A Deployment expects rollout progress within a configured time.
+
+Configuration:
+
+```yaml
+progressDeadlineSeconds: 600
+```
+
+Meaning:
+
+```text
+If rollout makes no progress
+
+for 600 seconds
+
+v
+
+Mark Deployment
+
+ProgressDeadlineExceeded
+```
+
+---
+
+# Why Progress Deadline Exists
+
+Suppose:
+
+New Pods:
+
+```text
+CrashLoopBackOff
+```
+
+The rollout never advances.
+
+Without a deadline:
+
+```text
+Deployment
+
+Waiting Forever
+```
+
+Instead,
+
+the Deployment reports rollout failure.
+
+---
+
+# Example
+
+```text
+ReplicaSet Created
+
+v
+
+Pods Never Become Ready
+
+v
+
+Deadline Exceeded
+
+v
+
+Deployment Condition Updated
+```
+
+The Deployment does **not** automatically roll back simply because the deadline is exceeded; it reports the failure so operators or higher-level automation can respond.
+
+---
+
+# Deployment Conditions
+
+Deployments publish status conditions such as:
+
+```text
+Available
+
+Progressing
+
+ReplicaFailure
+```
+
+These conditions help operators understand rollout state.
+
+---
+
+# Relationship with ReplicaSet Controller
+
+Deployment Controller:
+
+```text
+Manage ReplicaSets
+```
+
+ReplicaSet Controller:
+
+```text
+Manage Pods
+```
+
+Responsibilities remain separate.
+
+---
+
+# Relationship with Scheduler
+
+Deployment:
+
+```text
+Create ReplicaSet
+```
+
+ReplicaSet:
+
+```text
+Create Pods
+```
+
+Scheduler:
+
+```text
+Assign Nodes
+```
+
+---
+
+# Relationship with kubelet
+
+Deployment:
+
+```text
+Manage Versions
+```
+
+kubelet:
+
+```text
+Run Containers
+```
+
+Deployment never interacts directly with kubelet.
+
+---
+
+# Complete Production Workflow
+
+```text
+User
+
+v
+
+Update Deployment
+
+v
+
+Deployment Informer
+
+v
+
+WorkQueue
+
+v
+
+Deployment Worker
+
+v
+
+Reconcile
+
+v
+
+Create New ReplicaSet
+
+v
+
+Scale Up New ReplicaSet
+
+v
+
+Scale Down Old ReplicaSet
+
+v
+
+ReplicaSet Controller
+
+v
+
+Create/Delete Pods
+
+v
+
+Scheduler
+
+v
+
+Nodes
+
+v
+
+kubelet
+
+v
+
+Containers Running
+```
+
+---
+
+# Production Example 1
+
+Application Upgrade
+
+```text
+v1.29
+
+v
+
+Update Deployment
+
+v
+
+v1.30
+
+v
+
+Rolling Update
+
+v
+
+Zero Downtime
+```
+
+---
+
+# Production Example 2
+
+Rollback
+
+```text
+Revision 5
+
+v
+
+Bug Found
+
+v
+
+Rollback
+
+v
+
+Revision 4
+
+v
+
+Application Stable
+```
+
+---
+
+# Production Example 3
+
+Scaling During Rollout
+
+Deployment:
+
+```yaml
+replicas: 50
+```
+
+Rolling update:
+
+```text
+Old ReplicaSet
+
+v
+
+Scale Down
+
+v
+
+New ReplicaSet
+
+v
+
+Scale Up
+
+v
+
+Maintain Availability
+```
+
+---
+
+# Production Example 4
+
+Node Failure During Rollout
+
+```text
+Rolling Update
+
+v
+
+Node Fails
+
+v
+
+ReplicaSet Controller
+
+v
+
+Replace Missing Pods
+
+v
+
+Deployment Continues
+```
+
+Multiple Controllers cooperate to complete the rollout.
+
+---
+
+# Production Example 5
+
+Failed Rollout
+
+```text
+New Version
+
+v
+
+Pods Crash
+
+v
+
+No Progress
+
+v
+
+Progress Deadline Exceeded
+
+v
+
+Deployment Status Updated
+```
+
+Operators investigate and may initiate a rollback.
+
+---
+
+# Performance Considerations
+
+Deployment Controllers scale efficiently because they:
+
+- Use Shared Informers
+- Reconcile from local caches
+- Enqueue only Deployment keys
+- Manage ReplicaSets rather than Pods directly
+- Coordinate with ReplicaSet Controllers
+- Perform idempotent reconciliation
+
+---
+
+# Production Best Practices
+
+✔ Use Deployments instead of standalone ReplicaSets for long-running applications.
+
+✔ Configure appropriate `maxSurge` and `maxUnavailable` values based on application availability requirements.
+
+✔ Use readiness probes to ensure new Pods receive traffic only after becoming healthy.
+
+✔ Configure `progressDeadlineSeconds` for production workloads.
+
+✔ Retain sufficient revision history for rollback.
+
+✔ Monitor Deployment conditions during rollouts.
+
+✔ Perform gradual rollouts for critical applications.
+
+✔ Test rollback procedures regularly.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+Deployments create Pods directly.
+
+Wrong.
+
+Deployments create and manage ReplicaSets. ReplicaSets create Pods.
+
+---
+
+### ❌ Misconception 2
+
+Updating the image modifies the existing ReplicaSet.
+
+Wrong.
+
+A new Pod template results in a new ReplicaSet.
+
+---
+
+### ❌ Misconception 3
+
+Rolling updates delete all old Pods first.
+
+Wrong.
+
+Deployments gradually replace Pods according to the rollout strategy.
+
+---
+
+### ❌ Misconception 4
+
+Max Surge permanently increases replica count.
+
+Wrong.
+
+Additional Pods exist only temporarily during the rollout.
+
+---
+
+### ❌ Misconception 5
+
+Progress deadline automatically rolls back a Deployment.
+
+Wrong.
+
+The Deployment reports rollout failure through its status. Automatic rollback requires additional tooling or operator action.
+
+---
+
+### ❌ Misconception 6
+
+Revision history stores old Pods.
+
+Wrong.
+
+Revision history is represented by ReplicaSets (and their Pod templates), not by retained Pods.
+
+---
+
+### ❌ Misconception 7
+
+Deployments schedule Pods onto Nodes.
+
+Wrong.
+
+Scheduling is performed by the Kubernetes Scheduler after ReplicaSets create Pods.
+
+---
+
+# Common Interview Questions
+
+### Q1. What is the purpose of a Deployment?
+
+To manage ReplicaSets and provide declarative updates, scaling, rollbacks, and rollout strategies.
+
+---
+
+### Q2. Does a Deployment create Pods directly?
+
+No. It creates ReplicaSets, which create Pods.
+
+---
+
+### Q3. Why does every Pod template change create a new ReplicaSet?
+
+To support controlled rollouts, revision history, and rollbacks.
+
+---
+
+### Q4. What is a rolling update?
+
+A deployment strategy that gradually replaces old Pods with new Pods while maintaining application availability.
+
+---
+
+### Q5. What is Max Surge?
+
+The maximum number of additional Pods allowed above the desired replica count during a rolling update.
+
+---
+
+### Q6. What is Max Unavailable?
+
+The maximum number of desired Pods that may be unavailable during a rolling update.
+
+---
+
+### Q7. What is the purpose of revision history?
+
+To retain previous Deployment revisions so rollbacks are possible.
+
+---
+
+### Q8. What happens when the progress deadline is exceeded?
+
+The Deployment reports that the rollout has stalled by updating its status conditions.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Deployment rollout never completes | New Pods are not becoming Ready, image issues, or scheduling failures |
+| New ReplicaSet created but no Pods run | ReplicaSet reconciliation, scheduling, or resource constraints |
+| Rollout slower than expected | Conservative `maxSurge`/`maxUnavailable` settings or slow readiness |
+| Old ReplicaSets accumulate | `revisionHistoryLimit` retains previous revisions |
+| Deployment shows `ProgressDeadlineExceeded` | Rollout stalled because new Pods failed to make progress |
+| Rollback does not restore application health | Previous revision also contains configuration or application problems |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. What is the responsibility of the Deployment Controller?
+2. How does a Deployment differ from a ReplicaSet?
+3. Why does every Pod template change create a new ReplicaSet?
+4. What is a rolling update?
+5. How does a rollback work?
+6. Why is revision history important?
+7. What does `maxSurge` control?
+8. What does `maxUnavailable` control?
+9. What is `progressDeadlineSeconds`?
+10. How does the Deployment Controller interact with the ReplicaSet Controller?
+11. How do Deployments achieve zero-downtime upgrades?
+12. Why are Deployments the preferred workload resource for stateless applications?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the **Deployment Controller** orchestrates ReplicaSets to provide safe, declarative application lifecycle management.
+
+You learned:
+
+- The architecture of the Deployment Controller
+- How Deployments manage multiple ReplicaSets
+- Why every Pod template change creates a new ReplicaSet
+- How rolling updates gradually replace application versions
+- How rollbacks restore previous revisions
+- How revision history enables deployment recovery
+- The roles of `maxSurge` and `maxUnavailable` in balancing rollout speed and availability
+- How `progressDeadlineSeconds` detects stalled rollouts
+- The complete production workflow from Deployment updates to running Pods
+
+The Deployment Controller is one of Kubernetes' most powerful Controllers. Rather than managing Pods directly, it coordinates ReplicaSets, enabling controlled rollouts, safe rollbacks, version history, and high application availability. Together with the **ReplicaSet Controller**, **Shared Informers**, **WorkQueues**, and the **Reconciliation Loop**, it forms the foundation for reliable, production-grade application deployments in Kubernetes.
+
+---
+
+# Next Chapter
+
+**Chapter 8 — StatefulSet Controller**
+
+In the next chapter, we'll explore how Kubernetes manages **stateful applications** that require stable identities and persistent storage.
+
+Topics include:
+
+- Why StatefulSets Exist
+- Stable Network Identity
+- Stable Pod Identity
+- Stable Persistent Storage
+- Ordered Deployment
+- Ordered Termination
+- Rolling Updates
+- Pod Management Policy
+- VolumeClaimTemplates
+- Production Stateful Workflows
+
+You'll learn why databases, message queues, distributed storage systems, and other stateful workloads rely on the StatefulSet Controller instead of Deployments.
+```

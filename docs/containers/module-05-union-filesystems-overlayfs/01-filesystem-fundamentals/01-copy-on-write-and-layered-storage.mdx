@@ -1,0 +1,181 @@
+---
+title: "Chapter 1 — Copy-on-Write (CoW) & Layered Storage"
+sidebar_position: 1
+module: "Module 5.1 — Filesystem Fundamentals"
+description: "Master Union Filesystem fundamentals — Copy-on-Write (CoW) mechanics, immutable read-only layers, ephemeral writable layers, and page cache RAM deduplication."
+---
+
+# Chapter 1 — Copy-on-Write (CoW) & Layered Storage
+
+> **Goal:** Master the storage mechanics, memory deduplication algorithms, and performance trade-offs of **Union Filesystems (UnionFS)** and **Copy-on-Write (CoW)** — dissecting how container runtimes layer **immutable read-only image layers** beneath an **ephemeral writable container layer**, analyzing the latency overhead of **Copy-Up operations**, exploring **Linux Page Cache memory sharing**, and contrasting CoW storage with high-speed volume mounts.
+>
+> By the end of this chapter, you will understand:
+> 1. How Union Filesystems merge multiple distinct directory trees into a single unified view
+> 2. The exact step-by-step kernel sequence during a Copy-on-Write (CoW) write operation
+> 3. Why reading files from layered images incurs zero performance overhead
+> 4. How the Linux kernel shares read-only image binary pages in RAM across 1,000 containers
+> 5. Why heavy database writes should never execute on a container's Copy-on-Write layer
+> 6. How to benchmark and verify Copy-Up latency penalties using the command line
+
+---
+
+## Real-Life Analogy
+
+Think of a Union Filesystem and Copy-on-Write as **a stack of transparent acetate plastic sheets on an overhead classroom projector**:
+
+- **The Immutable Base Layers (The Printed Plastic Sheets):**
+  - Sheet 1 has an outline of the world map printed in permanent black ink (**Layer 0: Base Ubuntu OS**).
+  - Sheet 2 has country borders printed on top (**Layer 1: Python Runtime**).
+  - Sheet 3 has city names printed on top (**Layer 2: Application Code**).
+  - These sheets are permanently laminated: **no teacher can erase or alter them (Read-Only Image Layers)**.
+- **The Top Writable Sheet (The Ephemeral Writable Layer):**
+  - The teacher places a blank transparent sheet on top of the stack (**The Container Writable Layer**).
+  - The teacher uses an erasable dry-erase marker to draw red arrows and write notes (**Creating new files**).
+- **The Copy-on-Write (CoW) Rule:**
+  - If the teacher wants to "modify" the name of Paris on Sheet 3, they cannot erase Sheet 3 directly.
+  - Instead, the teacher copies the word "Paris" onto the top transparent sheet and scribbles over it with the new text (**Copy-Up**).
+  - From the audience's perspective looking at the projection screen (**The Merged View**), Paris was modified!
+  - When the class finishes, the teacher throws away the top plastic sheet (**`docker rm`**), and the original laminated map is **100% pristine and untouched**!
+
+---
+
+## Architecture Diagram
+
+```text
+               Union Filesystem Architecture & Copy-on-Write (CoW) Flow
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ MERGED UNIFIED CONTAINER VIEW (`/` inside running container)           │
+ │ ├── `/app/server.py`      (Modified in Upper Writable Layer)           │
+ │ ├── `/usr/bin/python3`    (Read directly from Immutable Layer 1)       │
+ │ └── `/etc/passwd`         (Read directly from Immutable Layer 0)       │
+ └────────────────────────────────────────────────────────────────────────┘
+                                     ▲
+             Merged via Linux OverlayFS Kernel Storage Driver
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ 1. EPHEMERAL WRITABLE LAYER (`upperdir` - R/W):                        │
+ │    - Contains only modified files & newly created delta files          │
+ │    - Deletion markers (`.wh.old_file`) for deleted files               │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 2. IMMUTABLE IMAGE LAYER 2 (`lowerdir[0]` - Read-Only):                │
+ │    - Application source code: `/app/server.py`                         │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 3. IMMUTABLE IMAGE LAYER 1 (`lowerdir[1]` - Read-Only):                │
+ │    - Python 3.11 binaries: `/usr/bin/python3`, `/usr/lib/python3.11`   │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 4. IMMUTABLE BASE LAYER 0 (`lowerdir[2]` - Read-Only):                 │
+ │    - Minimal Alpine/Ubuntu rootfs: `/bin/sh`, `/etc/passwd`            │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Copy-on-Write (CoW) Execution Mechanics
+
+```text
+ ┌───────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
+ │ Filesystem Operation      │ Linux Kernel Execution Path                                             │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **1. Read File (`open`)** │ Searches layers top-to-bottom. Serves the file from the FIRST layer     │
+ │                           │ where it is found. If found in read-only layer, read directly with 0 CoW│
+ │                           │ overhead.                                                               │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **2. Create New File**    │ Writes file directly into the **Upper Writable Layer**. Zero CoW delay. │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **3. Modify File**        │ **Copy-Up Trigger**: The kernel allocates space in the Upper Layer,     │
+ │                           │ copies the entire original file from the lower layer into the upper     │
+ │                           │ layer, and applies the modification to the copy!                        │
+ │───────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
+ │ **4. Delete File**        │ Creates a **Whiteout Marker File** (`.wh.<filename>`) in the Upper      │
+ │                           │ Layer. The original file remains untouched in the lower read-only layer.│
+ └───────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Memory Deduplication via Shared Linux Page Cache
+
+Because lower image layers are **read-only and immutable**, the Linux kernel automatically optimizes host RAM consumption through **Page Cache Sharing**:
+
+```text
+ Physical Host RAM (Total: 64GB)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ SINGLE COPY IN HOST PAGE CACHE: `python3.11` binary (Size: 45MB)       │
+ └──────┬───────────────────────────┬───────────────────────────┬─────────┘
+        │ Virtual Memory Mapping    │ Virtual Memory Mapping    │ Virtual Memory Mapping
+        ▼                           ▼                           ▼
+ ┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+ │ Container 01 (Web App) │  │ Container 02 (Worker)  │  │ Container 100 (API)    │
+ └────────────────────────┘  └────────────────────────┘  └────────────────────────┘
+```
+
+If 100 containers run the same Python image, **only 1 copy of the Python binary exists in host RAM (saving 4.5 GB of RAM!)**.
+
+---
+
+## The Copy-Up Performance Penalty
+
+When an application opens an existing large file (e.g. a 2GB SQLite database or log file stored in an image layer) with write access (`open("large.db", O_RDWR)`):
+1. The kernel **blocks the calling thread**.
+2. It physically copies all 2 Gigabytes of data from the lower layer to the upper writable layer.
+3. Only after the entire 2GB copy completes does the `open()` system call return.
+4. **Result: Sudden multi-second application stalls!**
+
+> [!WARNING]
+> **Database Anti-Pattern:** Never store databases (Postgres, MySQL, MongoDB, SQLite) or high-write files on a container's Copy-on-Write filesystem. Always mount **Docker Named Volumes or Bind Mounts**, which bypass the storage driver and write directly to host storage at full disk line-rate!
+
+---
+
+## Hands-On Lab: Observing Copy-on-Write Latency
+
+```bash
+# Step 1: Create a container with a 100MB file pre-baked in its rootfs
+docker run -d --name cow-demo alpine sh -c "dd if=/dev/zero of=/large-file.dat bs=1M count=100 && sleep 3600"
+
+# Step 2: Measure the time to append 1 byte to the file inside the container (Triggers Copy-Up!)
+time docker exec cow-demo sh -c "echo 'x' >> /large-file.dat"
+
+# Step 3: Run the append command a second time (File is ALREADY in upper layer!)
+time docker exec cow-demo sh -c "echo 'x' >> /large-file.dat"
+# Notice that the second write is nearly instantaneous because no Copy-Up is required!
+
+# Cleanup
+docker rm -f cow-demo
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a Union Filesystem (UnionFS), and how does it enable lightweight containerization?**
+
+A Union Filesystem is a Linux filesystem service that takes multiple separate directories (called branches or layers) and overlays them on top of one another to present a **single, unified virtual directory tree**. In containerization, the operating system and application dependencies are packaged as **immutable, read-only lower layers**, and a thin **ephemeral, read-write upper layer** is mounted on top. This allows hundreds of containers to share the exact same underlying base image files without duplicating data on disk, enabling sub-second container creation and massive storage savings.
+
+**Q2: What is the "Copy-Up" operation in Copy-on-Write (CoW), and when does it introduce latency?**
+
+When a container attempts to modify or write to a file that exists in one of the read-only lower image layers, the storage driver (OverlayFS) intercepts the write system call. Before applying the modification, the driver must physically **copy the entire original file from the lower layer into the upper writable layer (the "Copy-Up" operation)**. If the file is large (e.g. 500MB), the write operation blocks until the entire file is duplicated, introducing sudden latency spikes into write-heavy workloads.
+
+**Q3: How does the Linux kernel share Page Cache memory across multiple containers running the same image?**
+
+In Linux, when a file is read from disk, its data blocks are cached in host RAM as **Page Cache memory** indexed by the file's device and inode numbers. Because image layers in OverlayFS are read-only and shared across containers on the host, the kernel references the exact same underlying inodes. If 50 containers execute `/usr/bin/node` from the same base image, the Linux kernel loads the Node.js binary into host RAM **only once**. All 50 containers map their virtual memory to the exact same physical RAM pages, drastically reducing memory consumption.
+
+**Q4: Why should databases and high-throughput logging never use the container writable layer?**
+
+Container writable layers introduce two major issues for stateful and high-throughput workloads:
+1. **Performance Degradation**: Every write to existing files incurs Copy-Up overhead, and OverlayFS adds filesystem indirection latency, reducing maximum IOPS and disk bandwidth compared to native filesystems.
+2. **Ephemeral Data Loss**: The container writable layer is destroyed when the container is deleted (`docker rm`), leading to permanent database data loss. High-write workloads must use **Volumes or Bind Mounts**, which bypass the storage driver and write directly to host disks (ext4/XFS).
+
+**Q5: How does a Union Filesystem handle deleting a file that exists in a read-only lower layer?**
+
+Because lower layers are strictly read-only, the underlying file cannot be modified or unlinked. Instead, the storage driver creates a special **Whiteout Marker File** in the upper writable layer with the same name (prefixed by `.wh.`, e.g. `.wh.app.log`). When the driver resolves file lookups for that path, it encounters the whiteout marker and hides the file from the merged container directory view, making the file appear deleted to user-space applications.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Union Filesystems merge multiple directories into 1 unified view
+- [ ] Know that lower image layers are read-only and the top container layer is writable
+- [ ] Know that modifying a lower-layer file triggers an expensive "Copy-Up" operation
+- [ ] Know that read-only image layers share the exact same Page Cache in host RAM
+- [ ] Know that file deletions in lower layers create Whiteout marker files (`.wh.<name>`)
+- [ ] Know why databases must always use Volumes instead of the container CoW layer

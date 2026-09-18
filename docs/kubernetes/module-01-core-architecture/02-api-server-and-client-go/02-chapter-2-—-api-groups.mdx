@@ -1,0 +1,428 @@
+---
+title: "Chapter 2 — API Groups"
+sidebar_position: 2
+module: "Module 1.2 — API Server Deep Dive & client-go"
+description: "> **Goal:** Understand how Kubernetes organizes thousands of APIs into logical groups, why API Groups were introduced, and how Group-Version-Resource (GVR) and Group-Version-Kind (GVK) identify every resource."
+---
+
+# Chapter 2 — API Groups
+
+> **Goal:** Understand how Kubernetes organizes thousands of APIs into logical groups, why API Groups were introduced, how they prevent conflicts, and how new APIs are registered.
+>
+> By the end of this chapter, you'll understand:
+>
+> ```text
+> 1. Why API Groups were introduced
+> 2. The Core (legacy) API Group
+> 3. Named API Groups
+> 4. Group-Version-Resource (GVR)
+> 5. Group-Version-Kind (GVK)
+> 6. API Registration during startup
+> 7. How CRDs and Aggregated APIs fit into API Groups
+> ```
+
+---
+
+# Why Should You Learn This?
+
+Every Kubernetes engineer eventually asks:
+
+> **Why does a Pod use `apiVersion: v1` but a Deployment uses `apiVersion: apps/v1`?**
+
+Or:
+
+> **Why do I need `networking.k8s.io/v1` for an Ingress but `v1` for a Service?**
+
+The answer is **API Groups** — Kubernetes' system for organizing its ever-growing API surface into logical, independently versionable namespaces.
+
+Without understanding API Groups, you cannot:
+- Correctly write RBAC rules (`apiGroups: ["apps"]`)
+- Build `client-go` clients (`clientset.AppsV1()`)
+- Write CRD definitions (`group: myteam.example.com`)
+- Register Aggregated APIs
+- Understand why `kubectl api-versions` shows what it shows
+
+---
+
+# Real-Life Analogy
+
+Think of API Groups like departments in a large company.
+
+```text
+Company (Kubernetes)
+        |
+        +-- Engineering (apps)
+        |       Deployment, ReplicaSet, StatefulSet, DaemonSet
+        |
+        +-- Logistics (batch)
+        |       Job, CronJob
+        |
+        +-- Network (networking.k8s.io)
+        |       Ingress, NetworkPolicy, IngressClass
+        |
+        +-- Finance (autoscaling)
+        |       HorizontalPodAutoscaler
+        |
+        +-- Storage (storage.k8s.io)
+                StorageClass, CSIDriver
+```
+
+| Company Concept | Kubernetes Equivalent |
+| :--- | :--- |
+| Department name | API Group (`apps`, `batch`) |
+| Job title | Resource kind (`Deployment`, `Job`) |
+| Employee ID | Specific object name |
+| HR records | etcd storage |
+
+Each department manages its own area independently. Kubernetes does the same with API Groups.
+
+---
+
+# Before API Groups: The Problem
+
+In Kubernetes version 1.0, everything lived under:
+
+```text
+/api/v1
+```
+
+With only a handful of resources (Pods, Services, Namespaces) this was fine.
+
+As Kubernetes grew, hundreds of resources were added:
+
+```text
+Deployments    ReplicaSets    StatefulSets    DaemonSets
+Jobs           CronJobs       Ingresses       NetworkPolicies
+StorageClasses CSIDrivers     Leases          PriorityClasses
+```
+
+Putting everything under `/api/v1` caused serious problems:
+
+- **No independent versioning** — changing one resource affected all others
+- **No ownership clarity** — which team is responsible for which resource?
+- **Naming conflicts** — multiple teams could create resources with the same name
+- **No extensibility** — third-party resources couldn't be added cleanly
+
+---
+
+# The Solution: API Groups
+
+Kubernetes introduced API Groups to organize resources by functional domain.
+
+```text
+Kubernetes API
+        |
+        +-- Core API Group  (/api/v1)
+        |       Pod, Service, ConfigMap, Secret, Namespace, Node
+        |
+        +-- apps            (/apis/apps/v1)
+        |       Deployment, ReplicaSet, StatefulSet, DaemonSet
+        |
+        +-- batch           (/apis/batch/v1)
+        |       Job, CronJob
+        |
+        +-- networking.k8s.io  (/apis/networking.k8s.io/v1)
+        |       Ingress, NetworkPolicy, IngressClass
+        |
+        +-- autoscaling     (/apis/autoscaling/v2)
+        |       HorizontalPodAutoscaler
+        |
+        +-- storage.k8s.io  (/apis/storage.k8s.io/v1)
+        |       StorageClass, CSIDriver, CSIStorageCapacity
+        |
+        +-- coordination.k8s.io  (/apis/coordination.k8s.io/v1)
+        |       Lease
+        |
+        +-- policy          (/apis/policy/v1)
+        |       PodDisruptionBudget
+        |
+        +-- scheduling.k8s.io  (/apis/scheduling.k8s.io/v1)
+                PriorityClass
+```
+
+---
+
+# The Core API Group
+
+The Core API Group is special — it is the original Kubernetes API that existed before named groups were introduced.
+
+Its group name is an **empty string** (`""`), which is why it uses `/api` instead of `/apis`:
+
+```http
+GET /api/v1/pods
+GET /api/v1/namespaces/default/services
+GET /api/v1/nodes
+```
+
+In YAML, Core resources use just the version:
+```yaml
+apiVersion: v1
+kind: Pod
+```
+
+There is **no** `apiVersion: core/v1`.
+
+### Common Core Resources
+
+| Resource | API Version |
+| :--- | :--- |
+| Pod | `v1` |
+| Service | `v1` |
+| Namespace | `v1` |
+| Node | `v1` |
+| Secret | `v1` |
+| ConfigMap | `v1` |
+| PersistentVolume | `v1` |
+| PersistentVolumeClaim | `v1` |
+| Event | `v1` |
+| ServiceAccount | `v1` |
+
+---
+
+# Named API Groups
+
+All newer Kubernetes resources live in Named API Groups with explicit group names.
+
+Named groups use the `/apis` prefix:
+```http
+GET /apis/apps/v1/deployments
+GET /apis/batch/v1/jobs
+GET /apis/networking.k8s.io/v1/ingresses
+```
+
+In YAML:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+```
+
+The `apiVersion` is always `<group>/<version>`.
+
+---
+
+# Group-Version-Resource (GVR)
+
+Internally, Kubernetes identifies every resource using three components:
+
+```text
+Group    / Version / Resource
+apps     /   v1   / deployments
+batch    /   v1   / jobs
+""       /   v1   / pods        (Core group = empty string)
+```
+
+GVR is used by:
+- `client-go` Dynamic Client
+- RBAC rules (`apiGroups`, `resources`)
+- `kubectl api-resources` output
+
+### RBAC Example Using GVR
+```yaml
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "update"]
+```
+
+---
+
+# Group-Version-Kind (GVK)
+
+GVK identifies the **type** of an object (whereas GVR identifies the REST endpoint):
+
+```text
+Group    / Version / Kind
+apps     /   v1   / Deployment
+batch    /   v1   / Job
+""       /   v1   / Pod
+```
+
+- **GVR** → maps to the REST API URL (used for HTTP requests)
+- **GVK** → maps to the Go struct type (used internally in code)
+
+> **Important:** The same Kind can be served under multiple GVRs if multiple versions coexist (e.g., `autoscaling/v1` and `autoscaling/v2` both serve `HorizontalPodAutoscaler`).
+
+---
+
+# Why API Groups Exist: 5 Benefits
+
+## 1. Independent Versioning
+```text
+apps/v1   (stable)
+apps/v2   (future — only apps group changes)
+```
+Networking, storage, batch APIs remain unaffected.
+
+## 2. Independent Development
+Different Kubernetes SIGs (Special Interest Groups) own different API groups:
+
+| SIG | API Group |
+| :--- | :--- |
+| SIG Apps | `apps` |
+| SIG Network | `networking.k8s.io` |
+| SIG Storage | `storage.k8s.io` |
+| SIG Auth | `rbac.authorization.k8s.io` |
+
+## 3. No Naming Conflicts
+Two groups can have resources with the same Kind name:
+```text
+policy/v1/PodDisruptionBudget
+security.example.com/v1/Policy   (custom)
+```
+
+## 4. Extensibility via CRDs
+Custom Resource Definitions use custom group names:
+```yaml
+group: database.example.com
+versions:
+- name: v1alpha1
+```
+This creates `/apis/database.example.com/v1alpha1/redisclusters`.
+
+## 5. Extensibility via Aggregated APIs
+Extension API servers register additional groups (e.g., `metrics.k8s.io`).
+
+---
+
+# API Registration
+
+During startup, `kube-apiserver` registers all built-in API groups and their resources:
+
+```text
+kube-apiserver starts
+  |
+  v
+Load built-in API groups (core, apps, batch, ...)
+  |
+  v
+Register each Group + Version + Resource
+  |
+  v
+Expose REST endpoints for each GVR
+  |
+  v
+CRDs registered -> dynamic REST endpoints added
+  |
+  v
+Aggregated APIs registered -> requests proxied to extension servers
+```
+
+---
+
+# Discovering API Groups
+
+List all registered API groups:
+```bash
+kubectl api-versions
+```
+
+Output (subset):
+```text
+apps/v1
+batch/v1
+networking.k8s.io/v1
+storage.k8s.io/v1
+autoscaling/v2
+coordination.k8s.io/v1
+metrics.k8s.io/v1beta1          (if Metrics Server installed)
+custom.metrics.k8s.io/v1beta1   (if metrics adapter installed)
+```
+
+List all resources and their groups:
+```bash
+kubectl api-resources
+```
+
+Output (subset):
+```text
+NAME         SHORTNAMES  APIVERSION         NAMESPACED  KIND
+pods         po          v1                 true        Pod
+deployments  deploy      apps/v1            true        Deployment
+jobs                     batch/v1           true        Job
+ingresses    ing         networking.k8s.io/v1  true     Ingress
+nodes        no          v1                 false       Node
+```
+
+---
+
+# Complete API Group Lookup Flow
+
+```text
+kubectl get deployment nginx
+  |
+  v
+kubectl reads kubeconfig
+  |
+  v
+kubectl queries /apis (API discovery)
+  |
+  v
+API Server returns list of API groups
+  |
+  v
+kubectl identifies: Deployment -> apps/v1
+  |
+  v
+GET /apis/apps/v1/namespaces/default/deployments/nginx
+  |
+  v
+Authentication -> Authorization -> etcd read
+  |
+  v
+Response returned to kubectl
+```
+
+---
+
+# Common Interview Questions
+
+### Q1. What is an API Group?
+An API Group is a logical collection of related Kubernetes resources that can be versioned and developed independently. The group name forms part of the `apiVersion` field (e.g., `apps` in `apps/v1`).
+
+### Q2. Why does the Core API use `/api` instead of `/apis`?
+The Core API Group predates the named group system. Its group name is an empty string (`""`), so it uses the legacy `/api/v1` path instead of `/apis/<group>/<version>`.
+
+### Q3. What is the difference between GVR and GVK?
+GVR (Group-Version-Resource) identifies the REST API endpoint (`apps/v1/deployments`). GVK (Group-Version-Kind) identifies the Go object type (`apps/v1/Deployment`). GVR is used for HTTP requests; GVK is used for object type resolution in code.
+
+### Q4. How does RBAC reference API Groups?
+RBAC `rules` use the `apiGroups` field: `["apps"]` for Deployment, `["batch"]` for Jobs, `[""]` for Core resources like Pods.
+
+### Q5. How do CRDs extend the Kubernetes API?
+CRDs register a new custom group name (e.g., `database.example.com`) and a new resource kind. `kube-apiserver` dynamically creates REST endpoints for the CRD's resources backed by `etcd`.
+
+### Q6. How are Aggregated API groups different from CRD groups?
+CRD resources are served by `kube-apiserver` itself and stored in `etcd`. Aggregated API groups are served by separate extension API servers; `kube-aggregator` proxies requests to them. They may use their own storage backends.
+
+---
+
+# Troubleshooting Guide
+
+| Symptom | Likely Cause | Action |
+| :--- | :--- | :--- |
+| `no matches for kind "Deployment" in version "v1"` | Wrong `apiVersion` in YAML | Change to `apps/v1` |
+| RBAC `403` on Pods but not Deployments | `apiGroups: [""]` missing for Core resources | Add `""` to `apiGroups` in the Role |
+| `kubectl api-versions` missing a group | CRD not installed or APIService unhealthy | Check `kubectl get crd` and `kubectl get apiservice` |
+| Custom metric API missing | Metrics adapter not installed | Install Prometheus Adapter or check `APIService` status |
+| `client-go` dynamic client 404 | Wrong GVR passed to dynamic client | Verify group, version, resource strings with `kubectl api-resources` |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, verify that you can:
+1. Explain why API Groups were introduced.
+2. Distinguish between the Core API Group and Named API Groups.
+3. Explain why Core resources use `/api` while named group resources use `/apis`.
+4. Define GVR and GVK and explain when each is used.
+5. Write a correct RBAC rule for `deployments`, `pods`, and `ingresses`.
+6. Explain how CRDs extend the Kubernetes API.
+7. Run `kubectl api-resources` and interpret the APIVERSION column.
+
+---
+
+# Next Chapter
+
+**Chapter 3 — API Versions**
+
+In the next chapter, you'll learn how Kubernetes versions its APIs (`v1alpha1`, `v1beta1`, `v1`), how it converts objects between versions without breaking compatibility, and what internal and storage versions are.

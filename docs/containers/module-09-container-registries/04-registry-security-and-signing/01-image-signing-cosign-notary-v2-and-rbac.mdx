@@ -1,0 +1,184 @@
+---
+title: "Chapter 1 — Image Signing & Supply Chain: Cosign & Notary"
+sidebar_position: 1
+module: "Module 9.4 — Security & Signing"
+description: "Master container image signing and supply chain security — Sigstore Cosign keyless signing (OIDC, Fulcio, Rekor), Notary Project/Notation, and Kyverno admission enforcement."
+---
+
+# Chapter 1 — Image Signing & Supply Chain: Cosign & Notary
+
+> **Goal:** Master the cryptographic security models, public transparency logs, and admission control policies of **Container Image Signing & Supply Chain Security** — analyzing **Sigstore Cosign**, mastering **Keyless Signing** via **OIDC**, **Fulcio Ephemeral CAs**, and the **Rekor Transparency Log**, contrasting with **Notary Project (Notation)**, and enforcing signature verification at deploy-time using **Kyverno and OPA Gatekeeper**.
+>
+> By the end of this chapter, you will understand:
+> 1. The anatomy of modern software supply chain attacks on container pipelines
+> 2. How traditional asymmetric key-pair signing works in Cosign
+> 3. How Sigstore Keyless Signing eliminates the nightmare of private key management
+> 4. How Fulcio and Rekor create an unalterable, tamper-evident cryptographic audit trail
+> 5. How signature manifests are stored directly inside OCI registries as `.sig` artifacts
+> 6. How to author Kubernetes Kyverno policies that strictly block unsigned container images
+
+---
+
+## Real-Life Analogy
+
+Think of Container Image Signing as **a certified notary public stamping a royal decree with tamper-evident wax and recording it in an unalterable public town ledger**:
+
+- **1. The Unsigned Decree (The Vulnerable Container Image):**
+  - An unsigned piece of paper delivered to the king's castle (**An unverified image in Kubernetes**).
+  - Anyone could have intercepted the messenger on the road, modified the taxes, and delivered the forged letter (**Supply Chain Man-in-the-Middle Attack**)!
+- **2. Traditional Key Signing (The King's Private Wax Seal Ring):**
+  - The king presses his private gold signet ring into hot wax on the document (**Cosign Private Key**).
+  - **The Risk:** If an assassin steals the king's ring (**Compromised CI/CD private key**), they can stamp fake laws forever!
+- **3. Sigstore Keyless Signing (The Certified Public Notary & Town Hall Ledger):**
+  - The minister shows their royal ID badge (**OIDC Identity via GitHub Actions**).
+  - The official Royal Notary (**Fulcio CA**) issues a special stamp that self-destructs after 10 minutes (**Ephemeral X.509 Certificate**).
+  - The notary writes an indelible entry in the town square's stone monument ledger (**The Rekor Immutable Transparency Log**).
+  - When the castle gatekeeper (**Kubernetes Admission Controller**) checks the letter, they verify the wax stamp against the stone monument in the town square. If the decree is forged or untrusted, the gatekeeper **burns the letter and bars the castle gates (Pod creation blocked!)**!
+
+---
+
+## Architecture Diagram
+
+```text
+               Sigstore Keyless Signing & Kubernetes Admission Architecture
+
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CI/CD PIPELINE (GitHub Actions / GitLab / Jenkins)                     │
+ ├────────────────────────────────────────────────────────────────────────┤
+ │ 1. Pipeline authenticates via OIDC ──► Requests Ephemeral Cert         │
+ └──────┬─────────────────────────────────────────────────────────────────┘
+        │ OIDC Token (Identity: `https://github.com/org/repo/.github/...`)
+        ▼
+ ┌────────────────────────┐  ┌────────────────────────────────────────────┐
+ │ FULCIO CERT AUTHORITY  │  │ REKOR IMMUTABLE TRANSPARENCY LOG           │
+ │ Issues 10-Minute       │  │ Records cryptographic signature in an      │
+ │ Ephemeral X.509 Cert   │  │ append-only Merkle tree ledger!            │
+ └──────┬─────────────────┘  └──────┬─────────────────────────────────────┘
+        │ Signed Payload            │ Entry Log Hash
+        ▼                           ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ COSIGN: Attaches Signature Artifact (`sha256-...sig`) to OCI Registry! │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ Pushed to Registry (Harbor / AWS ECR / GAR)
+                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KUBERNETES CLUSTER (Deploy Time):                                      │
+ │ ├── Kubelet requests: `kubectl apply -f deployment.yaml`               │
+ │ └── KYVERNO / OPA GATEKEEPER ADMISSION CONTROLLER:                     │
+ │     - Verifies signature against Rekor Log & Fulcio Root               │
+ │     - ✅ Valid Signature: Pod Allowed!                                │
+ │     - ❌ Unsigned / Tampered: 💥 POD ADMISSION REJECTED!               │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Sigstore Keyless Signing: How It Works
+
+Traditional signing required developers to generate, store, and rotate private cryptographic keys. Sigstore **Keyless Signing** eliminates keys entirely:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Sigstore Component   │ Role in Keyless Container Signing                                           │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. OIDC Provider** │ Authenticates the builder (e.g. GitHub Actions, Google Cloud, Okta).        │
+ │ **2. Fulcio (CA)**   │ A free, automated Certificate Authority. Issues a **short-lived (10 min)   │
+ │                      │ X.509 certificate** binding the ephemeral public key to the OIDC identity.  │
+ │ **3. Rekor (Log)**   │ An **immutable, append-only transparency log (Merkle tree)**. Stores the    │
+ │                      │ signature and certificate, providing public, tamper-evident auditability.   │
+ │ **4. Cosign CLI**    │ Coordinates the signing process and uploads the signature directly into the │
+ │                      │ target OCI registry as an OCI artifact.                                     │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Kyverno Signature Verification Policy
+
+In Kubernetes, **Kyverno** can automatically verify container image signatures before allowing pods to run:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+spec:
+  validationFailureAction: Enforce   # 🛑 Blocks unsigned pods immediately!
+  rules:
+  - name: verify-sigstore-signature
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    verifyImages:
+    - imageReferences:
+      - "ghcr.io/my-org/*"
+      attestors:
+      - entries:
+        - keyless:
+            issuer: "https://token.actions.githubusercontent.com"
+            subject: "https://github.com/my-org/my-repo/*"
+```
+
+---
+
+## Hands-On Lab: Signing & Verifying an Image with Cosign
+
+```bash
+# Step 1: Generate a Cosign cryptographic key pair (Password protected)
+# cosign generate-key-pair
+
+# Step 2: Sign a container image in your registry
+# cosign sign --key cosign.key localhost:5000/my-alpine:v1
+
+# Step 3: Verify the image signature
+# cosign verify --key cosign.pub localhost:5000/my-alpine:v1 | jq .
+
+# Step 4: Perform Keyless Signing in GitHub Actions CI
+# cosign sign ghcr.io/my-org/my-app:v1.0.0 --yes
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is Sigstore Cosign, and how does "Keyless Signing" eliminate the danger of compromised private keys?**
+
+Cosign is an open-source CLI utility for signing and verifying OCI container artifacts. Traditional signing required storing long-lived private keys in CI/CD secrets, creating severe risks of key leakage. **Sigstore Keyless Signing** solves this by using **OpenID Connect (OIDC)**:
+1. The CI system authenticates with its OIDC provider (e.g. GitHub Actions).
+2. **Fulcio (an ephemeral CA)** generates a short-lived (10-minute) X.509 certificate bound to that specific CI workflow identity.
+3. The signature and certificate are permanently logged in **Rekor (an immutable public transparency log)**.
+4. The private key is discarded immediately after signing, **completely eliminating the risk of stolen private keys**.
+
+**Q2: How and where does Cosign store image signatures in a container registry?**
+
+Cosign stores digital signatures **directly inside the OCI container registry** as standard OCI artifacts. For an image tagged `my-app:v1.0.0` with SHA-256 digest `sha256:1a2b3c...`, Cosign uploads the signature payload to the exact same repository under a deterministic tag: **`sha256-1a2b3c...sig`**. This eliminates the need for separate signature infrastructure; the signatures travel with the image layers across registries and mirrors.
+
+**Q3: What is the difference between Sigstore Cosign and Notary Project (Notation)?**
+
+- **Sigstore Cosign**: Built by the Linux Foundation and CNCF. Focuses heavily on **Keyless Signing via OIDC, Fulcio, and Rekor transparency logs**. Extremely popular in modern open-source and Kubernetes cloud-native environments.
+- **Notary Project (Notation)**: A CNCF project backed by Microsoft and Amazon. Focuses on **traditional enterprise X.509 PKI certificates** integrated with enterprise hardware security modules (HSMs), AWS Signer, and Azure Key Vault.
+
+**Q4: How does a Kubernetes Admission Controller (like Kyverno) block unsigned images?**
+
+A Kubernetes Validating Webhook Admission Controller intercepts every Pod creation API request *before* the pod is persisted in `etcd`:
+1. The admission controller extracts the container image URL and digest from the Pod spec.
+2. It queries the container registry for the associated Cosign `.sig` artifact.
+3. It validates the cryptographic signature against the cluster's trusted public keys or Sigstore Rekor/Fulcio identities.
+4. If the signature is missing, invalid, or signed by an unauthorized identity, the admission controller **rejects the API request with HTTP 403 Forbidden**, preventing the untrusted container from ever executing.
+
+**Q5: What is an SBOM (Software Bill of Materials), and how does Cosign attach SBOM attestations to images?**
+
+An SBOM is a formal machine-readable inventory of all third-party libraries, OS packages, and dependencies bundled inside a container image (in SPDX or CycloneDX format). Using **`cosign attest`**, DevOps teams can attach an encrypted, cryptographically signed SBOM directly to the container image in the registry. Admission controllers can then enforce policies such as: *"Only allow deployment if the image has a valid signed SBOM and contains zero critical CVEs."*
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Sigstore Cosign provides container signing and verification
+- [ ] Know that Keyless Signing uses OIDC, Fulcio (Ephemeral CA), and Rekor (Log)
+- [ ] Know that Rekor is an append-only, tamper-evident Merkle tree transparency log
+- [ ] Know that Cosign stores signatures as `.sig` OCI artifacts in the registry
+- [ ] Know how Kyverno validates image signatures before admitting pods to the cluster
+- [ ] Can verify a signed image using `cosign verify --key cosign.pub <image>`

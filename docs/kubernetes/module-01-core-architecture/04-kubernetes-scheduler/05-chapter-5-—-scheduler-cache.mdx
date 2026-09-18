@@ -1,0 +1,1563 @@
+---
+title: "Chapter 5 — Scheduler Cache"
+sidebar_position: 5
+module: "Module 1.4 — Kubernetes Scheduler Internals"
+description: "> **Goal:** Understand one of the most important performance optimizations inside Kubernetes Scheduler—the **Scheduler Cache**. Learn why it exists, how it main..."
+---
+
+# Module 1.4 — Kubernetes Scheduler Internals
+
+# Chapter 5 — Scheduler Cache
+
+> **Goal:** Understand one of the most important performance optimizations inside Kubernetes Scheduler—the **Scheduler Cache**. Learn why it exists, how it maintains an in-memory view of the cluster, what `NodeInfo` and `PodInfo` contain, how image and resource information are tracked, how Informers keep the cache synchronized, and how Kubernetes achieves high scheduling throughput without constantly querying the API Server.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. Why Scheduler Cache exists (avoiding API Server calls during scheduling)
+> 2. NodeInfo: per-node resource accounting, conditions, Pod list
+> 3. PodInfo: per-pod resource requests tracked in NodeInfo
+> 4. Image cache: node-to-image mapping for locality scoring
+> 5. Assumed state: optimistic resource deduction before binding confirms
+> 6. How Informers keep the cache synchronized with API Server events
+> 7. Cache consistency: handling expired assumptions
+> 8. Performance: why O(1) node lookup matters in large clusters
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of the Scheduler Cache like a whiteboard snapshot of the entire conference room.
+
+```text
+Conference Room Whiteboard Analogy:
+
+Whiteboard shows which desks are taken, which are free
+Room manager (Scheduler) reads whiteboard, not the actual desks
+When someone sits down, whiteboard is updated immediately
+Manager pencils in a reservation before person arrives (assumed state)
+If person doesn't arrive, pencil mark is erased (expired assumption)
+```
+
+| Conference Room | Scheduler Cache |
+| :--- | :--- |
+| Whiteboard showing desk status | Scheduler Cache (NodeInfo map) |
+| Desk capacity | Node allocatable resources |
+| Occupied desks | Running Pods on the Node |
+| Penciling in a reservation | Assumed state after scheduling |
+| Erasing if person doesn't arrive | Expiring assumed state if binding times out |
+| Room manager reads whiteboard | Scheduler reads cache, not API Server |
+
+> **Important:** When a Pod is scheduled, the Scheduler immediately applies **assumed state** to its cache — deducting the Pod's resource requests from the target Node **before** the binding is confirmed. This allows the next scheduling cycle to begin immediately without double-allocating the same resources, even though the Pod is not yet running.
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- API Server
+- etcd
+- Informers
+- Watches
+- Scheduling Framework
+- Scheduling Cycle
+- Binding Cycle
+
+---
+
+# Why Does Scheduler Cache Exist?
+
+Imagine a Kubernetes cluster with:
+
+```text
+5,000 Nodes
+
+100,000 Running Pods
+
+20,000 Scheduling Decisions
+Per Minute
+```
+
+Now imagine that for **every scheduling decision**, the Scheduler asks the API Server:
+
+```text
+How much CPU
+is available on Node-1?
+
+v
+
+How much Memory
+is available on Node-2?
+
+v
+
+Which Pods
+are running on Node-3?
+
+v
+
+Which images
+exist on Node-4?
+
+v
+
+Repeat...
+```
+
+This would generate **millions of API calls per minute.**
+
+---
+
+# Without Scheduler Cache
+
+```text
+Scheduler
+
+v
+
+API Server
+
+v
+
+etcd
+
+v
+
+API Server
+
+v
+
+Scheduler
+
+v
+
+Next Node
+
+v
+
+API Server
+
+v
+
+etcd
+```
+
+Every Node evaluation requires network communication.
+
+Result:
+
+- High latency
+- API Server overload
+- etcd overload
+- Poor scheduling performance
+
+---
+
+# With Scheduler Cache
+
+Instead:
+
+```text
+Scheduler
+
+v
+
+Local Memory
+
+v
+
+Decision
+```
+
+Only cache updates come from the API Server.
+
+---
+
+# Core Idea
+
+The Scheduler keeps an **in-memory copy** of the cluster state.
+
+Instead of asking:
+
+```text
+API Server
+
+v
+
+What's happening?
+```
+
+The Scheduler already knows.
+
+---
+
+# Simple Definition
+
+The Scheduler Cache is:
+
+> **An in-memory representation of cluster resources that allows the Scheduler to make scheduling decisions without querying the API Server for every scheduling cycle.**
+
+---
+
+# High-Level Architecture
+
+```text
+                API Server
+
+                     |
+
+              Watch Events
+
+                     |
+
+                     ▼
+
+             Shared Informers
+
+                     |
+
+                     ▼
+
+             Scheduler Cache
+
+      ┌──────────────┼──────────────┐
+
+      ▼              ▼              ▼
+
+  NodeInfo       PodInfo      Image Cache
+
+      |              |              |
+
+      +--────────────┼──────────────┘
+
+                     ▼
+
+             Scheduling Cycle
+```
+
+---
+
+# What Does the Cache Store?
+
+The Scheduler Cache stores information about:
+
+```text
+Cluster
+
++-- Nodes
++-- Running Pods
++-- Images
++-- CPU
++-- Memory
++-- Ephemeral Storage
++-- Volumes
++-- Topology
++-- Taints
++-- Labels
++-- Scheduling Metadata
+```
+
+Everything required for scheduling.
+
+---
+
+# Why Isn't etcd Queried Directly?
+
+Because Kubernetes architecture requires:
+
+```text
+Scheduler
+
+v
+
+API Server
+
+v
+
+etcd
+```
+
+The Scheduler never talks directly to etcd.
+
+Instead,
+
+it receives continuous updates through Watches.
+
+---
+
+# Scheduler Cache Lifecycle
+
+```text
+API Server
+
+v
+
+Watch Event
+
+v
+
+Informer
+
+v
+
+Scheduler Cache
+
+v
+
+Scheduling Decision
+```
+
+This happens continuously.
+
+---
+
+# Scheduler Cache is Always Updating
+
+Even while scheduling occurs:
+
+```text
+Pod Started
+
+v
+
+Cache Updated
+
+v
+
+Node Deleted
+
+v
+
+Cache Updated
+
+v
+
+CPU Changed
+
+v
+
+Cache Updated
+
+v
+
+Volume Attached
+
+v
+
+Cache Updated
+```
+
+The cache is alive.
+
+---
+
+# Main Components
+
+```text
+Scheduler Cache
+
++-- NodeInfo
++-- PodInfo
++-- ImageState
++-- Resource Accounting
++-- Assumed Pods
++-- Snapshot Builder
++-- Event Handlers
+```
+
+Let's explore each one.
+
+---
+
+# NodeInfo
+
+The most important structure inside the Scheduler Cache is:
+
+```text
+NodeInfo
+```
+
+Every Node has one.
+
+Conceptually:
+
+```text
+Node
+
+v
+
+NodeInfo
+```
+
+---
+
+# What is NodeInfo?
+
+NodeInfo is:
+
+> **An aggregated view of everything the Scheduler needs to know about one Node.**
+
+It combines information from many Kubernetes resources.
+
+---
+
+# NodeInfo Structure
+
+Conceptually:
+
+```text
+NodeInfo
+
++-- Node Object
++-- Running Pods
++-- Requested Resources
++-- Allocatable Resources
++-- Images
++-- PVC Information
++-- Ports
++-- Taints
++-- Labels
++-- Scheduling Metadata
+```
+
+---
+
+# Example
+
+Suppose:
+
+```text
+Node
+
+worker-3
+```
+
+NodeInfo may contain:
+
+```text
+CPU
+
+16
+
+Memory
+
+64 GB
+
+Pods
+
+37
+
+Images
+
+nginx
+
+redis
+
+java
+
+python
+```
+
+Everything is immediately available.
+
+---
+
+# Why NodeInfo Exists
+
+Without NodeInfo,
+
+plugins would need:
+
+```text
+Node
+
+v
+
+Pods
+
+v
+
+Resources
+
+v
+
+Images
+
+v
+
+Volumes
+
+v
+
+Labels
+```
+
+From multiple API calls.
+
+Instead:
+
+```text
+NodeInfo
+
+v
+
+Everything
+```
+
+---
+
+# PodInfo
+
+Every Pod also has:
+
+```text
+PodInfo
+```
+
+---
+
+# What is PodInfo?
+
+PodInfo represents scheduling-relevant information about a Pod.
+
+Example:
+
+```text
+Pod
+
+v
+
+CPU Request
+
+v
+
+Memory Request
+
+v
+
+Affinity
+
+v
+
+Priority
+
+v
+
+Topology
+
+v
+
+Owner
+```
+
+This avoids repeatedly parsing the Pod object.
+
+---
+
+# Example
+
+```yaml
+resources:
+  requests:
+    cpu: 2
+    memory: 4Gi
+```
+
+PodInfo stores:
+
+```text
+CPU = 2
+
+Memory = 4Gi
+```
+
+Already parsed.
+
+---
+
+# Relationship Between NodeInfo and PodInfo
+
+```text
+Scheduler Cache
+
++-- NodeInfo
+|      |
+|      +-- Running Pods
+|              |
+|              ▼
+|          PodInfo
+```
+
+Every NodeInfo references the Pods currently assigned to that Node.
+
+---
+
+# Image Cache
+
+One overlooked optimization is the Image Cache.
+
+---
+
+# Why Track Images?
+
+Suppose a Pod needs:
+
+```text
+nginx:latest
+```
+
+Node A:
+
+```text
+Image Exists
+```
+
+Node B:
+
+```text
+Image Missing
+```
+
+Node A can start the Pod much faster.
+
+---
+
+# Image Cache Structure
+
+Conceptually:
+
+```text
+Node
+
+v
+
+Images
+
++-- nginx
++-- redis
++-- python
++-- java
++-- ubuntu
+```
+
+---
+
+# Image Locality
+
+During scoring,
+
+the ImageLocality plugin may prefer:
+
+```text
+Node
+
+Already Has Image
+```
+
+Reducing:
+
+- Pull time
+- Network traffic
+- Startup latency
+
+---
+
+# Resource Accounting
+
+One of the Scheduler Cache's most important responsibilities is tracking resources.
+
+Every Node maintains:
+
+```text
+Allocatable
+
+Requested
+
+Available
+```
+
+---
+
+# Example
+
+Node:
+
+```text
+16 CPU
+
+64 GB Memory
+```
+
+Running Pods:
+
+```text
+Pod A
+
+4 CPU
+
+v
+
+Pod B
+
+6 CPU
+```
+
+Scheduler Cache computes:
+
+```text
+Requested CPU
+
+10
+
+Available CPU
+
+6
+```
+
+No API call required.
+
+---
+
+# Resource Accounting Diagram
+
+```text
+Node
+
+16 CPU
+
+v
+
+Running Pods
+
+v
+
+Requested CPU
+
+10
+
+v
+
+Available CPU
+
+6
+```
+
+This is recalculated as Pods are added or removed.
+
+---
+
+# CPU Accounting Example
+
+```text
+Node
+
+8 CPU
+
+v
+
+Pod1
+
+2 CPU
+
+v
+
+Pod2
+
+3 CPU
+
+v
+
+Available
+
+3 CPU
+```
+
+The Scheduler immediately knows:
+
+```text
+Can Another
+
+4 CPU Pod
+
+Fit?
+
+v
+
+No
+```
+
+---
+
+# Memory Accounting
+
+Exactly the same concept.
+
+```text
+Node
+
+64 GB
+
+v
+
+Pods
+
+v
+
+42 GB Requested
+
+v
+
+22 GB Available
+```
+
+---
+
+# Ephemeral Storage Accounting
+
+The Scheduler also tracks:
+
+```text
+Ephemeral Storage
+```
+
+Example:
+
+```text
+Node
+
+500 GB
+
+v
+
+Pods
+
+v
+
+350 GB Used
+
+v
+
+150 GB Available
+```
+
+---
+
+# Port Accounting
+
+HostPort scheduling requires:
+
+```text
+Port
+
+Already Used?
+```
+
+NodeInfo keeps track of:
+
+```text
+TCP
+
+UDP
+
+SCTP
+
+Reserved Ports
+```
+
+---
+
+# Volume Information
+
+The Scheduler Cache stores scheduling-related storage metadata.
+
+Examples:
+
+- Attached volumes
+- PVC relationships
+- CSI information
+
+This helps plugins such as:
+
+```text
+VolumeBinding
+```
+
+---
+
+# Scheduler Assumed Pods
+
+One clever optimization is:
+
+```text
+Assumed Pods
+```
+
+---
+
+# Why Assume?
+
+Suppose:
+
+```text
+Scheduling
+
+v
+
+Binding
+
+v
+
+API Server
+
+v
+
+Network Delay
+```
+
+Without assumptions,
+
+another scheduling cycle may think:
+
+```text
+Resources
+
+Still Free
+```
+
+Race condition.
+
+---
+
+# Assumed Pod Workflow
+
+```text
+Scheduler
+
+v
+
+Assume Pod
+
+v
+
+Reserve Resources
+
+v
+
+Binding
+
+v
+
+API Server Success
+
+v
+
+Assumption Confirmed
+```
+
+If binding fails:
+
+```text
+Forget Assumption
+```
+
+---
+
+# Cache Updates
+
+The Scheduler Cache is continuously updated.
+
+Sources include:
+
+```text
+Pod Created
+
+Pod Deleted
+
+Node Added
+
+Node Deleted
+
+Node Updated
+
+PVC Updated
+
+Volume Updated
+```
+
+---
+
+# Update Flow
+
+```text
+API Server
+
+v
+
+Watch Event
+
+v
+
+Informer
+
+v
+
+Scheduler Cache
+
+v
+
+NodeInfo Updated
+```
+
+No polling required.
+
+---
+
+# Informer Integration
+
+Like Controllers,
+
+the Scheduler uses:
+
+```text
+Shared Informers
+```
+
+These watch:
+
+```text
+Pods
+
+Nodes
+
+Volumes
+
+StorageClasses
+
+CSINodes
+```
+
+Every change updates the cache.
+
+---
+
+# Informer Architecture
+
+```text
+API Server
+
+v
+
+Watch
+
+v
+
+Shared Informer
+
+v
+
+Event Handler
+
+v
+
+Scheduler Cache
+```
+
+This is identical to other Kubernetes control-plane components.
+
+---
+
+# Cache Consistency
+
+Question:
+
+How does Kubernetes ensure plugins don't see inconsistent data?
+
+Answer:
+
+```text
+Scheduling Snapshot
+```
+
+---
+
+# Snapshot Creation
+
+During every Scheduling Cycle:
+
+```text
+Scheduler Cache
+
+v
+
+Snapshot
+
+v
+
+Plugins
+```
+
+The snapshot freezes the cluster view.
+
+---
+
+# Why Snapshot Instead of Live Cache?
+
+Suppose:
+
+```text
+Filter Plugin
+
+Reads
+
+10 CPU Free
+```
+
+Milliseconds later:
+
+```text
+Score Plugin
+
+Reads
+
+6 CPU Free
+```
+
+Same scheduling cycle.
+
+Different answers.
+
+Snapshots eliminate this inconsistency.
+
+---
+
+# Cache vs Snapshot
+
+| Scheduler Cache | Scheduling Snapshot |
+|-----------------|---------------------|
+| Continuously changing | Immutable during one scheduling cycle |
+| Updated by Informers | Created from the cache |
+| Global cluster view | Point-in-time view |
+| Shared across cycles | Used by one scheduling cycle |
+
+---
+
+# Performance Optimizations
+
+The Scheduler Cache enables several optimizations.
+
+---
+
+## 1. Local Memory Access
+
+Instead of:
+
+```text
+Network Call
+
+v
+
+API Server
+```
+
+Use:
+
+```text
+RAM
+
+v
+
+Nanoseconds
+```
+
+---
+
+## 2. Incremental Updates
+
+Rather than rebuilding everything:
+
+```text
+Entire Cache
+```
+
+Only changes are applied.
+
+Example:
+
+```text
+One Pod Added
+
+v
+
+Update One NodeInfo
+```
+
+---
+
+## 3. Shared Informers
+
+Only one Watch stream is maintained.
+
+Multiple Scheduler components reuse it.
+
+---
+
+## 4. Snapshot Reuse
+
+One snapshot is shared across all plugins during a scheduling cycle.
+
+---
+
+## 5. Parallel Scheduling
+
+NodeInfo allows:
+
+```text
+100 Nodes
+
+v
+
+Parallel Filter
+
+v
+
+Parallel Score
+```
+
+Without repeated lookups.
+
+---
+
+# Production Workflow
+
+```text
+Pod Created
+
+v
+
+API Server
+
+v
+
+Watch Event
+
+v
+
+Informer
+
+v
+
+Scheduler Cache Updated
+
+v
+
+Scheduling Cycle Starts
+
+v
+
+Snapshot Created
+
+v
+
+Filter Plugins
+
+v
+
+Score Plugins
+
+v
+
+Best Node
+
+v
+
+Binding Cycle
+```
+
+---
+
+# Real Production Example
+
+Cluster:
+
+```text
+2,000 Nodes
+
+50,000 Pods
+```
+
+A new Pod arrives.
+
+Without Cache:
+
+```text
+2,000 API Requests
+```
+
+With Cache:
+
+```text
+Memory Lookups
+
+v
+
+Milliseconds
+```
+
+This is one of the reasons Kubernetes scales to very large clusters.
+
+---
+
+# Relationship with Previous Chapters
+
+```text
+API Server
+
+v
+
+Watch
+
+v
+
+Informer
+
+v
+
+Scheduler Cache
+
+v
+
+Scheduling Queue
+
+v
+
+Scheduling Cycle
+
+v
+
+Binding Cycle
+
+v
+
+kubelet
+```
+
+The Scheduler Cache is the foundation that enables every scheduling decision.
+
+---
+
+# Production Best Practices
+
+✔ Keep Scheduler Cache synchronized through Informers.
+
+✔ Monitor Scheduler cache freshness.
+
+✔ Avoid unnecessary API calls from custom plugins.
+
+✔ Prefer Framework Handle access over external API queries.
+
+✔ Minimize expensive calculations inside Filter plugins.
+
+✔ Monitor scheduling latency and cache update delays.
+
+✔ Keep API Server Watch connections healthy.
+
+✔ Use Scheduler metrics to detect cache synchronization problems.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+The Scheduler queries the API Server for every scheduling decision.
+
+Wrong.
+
+It primarily uses the Scheduler Cache.
+
+---
+
+### ❌ Misconception 2
+
+NodeInfo is just the Kubernetes Node object.
+
+Wrong.
+
+NodeInfo is an aggregated structure containing the Node plus scheduling-related metadata.
+
+---
+
+### ❌ Misconception 3
+
+The Scheduler Cache never changes during scheduling.
+
+Wrong.
+
+The cache is continuously updated, while each scheduling cycle uses an immutable snapshot.
+
+---
+
+### ❌ Misconception 4
+
+PodInfo duplicates the Pod object unnecessarily.
+
+Wrong.
+
+PodInfo stores preprocessed scheduling information to avoid repeated parsing.
+
+---
+
+### ❌ Misconception 5
+
+Image information is irrelevant to scheduling.
+
+Wrong.
+
+Image locality can significantly reduce container startup time and network usage.
+
+---
+
+### ❌ Misconception 6
+
+Assumed Pods are already running.
+
+Wrong.
+
+They are temporary Scheduler-side assumptions until binding succeeds.
+
+---
+
+### ❌ Misconception 7
+
+Snapshots replace the Scheduler Cache.
+
+Wrong.
+
+Snapshots are temporary, point-in-time views created from the continuously updated Scheduler Cache.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why does the Scheduler Cache exist?
+
+To maintain an in-memory view of cluster state and avoid querying the API Server for every scheduling decision.
+
+---
+
+### Q2. What is NodeInfo?
+
+An aggregated structure containing all scheduling-relevant information about a Node, including resources, Pods, images, labels, taints, and more.
+
+---
+
+### Q3. What is PodInfo?
+
+A preprocessed representation of a Pod containing scheduling-relevant information such as resource requests, affinity, and priority.
+
+---
+
+### Q4. Why does the Scheduler track images?
+
+To enable ImageLocality scoring, reducing image pull times and improving Pod startup performance.
+
+---
+
+### Q5. What is resource accounting?
+
+The Scheduler's process of tracking requested, allocatable, and available resources for every Node.
+
+---
+
+### Q6. How is the Scheduler Cache updated?
+
+Through Informers receiving watch events from the API Server.
+
+---
+
+### Q7. What is an Assumed Pod?
+
+A temporary Scheduler-side reservation used before binding completes to prevent race conditions.
+
+---
+
+### Q8. Why does the Scheduler create a snapshot?
+
+To ensure every plugin in a scheduling cycle evaluates a consistent, immutable view of the cluster.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Scheduler decisions appear outdated | Cache not synchronized, informer lag, or watch disruptions |
+| High scheduling latency | Large NodeInfo structures, expensive plugins, or stale cache updates |
+| Incorrect resource calculations | Delayed cache updates or resource accounting bugs |
+| Repeated scheduling conflicts | Assumed Pods not released after failures or race conditions |
+| Pods repeatedly marked unschedulable | Cache reflects genuine resource shortages or stale topology information |
+| Excessive API Server traffic from Scheduler | Custom plugins bypassing the Scheduler Cache and querying the API Server directly |
+
+---
+
+# Knowledge Check
+
+Before moving to the next chapter, you should be able to answer:
+
+1. Why does the Scheduler Cache exist?
+2. Why doesn't the Scheduler query the API Server for every scheduling decision?
+3. What information does NodeInfo contain?
+4. What is the purpose of PodInfo?
+5. Why does the Scheduler maintain an Image Cache?
+6. How does resource accounting work?
+7. What is an Assumed Pod, and why is it needed?
+8. How are Scheduler Cache updates propagated?
+9. Why are Informers critical to the Scheduler Cache?
+10. What is the difference between the Scheduler Cache and a Scheduling Snapshot?
+11. Why is cache consistency important during a scheduling cycle?
+12. Which performance optimizations depend on the Scheduler Cache?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how the Scheduler Cache enables Kubernetes to make fast, scalable scheduling decisions.
+
+You learned:
+
+- Why the Scheduler Cache exists and how it reduces API Server load
+- The architecture and lifecycle of the Scheduler Cache
+- The roles of `NodeInfo` and `PodInfo`
+- How image locality and resource accounting improve scheduling quality
+- How Informers continuously synchronize the cache with cluster state
+- Why the Scheduler creates immutable snapshots for each scheduling cycle
+- How Assumed Pods prevent race conditions during binding
+- The performance optimizations that allow Kubernetes to schedule Pods efficiently in large production clusters
+
+The Scheduler Cache is one of the key reasons Kubernetes can scale to thousands of Nodes while maintaining low scheduling latency. It acts as the Scheduler's "working memory," enabling rapid placement decisions based on a continuously updated view of the cluster.
+
+---
+
+# Next Chapter
+
+**Chapter 6 — Scheduling Queue**
+
+In the next chapter, we'll explore how Kubernetes manages Pods waiting to be scheduled.
+
+Topics include:
+
+- Active Queue
+- Backoff Queue
+- Unschedulable Queue
+- Queue Priorities
+- Queue Ordering
+- Queue Movement
+- Event-Driven Requeueing
+- Queue Performance
+- Starvation Prevention
+- Production Scheduling Queue Architecture
+
+You'll learn how Kubernetes efficiently manages thousands of pending Pods while ensuring fairness, responsiveness, and high scheduling throughput.
+```

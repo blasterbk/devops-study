@@ -1,0 +1,354 @@
+---
+title: "Chapter 3 — Service Discovery"
+sidebar_position: 3
+module: "Module 2.7 — DNS"
+description: "Deep dive into Kubernetes service discovery — how applications find and connect to other services using DNS, environment variables, and the service registry. Covers discovery patterns for multi-tenant clusters, client-side vs server-side discovery, and the service registry data model."
+---
+
+# Chapter 3 — Service Discovery
+
+> **Goal:** Understand the mechanisms Kubernetes uses for service discovery — DNS-based, environment variable-based, and Endpoint/EndpointSlice-based — and know the patterns, trade-offs, and failure modes for each.
+>
+> By the end of this chapter, you will understand:
+> 1. What service discovery is and why it's essential in a dynamic container environment
+> 2. DNS-based service discovery — the primary and preferred mechanism
+> 3. Environment variable-based discovery — the legacy mechanism and its critical limitation
+> 4. Client-side vs server-side discovery patterns
+> 5. How to implement service discovery for cross-namespace communication
+> 6. Service discovery in multi-cluster environments
+
+---
+
+## Real-Life Analogy
+
+Service discovery in Kubernetes is like **phone book systems in a large organization**:
+
+Without service discovery: every employee would need to know every other employee's direct line number. When someone moves desks or gets a new number, you have to call everyone to update their address books. This doesn't scale.
+
+**DNS-based discovery** is like the company phone directory: look up "Marketing Department" → get their extension. When Marketing moves offices, only the directory is updated — every caller automatically reaches the right number.
+
+**Environment variable discovery** is like giving each new hire a printed card on day one listing all colleagues' numbers at that moment. If anyone gets a new number after the card was printed, the new hire doesn't find out until they get a new card (Pod restart).
+
+---
+
+## Architecture Diagram
+
+```text
+              Service Discovery — Three Mechanisms
+
+Mechanism 1: DNS (Preferred)
+  App code: connect to "api-service.production"
+  /etc/resolv.conf: search production.svc.cluster.local ...
+  Resolution: api-service.production → api-service.production.svc.cluster.local
+           → 10.96.45.23 (ClusterIP) via CoreDNS
+  Dynamic: CoreDNS reflects changes immediately
+
+Mechanism 2: Environment Variables (Legacy)
+  At Pod start time, kubelet injects:
+  API_SERVICE_SERVICE_HOST=10.96.45.23
+  API_SERVICE_SERVICE_PORT=8080
+  Only Services existing BEFORE the Pod started are injected!
+  Dynamic: Changes not reflected until Pod restarts
+
+Mechanism 3: Service Registry via Endpoint/EndpointSlice Watch
+  Application watches the Kubernetes API directly:
+  kubectl get endpointslices -l kubernetes.io/service-name=api-service -w
+  Each endpoint update is delivered in real-time
+  Used by service meshes, client-side LB libraries (xDS, gRPC)
+```
+
+---
+
+## DNS-Based Service Discovery
+
+DNS is the standard, recommended service discovery mechanism:
+
+### Short Names and FQDNs
+
+```text
+Calling from: production namespace
+
+Short name:         api-service
+Expanded to:        api-service.production.svc.cluster.local → ClusterIP
+
+Cross-namespace:    api-service.staging
+Expanded to:        api-service.staging.svc.cluster.local → ClusterIP
+
+Full FQDN:          api-service.production.svc.cluster.local → ClusterIP
+```
+
+### DNS Name Formats
+
+```bash
+# Standard Service DNS names
+kubectl exec -it my-pod -n production -- nslookup api-service
+# Resolves: api-service.production.svc.cluster.local → ClusterIP
+
+# Cross-namespace (must use namespace qualifier)
+kubectl exec -it my-pod -n frontend -- nslookup api-service.backend
+# Resolves: api-service.backend.svc.cluster.local → ClusterIP
+
+# Headless Service (returns all Pod IPs)
+kubectl exec -it my-pod -- nslookup mongo.database
+# Returns: 10.244.1.5, 10.244.2.3, 10.244.2.7 (all Pod IPs)
+
+# StatefulSet Pod (via headless Service)
+kubectl exec -it my-pod -- nslookup mongo-0.mongo.database
+# Returns: 10.244.1.5 (Pod 0's IP, stable DNS)
+
+# SRV record discovery (find port + host)
+kubectl exec -it my-pod -- dig SRV _http._tcp.api-service.production.svc.cluster.local
+# Answer: mongo.database.svc.cluster.local. 30 IN SRV 0 33 8080 api-service.production.svc.cluster.local.
+```
+
+### Application Code Patterns
+
+```python
+# Python: DNS-based discovery (preferred)
+import httpx
+
+# Use Service DNS name — no hardcoded IPs
+response = httpx.get("http://api-service.production/api/users")
+
+# For databases (PostgreSQL):
+import psycopg2
+conn = psycopg2.connect(
+    host="postgres.database",  # Service DNS name
+    port=5432,
+    user="app",
+    database="mydb"
+)
+```
+
+```go
+// Go: DNS discovery is automatic via standard library
+resp, err := http.Get("http://api-service.production/api/users")
+// net.Dial → resolves via /etc/resolv.conf → CoreDNS → ClusterIP
+```
+
+---
+
+## Environment Variable Discovery (Legacy)
+
+When a Pod starts, kubelet injects environment variables for **all Services in the same namespace** that existed at Pod creation time:
+
+```bash
+# Check which Service env vars are injected
+kubectl exec my-pod -- env | grep -E "_SERVICE_HOST|_SERVICE_PORT"
+# API_SERVICE_SERVICE_HOST=10.96.45.23
+# API_SERVICE_SERVICE_PORT=8080
+# API_SERVICE_PORT=tcp://10.96.45.23:8080
+# API_SERVICE_PORT_8080_TCP=tcp://10.96.45.23:8080
+# API_SERVICE_PORT_8080_TCP_PROTO=tcp
+# API_SERVICE_PORT_8080_TCP_PORT=8080
+# API_SERVICE_PORT_8080_TCP_ADDR=10.96.45.23
+# KUBERNETES_SERVICE_HOST=10.96.0.1   ← Always present
+# KUBERNETES_SERVICE_PORT=443
+```
+
+> [!WARNING]
+> **Critical limitation**: Environment variables are injected **only once at Pod startup**. Services created **after** the Pod started are **NOT** injected. If you create Service B after Pod A is running, Pod A cannot discover Service B via environment variables until it restarts. **Always prefer DNS-based discovery.**
+
+> [!IMPORTANT]
+> **Service ordering dependency**: If Pod A depends on Service B via env vars, Pod A must start **after** Service B exists. This creates startup ordering dependencies that DNS-based discovery eliminates.
+
+### Disabling Environment Variable Injection
+
+```yaml
+# To disable env var injection (reduce env clutter):
+spec:
+  enableServiceLinks: false   # Disable Service environment variable injection
+```
+
+---
+
+## Client-Side vs Server-Side Discovery
+
+```text
+Server-Side Discovery (ClusterIP + kube-proxy):
+  Client queries DNS → gets ClusterIP
+  Client connects to ClusterIP
+  kube-proxy (iptables/IPVS) redirects to backend Pod
+  Client is unaware of individual Pods
+
+  Pros: Simple for the client (standard TCP connection)
+  Cons: Client cannot choose specific backend, no client intelligence
+        Long-lived connections (gRPC) load imbalance (see headless chapter)
+
+Client-Side Discovery (Headless + watch EndpointSlice):
+  Client queries DNS → gets all Pod IPs (headless Service)
+  OR client watches EndpointSlice directly via Kubernetes API
+  Client library (gRPC, service mesh client) manages load balancing
+  Client can apply custom policies (prefer nearby Pod, avoid unhealthy)
+
+  Pros: Fine-grained control, better load balancing for gRPC
+  Cons: More complex client code; client must handle discovery logic
+        Client must react to Pod churn (new IPs, deletions)
+```
+
+---
+
+## Cross-Namespace Service Discovery
+
+```yaml
+# Pod in 'frontend' namespace calling Service in 'backend' namespace
+# No special configuration needed for DNS — just use the full name:
+
+spec:
+  containers:
+  - name: frontend
+    image: myapp
+    env:
+    - name: BACKEND_URL
+      value: "http://api-service.backend:8080"  # namespace qualifier in DNS name
+```
+
+```bash
+# Verify cross-namespace resolution
+kubectl exec my-pod -n frontend -- nslookup api-service.backend
+# api-service.backend.svc.cluster.local → 10.96.x.x
+```
+
+For **Network Policies**, cross-namespace DNS works but traffic must be allowed:
+
+```yaml
+# Allow frontend namespace to reach backend Service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: frontend
+```
+
+---
+
+## Service Discovery for Multi-Cluster Environments
+
+### Option 1: ExternalName Service (Simple Cross-Cluster)
+
+```yaml
+# In cluster A: create alias pointing to cluster B's external endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: remote-api
+  namespace: production
+spec:
+  type: ExternalName
+  externalName: api.cluster-b.company.internal  # Cluster B's DNS name
+```
+
+### Option 2: Submariner (Layer 3 Multi-Cluster)
+
+Submariner creates IPsec tunnels between clusters and extends CoreDNS to resolve cross-cluster Service names:
+
+```text
+Cluster A Pod → api-service.production.svc.cluster.b → Cluster B Service
+                CoreDNS in Cluster A has Submariner plugin:
+                recognizes .cluster.b suffix → routes via tunnel → Cluster B
+```
+
+### Option 3: Service Mesh Federation (Istio)
+
+Istio's `ServiceEntry` resource can advertise services from remote clusters:
+
+```yaml
+# Cluster A: ServiceEntry pointing to Cluster B's service
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: cluster-b-api
+spec:
+  hosts:
+  - api.cluster-b.internal
+  ports:
+  - number: 8080
+    name: http
+    protocol: HTTP
+  endpoints:
+  - address: "10.200.1.100"   # Cluster B's ingress IP
+    ports:
+      http: 8080
+```
+
+---
+
+## Hands-On: Service Discovery Debugging
+
+```bash
+# 1. Verify DNS resolution for all Services in a namespace
+kubectl run dnstest --image=busybox --rm -it --restart=Never -- \
+  sh -c 'for svc in api-service auth-service db-service; do
+    echo -n "$svc: "; nslookup $svc.production.svc.cluster.local 2>/dev/null | grep Address
+  done'
+
+# 2. Check env var injection
+kubectl exec my-pod -- env | sort | grep -i service
+
+# 3. Test cross-namespace connectivity
+kubectl run curltest -n frontend --image=curlimages/curl --rm -it \
+  --restart=Never -- curl -s http://api-service.backend:8080/health
+
+# 4. Find which Services a Pod can discover via env vars
+kubectl exec my-pod -- env | grep SERVICE_HOST | \
+  awk -F= '{print $1}' | sed 's/_SERVICE_HOST$//' | tr '_' '-' | tr '[:upper:]' '[:lower:]'
+
+# 5. Verify headless service returns multiple IPs
+kubectl exec my-pod -- nslookup mongo.database.svc.cluster.local
+# Server: 10.96.0.10
+# Address: 10.244.1.5  (Pod 0)
+# Address: 10.244.2.3  (Pod 1)
+# Address: 10.244.3.1  (Pod 2)
+
+# 6. Watch EndpointSlice changes in real-time (client-side discovery simulation)
+kubectl get endpointslices -n production \
+  -l kubernetes.io/service-name=api-service --watch
+
+# 7. Test SRV record (port discovery without hardcoding)
+kubectl exec my-pod -- nslookup -type=SRV _http._tcp.api-service.production.svc.cluster.local
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What are the two mechanisms for service discovery in Kubernetes? Which is recommended?**
+
+Kubernetes supports two mechanisms: (1) **DNS-based** — CoreDNS resolves `<service>.<namespace>.svc.cluster.local` to the Service ClusterIP (or Pod IPs for headless). Dynamic — reflects changes immediately. (2) **Environment variable-based** — kubelet injects `<SERVICE>_SERVICE_HOST` and `<SERVICE>_SERVICE_PORT` when the Pod starts. Static — only Services existing at Pod creation time are included. **DNS is the recommended mechanism** — it's dynamic, doesn't require service startup ordering, and works cross-namespace with a simple name qualifier.
+
+**Q2: What is the critical limitation of environment variable-based service discovery?**
+
+Environment variables are injected **only once when the Pod starts**. Services created after the Pod started are never injected. This creates implicit startup ordering dependencies: if your app uses `$API_SERVICE_SERVICE_HOST` to discover a dependency, the dependency Service must exist before the Pod starts — otherwise the environment variable is empty. In dynamic, auto-scaling environments where Services are created and deleted frequently, this is fragile. DNS-based discovery has no such limitation.
+
+**Q3: How does a Pod in the "frontend" namespace discover a Service in the "backend" namespace?**
+
+Using DNS with a namespace qualifier: `api-service.backend` (short form, expanded by search domains) or `api-service.backend.svc.cluster.local` (FQDN). The short form `api-service` without namespace would first search `api-service.frontend.svc.cluster.local` (Pod's own namespace), which would fail. Adding `.backend` explicitly routes the DNS query to the correct namespace. No special Kubernetes RBAC or configuration is needed for DNS resolution — any Pod can resolve any Service's DNS name in any namespace.
+
+**Q4: What is the difference between server-side and client-side service discovery in Kubernetes?**
+
+**Server-side** (default with ClusterIP): The client connects to the Service ClusterIP. kube-proxy's iptables/IPVS rules transparently proxy to a backend Pod. The client has no knowledge of individual Pods. Load balancing is done server-side by kube-proxy (per-connection DNAT). **Client-side**: The client resolves a headless Service (gets all Pod IPs) or watches EndpointSlice directly, maintains its own list of healthy backends, and applies its own load balancing logic. Used by gRPC libraries and service mesh clients for per-RPC load balancing.
+
+**Q5: What DNS name does a StatefulSet Pod get and why is it stable?**
+
+A StatefulSet Pod gets the DNS name `<pod-name>.<headless-service>.<namespace>.svc.cluster.local`. For example, `kafka-0.kafka-headless.production.svc.cluster.local`. This name is stable because StatefulSet Pod names are deterministic (ordinal suffix: `-0`, `-1`, `-2`) and don't change across restarts. Even if the Pod IP changes (after rescheduling to a different node), the DNS name still resolves to the new IP — providing **stable identity** for stateful applications that need to address specific replicas (like Kafka consumers addressing specific broker Pods).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the two mechanisms: DNS (dynamic, preferred) and environment variables (static, legacy)
+- [ ] Know env var limitation: only Services existing at Pod start time are injected
+- [ ] Know cross-namespace DNS: `<svc>.<namespace>` or full FQDN — no Kubernetes config needed
+- [ ] Know server-side discovery (ClusterIP + kube-proxy) vs client-side (headless + client LB)
+- [ ] Know StatefulSet stable DNS: `<pod-name>.<headless-svc>.<ns>.svc.cluster.local`
+- [ ] Know `enableServiceLinks: false` disables env var injection
+- [ ] Can verify with `nslookup`, `dig SRV`, `kubectl exec env | grep SERVICE_HOST`

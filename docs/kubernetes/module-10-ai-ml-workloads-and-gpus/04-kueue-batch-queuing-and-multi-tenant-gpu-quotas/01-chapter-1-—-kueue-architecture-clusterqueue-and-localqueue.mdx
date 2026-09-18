@@ -1,0 +1,236 @@
+---
+title: "Chapter 1 — Kueue Batch Queuing Architecture"
+sidebar_position: 1
+module: "Module 10.4 — Kueue Batch Queuing"
+description: "Master CNCF Kueue batch queuing architecture — ClusterQueue, LocalQueue, Workload CRDs, Job suspension/admission mechanics, and preventing GPU deadlocks."
+---
+
+# Chapter 1 — Kueue Architecture: ClusterQueue & LocalQueue
+
+> **Goal:** Master Kubernetes-native batch scheduling, job queuing, and multi-tenant quota management for AI/ML workloads using **CNCF Kueue** — understanding why vanilla Kubernetes schedulers suffer from catastrophic gang-scheduling deadlocks, dissecting the structural CRD hierarchy (**`ResourceFlavor`**, **`ClusterQueue`**, **`LocalQueue`**, and **`Workload`**), and orchestrating the automated **Job Suspension $\to$ Admission** lifecycle for PyTorch, Ray, and batch Jobs.
+>
+> By the end of this chapter, you will understand:
+> 1. Why vanilla Kubernetes batch scheduling causes GPU starvation and job deadlocks
+> 2. The structural relationship between ClusterQueue (Global quota) and LocalQueue (Namespace queue)
+> 3. How `ResourceFlavor` models hardware tiers (`on-demand-a100`, `spot-h100`) via node labels
+> 4. How Kueue uses `spec.suspend: true` to hold jobs in queue until 100% of required GPUs are free
+> 5. How the `Workload` Custom Resource tracks scheduling priority and admission gates
+> 6. How to author production `ClusterQueue`, `LocalQueue`, and Kueue-managed batch Jobs
+
+---
+
+## Real-Life Analogy
+
+Think of CNCF Kueue as **the automated maître d' and reservation queue manager at an ultra-exclusive Michelin 3-star restaurant with only 16 dining seats**:
+
+- **The Vanilla Kubernetes Chaos (The Uncontrolled Stampede):** 50 large families (**50 Distributed PyTorch Training Jobs requiring 8 GPUs each**) arrive at the restaurant simultaneously.
+  - In vanilla Kubernetes, there is no queue manager. Everyone rushes through the door at once.
+  - Family A grabs 4 chairs. Family B grabs 4 chairs. Family C grabs 4 chairs. Family D grabs 4 chairs (**All 16 GPU seats are occupied**).
+  - But every family requires **8 chairs together** to eat (**Distributed Gang-Scheduling requirement**).
+  - Result: All 4 families sit at half-empty tables staring at each other for hours. Nobody can eat, no meals are served, and all 50 families deadlock (**100% GPU Starvation & Zero Throughput**).
+- **The Kueue Solution (The Professional Maître d'):**
+  - Kueue stands at the entrance and holds everyone in the lobby (**`spec.suspend: true`**).
+  - The maître d' checks the master table availability (**`ClusterQueue`**).
+  - Family A is called: *"Table for 8 is ready (**Job Admitted - `suspend: false`**)."*
+  - Family A eats their meal, finishes training in 30 minutes, and leaves.
+  - The maître d' immediately seats Family B.
+  - Result: 100% table utilization, zero deadlocks, and maximum throughput!
+
+---
+
+## Architecture Diagram
+
+```text
+               CNCF Kueue: Multi-Tenant Batch Queuing & Admission Workflow
+
+ 1. DEVELOPERS IN MULTIPLE NAMESPACES SUBMIT TRAINING JOBS:
+ ┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
+ │ Namespace: `team-nlp`                │  │ Namespace: `team-vision`             │
+ │ LocalQueue: `nlp-queue`              │  │ LocalQueue: `vision-queue`           │
+ │ Job: LLaMA-3 (Requests: 8x H100 GPUs)│  │ Job: Stable Diffusion (4x H100 GPUs) │
+ └──────────────────┬───────────────────┘  └──────────────────┬───────────────────┘
+                    │ Submits `Workload` (Initial State: `suspend: true`)
+                    ▼                                         ▼
+ 2. CENTRAL KUEUE ADMISSION CONTROLLER (Evaluates Global Quotas)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ CLUSTERQUEUE: `enterprise-gpu-cluster-queue` (Nominal Quota: 16 GPUs)  │
+ │ ├── ResourceFlavor: `h100-on-demand` (Matches node label: `gpu=h100`) │
+ │ └── Queue Ordering: Priority-Based FIFO / BestEffortFIFO               │
+ └──────────────────┬─────────────────────────────────────────────────────┘
+                    │ 1. Admits `nlp-workload` (8 GPUs) + `vision-workload` (4 GPUs)
+                    │ 2. Total Used: 12/16 GPUs ──► Flips `spec.suspend: false`!
+                    ▼
+ 3. KUBERNETES KUBE-SCHEDULER (Schedules Admitted Workloads onto Nodes)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ GPU NODE POOL: Pods start executing immediately with zero deadlocks!   │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 4 Core Kueue CRD Building Blocks
+
+```text
+ ┌──────────────────────┬─────────────────────────┬───────────────────────────────────────────────────┐
+ │ Resource Kind        │ Scope / Location        │ Architectural Function                            │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ResourceFlavor`** │ Cluster-Scoped          │ Maps hardware tiers (e.g. `spot-h100`, `a100-80g`)│
+ │                      │                         │ to underlying Node labels and taints.             │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`ClusterQueue`**   │ Cluster-Scoped          │ Manages the global pool of ResourceFlavors,       │
+ │                      │                         │ quota limits, borrowing rules, and preemption.    │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`LocalQueue`**     │ Namespace-Scoped        │ The tenant-facing entry point where developers    │
+ │                      │ (Tenant Namespaces)     │ submit jobs; points to a parent ClusterQueue.     │
+ │──────────────────────┼─────────────────────────┼───────────────────────────────────────────────────┤
+ │ **`Workload`**       │ Namespace-Scoped        │ Synthesized automatically by Kueue to track       │
+ │                      │ (Generated per Job)     │ scheduling status, admission conditions, & quota. │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. Defining Hardware Tiers (`ResourceFlavor`)
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: nvidia-h100-flavor
+spec:
+  nodeLabels:
+    nvidia.com/gpu.product: "NVIDIA-H100-SXM5-80GB"
+  nodeTaints:
+    - key: "nvidia.com/gpu"
+      value: "present"
+      effect: "NoSchedule"
+```
+
+---
+
+## 2. Defining Global Quota Pools (`ClusterQueue`)
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: cluster-gpu-queue
+spec:
+  namespaceSelector: {}                # Accessible by all authorized namespaces
+  queueingStrategy: BestEffortFIFO     # Admits smaller jobs if head-of-line job cannot fit!
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu", "cpu", "memory"]
+      flavors:
+        - name: nvidia-h100-flavor
+          resources:
+            - name: "nvidia.com/gpu"
+              nominalQuota: 16         # Total 16 GPUs in this physical cluster pool!
+            - name: "cpu"
+              nominalQuota: "128"
+            - name: "memory"
+              nominalQuota: "512Gi"
+```
+
+---
+
+## 3. Creating Tenant Entry Point (`LocalQueue`)
+
+Deploy this into the developer's team namespace:
+
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: nlp-team-queue
+  namespace: team-nlp
+spec:
+  clusterQueue: cluster-gpu-queue      # Binds to global ClusterQueue!
+```
+
+---
+
+## 4. Submitting a Queued PyTorch Job to Kueue
+
+Attach the **`kueue.x-k8s.io/queue-name`** label to any standard batch `Job`, `RayJob`, or `PyTorchJob`:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bert-large-pretraining
+  namespace: team-nlp
+  labels:
+    # Binds the Job to the local team queue!
+    kueue.x-k8s.io/queue-name: nlp-team-queue
+spec:
+  suspend: true                        # Kueue keeps job suspended until quota is free!
+  parallelism: 2
+  completions: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: trainer
+        image: nvcr.io/nvidia/pytorch:24.04-py3
+        command: ["python", "train.py"]
+        resources:
+          limits:
+            nvidia.com/gpu: 4          # 2 pods x 4 GPUs = 8 GPUs total
+            memory: "64Gi"
+```
+
+---
+
+## Hands-On Lab: Querying Kueue Queues & Workload States
+
+```bash
+# Step 1: Query all ClusterQueues and active quota utilization
+kubectl get clusterqueues.kueue.x-k8s.io 2>/dev/null || echo "Kueue CRDs active / simulated"
+
+# Step 2: Query LocalQueues across developer namespaces
+kubectl get localqueues.kueue.x-k8s.io -A
+
+# Step 3: Query active Workloads and inspect their admission status
+kubectl get workloads.kueue.x-k8s.io -A -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace,QUEUE:.spec.queueName,ADMITTED:.status.conditions[?(@.type=="Admitted")].status
+
+# Step 4: Inspect why a pending Workload is waiting in queue
+# kubectl describe workload <workload-name> -n team-nlp
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why does vanilla Kubernetes batch scheduling fail for multi-node distributed AI training jobs?**
+
+Vanilla Kubernetes lacks **Gang-Scheduling (All-or-Nothing Scheduling) and Job Queuing**. When multiple multi-node GPU training jobs are submitted concurrently, the `kube-scheduler` schedules individual pods incrementally. If Job A and Job B both require 8 GPUs on a cluster with only 8 GPUs total, the scheduler may assign 4 GPUs to Job A and 4 GPUs to Job B. Because distributed PyTorch/NCCL training requires **all worker pods to be online simultaneously to initialize collective communication**, both jobs hang indefinitely, consuming 100% of cluster GPUs without performing any computation.
+
+**Q2: How does Kueue use the `spec.suspend` field to prevent GPU deadlocks?**
+
+When a batch Job or PyTorchJob is submitted with a `kueue.x-k8s.io/queue-name` label, Kueue's mutating webhook automatically sets **`spec.suspend: true`**. The Kubernetes `kube-scheduler` ignores suspended jobs completely, preventing partial pod scheduling. Kueue's central admission controller monitors the `ClusterQueue`. Only when **100% of the requested GPUs, CPUs, and memory are simultaneously available** does Kueue admit the job and set `spec.suspend: false`, allowing all worker pods to be scheduled as a single unified gang.
+
+**Q3: What is the difference between `queueingStrategy: StrictFIFO` and `BestEffortFIFO` in Kueue?**
+
+- **`StrictFIFO`**: Jobs are evaluated in strict priority/timestamp order. If the job at the head of the queue cannot fit (e.g. requires 16 GPUs when only 8 are free), the queue **blocks completely**, preventing smaller downstream jobs from running until the head job is admitted.
+- **`BestEffortFIFO`**: If the head-of-line job cannot fit, Kueue scans downstream and admits smaller jobs that *can* fit within remaining idle quota, maximizing GPU hardware utilization without starving large jobs indefinitely.
+
+**Q4: What is a `ResourceFlavor` in Kueue, and how does it abstract heterogeneous compute?**
+
+A `ResourceFlavor` represents a distinct tier of physical hardware (e.g. `on-demand-h100`, `spot-a100`, `standard-cpu`). It associates the flavor with Kubernetes node labels and tolerations. Inside a `ClusterQueue`, administrators can define quota across multiple flavors in priority order, allowing Kueue to attempt scheduling a training job on cheap Spot GPUs first and falling back to On-Demand GPUs if Spot capacity is unavailable.
+
+**Q5: Which AI/ML job frameworks are natively supported by CNCF Kueue?**
+
+Kueue natively integrates with the entire cloud-native AI ecosystem via dedicated integration webhooks, including: (1) Standard `batch/v1` Jobs; (2) **Kubeflow Training Operator** (`PyTorchJob`, `TFJob`, `MPIJob`, `XGBoostJob`); (3) **KubeRay** (`RayJob`, `RayCluster`); (4) **JobSet** (multi-template batch jobs); and (5) **AppWrapper** (IBM AI workloads).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that Kueue solves gang-scheduling deadlocks for multi-GPU training
+- [ ] Know the CRD hierarchy: ResourceFlavor $\to$ ClusterQueue $\to$ LocalQueue $\to$ Workload
+- [ ] Know that `spec.suspend: true` holds jobs in queue until full capacity is free
+- [ ] Know the difference: `StrictFIFO` (strict order) vs `BestEffortFIFO` (backfill)
+- [ ] Know that Kueue supports batch/v1 Jobs, PyTorchJobs, and RayJobs natively
+- [ ] Can view active queue capacity using `kubectl get clusterqueues`

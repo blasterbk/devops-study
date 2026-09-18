@@ -1,0 +1,1430 @@
+---
+title: "Chapter 6 — eBPF-Based kube-proxy Replacement"
+sidebar_position: 6
+module: "Module 1.8 — kube-proxy Internals"
+description: "> **Goal:** Understand how modern Kubernetes networking replaces kube-proxy using **eBPF**. Learn how eBPF programs execute inside the Linux kernel, how Service..."
+---
+
+# Module 1.8 — kube-proxy Internals
+
+# Chapter 6 — eBPF-Based kube-proxy Replacement
+
+> **Goal:** Understand how modern Kubernetes networking replaces kube-proxy using **eBPF**. Learn how eBPF programs execute inside the Linux kernel, how Service load balancing works without iptables or IPVS, how Cilium implements a kube-proxy-free dataplane, and why many large Kubernetes platforms have adopted this architecture.
+>
+> By the end of this chapter, you will understand:
+>
+> ```text
+> 1. The fundamental limitations of iptables and IPVS at cloud scale
+> 2. What eBPF is: sandboxed bytecode running safely inside Linux kernel space
+> 3. Packet hook points: XDP (network card driver), TC (traffic control), socket layer
+> 4. BPF Maps: high-speed kernel key-value stores for Service VIP and Endpoint lookup
+> 5. Socket-level load balancing (sock_ops): translating VIP to Pod IP at connect() time
+> 6. Direct Server Return (DSR): allowing backend Pods to reply directly to clients without return SNAT
+> 7. kube-proxy-free architecture: how Cilium replaces kube-proxy entirely
+> 8. Observability advantages: Hubble, transparent encryption, and L7 policy enforcement
+> ```
+
+---
+
+# Real-Life Analogy
+
+Think of eBPF replacement like a smart highway with electronic overhead gantries.
+
+```text
+Smart Highway Analogy:
+
+Traditional toll booth (iptables): every car stops and queues up in lane 1..N
+Automated toll gate (IPVS): cars slow down to pass through high-speed gate
+Smart Highway overhead sensors (eBPF / XDP):
+  - Sensors read car license plate at full highway speed (packet at NIC / XDP)
+  - Instantly directs car to express exit lane without any speed reduction
+  - Zero toll booths, zero queues, zero bottlenecks
+```
+
+| Smart Highway | eBPF Replacement |
+| :--- | :--- |
+| Traditional toll booth queue | iptables linear chain traversal |
+| Automated electronic gate | IPVS kernel hash tables |
+| Overhead sensor at highway speed | XDP / TC eBPF hook at driver/kernel boundary |
+| Express routing without stopping | Socket-layer translation (`cgroup/connect4`) |
+| Central speed database | BPF Maps (Service & Endpoint kernel lookup) |
+| Direct return route | Direct Server Return (DSR) bypassing router |
+
+> **Important:** With eBPF socket-layer load balancing (`sock_ops` / `cgroup/connect4`), the destination IP translation happens **directly inside the client application's `connect()` syscall** before any packet is even created on the network stack. The packet leaves the client socket already addressed to the backend Pod IP, completely bypassing Netfilter, iptables, and conntrack overhead!
+
+---
+
+# Prerequisites
+
+Before reading this chapter, you should understand:
+
+- Linux Networking
+- kube-proxy
+- iptables
+- IPVS
+- conntrack
+- Kubernetes Services
+
+---
+
+# Where This Chapter Fits
+
+In previous chapters we learned:
+
+```text
+Client
+  |
+  v
+ClusterIP
+  |
+  v
+iptables
+
+or
+  |
+  v
+IPVS
+  |
+  v
+Backend Pod
+```
+
+This architecture has powered Kubernetes for years.
+
+However,
+
+large production environments began asking:
+
+> Can Kubernetes implement Services without iptables?
+
+The answer is:
+
+```text
+Yes.
+
+Using eBPF.
+```
+
+---
+
+# Why Replace kube-proxy?
+
+Traditional kube-proxy works well.
+
+But as clusters grow,
+
+certain limitations become more visible.
+
+Examples:
+
+```text
+Large iptables Rule Sets
+
+────────────
+
+Rule Synchronization
+
+────────────
+
+Complex Debugging
+
+────────────
+
+Limited Visibility
+```
+
+Modern platforms wanted a faster and more programmable dataplane.
+
+---
+
+# Evolution of Kubernetes Networking
+
+```text
+Userspace Proxy
+  |
+  v
+iptables
+  |
+  v
+IPVS
+  |
+  v
+eBPF
+```
+
+Each generation moved more packet processing into efficient kernel components.
+
+---
+
+# What is eBPF?
+
+eBPF stands for:
+
+```text
+Extended Berkeley Packet Filter
+```
+
+Originally,
+
+BPF was designed for packet filtering.
+
+Modern eBPF has evolved into a general-purpose programmable execution environment inside the Linux kernel.
+
+---
+
+# Important Definition
+
+eBPF is **not** a networking tool.
+
+It is a kernel technology that allows verified programs to run safely inside the Linux kernel.
+
+Networking is only one of its many use cases.
+
+---
+
+# Traditional Networking
+
+Without eBPF:
+
+```text
+Packet
+  |
+  v
+Kernel
+  |
+  v
+iptables Rules
+  |
+  v
+Forward
+```
+
+The kernel follows predefined networking logic.
+
+---
+
+# eBPF Networking
+
+With eBPF:
+
+```text
+Packet
+  |
+  v
+eBPF Program
+  |
+  v
+Decision
+  |
+  v
+Forward
+```
+
+The kernel executes custom verified logic at specific hook points.
+
+---
+
+# Why is eBPF Safe?
+
+Running arbitrary code in the kernel would be dangerous.
+
+Before execution,
+
+every eBPF program passes through the:
+
+```text
+Verifier
+```
+
+The verifier checks:
+
+- Program safety
+- Memory safety
+- Loop correctness
+- Execution limits
+
+Only verified programs are loaded.
+
+---
+
+# eBPF Architecture
+
+```text
+                Userspace
+
+                     |
+
+             Compile Program
+
+                     |
+
+                     ▼
+
+               Kernel Verifier
+
+                     |
+
+          Safe Program Approved
+
+                     |
+
+                     ▼
+
+              eBPF Program
+
+                     |
+
+             Kernel Hook Point
+```
+
+---
+
+# eBPF Datapath
+
+Instead of relying on:
+
+```text
+iptables
+  |
+  v
+Rule Chains
+```
+
+or
+
+```text
+IPVS
+  |
+  v
+Kernel Tables
+```
+
+the packet enters an eBPF program.
+
+---
+
+# High-Level Datapath
+
+```text
+Packet
+  |
+  v
+eBPF Hook
+  |
+  v
+Service Lookup
+  |
+  v
+Backend Selection
+  |
+  v
+Forward Packet
+```
+
+No long rule chains are required.
+
+---
+
+# Complete Architecture
+
+```text
+Client
+  |
+  v
+NIC
+  |
+  v
+Kernel
+  |
+  v
+eBPF Program
+  |
+  v
+Service Lookup
+  |
+  v
+Backend Pod
+```
+
+---
+
+# Why is This Faster?
+
+Traditional iptables:
+
+```text
+Packet
+  |
+  v
+Evaluate Rules
+  |
+  v
+Find Match
+```
+
+eBPF:
+
+```text
+Packet
+  |
+  v
+Hash Lookup
+  |
+  v
+Backend
+```
+
+Fewer processing steps can reduce latency and CPU overhead.
+
+---
+
+# Hook Points
+
+eBPF programs execute at predefined hook points inside the kernel.
+
+The two most important networking hooks are:
+
+```text
+XDP
+
+TC
+```
+
+---
+
+# XDP
+
+XDP stands for:
+
+```text
+Express Data Path
+```
+
+It executes extremely early.
+
+Packet flow:
+
+```text
+NIC
+  |
+  v
+XDP
+  |
+  v
+Kernel Network Stack
+```
+
+This allows packet processing before much of the traditional networking stack executes.
+
+---
+
+# Why XDP?
+
+Early processing allows:
+
+- Early packet drops
+- Early forwarding
+- DDoS mitigation
+- High-performance packet handling
+
+---
+
+# XDP Workflow
+
+```text
+Packet
+  |
+  v
+NIC Driver
+  |
+  v
+XDP
+  |
+  v
+Decision
+  |
+  v
+Drop
+
+Pass
+
+Redirect
+```
+
+---
+
+# TC Hooks
+
+Another important hook is:
+
+```text
+Traffic Control
+
+(TC)
+```
+
+Unlike XDP,
+
+TC executes later in the networking pipeline.
+
+---
+
+# TC Architecture
+
+```text
+Packet
+  |
+  v
+Kernel Stack
+  |
+  v
+TC Hook
+  |
+  v
+eBPF Program
+  |
+  v
+Continue
+```
+
+TC provides access after more networking context has been established.
+
+---
+
+# XDP vs TC
+
+| XDP | TC |
+|------|----|
+| Earliest hook | Later hook |
+| Driver level | Network stack level |
+| Extremely fast | More networking context available |
+| Limited packet context | Rich packet metadata |
+
+---
+
+# BPF Maps
+
+Programs need memory.
+
+They cannot use ordinary kernel variables.
+
+Instead,
+
+they use:
+
+```text
+BPF Maps
+```
+
+---
+
+# What are BPF Maps?
+
+BPF Maps are shared kernel data structures.
+
+They store:
+
+- Service information
+- Endpoint lists
+- Connection state
+- Statistics
+- Configuration
+
+Think of them as extremely fast kernel key-value stores.
+
+---
+
+# Architecture
+
+```text
+eBPF Program
+  |
+  v
+Lookup
+  |
+  v
+BPF Map
+  |
+  v
+Result
+```
+
+---
+
+# Example
+
+Conceptually:
+
+```text
+Service IP
+  |
+  v
+10.96.0.15
+  |
+  v
+Lookup
+  |
+  v
+Backend List
+```
+
+The Service definition exists inside a BPF Map.
+
+---
+
+# Types of Maps
+
+Common map types include:
+
+- Hash Maps
+- Array Maps
+- LRU Hash Maps
+- Per-CPU Maps
+- Ring Buffers
+
+Networking solutions such as Cilium use several map types simultaneously.
+
+---
+
+# Service Lookup
+
+Suppose:
+
+```text
+Destination
+
+10.96.0.15
+```
+
+Instead of:
+
+```text
+iptables
+  |
+  v
+Rule Chain
+```
+
+the eBPF program performs:
+
+```text
+Service IP
+  |
+  v
+BPF Map Lookup
+  |
+  v
+Backend List
+```
+
+---
+
+# Internal Workflow
+
+```text
+Packet
+  |
+  v
+Extract Service IP
+  |
+  v
+Lookup BPF Map
+  |
+  v
+Return Backends
+  |
+  v
+Choose Backend
+```
+
+The lookup is efficient and avoids traversing rule chains.
+
+---
+
+# Load Balancing
+
+Once backends are found,
+
+the eBPF dataplane selects one.
+
+Conceptually:
+
+```text
+Backend List
+  |
+  v
+Selection
+  |
+  v
+Chosen Pod
+```
+
+The exact selection algorithm depends on the implementation.
+
+---
+
+# Connection Tracking
+
+eBPF implementations still require connection tracking.
+
+Modern dataplanes may:
+
+- Integrate with Linux conntrack
+- Maintain their own connection-tracking mechanisms
+- Use a combination of both
+
+The exact behavior depends on the implementation (for example, Cilium supports both approaches depending on the feature and deployment mode).
+
+---
+
+# Direct Server Return (DSR)
+
+Traditional networking often returns packets through the Node that received them.
+
+Example:
+
+```text
+Client
+  |
+  v
+Node A
+  |
+  v
+Pod
+  |
+  v
+Node A
+  |
+  v
+Client
+```
+
+This introduces an extra return hop.
+
+---
+
+# What is DSR?
+
+DSR stands for:
+
+```text
+Direct Server Return
+```
+
+Instead of returning through the ingress Node,
+
+the backend responds directly.
+
+---
+
+# Traditional Response
+
+```text
+Client
+  |
+  v
+Node
+  |
+  v
+Pod
+  |
+  v
+Node
+  |
+  v
+Client
+```
+
+---
+
+# DSR Response
+
+```text
+Client
+  |
+  v
+Node
+  |
+  v
+Pod
+  |
+  v
+Client
+```
+
+The response bypasses the original forwarding Node.
+
+---
+
+# Advantages
+
+- Lower latency
+- Reduced Node bandwidth
+- Better scalability
+- Reduced CPU utilization
+
+---
+
+# kube-proxy-free Kubernetes
+
+One of the biggest innovations:
+
+```text
+No kube-proxy
+```
+
+The traditional dataplane disappears.
+
+Instead:
+
+```text
+API Server
+  |
+  v
+Networking Agent
+  |
+  v
+eBPF Programs
+  |
+  v
+Kernel
+```
+
+Service implementation happens directly through eBPF.
+
+---
+
+# Architecture Comparison
+
+Traditional:
+
+```text
+API Server
+  |
+  v
+kube-proxy
+  |
+  v
+iptables/IPVS
+  |
+  v
+Kernel
+```
+
+Modern:
+
+```text
+API Server
+  |
+  v
+eBPF Agent
+  |
+  v
+Kernel Programs
+```
+
+No kube-proxy rule management is required.
+
+---
+
+# Cilium
+
+The best-known eBPF Kubernetes networking platform is:
+
+```text
+Cilium
+```
+
+Cilium provides:
+
+- CNI
+- Service Load Balancing
+- Network Policies
+- Observability
+- Encryption
+- Hubble
+- kube-proxy Replacement
+
+---
+
+# Cilium Architecture
+
+```text
+               API Server
+
+                    |
+
+                    ▼
+
+               Cilium Agent
+
+                    |
+
+             BPF Maps
+
+                    |
+
+             eBPF Programs
+
+                    |
+
+              Linux Kernel
+
+                    |
+
+              Backend Pods
+```
+
+---
+
+# Cilium Components
+
+Major components include:
+
+```text
+Cilium Agent
+  |
+  v
+BPF Loader
+  |
+  v
+BPF Maps
+  |
+  v
+eBPF Programs
+  |
+  v
+Hubble
+```
+
+Each Node runs its own Cilium Agent.
+
+---
+
+# How Cilium Learns About Services
+
+Workflow:
+
+```text
+API Server
+  |
+  v
+Watch Services
+  |
+  v
+Watch EndpointSlices
+  |
+  v
+Update BPF Maps
+  |
+  v
+Kernel
+```
+
+Notice the similarity to kube-proxy.
+
+The difference is **how** the dataplane is programmed.
+
+---
+
+# Packet Walkthrough
+
+Suppose:
+
+```text
+Client
+  |
+  v
+10.96.0.15
+```
+
+Workflow:
+
+```text
+Packet Arrives
+  |
+  v
+eBPF Hook
+  |
+  v
+Lookup Service
+  |
+  v
+Read BPF Map
+  |
+  v
+Choose Backend
+  |
+  v
+Rewrite Destination
+  |
+  v
+Forward Packet
+```
+
+No iptables chains are traversed.
+
+---
+
+# Rolling Updates
+
+Suppose:
+
+```text
+Deployment
+  |
+  v
+New Pod Ready
+```
+
+Workflow:
+
+```text
+EndpointSlice Updated
+  |
+  v
+Cilium Agent
+  |
+  v
+Update BPF Map
+  |
+  v
+Traffic Uses New Pod
+```
+
+No iptables regeneration occurs.
+
+---
+
+# Failure Handling
+
+Suppose:
+
+```text
+Pod
+  |
+  v
+Crash
+```
+
+Workflow:
+
+```text
+Endpoint Removed
+  |
+  v
+BPF Map Updated
+  |
+  v
+Traffic Redirected
+```
+
+Healthy Pods continue serving requests.
+
+---
+
+# Performance Comparison
+
+| Feature | iptables | IPVS | eBPF |
+|----------|----------|------|-------|
+| Rule Traversal | Yes | No | No |
+| Table Lookup | Limited | Yes | Yes |
+| Programmable | Limited | Limited | Extensive |
+| Kernel Execution | Yes | Yes | Yes |
+| Observability | Basic | Good | Excellent |
+| Scalability | Good | Better | Excellent |
+
+---
+
+# Resource Usage
+
+Generally,
+
+eBPF implementations reduce:
+
+- Rule synchronization overhead
+- CPU usage for packet processing
+- Network latency
+
+However,
+
+they also introduce:
+
+- More sophisticated kernel programming
+- Additional operational complexity
+- Kernel version requirements
+
+---
+
+# Advantages
+
+✔ High-performance dataplane
+
+✔ Minimal packet processing overhead
+
+✔ Rich observability
+
+✔ Flexible programming model
+
+✔ Efficient Service lookup
+
+✔ Advanced networking features
+
+✔ kube-proxy-free operation
+
+---
+
+# Trade-offs
+
+✖ Steeper learning curve
+
+✖ Requires modern Linux kernels
+
+✖ More advanced troubleshooting
+
+✖ Greater operational complexity
+
+✖ Implementation-specific behavior
+
+---
+
+# Complete Internal Architecture
+
+```text
+                 API Server
+
+                      |
+
+          Services / EndpointSlices
+
+                      |
+
+                      ▼
+
+               Cilium Agent
+
+                      |
+
+             Update BPF Maps
+
+                      |
+
+                      ▼
+
+              Linux Kernel
+
+                      |
+
+              eBPF Hook
+
+                      |
+
+             Service Lookup
+
+                      |
+
+              Backend Selection
+
+                      |
+
+                      ▼
+
+                  Backend Pod
+```
+
+---
+
+# Production Example 1
+
+Large Kubernetes Platform
+
+```text
+100,000 Pods
+  |
+  v
+eBPF
+  |
+  v
+Efficient Dataplane
+```
+
+---
+
+# Production Example 2
+
+Financial Services
+
+```text
+Low Latency
+  |
+  v
+eBPF
+  |
+  v
+Fast Packet Processing
+```
+
+---
+
+# Production Example 3
+
+High Observability
+
+```text
+Packet Flow
+  |
+  v
+Hubble
+  |
+  v
+Real-Time Visibility
+```
+
+Network traffic can be observed without relying solely on traditional packet captures.
+
+---
+
+# Production Example 4
+
+kube-proxy-free Cluster
+
+```text
+Cilium
+  |
+  v
+eBPF
+  |
+  v
+No kube-proxy
+```
+
+Services are implemented entirely through eBPF programs and BPF maps.
+
+---
+
+# Production Best Practices
+
+✔ Use modern Linux kernels compatible with your eBPF platform.
+
+✔ Monitor BPF Map utilization.
+
+✔ Keep eBPF programs updated with platform releases.
+
+✔ Understand the packet hook points before troubleshooting.
+
+✔ Use observability tools such as Hubble where available.
+
+✔ Validate kernel compatibility before enabling kube-proxy replacement.
+
+✔ Benchmark workloads before migrating from iptables or IPVS.
+
+---
+
+# Common Misconceptions
+
+### ❌ Misconception 1
+
+eBPF replaces the Linux kernel.
+
+**Correct:** eBPF runs inside the Linux kernel.
+
+---
+
+### ❌ Misconception 2
+
+eBPF is only for networking.
+
+**Correct:** eBPF supports networking, security, tracing, observability, and many other kernel extensions.
+
+---
+
+### ❌ Misconception 3
+
+BPF Maps are user-space databases.
+
+**Correct:** BPF Maps are kernel-resident data structures shared between user space and eBPF programs.
+
+---
+
+### ❌ Misconception 4
+
+XDP and TC are the same.
+
+**Correct:** XDP executes much earlier in the packet path, while TC executes later with additional networking context.
+
+---
+
+### ❌ Misconception 5
+
+Every eBPF implementation behaves identically.
+
+**Correct:** Different platforms implement connection tracking, load balancing, and advanced features differently.
+
+---
+
+### ❌ Misconception 6
+
+eBPF eliminates connection tracking.
+
+**Correct:** Stateful networking still requires connection tracking. The implementation may use Linux conntrack, custom eBPF-based tracking, or both.
+
+---
+
+### ❌ Misconception 7
+
+Cilium is only a CNI plugin.
+
+**Correct:** Cilium is a comprehensive networking platform that provides CNI functionality, Service load balancing, network policies, observability, and optional kube-proxy replacement.
+
+---
+
+# Common Interview Questions
+
+### Q1. Why are organizations replacing kube-proxy?
+
+To reduce dataplane overhead, improve scalability, and enable programmable kernel networking.
+
+---
+
+### Q2. What is eBPF?
+
+A safe programmable execution environment inside the Linux kernel.
+
+---
+
+### Q3. What is the purpose of the eBPF verifier?
+
+To ensure programs are safe before they are loaded into the kernel.
+
+---
+
+### Q4. What is the difference between XDP and TC?
+
+XDP executes at the earliest packet processing stage, while TC executes later within the networking stack.
+
+---
+
+### Q5. What are BPF Maps?
+
+Kernel-resident key-value data structures used by eBPF programs to store and retrieve state.
+
+---
+
+### Q6. How does Service lookup work in an eBPF dataplane?
+
+The eBPF program performs a lookup in BPF Maps to retrieve backend information instead of traversing iptables rules.
+
+---
+
+### Q7. What is Direct Server Return (DSR)?
+
+A networking technique in which response traffic returns directly from the backend to the client instead of passing back through the ingress forwarding Node.
+
+---
+
+### Q8. What does kube-proxy-free Kubernetes mean?
+
+Service networking is implemented by eBPF programs rather than kube-proxy-managed iptables or IPVS rules.
+
+---
+
+### Q9. What role does Cilium play?
+
+Cilium provides an eBPF-powered Kubernetes networking platform, including CNI, Service load balancing, network policies, observability, and optional kube-proxy replacement.
+
+---
+
+### Q10. Is eBPF always better than IPVS?
+
+Not necessarily. eBPF offers many advantages, but the best choice depends on kernel support, operational expertise, feature requirements, and workload characteristics.
+
+---
+
+# Troubleshooting Guide
+
+| Problem | Likely Cause |
+|----------|--------------|
+| Service unreachable | Missing or stale BPF Map entries, agent synchronization issue, or networking problem |
+| Incorrect backend selection | Outdated BPF Maps or endpoint synchronization failure |
+| High packet drops | eBPF program issue, policy enforcement, or underlying network problem |
+| Client IP unexpectedly changed | DSR configuration, NAT behavior, or traffic policy configuration |
+| Poor performance after migration | Kernel compatibility, configuration issues, or workload-specific behavior |
+| eBPF programs not loaded | Verifier rejection, unsupported kernel features, or agent failure |
+
+---
+
+# Knowledge Check
+
+Before completing this module, you should be able to answer:
+
+1. Why do some organizations replace kube-proxy?
+2. What is eBPF?
+3. Why is the verifier required?
+4. What is the difference between XDP and TC?
+5. What are BPF Maps?
+6. How does Service lookup work in an eBPF dataplane?
+7. What is Direct Server Return?
+8. What does kube-proxy-free Kubernetes mean?
+9. How does Cilium implement Services?
+10. What are the advantages and trade-offs of eBPF?
+
+---
+
+# Chapter Summary
+
+In this chapter, you learned how **eBPF** is transforming Kubernetes networking by replacing traditional kube-proxy dataplanes.
+
+You learned:
+
+- Why organizations are moving beyond iptables and IPVS
+- The fundamentals of eBPF and its safe execution model
+- How eBPF programs process packets through XDP and TC hook points
+- How BPF Maps enable efficient Service lookups
+- How Service load balancing works without iptables rule chains
+- The concept and benefits of Direct Server Return (DSR)
+- What kube-proxy-free Kubernetes means
+- How Cilium implements a modern eBPF networking architecture
+- The performance advantages and operational trade-offs of eBPF
+
+Modern Kubernetes networking is increasingly centered around eBPF because it combines high performance, deep observability, and flexible kernel programmability. While iptables and IPVS remain important foundations to understand, eBPF represents the current direction of cloud-native networking and is becoming the preferred dataplane for many production Kubernetes environments.
+
+---
+
+# Module 1.8 Summary — kube-proxy Internals
+
+You have now completed **Module 1.8 — kube-proxy Internals**.
+
+Across these six chapters, you learned:
+
+- **Chapter 1:** kube-proxy Architecture
+- **Chapter 2:** iptables Mode Internals
+- **Chapter 3:** IPVS Mode Internals
+- **Chapter 4:** conntrack Internals
+- **Chapter 5:** Service Load Balancing
+- **Chapter 6:** eBPF-Based kube-proxy Replacement
+
+Together, these chapters explain how Kubernetes implements Service networking—from traditional iptables rule chains and IPVS kernel load balancing to modern eBPF-based dataplanes. You now understand how traffic flows from a virtual Service IP to backend Pods, how connections are tracked, how endpoints are managed, and how next-generation networking platforms such as Cilium provide kube-proxy-free Kubernetes.
+
+---
+
+# Next Module
+
+## Module 1.9 — CRDs & Operators
+
+Topics include:
+
+- Custom Resource Definitions (CRDs)
+- Kubernetes API Extension
+- Custom Resources
+- API Registration
+- Versioning
+- Conversion Webhooks
+- Controllers
+- Operators
+- Kubebuilder
+- Operator SDK
+- Finalizers
+- OwnerReferences
+- Production Patterns
+
+In the next module, you'll learn how Kubernetes extends its API beyond built-in resources, enabling you to create entirely new object types and automate complex operational workflows using custom controllers and operators.

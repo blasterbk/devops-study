@@ -1,0 +1,424 @@
+---
+title: "Chapter 1 — Pod Architecture & Phase Lifecycle"
+sidebar_position: 1
+module: "Module 3.1 — Pods & Containers"
+description: "Deep dive into Kubernetes Pod internals — Linux namespaces, pause/infra container, phase state machines, Pod conditions, container states, restart policies, static pods, and lifecycle troubleshooting."
+---
+
+# Chapter 1 — Pod Architecture & Phase Lifecycle
+
+> **Goal:** Master the internal mechanics of Kubernetes Pods — from Linux namespace sharing via the pause container to the complete Pod and container lifecycle state machines, condition transitions, restart policies, static Pod operations, and diagnostic techniques.
+>
+> By the end of this chapter, you will understand:
+> 1. What a Pod actually is at the Linux kernel and container runtime level
+> 2. The role and lifecycle of the `pause` (infra) container
+> 3. Pod phase transitions (`Pending`, `Running`, `Succeeded`, `Failed`, `Unknown`)
+> 4. Pod conditions (`PodScheduled`, `Initialized`, `ContainersReady`, `Ready`) and probes
+> 5. Container states (`Waiting`, `Running`, `Terminated`) and crash reasons
+> 6. How `restartPolicy` interacts with workload controllers
+> 7. How Kubelet manages Static Pods independently of the Control Plane
+
+---
+
+## Real-Life Analogy
+
+Think of a Pod as a **hotel room occupied by a touring band**:
+
+- The **hotel room itself (with its shared bathroom, Wi-Fi router, and room number)** is the **Pod Sandbox** created by the **pause container**. The room holds the shared IP address, local network, and shared disk storage.
+- The **band members** staying in the room are the **containers**. The lead singer (main app container) and the sound engineer logging everything (sidecar container) live in the exact same room.
+- They talk to each other effortlessly without dialing an outside phone line — they just speak across the room (`localhost:8080`).
+- If one band member passes out (container crash), the hotel manager (Kubelet) checks the band's contract (`restartPolicy`) to decide whether to wake them up with a cold splash of water (`Always`), only wake them up if they fell ill (`OnFailure`), or leave them alone (`Never`).
+- The front desk status board shows whether the room is being prepared (`Pending`), occupied and performing (`Running`), checked out cleanly (`Succeeded`), or trashed (`Failed`).
+
+---
+
+## Architecture Diagram
+
+```text
+               Inside a Kubernetes Pod Sandbox
+
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ Node Network / Linux Kernel                                              │
+ │   veth pair ───► eth0 (10.244.1.45)                                      │
+ │                                                                          │
+ │ Pod Network Namespace (netns), IPC Namespace (ipcns), UTS Namespace      │
+ │ ┌──────────────────────────────────────────────────────────────────────┐ │
+ │ │ Pause Container (k8s.gcr.io/pause:3.9)                               │ │
+ │ │ - Holds network namespace (IP: 10.244.1.45, Port space)              │ │
+ │ │ - Holds IPC namespace (POSIX queues, SysV shared memory)             │ │
+ │ │ - Reaps orphaned zombie processes if PID sharing is enabled         │ │
+ │ └──────────────┬───────────────────────────────────────┬───────────────┘ │
+ │                │ shares netns & volumes                │ shares netns    │
+ │                ▼                                       ▼                 │
+ │ ┌──────────────────────────────┐     ┌─────────────────────────────────┐ │
+ │ │ Main Application Container   │     │ Sidecar Container (e.g. Envoy)  │ │
+ │ │ - PID 1: python app.py       │     │ - PID 1: envoy -c config.yaml   │ │
+ │ │ - Listens on 127.0.0.1:8080  │◄───►│ - Listens on 127.0.0.1:15001   │ │
+ │ │ - Mounts /var/log (emptyDir) │     │ - Mounts /var/log (emptyDir)    │ │
+ │ └──────────────────────────────┘     └─────────────────────────────────┘ │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## What is a Pod Under the Hood?
+
+In Linux, there is no single kernel object called a "container" or a "pod". A container is simply a standard Linux process isolated by **cgroups** (resource limits) and **namespaces** (visibility boundaries).
+
+A **Pod** is a set of Linux namespaces shared across one or more containers:
+
+1. **Network Namespace (`netns`):** All containers in the Pod share the same IP address, MAC address, routing table, and TCP/UDP port range. Two containers in the same Pod cannot bind to the same port. They communicate with each other over `127.0.0.1` (`localhost`).
+2. **IPC Namespace (`ipcns`):** Containers can communicate via System V IPC or POSIX message queues.
+3. **UTS Namespace (`utsns`):** All containers see the same hostname (the Pod name).
+4. **Volume Mounts:** Storage volumes are defined at the Pod level and mounted into individual containers at custom container paths.
+5. **PID Namespace (`pidns`):** By default, each container has its own PID namespace. However, if `shareProcessNamespace: true` is set in the Pod spec, all containers share a single PID namespace, allowing container A to see and signal processes in container B.
+
+### The Critical Role of the `pause` Container
+
+When Kubelet creates a Pod on a node via the Container Runtime Interface (CRI):
+1. It first calls `RunPodSandbox` to instruct the container runtime (containerd or CRI-O) to spawn an **infrastructure container** (commonly known as the `pause` container).
+2. The `pause` container creates and holds the Linux `netns`, `ipcns`, and `utsns`.
+3. It executes a tiny C binary that does almost nothing: registers signal handlers, goes to sleep via `pause()`, and reaps orphaned zombie processes if PID namespace sharing is active.
+4. When subsequent user containers (`app`, `sidecar`, `init`) are launched, their container runtimes attach them to the already-existing namespaces created by the `pause` container (`--net=container:pause_id`).
+5. If an application container crashes and restarts, the network identity (IP address and socket connections) remains intact because the `pause` container never stopped running.
+
+---
+
+## Pod Phase State Machine
+
+A Pod's high-level status is tracked in `.status.phase`. This is a summary abstraction generated by the Control Plane:
+
+```text
+                        Pod Phase State Machine
+
+             ┌───────────────┐
+             │   Manifest    │
+             │   Created     │
+             └───────┬───────┘
+                     │ (Kube-Scheduler binds Pod to Node)
+                     ▼
+             ┌───────────────┐
+             │    Pending    │◄─────────────────────────────┐
+             └───────┬───────┘                              │
+                     │ (Kubelet pulls images & starts containers)
+                     ▼                                      │
+             ┌───────────────┐                              │
+             │    Running    │                              │
+             └───────┬───────┘                              │
+                     │                                      │
+        ┌────────────┴────────────┐                         │
+        │                         │                         │
+ (All containers           (Any container                   │ (Node fails /
+  exit with 0)              exits non-zero &                │  Network partition)
+        ▼                   restartPolicy: Never)           ▼
+ ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+ │   Succeeded   │         │    Failed     │         │    Unknown    │
+ └───────────────┘         └───────────────┘         └───────────────┘
+```
+
+| Phase | Meaning & Trigger Conditions |
+| :--- | :--- |
+| **`Pending`** | The Pod has been accepted by the Kubernetes API server, but one or more containers have not been created. This includes time spent waiting to be scheduled, downloading images over the network, or waiting for init containers. |
+| **`Running`** | The Pod has been bound to a Node, and all containers have been created. At least one container is currently running, or is in the process of starting or restarting. |
+| **`Succeeded`** | All containers in the Pod have terminated successfully (exit code `0`) and will not be restarted. Typically observed with completed batch `Jobs`. |
+| **`Failed`** | All containers in the Pod have terminated, and at least one container has terminated in failure (exit code non-zero or terminated by the kernel/OOM). |
+| **`Unknown`** | The state of the Pod cannot be obtained, usually due to a communication failure between the Control Plane (`kube-controller-manager`) and the `kubelet` on the worker node. |
+
+---
+
+## Pod Conditions: Fine-Grained Status
+
+While `.status.phase` is a broad rollup, `.status.conditions` provides detailed diagnostic milestones. Every condition has a `Type`, `Status` (`True`, `False`, `Unknown`), `LastTransitionTime`, `Reason`, and `Message`.
+
+```yaml
+status:
+  phase: Running
+  conditions:
+  - type: PodScheduled
+    status: "True"
+  - type: Initialized
+    status: "True"
+  - type: ContainersReady
+    status: "True"
+  - type: Ready
+    status: "True"
+```
+
+```text
+ Lifecycle Progression of Pod Conditions:
+
+ 1. PodScheduled   ──► True when Kube-Scheduler assigns Pod to a Node.
+ 2. Initialized     ──► True when ALL Init Containers complete with exit code 0.
+ 3. ContainersReady ──► True when ALL application containers pass Readiness Probes.
+ 4. Ready           ──► True when the Pod is ready to receive network traffic from Services.
+```
+
+### Readiness Gates (Extending Pod Conditions)
+
+You can inject custom external conditions into the `Ready` calculation using **Readiness Gates**. This is common with cloud Load Balancers (like AWS ALB Controller or GKE Ingress) to ensure traffic isn't routed to a Pod until the cloud target group registration completes:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-app-custom-gate
+spec:
+  readinessGates:
+  - conditionType: "target-health.alb.ingress.k8s.aws/instance-healthy"
+  containers:
+  - name: web
+    image: nginx:1.25
+```
+
+---
+
+## Container States and Crash Troubleshooting
+
+Within `.status.containerStatuses[]`, each container resides in one of three mutually exclusive states:
+
+```text
+                     Container State Lifecycle
+
+             ┌────────────────────────────────┐
+             │            Waiting             │
+             │ (Pulling, CrashLoopBackOff,    │
+             │  CreateContainerConfigError)   │
+             └───────────────┬────────────────┘
+                             │
+                             ▼
+             ┌────────────────────────────────┐
+             │            Running             │
+             │ (Executing, Probes active)     │
+             └───────────────┬────────────────┘
+                             │
+                             ▼
+             ┌────────────────────────────────┐
+             │           Terminated           │
+             │ (Completed, OOMKilled, Error)  │
+             └────────────────────────────────┘
+```
+
+### Common Container Failure Reasons
+
+| Reason | State | Underlying Cause | Diagnostic Command |
+| :--- | :--- | :--- | :--- |
+| **`ImagePullBackOff` / `ErrImagePull`** | Waiting | Image name/tag typo, registry authentication missing, rate limit hit. | `kubectl describe pod <pod>` |
+| **`CrashLoopBackOff`** | Waiting | Process starts, fails, exits non-zero; Kubelet backs off exponentially (10s, 20s, 40s... up to 5m). | `kubectl logs <pod> --previous` |
+| **`CreateContainerConfigError`** | Waiting | Missing Secret or ConfigMap referenced in `env` or `envFrom`. | `kubectl get secrets,cm` |
+| **`OOMKilled` (Exit Code 137)** | Terminated | Container process exceeded its `resources.limits.memory` cgroup limit. | `kubectl describe pod <pod> | grep -i oom` |
+| **`ContainerCannotRun`** | Waiting | Mount permission error, invalid command/entrypoint binary, selinux error. | `kubectl describe pod <pod>` |
+
+---
+
+## Pod `restartPolicy` Mechanics
+
+The `spec.restartPolicy` controls how Kubelet handles terminated containers in a Pod:
+
+- **`Always` (Default):** Kubelet restarts the container regardless of why it terminated (exit 0 or non-zero). Used for long-running services (Deployments, StatefulSets, DaemonSets).
+- **`OnFailure`:** Kubelet restarts the container ONLY if it exits with a non-zero exit code or is terminated abnormally. Used for batch `Jobs` that should run to completion.
+- **`Never`:** Kubelet never restarts the container. If it exits (even with failure), it stays in `Terminated` state.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: batch-worker
+spec:
+  restartPolicy: OnFailure    # Options: Always, OnFailure, Never
+  containers:
+  - name: worker
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 10; exit 0"]
+```
+
+---
+
+## Static Pods: Independent Node Workloads
+
+A **Static Pod** is managed directly by the `kubelet` daemon on a specific node, completely bypassing the API server and `kube-scheduler`.
+
+```text
+                  Static Pod Architecture
+
+ Master / Worker Node File System
+ ┌──────────────────────────────────────────────────────────┐
+ │ /etc/kubernetes/manifests/                               │
+ │   ├── kube-apiserver.yaml                                │
+ │   ├── kube-controller-manager.yaml                       │
+ │   └── etcd.yaml                                          │
+ └────────────────────────────┬─────────────────────────────┘
+                              │ Kubelet file-watcher
+                              ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │ Kubelet Daemon                                           │
+ │ 1. Reads local YAML files directly                       │
+ │ 2. Creates & supervises containers via CRI               │
+ │ 3. Generates Mirror Pod on API Server (read-only view)   │
+ └──────────────────────────────────────────────────────────┘
+```
+
+### Static Pod Key Characteristics:
+1. **Control Plane Bootstrapping:** Used by `kubeadm` to run `etcd`, `kube-apiserver`, `kube-controller-manager`, and `kube-scheduler` as containers before the Kubernetes API is operational.
+2. **Directory Watcher:** Kubelet periodically scans `/etc/kubernetes/manifests/` (defined by `--pod-manifest-path` or `staticPodPath` in `/var/lib/kubelet/config.yaml`). Adding, modifying, or deleting a manifest immediately creates, restarts, or deletes the Pod.
+3. **Mirror Pods:** Kubelet creates a read-only "Mirror Pod" on the API server with the node name appended (e.g., `etcd-master-01`). If you run `kubectl delete pod etcd-master-01`, the API server deletes the mirror object, but Kubelet immediately recreates it from the local disk file!
+
+---
+
+## Complete Multi-Container Pod Example
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: telemetry-web-app
+  namespace: production
+  labels:
+    app: telemetry-web
+    tier: frontend
+spec:
+  restartPolicy: Always
+  shareProcessNamespace: true
+  
+  containers:
+  # 1. Main Web Service
+  - name: web-server
+    image: nginx:1.25-alpine
+    ports:
+    - name: http
+      containerPort: 80
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+    volumeMounts:
+    - name: shared-logs
+      mountPath: /var/log/nginx
+
+  # 2. Sidecar Log Shipper
+  - name: log-exporter
+    image: busybox:1.36
+    command: ["sh", "-c", "tail -n+1 -F /var/log/nginx/access.log"]
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "100m"
+        memory: "128Mi"
+    volumeMounts:
+    - name: shared-logs
+      mountPath: /var/log/nginx
+
+  volumes:
+  - name: shared-logs
+    emptyDir: {}
+```
+
+---
+
+## Hands-On Lab: Diagnosing Pods & Static Pods
+
+Execute the following steps to observe lifecycle transitions and experiment with namespaces and static pods.
+
+```bash
+# Step 1: Create a namespace for testing
+kubectl create namespace pod-lab
+
+# Step 2: Deploy the telemetry pod
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: namespace-demo
+  namespace: pod-lab
+spec:
+  shareProcessNamespace: true
+  containers:
+  - name: web
+    image: nginx:1.25-alpine
+  - name: observer
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Verify Pod conditions and wait until Ready
+kubectl get pods -n pod-lab -o wide
+kubectl describe pod namespace-demo -n pod-lab | grep -A 8 "Conditions:"
+
+# Step 4: Verify shared network namespace (localhost access)
+kubectl exec -n pod-lab namespace-demo -c observer -- apk add --no-cache curl
+kubectl exec -n pod-lab namespace-demo -c observer -- curl -s http://127.0.0.1:80 | grep "Welcome to nginx"
+
+# Step 5: Verify shared PID namespace (observer sees nginx process)
+kubectl exec -n pod-lab namespace-demo -c observer -- ps aux
+# Notice nginx master/worker processes are visible from observer!
+
+# Step 6: Simulate an OOMKill and inspect exit code
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-test
+  namespace: pod-lab
+spec:
+  restartPolicy: Never
+  containers:
+  - name: memory-eater
+    image: python:3.9-slim
+    command: ["python", "-c", "x = ' ' * 100 * 1024 * 1024"] # 100MB allocation
+    resources:
+      limits:
+        memory: "20Mi"
+EOF
+
+# Wait a moment, then check terminated status
+kubectl get pod oom-test -n pod-lab
+kubectl get pod oom-test -n pod-lab -o jsonpath='{.status.containerStatuses[0].state.terminated}'
+# Notice exitCode: 137, reason: OOMKilled
+
+# Step 7: Inspect Static Pod manifest location on control plane node
+ls -la /etc/kubernetes/manifests/ 2>/dev/null || echo "Run on control-plane node to see kube-apiserver.yaml"
+
+# Step 8: Clean up lab resources
+kubectl delete namespace pod-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What happens under the hood when a container inside a Pod crashes?**
+
+When a container process crashes, the Linux kernel terminates the process and releases its memory/cgroup allocations. The Container Runtime (containerd/CRI-O) detects the termination event and notifies the Kubelet. The Kubelet inspects the Pod's `restartPolicy`. If set to `Always` (or `OnFailure` with a non-zero exit code), Kubelet triggers a restart using an exponential backoff algorithm (`CrashLoopBackOff` delay doubles from 10s up to 300s). Critically, the Pod's network namespace and IP address remain untouched because the `pause` container continues running.
+
+**Q2: What is the pause container, and why does every Kubernetes Pod have one?**
+
+The `pause` container is an infrastructure container automatically spawned by the container runtime at the start of a Pod's creation (`RunPodSandbox`). Its primary purpose is to hold open the shared Linux namespaces (`netns`, `ipcns`, `utsns`) and act as the parent anchor for all user containers within that Pod. Additionally, when `shareProcessNamespace: true` is enabled, the `pause` container assumes PID 1 for the Pod sandbox, allowing it to act as an init system and reap orphaned zombie processes.
+
+**Q3: Explain the difference between Pod Phase and Pod Condition.**
+
+A Pod Phase (`Pending`, `Running`, `Succeeded`, `Failed`, `Unknown`) is a coarse, high-level summary of where the Pod is in its overarching lifecycle. In contrast, Pod Conditions (`PodScheduled`, `Initialized`, `ContainersReady`, `Ready`) provide precise, verifiable diagnostic assertions about specific lifecycle stages. A Pod can be in the `Running` phase while its `Ready` condition is `False` (for example, if its application readiness probe is currently failing).
+
+**Q4: How does a Static Pod differ from a standard Kubernetes Pod, and how is it updated?**
+
+Standard Pods are submitted to the API server, stored in `etcd`, and scheduled onto nodes by `kube-scheduler`. A Static Pod is defined in a raw YAML manifest placed directly on a worker/master node's local filesystem (typically `/etc/kubernetes/manifests/`). The local `kubelet` daemon directly watches this directory and manages the container lifecycle without scheduler intervention. To update a Static Pod, an administrator modifies the YAML file on the node's disk; Kubelet detects the change and automatically restarts the Pod.
+
+**Q5: What causes Exit Code 137 and Exit Code 143 in a Pod container?**
+
+Exit codes greater than 128 indicate termination by a Linux signal (`128 + Signal Number`). Exit code **137** corresponds to `SIGKILL` (`Signal 9` -> `128 + 9 = 137`), which is most frequently triggered by the Linux kernel OOM (Out Of Memory) killer when a container exceeds its memory limit, or by Kubelet when a container fails to terminate within its `terminationGracePeriodSeconds`. Exit code **143** corresponds to `SIGTERM` (`Signal 15` -> `128 + 15 = 143`), indicating that the container was sent a polite termination signal during standard Pod shutdown or rolling update.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that containers in a Pod share `netns`, `ipcns`, and `utsns` via the `pause` container
+- [ ] Know that `shareProcessNamespace: true` enables shared PID namespace across containers
+- [ ] Know the 5 Pod Phases: `Pending`, `Running`, `Succeeded`, `Failed`, `Unknown`
+- [ ] Know the 4 Core Pod Conditions: `PodScheduled`, `Initialized`, `ContainersReady`, `Ready`
+- [ ] Know the difference between `restartPolicy: Always`, `OnFailure`, and `Never`
+- [ ] Know that Exit Code 137 means `SIGKILL` (often OOMKilled) and Exit Code 143 means `SIGTERM`
+- [ ] Know that Static Pods are driven directly by Kubelet from `/etc/kubernetes/manifests/`
+- [ ] Can diagnose Pod startup issues with `kubectl describe pod` and `kubectl logs --previous`

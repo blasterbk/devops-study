@@ -1,0 +1,158 @@
+---
+title: "Chapter 1 — WireGuard VPN: Cryptokey Routing, Noise Protocol & Kernel Datapath"
+sidebar_position: 1
+module: "Module 11.1 — WireGuard VPN"
+description: "Master modern VPN architecture with WireGuard — Cryptokey Routing table, Noise Protocol Framework cryptography (Curve25519, ChaCha20-Poly1305, BLAKE2s), in-kernel implementation, and Kubernetes mesh encryption."
+---
+
+# Chapter 1 — WireGuard VPN: Cryptokey Routing, Noise Protocol & Kernel Datapath
+
+> **Goal:** Master the revolutionary architecture of WireGuard (RFC draft & Linux kernel mainlined). Understand how WireGuard replaces the massive codebase complexity of OpenVPN (100k+ lines in user space) and IPsec (400k+ lines) with an ultra-minimal ~4,000-line secure in-kernel implementation, the Cryptokey Routing model, Noise Protocol Framework cryptographic handshakes, and cloud-native Kubernetes encryption (Cilium / Calico WireGuard).
+>
+> By the end of this chapter, you will understand:
+> 1. WireGuard design philosophy: Opinionated, modern cryptography with zero cipher agility / negotiation
+> 2. State-of-the-art cryptographic suite: Curve25519 (ECDH), ChaCha20 (Stream cipher), Poly1305 (MAC), BLAKE2s (Hashing), SipHash24
+> 3. Cryptokey Routing: mapping public keys directly to IP addresses in the kernel network interface
+> 4. 1-RTT Handshake and timerless connection state (silent when idle, zero chatty keep-alives)
+> 5. Roaming and endpoint adaptation (seamless IP change handling)
+> 6. CLI configuration and monitoring using `wg`, `wg-quick`, and Linux `ip`
+
+---
+
+## Real-Life Analogy
+
+Think of WireGuard vs legacy VPNs as **a modern Tesla electric car vs a 1970s diesel freight truck**:
+
+- **Legacy IPsec / OpenVPN (The 1970s Diesel Truck):**
+  - Requires a 50-page manual, 100 knobs and switches (**Cipher negotiation, DH groups, IKE phases, TLS certs, TAP drivers**). Heavy, slow, high CPU usage, and breaks frequently.
+- **WireGuard (The Tesla):**
+  - Just 2 pedals and a single button (**Cryptokey Routing**).
+  - You exchange public keys with your peer once. The car accelerates instantly at line rate inside the Linux kernel (**4,000 lines of audited code**).
+  - When your phone switches from Wi-Fi to 5G, WireGuard doesn't crash or re-negotiate for 30 seconds; it seamlessly adapts to your new IP in 1 millisecond.
+
+---
+
+## Architecture Diagram
+
+```text
+                  WireGuard Cryptokey Routing Architecture
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ WIREGUARD PEER A (Kernel `wg0` Interface: 10.0.0.1/24)                      │
+ │ Private Key: A_PrivKey, Public Key: A_PubKey                                │
+ │                                                                             │
+ │ ┌─────────────────────────────────────────────────────────────────────────┐ │
+ │ │ CRYPTOKEY ROUTING TABLE:                                                │ │
+ │ │ ┌─────────────────────────────────────┬───────────────────────────────┐ │ │
+ │ │ │ Peer Public Key                     │ AllowedIPs (Routing Allowed)  │ │ │
+ │ │ ├─────────────────────────────────────┼───────────────────────────────┤ │ │
+ │ │ │ B_PubKey (e.g. `xT5...9qB=`)        │ `10.0.0.2/32`, `192.168.2.0/24`│ │ │
+ │ │ └─────────────────────────────────────┴───────────────────────────────┘ │ │
+ │ └───────────────────────────────────┬─────────────────────────────────────┘ │
+ └─────────────────────────────────────┼───────────────────────────────────────┘
+                                       │
+                                       ▼ (Packet to 10.0.0.2 matches B_PubKey)
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ IN-KERNEL ENCRYPTION (ChaCha20-Poly1305 with B_PubKey session key)          │
+ │                                                                             │
+ │ Outer UDP Packet: Src: 203.0.113.10:51820 ──► Dst: 198.51.100.20:51820      │
+ └─────────────────────────────────────┬───────────────────────────────────────┘
+                                       │ (Public Internet)
+                                       ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ WIREGUARD PEER B (Kernel `wg0` Interface: 10.0.0.2/24)                      │
+ │ - Authenticates packet: Validates sender signature against A_PubKey         │
+ │ - Verifies decrypted inner source IP (10.0.0.1) is in A_PubKey's AllowedIPs │
+ │ - Decapsulates payload and passes directly to local OS socket               │
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Opinionated Cryptographic Suite (No Cipher Agility)
+
+Legacy protocols like IPsec and OpenVPN allow peers to negotiate ciphers during the handshake. If a weak legacy cipher (DES, MD5, SHA-1) is supported, attackers can execute **Cipher Downgrade Attacks**. WireGuard eliminated cipher negotiation entirely by hardcoding a single, battle-tested modern cryptographic suite:
+
+```text
+ ┌──────────────────────────┬──────────────────────────┬──────────────────────────────────────────────┐
+ │ Primitive                │ Algorithm                │ Security & Performance Benefit               │
+ │──────────────────────────┼──────────────────────────┼──────────────────────────────────────────────┤
+ │ **Key Exchange**         │ Curve25519 (ECDH)        │ High security, immune to timing side-channels│
+ │ **Symmetric Encryption** │ ChaCha20                 │ Ultra-fast in software (no AES-NI required)  │
+ │ **Authentication (MAC)** │ Poly1305                 │ Constant-time cryptographic verification     │
+ │ **Hashing**              │ BLAKE2s                  │ Faster than SHA-3 with equivalent security   │
+ │ **Key Derivation**       │ HKDF (RFC 5869)          │ Standardized extract-and-expand key derivation│
+ └──────────────────────────┴──────────────────────────┴──────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Cryptokey Routing & The `AllowedIPs` Contract
+
+In WireGuard, the `AllowedIPs` configuration setting serves a dual function:
+1. **Outbound Routing:** Directs which destination IP ranges route to which specific peer's public key.
+2. **Inbound Firewall / Source IP Validation:** When a decrypted packet arrives, WireGuard checks its internal source IP. If the source IP does **not** match the sender's `AllowedIPs` list, the kernel drops the packet immediately (preventing IP spoofing).
+
+---
+
+## Hands-On Lab: Setting up a WireGuard Tunnel via Linux CLI
+
+```bash
+# Step 1: Generate private and public cryptographic keys
+wg genkey | tee privatekey | wg pubkey > publickey
+
+# Step 2: Create a WireGuard network interface
+sudo ip link add dev wg0 type wireguard
+
+# Step 3: Assign a private overlay IP to the interface
+sudo ip addr add 10.50.0.1/24 dev wg0
+
+# Step 4: Configure the interface with private key and listen port
+sudo wg set wg0 listen-port 51820 private-key ./privatekey
+
+# Step 5: Add a peer with its public key and allowed IP range
+sudo wg set wg0 peer "yAnz5TF+lXXJ5UVveGnHQv8y614qV7eLg8w=" \
+  allowed-ips 10.50.0.2/32 \
+  endpoint 198.51.100.20:51820
+
+# Step 6: Bring up the interface and inspect status
+sudo ip link set up dev wg0
+sudo wg show
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does WireGuard's Cryptokey Routing model fundamentally differ from IPsec and OpenVPN?**
+
+- **OpenVPN / IPsec:** Routing and encryption are decoupled into separate subsystems (IPsec uses Security Policy Databases [SPD] and Security Associations [SA]; OpenVPN uses user-space TUN interfaces with routing daemons).
+- **WireGuard:** Integrates routing and public key encryption into a single concept: **Cryptokey Routing**. Each peer public key is assigned a list of IP addresses (`AllowedIPs`). The kernel routes packets directly to public keys and enforces that decrypted packets only originate from authorized IPs.
+
+**Q2: What is the security advantage of WireGuard's lack of "Cipher Agility"?**
+
+Cipher Agility allows two endpoints to negotiate encryption algorithms during the handshake. This introduces attack surfaces where Man-in-the-Middle attackers intercept handshakes and force the endpoints to downgrade to weak or broken legacy algorithms (e.g. 3DES or MD5). WireGuard hardcodes a single modern cipher suite (ChaCha20-Poly1305); if a vulnerability is ever discovered, a new version of WireGuard is released, completely eliminating downgrade attacks.
+
+**Q3: How does WireGuard achieve zero-latency Roaming when a mobile client changes IP addresses?**
+
+When a mobile device switches from Wi-Fi to 5G, its source IP changes. When it transmits a WireGuard packet to the server, the server validates the cryptographic Poly1305 MAC using the client's public key. Once authenticated, the server **automatically updates the client's endpoint IP and port in memory** to the new 5G address without re-authenticating or dropping active TCP connections.
+
+**Q4: Why does WireGuard remain completely silent and unresponsive on the network when scanned by port scanners like Nmap?**
+
+WireGuard does not respond to unauthenticated packets. If an attacker sends random UDP packets to WireGuard's listen port (e.g. port 51820) or conducts an Nmap scan, WireGuard fails to verify the cryptographic MAC and **silently drops the packet without sending any ICMP error or TCP RST response**. The port appears completely closed/dead to unauthorized port scanners.
+
+**Q5: How does WireGuard enable seamless node-to-node Pod encryption in Kubernetes (e.g., Cilium or Calico)?**
+
+Cilium and Calico utilize the Linux kernel WireGuard module to automatically establish an encrypted mesh across all Kubernetes worker nodes. Each worker node generates a WireGuard keypair and exchanges public keys via Kubernetes CRDs. All inter-node Pod traffic is automatically routed through the kernel `wg0` interface with near zero-CPU overhead and full hardware offloading.
+
+---
+
+## Summary Checksheet
+
+- [ ] Understand Cryptokey Routing and the role of `AllowedIPs`
+- [ ] Memorize the cipher suite: Curve25519, ChaCha20-Poly1305, BLAKE2s
+- [ ] Understand why WireGuard is silent when port-scanned
+- [ ] Know how automatic Endpoint Roaming handles Wi-Fi $\to$ 5G handoffs
+- [ ] Master Linux `wg` and `wg-quick` configuration commands

@@ -1,0 +1,308 @@
+---
+title: "Chapter 2 — Default-Deny & Zero-Trust Policies"
+sidebar_position: 2
+module: "Module 5.5 — Network Security & Policies"
+description: "Master Zero-Trust Kubernetes network microsegmentation — Default-Deny Ingress and Egress patterns, additive hole-punching policies, namespace isolation, and CoreDNS whitelisting."
+---
+
+# Chapter 2 — Default-Deny Policies & Zero-Trust Networking
+
+> **Goal:** Master Zero-Trust microsegmentation in Kubernetes — implementing default-deny network perimeters across namespaces, establishing baseline isolation for all workloads using empty selectors (`podSelector: {}`), combining additive hole-punching policies for approved application traffic, and crafting mandatory CoreDNS egress rules to prevent cluster-wide DNS failures.
+>
+> By the end of this chapter, you will understand:
+> 1. The Zero-Trust principle ("Never Trust, Always Verify") applied to Kubernetes container networks
+> 2. How `podSelector: {}` targets every Pod in a namespace to enforce Default-Deny
+> 3. The 3 Default-Deny patterns: Ingress-Only, Egress-Only, and Complete Ingress/Egress Lockdown
+> 4. How the additive NetworkPolicy engine combines default-deny with granular allow-rules
+> 5. How to design a multi-tenant namespace isolation boundary
+> 6. How to author production-ready CoreDNS and API Server egress whitelist policies
+
+---
+
+## Real-Life Analogy
+
+Think of Zero-Trust Default-Deny policies as **the security architecture of a maximum-security research vault**:
+
+- **Perimeter-Only Security (The Castle and Moat Anti-Pattern):** You build a 50-foot moat and a drawbridge outside the castle (Ingress Controller / Firewall). But once a visitor crosses the drawbridge into the courtyard, all interior building doors are unlocked. If a thief disguises themselves as a delivery driver (Container Remote Code Execution), they can walk freely into the gold vault, the armory, and the king's private bedroom (**Lateral Movement Attack**).
+- **Zero-Trust Default-Deny (The Hermetically Sealed Vault):** Every single room in the building is constructed with 6-foot solid steel walls and zero doors by default (**Default-Deny All Ingress & Egress**). Nobody can walk in, and nobody can walk out.
+- **Additive Hole-Punching (Laser-Cut Access Windows):** The chief architect laser-cuts an exact 4-inch slot in the steel wall between the Kitchen and the Dining Room for food trays (**Allow Ingress Port 8080**), and a pneumatic tube to the central library for reference books (**Allow Egress to CoreDNS Port 53**). If a fire breaks out in the Kitchen, it is physically contained within that one room.
+
+---
+
+## Architecture Diagram
+
+```text
+               Zero-Trust Microsegmentation: Default-Deny + Whitelist
+
+ Namespace: "production" (Default-Deny All Ingress & Egress Applied!)
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ BASELINE SOLID PERIMETER: `podSelector: {}` (Blocks 100% of Traffic!)  │
+ │                                                                        │
+ │   ┌────────────────────────────────────────────────────────────────┐   │
+ │   │ Pod: payment-service (ISOLATED BY DEFAULT)                     │   │
+ │   │                                                                │   │
+ │   │ 1. Ingress Hole-Punch:                                         │   │
+ │   │    ALLOW TCP 8080 ◄── From: `app=api-gateway` in 'frontend' ns │   │
+ │   │                                                                │   │
+ │   │ 2. Egress Hole-Punch (Database):                               │   │
+ │   │    ALLOW TCP 5432 ──► To: `app=postgres` in 'database' ns      │   │
+ │   │                                                                │   │
+ │   │ 3. Egress Hole-Punch (Cluster DNS):                            │   │
+ │   │    ALLOW UDP 53   ──► To: `kube-dns` in 'kube-system' ns       │   │
+ │   └────────────────────────────────────────────────────────────────┘   │
+ │                                                                        │
+ │ All other connections (Internet outbound, Lateral pod scanning) ──► X  │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The 3 Default-Deny Patterns
+
+A `NetworkPolicy` with an empty `podSelector: {}` matches **every single Pod** in the namespace:
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Policy Pattern       │ Manifest Spec                                                               │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Default-Deny**  │ `spec:`                                                                     │
+ │    **Ingress Only**  │ `  podSelector: {}`                                                         │
+ │                      │ `  policyTypes: ["Ingress"]` (Omits `ingress:` block ──► Denies all inbound)│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Default-Deny**  │ `spec:`                                                                     │
+ │    **Egress Only**   │ `  podSelector: {}`                                                         │
+ │                      │ `  policyTypes: ["Egress"]` (Omits `egress:` block ──► Denies all outbound) │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Default-Deny**  │ `spec:`                                                                     │
+ │    **ALL In/Egress** │ `  podSelector: {}`                                                         │
+ │                      │ `  policyTypes: ["Ingress", "Egress"]` (Zero inbound, Zero outbound!)       │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Additive (Union) Evaluation Model
+
+> [!IMPORTANT]
+> **Kubernetes NetworkPolicies are purely additive (whitelist-based).**
+
+1. Applying a `default-deny-all` policy drops all packets.
+2. Applying a second policy (`allow-frontend-to-backend`) punches a hole through the deny wall.
+3. The CNI computes the **union** of all matching policies:
+
+$$\text{Permitted Traffic} = \text{Policy}_1 \cup \text{Policy}_2 \cup \dots \cup \text{Policy}_N$$
+
+---
+
+## The Mandatory CoreDNS Egress Rule
+
+When applying Default-Deny Egress across a namespace, **all Pods instantly lose DNS resolution capabilities** unless explicitly whitelisted:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-coredns-egress
+  namespace: production
+spec:
+  podSelector: {}                     # Applies to ALL pods in namespace!
+  policyTypes:
+    - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+```
+
+---
+
+## Complete Multi-Tenant Zero-Trust Namespace Policy Bundle
+
+```yaml
+# 1. Baseline: Lock Down All Ingress & Egress in Namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: secure-tenant
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# 2. Allow CoreDNS Outbound
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: secure-tenant
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+# 3. Allow Specific Inter-Pod Microservice Traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-to-api
+  namespace: secure-tenant
+spec:
+  podSelector:
+    matchLabels:
+      app: backend-api
+  policyTypes:
+    - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: web-frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+---
+
+## Hands-On Lab: Deploying Default-Deny with Additive Whitelisting
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace zero-trust-lab
+
+# Step 2: Deploy a web server and client
+cat <<EOF | kubectl apply -f - -n zero-trust-lab
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-server
+  labels:
+    app: web
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25-alpine
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client-pod
+  labels:
+    app: client
+spec:
+  containers:
+  - name: curl
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+EOF
+
+# Step 3: Wait for Pods to become Ready
+kubectl wait --for=condition=Ready pod --all -n zero-trust-lab --timeout=30s
+SERVER_IP=$(kubectl get pod web-server -n zero-trust-lab -o jsonpath='{.status.podIP}')
+
+# Step 4: Verify traffic flows before default-deny
+kubectl exec -n zero-trust-lab client-pod -- wget -qO- --timeout=2 http://$SERVER_IP
+
+# Step 5: Apply Default-Deny All Ingress
+cat <<EOF | kubectl apply -f - -n zero-trust-lab
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+EOF
+
+# Step 6: Verify client is now BLOCKED
+kubectl exec -n zero-trust-lab client-pod -- wget -qO- --timeout=2 http://$SERVER_IP 2>&1 || echo "BLOCKED: Default-deny successfully dropped traffic!"
+
+# Step 7: Apply Additive Whitelist Hole-Punch
+cat <<EOF | kubectl apply -f - -n zero-trust-lab
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-client-to-web
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: client
+    ports:
+    - protocol: TCP
+      port: 80
+EOF
+
+# Step 8: Verify client can connect again (Additive whitelist active!)
+kubectl exec -n zero-trust-lab client-pod -- wget -qO- --timeout=2 http://$SERVER_IP
+
+# Step 9: Clean up lab
+kubectl delete namespace zero-trust-lab
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the Zero-Trust network architecture in Kubernetes, and why is perimeter security insufficient?**
+
+Perimeter security (such as API Gateways or external WAFs) only inspects traffic entering the cluster from the public internet. If an attacker gains remote code execution (RCE) inside a single frontend container, a perimeter-only architecture allows them to move laterally across the internal flat network to access sensitive internal databases and secrets. Zero-Trust enforces microsegmentation inside the cluster: by applying Default-Deny policies, every internal container connection is blocked unless explicitly authorized.
+
+**Q2: How does a `Default-Deny All Ingress and Egress` NetworkPolicy work in Kubernetes?**
+
+A Default-Deny All policy sets `spec.podSelector: {}` (which matches all Pods in that namespace) and declares `policyTypes: ["Ingress", "Egress"]` while omitting both the `ingress:` and `egress:` rule arrays. Because the policy matches every Pod but specifies zero allowed rules, the CNI policy engine isolates every container in the namespace, immediately dropping 100% of all incoming and outgoing network packets.
+
+**Q3: How does the Kubernetes NetworkPolicy engine combine multiple policies targeting the same Pod?**
+
+The Kubernetes NetworkPolicy engine is strictly **additive (union-based)**. If multiple NetworkPolicies select the same Pod, the CNI merges all `ingress` rules and all `egress` rules into a single combined whitelist. As long as incoming or outgoing traffic satisfies *at least one* permitted rule across any matching policy, the connection is allowed.
+
+**Q4: What catastrophic issue occurs if you apply a Default-Deny Egress policy without whitelisting CoreDNS?**
+
+If a Default-Deny Egress policy is applied to a namespace without an explicit egress rule for CoreDNS (port 53 UDP/TCP in `kube-system`), all outbound DNS lookup packets from application containers are dropped by the CNI. Containers become completely unable to resolve internal Kubernetes Service names (like `postgres.database.svc`) or external internet APIs, causing application startup failures and database connection timeouts.
+
+**Q5: How do you enforce namespace-level isolation so Pods in Namespace A cannot reach Pods in Namespace B?**
+
+To enforce namespace isolation: (1) Apply a `default-deny-ingress` policy in Namespace B; (2) To allow specific traffic from Namespace A, create an ingress NetworkPolicy in Namespace B with a `namespaceSelector` targeting `kubernetes.io/metadata.name: namespace-a` and a `podSelector` targeting the specific allowed client pods on specific ports. All other unauthorized namespaces will be dropped.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `podSelector: {}` matches ALL Pods in the namespace
+- [ ] Know the 3 default-deny templates (Ingress, Egress, and Ingress+Egress)
+- [ ] Know that NetworkPolicies are strictly additive (whitelist union)
+- [ ] Know that Default-Deny Egress requires an explicit CoreDNS rule on port 53 UDP/TCP
+- [ ] Know how Zero-Trust microsegmentation prevents lateral movement during breaches
+- [ ] Know how to isolate namespaces using `namespaceSelector` with `kubernetes.io/metadata.name`
+- [ ] Can verify policy isolation using `wget -qO- --timeout=2` probes

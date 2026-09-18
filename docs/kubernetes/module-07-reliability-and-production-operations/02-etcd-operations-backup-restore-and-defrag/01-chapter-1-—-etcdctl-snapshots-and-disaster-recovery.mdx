@@ -1,0 +1,265 @@
+---
+title: "Chapter 1 — etcdctl Snapshots & Disaster Recovery"
+sidebar_position: 1
+module: "Module 7.2 — etcd Operations"
+description: "Master Kubernetes etcd backup and disaster recovery — etcdctl snapshot save, snapshot status validation, complete control-plane restore protocols, and S3 automated backups."
+---
+
+# Chapter 1 — etcdctl Snapshots & Disaster Recovery
+
+> **Goal:** Master the mission-critical disaster recovery protocols for Kubernetes `etcd` — understanding how to capture point-in-time cryptographic snapshots using **`etcdctl snapshot save`**, verifying snapshot database integrity and revision consistency (`etcdctl snapshot status`), executing the 5-step control plane restoration procedure with zero data corruption, and deploying automated S3 backup CronJobs.
+>
+> By the end of this chapter, you will understand:
+> 1. Why `etcd` is the single authoritative state store for the entire Kubernetes cluster
+> 2. How to take consistent point-in-time snapshots without interrupting live API traffic
+> 3. How to validate snapshot hashes, total keys, and revision status using `etcdctl`
+> 4. The step-by-step restoration sequence (stopping static pods, restoring `--data-dir`, restarting Kubelet)
+> 5. How to restore snapshots across a multi-node high-availability etcd cluster
+> 6. How to deploy production automated backup CronJobs with S3 object encryption
+
+---
+
+## Real-Life Analogy
+
+Think of etcd snapshots and disaster recovery as **taking a certified carbon-copy backup of the master architectural blueprints of a skyscraper**:
+
+- **The Living Blueprints (`etcd` Database):** Every floor, water pipe, electrical wire, and tenant lease contract (**Every Pod, Secret, Deployment, and PVC**) is recorded inside a central blueprint ledger (**`etcd`**).
+- **The Point-in-Time Photocopy (`etcdctl snapshot save`):** A high-speed digital scanner creates an instant 100% exact photocopy of the ledger (**The Snapshot DB file**). The scanner runs while the architects are actively working without pausing their pens (**Zero Downtime Backup**).
+- **The Cryptographic Seal (`etcdctl snapshot status`):** An independent notary inspects the photocopy, counts the pages (**Total Keys**), verifies the revision number (**Raft Revision**), and stamps a tamper-proof SHA-256 seal on the cover (**Snapshot Integrity Check**).
+- **The Catastrophic Fire & Reconstruction (Disaster Recovery Restore):** If an earthquake destroys the building office (**Control Plane Crash / Accidental `kubectl delete all`**), the construction crew does **not** try to write new blueprints from memory. They stop all work (**Halt API servers**), lay down a clean new foundation table (**`--data-dir=/var/lib/etcd-restored`**), unroll the verified photocopy (**`snapshot restore`**), and turn the lights back on.
+
+---
+
+## Architecture Diagram
+
+```text
+               etcd Backup & Disaster Recovery Restoration Lifecycle
+
+ 1. LIVE BACKUP GENERATION (Zero Downtime!):
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Live etcd Cluster (Port 2379) ──► `etcdctl snapshot save /backup/etcd.db`│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │ Uploads encrypted snapshot
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ AUTOMATED CLOUD BACKUP STORAGE (AWS S3 / GCS Bucket with AES-256)      │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+ 2. DISASTER RESTORATION WORKFLOW:  │ (Catastrophic Data Loss Occurs!)
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 1: HALT CONTROL PLANE PODS                                        │
+ │ Move static manifests out of `/etc/kubernetes/manifests/` (Stops API)  │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 2: RESTORE TO CLEAN DATA DIRECTORY                                │
+ │ `etcdctl snapshot restore /backup/etcd.db --data-dir=/var/lib/etcd-new`│
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ STEP 3: UPDATE MANIFEST & RESTART CONTROL PLANE                        │
+ │ Update `etcd.yaml` hostPath to `/var/lib/etcd-new` ──► Move manifests  │
+ │ back into `/etc/kubernetes/manifests/` ──► Cluster Restored!           │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Taking Point-in-Time Snapshots with `etcdctl`
+
+Always specify client certificates for mutual TLS authentication:
+
+```bash
+ETCDCTL_API=3 etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save /var/backups/etcd-snapshot-$(date +%Y%m%d_%H%M%S).db
+```
+
+```text
+ Output:
+ Snapshot saved at /var/backups/etcd-snapshot-20260818_120000.db
+```
+
+---
+
+## Validating Snapshot Integrity
+
+Before trusting a snapshot for disaster recovery, verify its SHA-256 hash and metadata:
+
+```bash
+ETCDCTL_API=3 etcdctl --write-out=table snapshot status /var/backups/etcd-snapshot-20260818_120000.db
+```
+
+```text
+ ┌──────────┬──────────┬────────────────┬────────────┐
+ │   HASH   │ REVISION │ TOTAL KEYS     │ TOTAL SIZE │
+ ├──────────┼──────────┼────────────────┼────────────┤
+ │ 7a8f3b1c │  2548901 │          14250 │     42 MB  │
+ └──────────┴──────────┴────────────────┴────────────┘
+```
+
+---
+
+## The 5-Step Disaster Recovery Restoration Protocol
+
+```text
+ ┌──────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+ │ Step                 │ Action & Shell Commands                                                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **1. Stop Masters**  │ Stop the API Server and etcd containers by moving their static pod manifests│
+ │                      │ out of Kubelet's watch path:                                                │
+ │                      │ `mv /etc/kubernetes/manifests/* /tmp/manifests-backup/`                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **2. Execute**       │ Restore the snapshot to a brand new, clean directory path:                  │
+ │ **Restore**          │ `ETCDCTL_API=3 etcdctl snapshot restore /var/backups/etcd-snapshot.db \`   │
+ │                      │ `  --data-dir=/var/lib/etcd-restored \`                                     │
+ │                      │ `  --initial-cluster=k8s-master=https://127.0.0.1:2380 \`                   │
+ │                      │ `  --initial-advertise-peer-urls=https://127.0.0.1:2380`                    │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **3. Update HostPath**│ Edit `/tmp/manifests-backup/etcd.yaml`:                                     │
+ │                      │ Change volume `hostPath.path` from `/var/lib/etcd` $\to$ `/var/lib/etcd-restored`│
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **4. Restart Pods**  │ Move the manifests back into Kubelet's directory:                           │
+ │                      │ `mv /tmp/manifests-backup/* /etc/kubernetes/manifests/`                     │
+ │──────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+ │ **5. Verify Cluster**│ Verify cluster restoration: `kubectl get nodes`, `kubectl get pods -A`      │
+ └──────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+```
+
+> [!CAUTION]
+> **Never restore into an existing `--data-dir` without changing the directory path or wiping the old directory.** If existing corrupted WAL files remain in the target directory, `etcdctl snapshot restore` will fail with fatal database lock errors.
+
+---
+
+## Complete Automated etcd Backup CronJob Manifest
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-automated-backup
+  namespace: kube-system
+spec:
+  schedule: "0 */4 * * *"              # Runs every 4 hours!
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          hostNetwork: true
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
+          tolerations:
+          - key: "node-role.kubernetes.io/control-plane"
+            operator: "Exists"
+            effect: "NoSchedule"
+          restartPolicy: OnFailure
+          containers:
+          - name: etcd-backup
+            image: registry.k8s.io/etcd:3.5.13-0
+            env:
+            - name: ETCDCTL_API
+              value: "3"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              BACKUP_FILE="/backup/etcd-snapshot-${TIMESTAMP}.db"
+              etcdctl --endpoints=https://127.0.0.1:2379 \
+                      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                      --cert=/etc/kubernetes/pki/etcd/server.crt \
+                      --key=/etc/kubernetes/pki/etcd/server.key \
+                      snapshot save ${BACKUP_FILE}
+              etcdctl --write-out=table snapshot status ${BACKUP_FILE}
+              echo "Snapshot successfully saved to ${BACKUP_FILE}"
+            volumeMounts:
+            - name: etcd-certs
+              mountPath: /etc/kubernetes/pki/etcd
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backup
+          volumes:
+          - name: etcd-certs
+            hostPath:
+              path: /etc/kubernetes/pki/etcd
+          - name: backup-storage
+            hostPath:
+              path: /var/backups/etcd
+```
+
+---
+
+## Hands-On Lab: Capturing & Inspecting an etcd Snapshot
+
+```bash
+# Step 1: Query control plane master nodes
+kubectl get nodes -l node-role.kubernetes.io/control-plane=
+
+# Step 2: Verify etcd TLS certificate directory on host
+ls -la /etc/kubernetes/pki/etcd/ 2>/dev/null || echo "etcd PKI directory active"
+
+# Step 3: Run a simulated snapshot save command
+# ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+#   --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+#   --cert=/etc/kubernetes/pki/etcd/server.crt \
+#   --key=/etc/kubernetes/pki/etcd/server.key \
+#   snapshot save /tmp/test-snapshot.db
+
+# Step 4: Validate snapshot status
+# ETCDCTL_API=3 etcdctl --write-out=table snapshot status /tmp/test-snapshot.db
+
+# Step 5: Clean up test snapshot
+rm -f /tmp/test-snapshot.db 2>/dev/null || true
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does `etcdctl snapshot save` capture a consistent database backup without locking or stopping the cluster?**
+
+`etcd` is built on a Multi-Version Concurrency Control (MVCC) transactional data model. When `etcdctl snapshot save` is executed, etcd creates a point-in-time consistent read transaction at the current **Raft Revision Number**. It streams an exact byte-for-byte copy of the underlying BoltDB B-tree database file over HTTP/2 without holding exclusive write locks, allowing `kube-apiserver` to continue processing live read and write operations concurrently with zero cluster downtime.
+
+**Q2: What is the exact sequence of steps required to restore an etcd snapshot on a master node?**
+
+1. **Stop Control Plane**: Move static pod manifests (`/etc/kubernetes/manifests/`) to a temporary folder to stop `kube-apiserver` and `etcd`.
+2. **Execute Restore**: Run `etcdctl snapshot restore <snapshot.db> --data-dir=/var/lib/etcd-restored` with proper initial cluster flags.
+3. **Update Manifest**: Edit the etcd static pod manifest (`etcd.yaml`) to point the `hostPath` volume to the new `/var/lib/etcd-restored` directory.
+4. **Restart Control Plane**: Move manifests back to `/etc/kubernetes/manifests/`. Kubelet detects the manifests, restarts etcd with the restored data, and boots the API server.
+5. **Verify**: Run `kubectl get nodes,pods -A` to validate cluster recovery.
+
+**Q3: Why must you restore an etcd snapshot to a new `--data-dir` rather than overwriting the existing folder?**
+
+If you attempt to restore into an existing data directory containing active or corrupted write-ahead log (WAL) files, member ID metadata, and BoltDB files, `etcdctl` will fail to acquire file locks or will blend stale WAL entries with the snapshot. Restoring into a clean target directory (e.g. `/var/lib/etcd-restored`) ensures a clean, isolated database state with newly generated member IDs.
+
+**Q4: How do you restore an etcd snapshot across a multi-node 3-member HA cluster?**
+
+To restore a 3-member cluster:
+1. Stop `etcd` and `kube-apiserver` on **all 3 master nodes** simultaneously.
+2. Distribute the same snapshot `.db` file to all 3 nodes.
+3. Run `etcdctl snapshot restore` on **each node independently**, specifying that node's specific name, `--initial-cluster-token`, `--initial-advertise-peer-urls`, and the full 3-node `--initial-cluster` list.
+4. Point all 3 static pod manifests to their local restored directory and start the nodes. The 3 members will discover each other, form a new Raft consensus group, and elect a leader.
+
+**Q5: What is the risk of "Stale Object Resurrections" when restoring an older etcd snapshot?**
+
+If a cluster is restored from a 12-hour-old backup: (1) Pods, Deployments, and Secrets that were deleted during those 12 hours will **reappear**; (2) Resources created after the backup will **disappear**; and (3) External stateful components (like AWS Cloud Load Balancers, EBS CSI volume attachments, or external RDS databases) will be out-of-sync with Kubernetes object UIDs, requiring manual reconciliation of orphaned cloud resources.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `etcd` is the single authoritative source of truth for Kubernetes
+- [ ] Know how to capture snapshots using `ETCDCTL_API=3 etcdctl snapshot save`
+- [ ] Know how to validate snapshot integrity using `etcdctl snapshot status`
+- [ ] Know the 5-step restore sequence: Stop masters $\to$ Restore to new dir $\to$ Update hostPath $\to$ Restart
+- [ ] Know why restoring into a new `--data-dir` prevents database corruption
+- [ ] Know the implications of stale object resurrection during disaster recovery
+- [ ] Can inspect etcd certificates in `/etc/kubernetes/pki/etcd/`

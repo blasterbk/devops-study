@@ -1,0 +1,318 @@
+---
+title: "Chapter 1 — PriorityClasses & Preemption Mechanics"
+sidebar_position: 1
+module: "Module 3.7 — Priority, Preemption & QoS"
+description: "Master Kubernetes PriorityClasses and scheduler preemption — priority queue sorting, victim selection algorithms, non-preempting priority policies, system-critical classes, and PDB interactions."
+---
+
+# Chapter 1 — PriorityClasses & Preemption Mechanics
+
+> **Goal:** Master workload prioritization and preemption in Kubernetes — understanding how `PriorityClass` resources order scheduling queues, how the scheduler's preemption algorithm evicts lower-priority victims to satisfy high-priority workloads, configuring non-preempting priorities (`preemptionPolicy: Never`), and leveraging built-in system-critical priorities for infrastructure reliability.
+>
+> By the end of this chapter, you will understand:
+> 1. How the `PriorityClass` resource maps human-readable tiers to 32-bit integer weights
+> 2. How the scheduler's `activeQ` sorts pending Pods by priority
+> 3. The 4-step victim selection algorithm executed during scheduler preemption
+> 4. How `preemptionPolicy: Never` creates fast-lane scheduling without evicting running workloads
+> 5. The reserved system PriorityClasses (`system-node-critical` and `system-cluster-critical`)
+> 6. How the preemption engine interacts with active `PodDisruptionBudgets`
+
+---
+
+## Real-Life Analogy
+
+Think of Kubernetes priority and preemption as the **triage system in a hospital Emergency Room (ER)**:
+
+- **Standard Priority (`globalDefault: true`):** A patient with a minor sprained wrist walks into the waiting room. They take a standard queue ticket (Priority: 100) and wait their turn.
+- **Priority Queue Ordering:** A patient with a broken arm (Priority: 500) arrives after the sprained wrist patient. The triage nurse moves the broken arm patient **ahead in line** to see the next available doctor first.
+- **Preemption (Evicting Low-Priority for Critical Emergencies):** A patient arrives via ambulance with a massive heart attack (`PriorityClass: emergency-critical`, Priority: 1,000,000). All operating rooms and doctors are 100% occupied. The chief of surgery immediately halts a non-urgent cosmetic procedure (low-priority victim Pod), wheels the cosmetic patient out of the OR (graceful `SIGTERM` eviction), and admits the heart attack patient into the operating room immediately.
+- **Non-Preempting Fast Lane (`preemptionPolicy: Never`):** A senior surgeon's VIP guest needs a flu shot. They jump to the front of the waiting room line, but they are **not** permitted to kick anyone out of an active operating room.
+
+---
+
+## Architecture Diagram
+
+```text
+               Kube-Scheduler Preemption & Victim Selection Flow
+
+ High-Priority Pod (Priority: 10,000) arrives ──► All Nodes Full!
+  │
+  ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Kube-Scheduler Preemption Algorithm                                    │
+ │                                                                        │
+ │ 1. Identify Candidate Nodes that COULD fit High-Pri Pod if lower-pri   │
+ │    Pods are removed.                                                   │
+ │                                                                        │
+ │ 2. On Candidate Node 1:                                                │
+ │    - Pod A (Priority: 10,000) ──► PROTECTED (Equal/Higher priority)    │
+ │    - Pod B (Priority: 100)    ──► VICTIM TARGET (Low priority)         │
+ │    - Pod C (Priority: 50)     ──► VICTIM TARGET (Low priority)         │
+ │                                                                        │
+ │ 3. Check PodDisruptionBudgets (PDB):                                   │
+ │    Prefers victims whose eviction will NOT violate a PDB.              │
+ └──────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ Execution:                                                             │
+ │ - Sends graceful deletion (SIGTERM) to Victim Pod C                    │
+ │ - Sets High-Pri Pod `.status.nominatedNodeName: worker-01`             │
+ │ - Once Pod C terminates, High-Pri Pod is BOUND to worker-01!           │
+ └────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The `PriorityClass` Resource
+
+A `PriorityClass` is a cluster-scoped object defining an integer priority value from **$-1{,}000{,}000{,}000$ to $1{,}000{,}000{,}000$**:
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority-tier
+value: 1000000
+globalDefault: false            # If true, applies to any Pod lacking priorityClassName
+preemptionPolicy: PreemptLowerPriority   # Options: PreemptLowerPriority | Never
+description: "Mission-critical payment processing tier."
+```
+
+```text
+ Standard Production Priority Tiering Strategy:
+
+ ┌───────────────────────────┬──────────────┬─────────────────────────────────────────────────────────┐
+ │ Tier Name                 │ Integer Val  │ Target Workload Type                                    │
+ │───────────────────────────┼──────────────┼─────────────────────────────────────────────────────────┤
+ │ `system-node-critical`    │ 2,000,001,000│ Kubelet, CNI (Cilium), CSI storage node plugins         │
+ │ `system-cluster-critical` │ 2,000,000,000│ CoreDNS, Ingress Controllers, API gateways              │
+ │ `production-critical`     │ 1,000,000    │ Checkout APIs, Payment Webhooks, Core Databases         │
+ │ `production-standard`     │ 100,000      │ Standard backend APIs, web frontends                    │
+ │ `batch-low-priority`      │ 1,000        │ Offline analytics, nightly ETL, report generators       │
+ │ `best-effort-scavenger`   │ 10           │ Dev/Test workloads, background cache pre-warmers        │
+ └───────────────────────────┴──────────────┴─────────────────────────────────────────────────────────┘
+```
+
+> [!WARNING]
+> Only **one** `PriorityClass` in the cluster can have `globalDefault: true`. If multiple classes declare `globalDefault: true`, the API server will reject new additions.
+
+---
+
+## The Preemption & Victim Selection Algorithm
+
+When a Pod cannot be scheduled due to insufficient CPU, memory, or topology constraints, the scheduler evaluates nodes for **preemption**:
+
+1. **Candidate Node Identification:** The scheduler searches for nodes where evicting Pods with *lower priority* than the pending Pod would free up enough resources.
+2. **Victim Minimization:** On each candidate node, the scheduler finds the smallest set of lowest-priority Pods whose removal clears sufficient capacity.
+3. **PDB Violation Avoidance:** The scheduler prioritizes candidate nodes where victim eviction **does not violate** any active `PodDisruptionBudget`.
+4. **Node Nomination:** The scheduler selects the best node and sets the pending Pod's `.status.nominatedNodeName`.
+5. **Eviction:** Victim Pods receive standard graceful `SIGTERM` deletion signals.
+6. **Binding:** As soon as victim Pods terminate and release capacity, the high-priority Pod is bound and started.
+
+---
+
+## Non-Preempting Priority: `preemptionPolicy: Never`
+
+In high-performance computing (HPC) or batch data pipelines, a high-priority machine learning training job should jump ahead of non-urgent tasks in the scheduling queue, but it should **never kill** already-running batch jobs that have been computing for 10 hours.
+
+Set `preemptionPolicy: Never`:
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: urgent-batch-queue
+value: 500000
+preemptionPolicy: Never    # <--- Jumps queue, but NEVER preempts running pods!
+globalDefault: false
+```
+
+```text
+ Preemption Policy Comparison:
+ - `PreemptLowerPriority` (Default): Jumps queue AND actively kills lower-priority running pods.
+ - `Never`: Jumps queue to the front of activeQ, but waits politely for running pods to finish naturally.
+```
+
+---
+
+## Built-In System Critical Classes
+
+Kubernetes ships with two reserved, immutable system-level PriorityClasses:
+
+```text
+ 1. system-node-critical (Value: 2000001000)
+    - Highest priority in Kubernetes.
+    - Used by daemons that MUST never be evicted (e.g. CNI plugins, CSI node drivers).
+    - Can preempt almost anything in the cluster.
+
+ 2. system-cluster-critical (Value: 2000000000)
+    - Second highest priority.
+    - Used by cluster add-ons essential for cluster health (e.g. CoreDNS, metrics-server).
+```
+
+---
+
+## Complete Production Priority Manifest
+
+```yaml
+# 1. High-Priority Class for Production
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mission-critical-api
+value: 1000000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+---
+# 2. Low-Priority Class for Batch Workers
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: batch-scavenger
+value: 100
+preemptionPolicy: Never
+globalDefault: false
+---
+# 3. Critical Production Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-authorizer
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: payment-authorizer
+  template:
+    metadata:
+      labels:
+        app: payment-authorizer
+    spec:
+      priorityClassName: mission-critical-api   # Bound to High-Priority Class!
+      containers:
+      - name: api
+        image: payment-auth:v1.0
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+```
+
+---
+
+## Hands-On Lab: Observing Preemption in Action
+
+```bash
+# Step 1: Create lab namespace
+kubectl create namespace priority-lab
+
+# Step 2: Create High and Low PriorityClasses
+cat <<EOF | kubectl apply -f -
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: lab-low-priority
+value: 100
+preemptionPolicy: PreemptLowerPriority
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: lab-high-priority
+value: 1000000
+preemptionPolicy: PreemptLowerPriority
+EOF
+
+# Step 3: Deploy a low-priority Pod that consumes large CPU/memory on a node
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: victim-pod
+  namespace: priority-lab
+spec:
+  priorityClassName: lab-low-priority
+  containers:
+  - name: heavy-app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: "800m"
+EOF
+
+kubectl wait --for=condition=Ready pod/victim-pod -n priority-lab --timeout=30s
+VICTIM_NODE=$(kubectl get pod victim-pod -n priority-lab -o jsonpath='{.spec.nodeName}')
+echo "Victim pod is running on: $VICTIM_NODE"
+
+# Step 4: Deploy a high-priority Pod requesting large resources targeted at the same node
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vip-pod
+  namespace: priority-lab
+spec:
+  priorityClassName: lab-high-priority
+  nodeName: $VICTIM_NODE
+  containers:
+  - name: vip-app
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: "800m"
+EOF
+
+# Step 5: Observe preemption events in the namespace
+sleep 3
+kubectl get events -n priority-lab --sort-by='.metadata.creationTimestamp' | grep -i "preempt"
+
+# Step 6: Verify victim-pod was evicted or preempted to make room for vip-pod
+kubectl get pods -n priority-lab -o wide
+
+# Step 7: Clean up lab
+kubectl delete namespace priority-lab
+kubectl delete priorityclass lab-low-priority lab-high-priority
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is a `PriorityClass` in Kubernetes, and how does the scheduler utilize it?**
+
+A `PriorityClass` is a cluster-scoped object that maps a human-readable name to a 32-bit integer value (e.g. `1,000,000`). The `kube-scheduler` maintains an active priority queue (`activeQ`). When Pods are submitted, the scheduler sorts the queue in descending order of priority value, ensuring that higher-priority Pods are popped off the queue and scheduled before lower-priority Pods, regardless of submission time.
+
+**Q2: How does the scheduler's preemption mechanism work when cluster resources are full?**
+
+When a high-priority Pod cannot be scheduled due to resource constraints across all nodes, the scheduler enters the Preemption phase: (1) It evaluates candidate nodes where removing lower-priority Pods would clear sufficient capacity; (2) It selects the node that minimizes victim count and avoids violating active `PodDisruptionBudgets`; (3) It nominates the node (`nominatedNodeName`) and sends graceful `SIGTERM` deletion requests to the selected victim Pods; (4) Once the victims terminate and free up resources, the high-priority Pod is scheduled.
+
+**Q3: What is the difference between `preemptionPolicy: PreemptLowerPriority` and `preemptionPolicy: Never`?**
+
+`preemptionPolicy: PreemptLowerPriority` (the default) permits the Pod to jump ahead in the scheduling queue AND actively evict lower-priority running Pods if the cluster lacks capacity. `preemptionPolicy: Never` allows the Pod to jump ahead of lower-priority pending Pods in the queue, but strictly **forbids** the scheduler from evicting any currently running workloads. The non-preempting Pod waits at the head of the queue until resources are naturally freed.
+
+**Q4: What are `system-node-critical` and `system-cluster-critical`, and when are they used?**
+
+They are reserved, built-in PriorityClasses with extremely high integer values (`2,000,001,000` and `2,000,000,000`). `system-node-critical` is used by essential node-level infrastructure daemons (such as CNI plugins like Cilium and CSI storage drivers) that must never be starved or evicted by user workloads. `system-cluster-critical` is used by cluster-wide control plane components and vital add-ons (such as CoreDNS and Ingress controllers) necessary for basic cluster operation.
+
+**Q5: How does scheduler preemption interact with active PodDisruptionBudgets (PDB)?**
+
+During the victim selection phase, the scheduler actively attempts to select candidate nodes where evicting lower-priority Pods does **not** violate any active PDB (`ALLOWED DISRUPTIONS > 0`). However, PDB compliance is a "best-effort" preference during preemption; if no candidate nodes can satisfy the high-priority Pod without violating a PDB, the scheduler may still choose to preempt victims and violate the PDB to guarantee that critical workloads are placed.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know that `PriorityClass` maps integer values from $-10^9$ to $10^9$
+- [ ] Know that higher integer values schedule before lower integer values
+- [ ] Know that only one PriorityClass can have `globalDefault: true`
+- [ ] Know how the preemption algorithm selects victims and avoids PDB violations
+- [ ] Know how `preemptionPolicy: Never` enables fast-lane queueing without evictions
+- [ ] Know the reserved system classes: `system-node-critical` and `system-cluster-critical`
+- [ ] Can view priority classes with `kubectl get priorityclass`

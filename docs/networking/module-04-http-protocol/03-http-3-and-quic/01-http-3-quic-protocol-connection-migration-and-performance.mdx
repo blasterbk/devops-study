@@ -1,0 +1,159 @@
+---
+title: "Chapter 3 — HTTP/3 & QUIC: Connection Migration, 0-RTT & Zero HoL Blocking"
+sidebar_position: 1
+module: "Module 4.3 — HTTP/3 & QUIC"
+description: "Master HTTP/3 and QUIC (RFC 9000 & RFC 9114) — transport over UDP, unified TLS 1.3 handshake, zero Head-of-Line blocking, Connection ID migration across IP changes, and QPACK compression."
+---
+
+# Chapter 3 — HTTP/3 & QUIC: Connection Migration, 0-RTT & Zero HoL Blocking
+
+> **Goal:** Master the architecture of HTTP/3 and the QUIC transport protocol (RFC 9000, 9001, 9114). Understand why QUIC replaces TCP with UDP in user space, how it merges transport and cryptographic handshakes into a 1-RTT (or 0-RTT) setup, eliminates TCP Head-of-Line blocking, enables seamless Connection ID migration when switching from Wi-Fi to Cellular 5G, and applies QPACK header compression.
+>
+> By the end of this chapter, you will understand:
+> 1. The protocol stack evolution: HTTP/1.1 (TCP) $\to$ HTTP/2 (TCP + TLS) $\to$ HTTP/3 (UDP + QUIC + TLS 1.3)
+> 2. The unified QUIC Handshake: 1-RTT connection + TLS 1.3 encryption setup in a single round-trip
+> 3. Zero Transport-Layer Head-of-Line (HoL) blocking: true per-stream independent loss recovery
+> 4. QUIC Connection IDs (CID) and seamless Connection Migration across IP/NAT network switches
+> 5. QPACK header compression and stream-synchronization state machines
+> 6. CLI verification and debugging with `curl --http3`
+
+---
+
+## Real-Life Analogy
+
+Think of HTTP/3 and QUIC as **upgrading from a rigid freight train to a fleet of autonomous GPS-guided drones**:
+
+- **HTTP/2 over TCP (Freight Train):**
+  - All packages are loaded into consecutive railcars on a single physical track. If railcar #2 derails (**1 dropped packet**), the entire 100-car train must halt on the tracks until maintenance fixes car #2 (**TCP Head-of-Line Blocking**).
+- **HTTP/3 over QUIC (Autonomous Drones):**
+  - Every order travels in its own independent autonomous drone over an open airspace (**UDP**).
+  - If Drone #2 gets blown off course by wind, Drones #1, #3, and #4 continue flying and deliver their payloads immediately. Drone #2 simply retries on its own.
+- **Connection Migration (Walking from Wi-Fi to 5G):**
+  - In TCP, when your phone disconnects from home Wi-Fi and connects to 5G, your IP changes from `192.168.1.5` to `172.56.21.9`. The TCP 4-tuple breaks, and your active video download crashes.
+  - In QUIC, your connection is identified by a unique **Connection ID (CID)**. The server continues streaming data to your new 5G IP without dropping the session!
+
+---
+
+## Architecture Diagram
+
+```text
+                  Protocol Stack Evolution: HTTP/1.1 vs HTTP/2 vs HTTP/3
+                  
+     HTTP/1.1                    HTTP/2                       HTTP/3
+ ┌──────────────┐           ┌──────────────┐             ┌──────────────┐
+ │   HTTP/1.1   │           │    HTTP/2    │             │    HTTP/3    │
+ ├──────────────┤           ├──────────────┤             ├──────────────┤
+ │  TLS (Opt.)  │           │   TLS 1.2+   │             │    QPACK     │
+ ├──────────────┤           ├──────────────┤             ├──────────────┤
+ │     TCP      │           │     TCP      │             │  QUIC / TLS  │
+ ├──────────────┤           ├──────────────┤             ├──────────────┤
+ │      IP      │           │      IP      │             │     UDP      │
+ ├──────────────┤           ├──────────────┤             ├──────────────┤
+ │   Ethernet   │           │   Ethernet   │             │      IP      │
+ └──────────────┘           └──────────────┘             └──────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Unified 1-RTT & 0-RTT Connection Establishment
+
+In HTTP/2 over TLS 1.3, opening a new connection requires:
+1. TCP Handshake (1 RTT)
+2. TLS 1.3 Handshake (1 RTT)
+3. Total before HTTP Request: **2 RTTs** (or 3 RTTs on TLS 1.2).
+
+In **HTTP/3 over QUIC**:
+1. Transport connection parameters and TLS 1.3 keys are negotiated **concurrently in the very first round-trip** (1 RTT).
+2. **0-RTT Resumption (Early Data):** On subsequent visits, clients use pre-shared session tickets to send encrypted HTTP GET requests inside the very first UDP packet!
+
+```text
+ Client                                                       Server
+   │                                                            │
+   │─── Initial Packet (QUIC ClientHello + Transport Params) ──►│ (RTT 0.5)
+   │                                                            │
+   │◄── Handshake Packet (ServerHello + Cert + Finished) ───────│ (RTT 1.0)
+   │                                                            │
+   ▼                                                            ▼
+ [ 1 RTT: Connection Established & Encrypted Application Data Exchanged ]
+```
+
+---
+
+### 2. Elimination of Transport-Layer HoL Blocking
+
+In QUIC, each stream has its own independent **Stream Offset** counter:
+- Stream 1: Frames $0\dots 1000$
+- Stream 2: Frames $0\dots 1000$
+- Stream 3: Frames $0\dots 1000$
+
+If a UDP packet carrying Stream 2 Frame is dropped, the OS kernel delivers Stream 1 and Stream 3 frames to the application layer **instantly**. Only Stream 2 waits for retransmission.
+
+---
+
+### 3. Connection ID (CID) & Connection Migration
+
+A traditional TCP connection is bound to a 4-tuple: `(Src IP, Src Port, Dst IP, Dst Port)`. If any element changes, the connection dies.
+
+QUIC identifies connections using a **64-bit to 160-bit Connection ID (CID)**:
+1. Client connects via Wi-Fi (`IP: 192.168.1.50`, `CID: 0x8a92f01c`).
+2. Client walks out of the building; phone switches to LTE 5G (`IP: 172.56.21.9`).
+3. Client transmits a `PATH_CHALLENGE` frame to the server using the identical `CID: 0x8a92f01c`.
+4. Server verifies the cryptographically signed challenge response and immediately redirects data packets to the new LTE IP with **zero session interruption**.
+
+---
+
+## Hands-On Lab: Inspecting HTTP/3 with cURL
+
+```bash
+# Step 1: Verify if your curl build supports HTTP/3
+curl --version | grep -i "http3"
+
+# Step 2: Perform an HTTP/3 request over UDP port 443 with verbose logging
+curl -v --http3 https://cloudflare.com -o /dev/null
+
+# Step 3: Inspect the Alt-Svc (Alternative Services) header advertising HTTP/3
+curl -I https://www.google.com | grep -i "alt-svc"
+
+# Step 4: Monitor outgoing UDP port 443 QUIC traffic using tcpdump
+sudo tcpdump -n -i any "udp port 443" -c 5
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does HTTP/3 handle protocol discovery if the client does not know whether the server supports QUIC?**
+
+Browsers initially connect to a website using **HTTP/2 over TCP**. In the response headers, the server advertises its HTTP/3 support via the `Alt-Svc` (Alternative Services) header:
+`Alt-Svc: h3=":443"; ma=86400`
+The browser caches this header and automatically uses **HTTP/3 over UDP** for all subsequent requests within the `ma` (max-age) window.
+
+**Q2: What is the difference between HPACK (HTTP/2) and QPACK (HTTP/3)?**
+
+HPACK relies on strict in-order stream delivery to synchronize its Dynamic Table. Because QUIC streams are processed out-of-order, HPACK would reintroduce Head-of-Line blocking. **QPACK (RFC 9204)** solves this by decoupling header table updates into dedicated unidirectional control streams (Encoder Stream & Decoder Stream) with explicit stream acknowledgments.
+
+**Q3: What are the security risks associated with QUIC 0-RTT Connection Resumption?**
+
+0-RTT Early Data is vulnerable to **Replay Attacks**. If an attacker records an encrypted 0-RTT packet sent over public Wi-Fi, they can replay it to the server later. If the 0-RTT request contains a state-modifying action (e.g., `POST /transfer-money`), the server might execute the transaction twice. Therefore, RFC 9114 strictly mandates that 0-RTT must only be permitted for **safe, idempotent methods (GET/HEAD)**.
+
+**Q4: How does QUIC prevent UDP Amplification DDoS attacks during the handshake?**
+
+In UDP, source IPs can be spoofed. An attacker could send a 50-byte spoofed initial packet to a QUIC server, causing it to send a massive 5,000-byte certificate response to a victim. QUIC mitigates this via two rules:
+1. **Client Padding:** The client's Initial Packet must be padded with zeroes to at least **1200 bytes**.
+2. **Anti-Amplification Limit:** Until the client's IP is validated by returning an ACK, the server is forbidden from transmitting more than **$3\times$ the byte volume** received from the client.
+
+**Q5: Why do some enterprise firewalls block UDP port 443, and what happens when they do?**
+
+Enterprise firewalls often block UDP port 443 because legacy Deep Packet Inspection (DPI) appliances cannot inspect inside QUIC's fully encrypted headers (unlike TCP where sequence numbers and TLS handshakes are partially visible). When UDP 443 is blocked, modern browsers automatically execute a **Happy Eyeballs fallback** to HTTP/2 over TCP within ~300ms without breaking the user experience.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the HTTP/3 protocol stack: UDP $\to$ QUIC $\to$ TLS 1.3 $\to$ QPACK $\to$ HTTP/3
+- [ ] Understand 1-RTT unified handshake and 0-RTT early data replay risks
+- [ ] Explain how QUIC eliminates transport-layer HoL blocking
+- [ ] Understand Connection IDs (CIDs) and Connection Migration across IP changes
+- [ ] Know how `Alt-Svc` enables automatic upgrade from HTTP/2 to HTTP/3

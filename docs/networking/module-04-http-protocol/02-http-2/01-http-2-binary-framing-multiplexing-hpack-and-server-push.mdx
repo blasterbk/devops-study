@@ -1,0 +1,157 @@
+---
+title: "Chapter 2 — HTTP/2: Binary Framing, Multiplexing, HPACK & Streams"
+sidebar_position: 1
+module: "Module 4.2 — HTTP/2"
+description: "Deep dive into HTTP/2 (RFC 7540) — Binary Framing Layer, full-duplex stream multiplexing over a single TCP connection, HPACK header compression, stream prioritization, and Server Push."
+---
+
+# Chapter 2 — HTTP/2: Binary Framing, Multiplexing, HPACK & Streams
+
+> **Goal:** Dissect the architectural shift introduced in HTTP/2 (RFC 7540 / RFC 9113). Understand how the Binary Framing Layer replaces plain text, how bidirectional stream multiplexing eliminates HTTP Head-of-Line blocking over a single TCP socket, HPACK compression algorithms, and stream weight prioritization.
+>
+> By the end of this chapter, you will understand:
+> 1. The HTTP/2 Binary Framing Layer structure (Length, Type, Flags, Stream Identifier, Frame Payload)
+> 2. Frame types: `HEADERS`, `DATA`, `SETTINGS`, `RST_STREAM`, `PING`, and `WINDOW_UPDATE`
+> 3. True full-duplex multiplexing: interleaving concurrent request/response streams over a single TCP connection
+> 4. HPACK header compression algorithm (Static Table, Dynamic Table, and Huffman Encoding)
+> 5. Stream states, dependency trees, and weight-based prioritization
+> 6. Server Push mechanics, deprecation rationale, and CLI inspection via `curl --http2`
+
+---
+
+## Real-Life Analogy
+
+Think of the difference between HTTP/1.1 and HTTP/2 as **a one-lane delivery road vs a high-speed multi-lane railway container terminal**:
+
+- **HTTP/1.1 (Single Lane Highway):**
+  - Each truck (HTTP request) must drive down the lane, unload at the warehouse, and return before the next truck can enter (**Sequential processing**). If one truck gets a flat tire, all trucks behind it are stuck (**HoL Blocking**).
+- **HTTP/2 (Container Train with Tagged Boxes):**
+  - All cargo is packed into standardized, compact wooden crates (**Binary Frames**).
+  - Every crate has a color-coded tag (**Stream ID**). Crates from Order #1, Order #2, and Order #3 are all loaded onto the **same train simultaneously** (**Multiplexing**).
+  - At the destination, the receiver unloads all crates and sorts them by tag ID. If Order #2 takes longer to assemble, Order #1 and Order #3 are delivered immediately without waiting.
+
+---
+
+## Architecture Diagram
+
+```text
+               HTTP/1.1 Sequential vs HTTP/2 Multiplexed Framing
+               
+ 1. HTTP/1.1 (6 Parallel TCP Connections per Host needed):
+   TCP Conn 1: ───[ Request 1 ]───► ◄───[ Response 1 ]───► ───[ Request 2 ]───►
+   TCP Conn 2: ───[ Request 3 ]───► ◄───[ Response 3 ]───► ───[ Request 4 ]───►
+ 
+ 2. HTTP/2 (Single Shared TCP Connection with Multiplexed Binary Frames):
+   ┌─────────────────────────────────────────────────────────────────────────┐
+   │ SINGLE TCP SOCKET                                                       │
+   │                                                                         │
+   │ ──► [HEADERS: Stream 1] ──► [HEADERS: Stream 3] ──► [DATA: Stream 1] ── │
+   │ ──► [DATA: Stream 3]    ──► [HEADERS: Stream 5] ──► [DATA: Stream 5] ── │
+   └─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. The Binary Framing Layer
+
+HTTP/2 breaks every message into discrete binary frames:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                 Length (24 bits)              |  Type (8 bits)|
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Flags (8)   |R|              Stream Identifier (31 bits)    |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Frame Payload (0...N)                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+```text
+ ┌────────────┬──────┬────────────────────────────────────────────────────────────────────────┐
+ │ Frame Type │ Code │ Description & Functionality                                            │
+ │────────────┼──────┼────────────────────────────────────────────────────────────────────────┤
+ │ `DATA`     │ 0x0  │ Transports the core message payload body (HTML, JSON, binary image)    │
+ │ `HEADERS`  │ 0x1  │ Opens a stream and transmits HPACK-compressed HTTP headers & pseudo-hdr│
+ │ `SETTINGS` │ 0x4  │ Negotiates connection parameters (e.g. `MAX_CONCURRENT_STREAMS`, MTU) │
+ │ `RST_STREAM`|0x3  │ Abruptly cancels an active stream without tearing down the TCP socket  │
+ │ `PING`     │ 0x6  │ Measures RTT latency and acts as a keep-alive heartbeat                │
+ │ `WINDOW_UPDATE`|0x8| Implements stream-level and connection-level flow control             │
+ └────────────┴──────┴────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. HPACK Header Compression (RFC 7541)
+
+In HTTP/1.1, redundant headers (`User-Agent`, `Cookie`, `Accept`) added 1–2KB of uncompressed overhead per request. HPACK compresses headers via 3 layers:
+1. **Static Table:** 61 pre-defined common header name/value pairs (e.g., Index 2 = `:method: GET`, Index 7 = `:scheme: https`).
+2. **Dynamic Table:** A rolling FIFO table updated statefully during the session. If `cookie: session_id=xyz` was sent once, subsequent requests transmit only its 1-byte dynamic index.
+3. **Huffman Coding:** Compresses custom strings into variable-length binary bit sequences.
+
+---
+
+### 3. Stream Multiplexing & Pseudo-Headers
+
+HTTP/2 replaces textual request lines with **Pseudo-Headers**:
+- `:method` $\to$ `GET`
+- `:path` $\to$ `/api/v1/data`
+- `:scheme` $\to$ `https`
+- `:authority` $\to$ `api.example.com` (replaces `Host`)
+- `:status` $\to$ `200` (in responses)
+
+Stream IDs initiated by the **client are always odd** ($1, 3, 5\dots$); stream IDs initiated by the **server (Server Push) are even** ($2, 4, 6\dots$).
+
+---
+
+## Hands-On Lab: Inspecting HTTP/2 Frames & Multiplexing
+
+```bash
+# Step 1: Query an HTTP/2 server and inspect ALPN TLS negotiation (h2)
+curl -v --http2 https://cloudflare.com -o /dev/null
+
+# Step 2: Fetch multiple resources over a single multiplexed HTTP/2 connection
+curl -v --http2 https://nghttp2.org/ http://nghttp2.org/robots.txt
+
+# Step 3: Inspect HTTP/2 binary frame streams using nghttp (install via nghttp2-client)
+nghttp -nv https://nghttp2.org/ 2>/dev/null || echo "Run: apt install nghttp2-client"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How does HTTP/2 solve Application-Layer Head-of-Line (HoL) blocking?**
+
+In HTTP/1.1, requests on a single TCP connection must be processed sequentially. HTTP/2 introduces the **Binary Framing Layer**, dividing requests and responses into small binary frames tagged with a unique **Stream ID**. Frames from dozens of concurrent requests are interleaved across a single TCP connection and reassembled independently at the receiver, allowing fast requests to complete without waiting for slow ones.
+
+**Q2: What is the ALPN (Application-Layer Protocol Negotiation) extension in TLS?**
+
+ALPN (RFC 7301) is a TLS extension used during the initial TLS handshake. Inside the `ClientHello`, the browser advertises its supported application protocols (e.g., `["h2", "http/1.1"]`). The server selects `h2` and includes it in its `ServerHello`, allowing HTTP/2 to be negotiated securely without an extra network round-trip.
+
+**Q3: What is the difference between Stream-level and Connection-level Flow Control in HTTP/2?**
+
+HTTP/2 implements credit-based flow control using `WINDOW_UPDATE` frames:
+- **Connection-level:** Restricts total bytes transmitted across the entire TCP socket to prevent saturating the receiver's NIC buffer.
+- **Stream-level:** Restricts bytes transmitted on a specific individual stream (e.g., throttling a large video stream while allowing high-priority API JSON responses to flow freely).
+
+**Q4: Why was HTTP/2 Server Push deprecated in modern browsers like Chrome?**
+
+Server Push allowed the server to preemptively send secondary resources (CSS, JS) before the browser requested them. In production, Server Push frequently pushed assets already present in the browser's disk cache (wasting bandwidth), caused complex race conditions with client caches, and was outperformed by modern **103 Early Hints** (`Link: </style.css>; rel=preload`).
+
+**Q5: Why does HTTP/2 still suffer from Transport-Layer TCP Head-of-Line blocking?**
+
+Although HTTP/2 eliminates application-level HoL blocking, it runs on top of a single TCP stream. TCP requires all packets to be acknowledged in strict sequential byte order. If a single TCP packet is dropped in the network, the operating system kernel holds all subsequent multiplexed HTTP/2 frames in the socket buffer until the missing packet is retransmitted, stalling all 100 HTTP/2 streams simultaneously. This led directly to the creation of **HTTP/3 over QUIC**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the Binary Framing Layer (Length, Type, Flags, Stream ID, Payload)
+- [ ] Understand key frame types: `HEADERS`, `DATA`, `SETTINGS`, `RST_STREAM`, `WINDOW_UPDATE`
+- [ ] Know HPACK compression: Static Table (61 items), Dynamic Table, Huffman Coding
+- [ ] Understand ALPN negotiation in TLS (`h2`)
+- [ ] Explain why TCP packet loss causes transport-level HoL blocking across all streams

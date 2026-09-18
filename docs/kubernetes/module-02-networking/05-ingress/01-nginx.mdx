@@ -1,0 +1,424 @@
+---
+title: "Chapter 1 — NGINX Ingress Controller"
+sidebar_position: 1
+module: "Module 2.5 — Ingress"
+description: "Deep dive into the NGINX Ingress Controller — how it translates Ingress objects into NGINX configuration, the nginx.conf generation pipeline, rate limiting, upstream keep-alive, and production configuration patterns."
+---
+
+# Chapter 1 — NGINX Ingress Controller
+
+> **Goal:** Understand how the NGINX Ingress Controller watches Ingress resources and dynamically generates nginx.conf, how traffic flows from external clients through NGINX to backend Services, and how to configure advanced NGINX features via annotations.
+>
+> By the end of this chapter, you will understand:
+> 1. What an Ingress Controller is and why it's needed (Services don't do L7 routing)
+> 2. How NGINX Ingress watches Kubernetes API and generates nginx.conf
+> 3. The complete request path from client to backend Pod
+> 4. Host-based and path-based routing with real examples
+> 5. Key NGINX annotations for production configuration
+> 6. How to debug NGINX Ingress issues with logs and the NGINX config dump
+
+---
+
+## Real-Life Analogy
+
+Imagine a **large shopping mall** with a single entrance (one external IP/LoadBalancer):
+
+Without an Ingress, you'd need a separate entrance (LoadBalancer Service = expensive cloud LB) for every store. With an Ingress Controller, there's **one entrance with a smart directory board** (NGINX): walk in, check the board — "Shoe Store → Level 2 East, Electronics → Level 3 West." The board routes you by destination, not by door.
+
+The **NGINX Ingress Controller** is the directory board operator — it reads the mall's tenant list (Ingress objects) and keeps the board accurate in real-time. New stores (Services) appear automatically when they add their entry (Ingress resource).
+
+---
+
+## Architecture Diagram
+
+```text
+              NGINX Ingress Controller — Traffic Flow
+
+Internet
+  │
+  ▼
+Cloud LoadBalancer (203.0.113.100)
+  │  (created by ingress-nginx Service type:LoadBalancer)
+  ▼
+NGINX Ingress Controller Pod
+  ┌──────────────────────────────────────────────────────┐
+  │  nginx (main process)                                │
+  │  Generated nginx.conf:                               │
+  │                                                      │
+  │  server {                                            │
+  │    server_name api.example.com;                      │
+  │    location /v1/ { proxy_pass http://api-svc; }      │
+  │    location /v2/ { proxy_pass http://api-v2-svc; }   │
+  │  }                                                   │
+  │  server {                                            │
+  │    server_name web.example.com;                      │
+  │    location / { proxy_pass http://web-svc; }         │
+  │  }                                                   │
+  │                                                      │
+  │  Upstream lua (using Kubernetes endpoints directly): │
+  │  upstream api-svc { 10.244.1.5:8080; 10.244.2.3:8080 }│
+  └──────────────────────────────────────────────────────┘
+  │
+  ├── → api-svc (10.244.1.5:8080, 10.244.2.3:8080)
+  └── → web-svc (10.244.3.1:80)
+```
+
+---
+
+## What an Ingress Controller Is
+
+The Kubernetes **Ingress** resource is just a specification — it has no effect until an **Ingress Controller** is running. The controller is responsible for reading Ingress objects and configuring a reverse proxy (NGINX, Traefik, HAProxy, etc.) to implement them.
+
+```text
+Kubernetes API has TWO parts for Ingress:
+
+1. Ingress object (built-in):
+   - Defines routing rules (host, path, backend Service)
+   - Does nothing by itself
+   - Any number of Ingress objects can exist
+
+2. Ingress Controller (external, not built-in):
+   - Watches Ingress objects
+   - Configures a real reverse proxy
+   - Must be installed separately
+   - Multiple implementations: nginx, traefik, haproxy, istio, kong
+```
+
+---
+
+## Installing NGINX Ingress Controller
+
+```bash
+# Install via Helm (recommended for production)
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.replicaCount=2 \
+  --set controller.nodeSelector."kubernetes\.io/os"=linux
+
+# Wait for external IP
+kubectl get svc ingress-nginx-controller -n ingress-nginx --watch
+
+# Verify controller is running
+kubectl get pods -n ingress-nginx
+kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller
+```
+
+---
+
+## Creating Ingress Resources
+
+### Host-Based Routing
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: multi-host-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+  - host: web.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-service
+            port:
+              number: 80
+```
+
+### Path-Based Routing
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: path-based-ingress
+  namespace: production
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /api(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 8080
+      - path: /static
+        pathType: Prefix
+        backend:
+          service:
+            name: static-service
+            port:
+              number: 80
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 3000
+```
+
+### PathType Options
+
+| PathType | Matching Behavior |
+|----------|------------------|
+| `Exact` | Exact path match only (`/api` matches only `/api`) |
+| `Prefix` | Prefix match (`/api` matches `/api`, `/api/users`, `/api/v1/...`) |
+| `ImplementationSpecific` | Regex or NGINX-specific (controller-dependent) |
+
+---
+
+## How NGINX Config is Generated
+
+The NGINX Ingress Controller uses a Go template (`nginx.tmpl`) to generate `nginx.conf`:
+
+```text
+Watch cycle (simplified):
+  1. Receive event: Ingress/Service/Endpoint change
+  2. Call store.BuildConfiguration()
+     → Collect all Ingress objects
+     → Resolve backend Services → EndpointSlices → Pod IPs
+     → Merge annotations
+  3. Check if config diff from current
+  4. If changed:
+     → Render nginx.conf from template
+     → Validate: nginx -t
+     → Hot-reload: nginx -s reload (or Lua dynamic update)
+
+Key insight: For endpoint-only changes (Pod scaling),
+NGINX Ingress uses Lua (lua-resty-balancer) to update
+upstream servers WITHOUT nginx -s reload.
+Only structural changes (new hosts/paths) require reload.
+```
+
+```bash
+# View the generated nginx.conf
+kubectl exec -n ingress-nginx ingress-nginx-controller-<id> \
+  -- cat /etc/nginx/nginx.conf | grep -A20 "server_name api.example.com"
+
+# Check for recent config changes in logs
+kubectl logs -n ingress-nginx ingress-nginx-controller-<id> | \
+  grep -i "reload\|configuration change"
+```
+
+---
+
+## Key Production Annotations
+
+### Rate Limiting
+
+```yaml
+metadata:
+  annotations:
+    # Limit requests per second per IP
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    # Burst above limit
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+    # Limit connections per IP
+    nginx.ingress.kubernetes.io/limit-connections: "5"
+    # Whitelist IPs from rate limiting
+    nginx.ingress.kubernetes.io/limit-whitelist: "10.0.0.0/8,203.0.113.5/32"
+```
+
+### Upstream Configuration
+
+```yaml
+metadata:
+  annotations:
+    # Keep-alive connections to backends
+    nginx.ingress.kubernetes.io/upstream-keepalive-connections: "100"
+    nginx.ingress.kubernetes.io/upstream-keepalive-timeout: "60"
+    nginx.ingress.kubernetes.io/upstream-keepalive-requests: "10000"
+    
+    # Load balancing algorithm
+    nginx.ingress.kubernetes.io/load-balance: "round_robin"
+    # or: ip_hash, ewma, random, least_conn
+    
+    # Connection timeout
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+```
+
+### Rewrites and Redirects
+
+```yaml
+metadata:
+  annotations:
+    # Strip prefix before forwarding to backend
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    
+    # Force HTTPS redirect
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    
+    # Custom redirect
+    nginx.ingress.kubernetes.io/permanent-redirect: "https://new.example.com"
+    
+    # Strip /api prefix: /api/users → /users
+    # (use with path: /api(/|$)(.*) and rewrite-target: /$2)
+```
+
+### Backend Protocol
+
+```yaml
+metadata:
+  annotations:
+    # Backend speaks HTTPS
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    
+    # Backend speaks gRPC
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    nginx.ingress.kubernetes.io/grpc-backend: "true"
+```
+
+---
+
+## Configmap for Global NGINX Settings
+
+```yaml
+# nginx-ingress-controller ConfigMap — global defaults
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+data:
+  # Increase worker processes
+  worker-processes: "auto"
+
+  # HTTP/2 (recommended for gRPC and modern clients)
+  use-http2: "true"
+
+  # HSTS (HTTP Strict Transport Security)
+  hsts: "true"
+  hsts-max-age: "31536000"
+
+  # Enable Brotli compression
+  enable-brotli: "true"
+
+  # Log format (JSON for log aggregation)
+  log-format-escape-json: "true"
+  log-format-upstream: >
+    {"time":"$time_iso8601","remote_addr":"$remote_addr","x_forwarded_for":"$proxy_add_x_forwarded_for",
+    "request_id":"$req_id","host":"$host","uri":"$uri","status":"$status",
+    "request_time":"$request_time","upstream_time":"$upstream_response_time","bytes_sent":"$bytes_sent"}
+
+  # WebSocket support
+  proxy-read-timeout: "3600"
+  proxy-send-timeout: "3600"
+
+  # Client body size (for file uploads)
+  proxy-body-size: "100m"
+
+  # Real IP from load balancer
+  use-forwarded-headers: "true"
+  forwarded-for-header: "X-Forwarded-For"
+  compute-full-forwarded-for: "true"
+```
+
+---
+
+## Hands-On: Debugging NGINX Ingress
+
+```bash
+# 1. Check if Ingress has an address assigned
+kubectl get ingress my-ingress -n production
+# NAME         HOSTS              ADDRESS          PORTS  AGE
+# my-ingress   api.example.com    203.0.113.100    80     5m
+# If ADDRESS is empty: Ingress controller is not running or misconfigured
+
+# 2. Check ingress events
+kubectl describe ingress my-ingress -n production
+# Look for: "Error from server (NotFound): ingress class not found"
+# or: "backend service not found"
+
+# 3. Inspect generated nginx.conf for a specific host
+kubectl exec -n ingress-nginx ingress-nginx-controller-<id> \
+  -- nginx -T 2>/dev/null | grep -A 30 "server_name api.example.com"
+
+# 4. Test nginx config validity
+kubectl exec -n ingress-nginx ingress-nginx-controller-<id> -- nginx -t
+
+# 5. Follow access logs
+kubectl logs -n ingress-nginx ingress-nginx-controller-<id> -f \
+  | grep "api.example.com"
+
+# 6. Test routing from inside the cluster (bypassing LoadBalancer)
+CONTROLLER_IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+  -o jsonpath='{.spec.clusterIP}')
+kubectl run curl-test --image=curlimages/curl --restart=Never \
+  -- curl -H "Host: api.example.com" http://$CONTROLLER_IP/
+
+# 7. Check Ingress class
+kubectl get ingressclass
+# NAME    CONTROLLER                             PARAMETERS  AGE
+# nginx   k8s.io/ingress-nginx                  <none>      1h
+
+# 8. Test rate limiting
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w "%{http_code}\n" https://api.example.com/test
+done
+# First 10: 200, remaining: 429 (Too Many Requests)
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: What is the difference between an Ingress resource and an Ingress Controller?**
+
+The Ingress resource is a Kubernetes API object that defines routing rules (which hostnames/paths route to which Services). It's just data — it has no effect on its own. The Ingress Controller is a separate program (not built into Kubernetes) that reads Ingress objects and configures a reverse proxy (NGINX, Traefik, etc.) to implement the routing rules. Without an Ingress Controller running in the cluster, Ingress objects do nothing.
+
+**Q2: How does NGINX Ingress avoid a reload when Pods scale up/down?**
+
+NGINX Ingress uses Lua (via the `lua-resty-balancer` library) to manage upstream server lists dynamically. When Pod endpoints change (scale up/down), the controller updates an in-memory Lua table without performing `nginx -s reload`. Only structural changes — new Ingress rules, new hosts/paths, annotation changes — require a full NGINX reload. This prevents the performance impact of frequent reloads in dynamic Pod environments.
+
+**Q3: What is the `ingressClassName` field and how does it differ from the `kubernetes.io/ingress.class` annotation?**
+
+`ingressClassName` references an `IngressClass` resource (introduced in Kubernetes 1.18, GA in 1.19). It's the recommended, API-native way to associate an Ingress with a controller. The `kubernetes.io/ingress.class` annotation is the older, deprecated mechanism that served the same purpose as a string annotation. Both tell the Ingress Controller "this Ingress object is for you to process." In modern clusters, use `spec.ingressClassName` instead of the annotation.
+
+**Q4: How does NGINX handle path-based routing with the `rewrite-target` annotation?**
+
+The `rewrite-target` annotation tells NGINX to rewrite the request URI before proxying to the backend. For example: `path: /api(/|$)(.*)` with `rewrite-target: /$2` means requests to `/api/users` are forwarded as `/users` to the backend. The capture groups `(...)` in the path pattern are referenced in the rewrite target as `$1`, `$2`, etc. Without rewriting, the backend receives the full path including the prefix (e.g., `/api/users`), which many backends aren't configured to handle.
+
+**Q5: Why is it important to configure `upstream-keepalive-connections` for production?**
+
+Without keepalive, NGINX opens a new TCP connection to a backend Pod for every request. This means every HTTP request incurs TCP handshake overhead (1-2 RTT). With `upstream-keepalive-connections: 100`, NGINX maintains a pool of persistent connections to each backend Pod and reuses them. This reduces latency by eliminating per-request TCP handshakes and reduces CPU load on both NGINX and the backend Pods. For high-throughput APIs, this difference can be significant — from 5-10ms overhead per request to near-zero.
+
+---
+
+## Summary Checksheet
+
+- [ ] Know the distinction: Ingress resource (routing spec) vs Ingress Controller (actual proxy implementation)
+- [ ] Understand NGINX Ingress watches Ingress objects and generates nginx.conf dynamically
+- [ ] Know host-based routing (`server_name`) and path-based routing (`location`) in NGINX
+- [ ] Know PathType options: Exact, Prefix, ImplementationSpecific
+- [ ] Know key annotations: rate limiting, upstream keepalive, rewrite-target, backend-protocol
+- [ ] Understand that endpoint-only changes use Lua dynamic update (no nginx reload)
+- [ ] Can debug with `nginx -T`, access logs, `kubectl describe ingress`, and bypass testing via ClusterIP

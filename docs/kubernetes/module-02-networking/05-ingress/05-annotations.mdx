@@ -1,0 +1,362 @@
+---
+title: "Chapter 5 — Ingress Annotations"
+sidebar_position: 5
+module: "Module 2.5 — Ingress"
+description: "Deep dive into Ingress annotations — the mechanism for controller-specific configuration, canary deployments, CORS configuration, WebSocket support, custom error pages, and authentication. Covers NGINX, Traefik, and HAProxy annotation patterns."
+---
+
+# Chapter 5 — Ingress Annotations
+
+> **Goal:** Understand how Ingress annotations extend the standard Ingress API with controller-specific behavior, master the most important annotation categories (canary, rate limiting, auth, rewrite, CORS), and understand how to manage annotation sprawl in large clusters.
+>
+> By the end of this chapter, you will understand:
+> 1. What Ingress annotations are and why they exist (Ingress spec limitations)
+> 2. Canary deployments via annotations (weight-based and header-based)
+> 3. CORS configuration for browser API access
+> 4. WebSocket and gRPC routing via annotations
+> 5. External authentication with `auth-url`
+> 6. Why Gateway API is replacing annotations-heavy patterns
+
+---
+
+## Real-Life Analogy
+
+The Kubernetes Ingress specification is like a **standard building permit form** — it covers the basics (location, dimensions, use type). But every city (Ingress Controller) has additional customization options that aren't on the standard form.
+
+Annotations are like **sticky notes attached to the permit** — they're controller-specific instructions: "NGINX note: enable gzip compression", "Traefik note: apply rate limiting middleware", "HAProxy note: use TCP mode".
+
+The building (application) works based on the permit, but the construction company (Ingress Controller) follows the sticky notes for the customized details. This is powerful but messy — the notes only work with the company that understands them.
+
+---
+
+## Architecture Diagram
+
+```text
+              Annotation Processing Flow
+
+  Ingress YAML                       Controller-specific
+  ┌─────────────────────────────┐    nginx.conf / haproxy.cfg
+  │ metadata:                   │    ┌──────────────────────────────┐
+  │   annotations:              │    │ upstream backend {            │
+  │     nginx.ingress.../       │ ──▶│   keepalive 100;             │
+  │       upstream-keepalive    │    │   keepalive_timeout 60s;     │
+  │       rate-limit: 100       │    │ }                            │
+  │       auth-url: /auth       │    │ limit_req_zone ... 100r/s;   │
+  │       canary-weight: 20     │    │ auth_request /auth;          │
+  │       cors-allow-*          │    │ add_header Access-Control-*; │
+  └─────────────────────────────┘    └──────────────────────────────┘
+  Standard Ingress spec              Controller translates annotations
+  (understood by all controllers)    into its native configuration
+```
+
+---
+
+## Why Annotations Exist
+
+The standard Kubernetes Ingress spec is intentionally minimal:
+- `spec.rules[].host` — hostname matching
+- `spec.rules[].http.paths[].path` — path matching
+- `spec.tls` — TLS certificate reference
+
+Everything else — rate limiting, authentication, CORS, canary, timeouts — must be implemented via controller-specific annotations. This is a known limitation being addressed by the Gateway API (see Module 2.6).
+
+---
+
+## Canary Deployments
+
+One of the most powerful annotation use cases is **canary routing** — sending a percentage of traffic to a new version:
+
+### Weight-Based Canary (NGINX)
+
+```yaml
+# Production Ingress (stable version)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-stable
+  namespace: production
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-v1-service    # Stable: receives 80% of traffic
+            port:
+              number: 80
+---
+# Canary Ingress (new version)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-canary
+  namespace: production
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "20"   # 20% to this Ingress
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-v2-service    # Canary: receives 20% of traffic
+            port:
+              number: 80
+```
+
+### Header-Based Canary
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+    nginx.ingress.kubernetes.io/canary-by-header-value: "always"
+```
+
+Requests with `X-Canary: always` header → canary service. All others → stable service.
+
+```bash
+# Test canary routing
+curl -H "X-Canary: always" https://api.example.com/  # → v2 service
+curl https://api.example.com/                         # → v1 service (80%)
+```
+
+### Cookie-Based Canary
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-by-cookie: "canary-session"
+```
+
+If cookie `canary-session=always` is present → canary service. Useful for sticky browser sessions in A/B testing.
+
+---
+
+## CORS Configuration
+
+Browser-based APIs need CORS headers. Without these, browser security prevents cross-origin requests:
+
+```yaml
+metadata:
+  annotations:
+    # Enable CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    
+    # Allowed origins
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com,https://admin.example.com"
+    
+    # Allowed methods
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    
+    # Allowed headers
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization,Content-Type,X-API-Key"
+    
+    # Allow credentials (cookies, authorization headers)
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    
+    # Preflight cache duration (seconds)
+    nginx.ingress.kubernetes.io/cors-max-age: "86400"
+```
+
+Generated NGINX config (simplified):
+```nginx
+add_header 'Access-Control-Allow-Origin' 'https://app.example.com';
+add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS';
+add_header 'Access-Control-Allow-Credentials' 'true';
+
+if ($request_method = 'OPTIONS') {
+    add_header 'Access-Control-Max-Age' '86400';
+    return 204;
+}
+```
+
+---
+
+## WebSocket Support
+
+WebSocket requires HTTP Upgrade headers and long-lived connections. NGINX Ingress handles this automatically when configured:
+
+```yaml
+metadata:
+  annotations:
+    # Increase timeouts for WebSocket connections
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    
+    # Enable WebSocket upgrade
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+```
+
+Note: From NGINX Ingress v1.0+, WebSocket is supported automatically without annotations — NGINX detects the Upgrade header and handles the connection upgrade transparently.
+
+---
+
+## gRPC Backend Routing
+
+```yaml
+metadata:
+  annotations:
+    # Tell NGINX the backend speaks gRPC (HTTP/2)
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    
+    # gRPC requires HTTP/2 end-to-end
+    nginx.ingress.kubernetes.io/grpc-backend: "true"
+```
+
+For gRPC, the Ingress must have TLS configured (gRPC requires HTTP/2, which requires TLS in most browsers):
+
+```yaml
+spec:
+  tls:
+  - hosts:
+    - grpc.example.com
+    secretName: grpc-tls-cert
+  rules:
+  - host: grpc.example.com
+    http:
+      paths:
+      - path: /mypackage.MyService
+        pathType: Prefix
+        backend:
+          service:
+            name: grpc-service
+            port:
+              number: 50051
+```
+
+---
+
+## External Authentication (`auth-url`)
+
+Delegate authentication to an external service:
+
+```yaml
+metadata:
+  annotations:
+    # Every request is validated against this URL first
+    nginx.ingress.kubernetes.io/auth-url: "https://auth.example.com/validate"
+    
+    # Forward the Authorization header to the auth service
+    nginx.ingress.kubernetes.io/auth-signin: "https://auth.example.com/login"
+    
+    # Pass validated user info to backend as headers
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-User-ID,X-User-Email,X-User-Roles"
+    
+    # Cache auth responses (per cache key)
+    nginx.ingress.kubernetes.io/auth-cache-key: "$cookie_session_id"
+    nginx.ingress.kubernetes.io/auth-cache-duration: "200 10m"
+```
+
+Flow:
+```text
+Client request
+  → NGINX sends sub-request to auth-url (same headers, no body)
+  → Auth service returns:
+      200: Authenticated → NGINX forwards to backend + auth-response-headers
+      401/403: Unauthorized → NGINX redirects to auth-signin URL
+```
+
+---
+
+## Configuration Snippets
+
+For NGINX Ingress, `configuration-snippet` allows injecting raw NGINX directives:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      # Add custom response headers
+      add_header X-App-Version "v2.1.0" always;
+      add_header Cache-Control "no-store" always;
+      
+      # Rate limit specific paths more aggressively
+      limit_req zone=api burst=5 nodelay;
+      
+      # Block specific user agents
+      if ($http_user_agent ~* "BadBot|Scrapy") {
+        return 403;
+      }
+    
+    # Server-level snippet (affects the entire server block)
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location /blocked-path {
+        deny all;
+      }
+```
+
+> [!WARNING]
+> `configuration-snippet` was disabled by default in NGINX Ingress v1.9.0+ due to security concerns — it can be used to inject malicious NGINX config if Ingress creation is not access-controlled. Re-enable with `--allow-snippet-annotations=true` only in trusted environments.
+
+---
+
+## Annotation Sprawl and Gateway API
+
+As clusters grow, annotation-heavy Ingresses become difficult to manage:
+
+```text
+Problems with the annotation approach:
+  1. Not portable — nginx.ingress.kubernetes.io/* doesn't work with Traefik
+  2. Not validated — typos in annotation names silently fail
+  3. Not type-safe — all values are strings, errors found only at runtime
+  4. Complex dependencies — canary Ingresses must reference the same host as main Ingress
+  5. Permissions problem — any namespace admin can set security-sensitive annotations
+```
+
+The **Gateway API** (Module 2.6) solves these with:
+- Role-separated resources (GatewayClass → Gateway → HTTPRoute)
+- Native CRD types (not annotations) with schema validation
+- Native canary support in HTTPRoute weights
+- Native header matching and modification
+- Cross-namespace routing support
+
+---
+
+## Common Interview Questions
+
+**Q1: Why do Ingress annotations exist and what is their main drawback?**
+
+The Kubernetes Ingress spec is deliberately minimal — it only covers host/path routing and TLS certificates. Everything else (rate limiting, authentication, CORS, canary routing, timeouts) must be configured via controller-specific annotations. The main drawbacks: annotations are not portable across controllers (an annotation for NGINX doesn't work with Traefik), they're not type-validated at the API level (typos silently fail), all values are strings (no schema), and security-sensitive annotations (like `auth-url`) can be set by any namespace admin who can create Ingress resources.
+
+**Q2: How does NGINX Ingress implement canary deployments?**
+
+Two Ingress objects share the same host. The "stable" Ingress has no canary annotations and routes to the production service. The "canary" Ingress has `nginx.ingress.kubernetes.io/canary: "true"` and defines the traffic split: by weight (percentage), by HTTP header value, or by cookie. NGINX Ingress merges both Ingress objects into a single NGINX configuration and applies the split rule at the proxy level. The canary can be progressively increased (20% → 50% → 100%) then the old Ingress deleted.
+
+**Q3: What is `auth-url` in NGINX Ingress and how does it work?**
+
+`nginx.ingress.kubernetes.io/auth-url` configures NGINX's `auth_request` module. For every incoming request, NGINX sends a subrequest (GET) to the configured URL with the same headers (Authorization, Cookie) but no body. If the auth service returns 200, the original request proceeds to the backend; NGINX can also forward headers from the auth response (`auth-response-headers`). If the auth service returns 401/403, NGINX redirects to `auth-signin` URL. This enables delegating authentication to an external OAuth/OIDC service (Dex, Keycloak, oauth2-proxy).
+
+**Q4: Why was `configuration-snippet` disabled by default in NGINX Ingress v1.9?**
+
+The `configuration-snippet` annotation allows injecting arbitrary NGINX configuration into the generated nginx.conf. This is powerful but dangerous: a malicious or misconfigured snippet can cause NGINX to leak data (e.g., `return 200 $upstream_http_set_cookie;`), bypass other security configurations, or crash NGINX entirely. In multi-tenant clusters where many teams can create Ingress objects, this is a privilege escalation vector. The annotation was disabled by default and requires explicit opt-in (`--allow-snippet-annotations=true`) with proper RBAC to restrict who can create Ingress objects.
+
+**Q5: What is the fundamental limitation of Ingress annotations that Gateway API addresses?**
+
+Annotations are strings with no schema validation — typos silently fail. They're controller-specific — code doesn't work across NGINX/Traefik/HAProxy. They can't express complex typed configurations (objects, arrays). There's no role separation — a namespace admin can set any annotation, including security-sensitive ones. Gateway API replaces annotations with purpose-built CRDs (`HTTPRoute`, `GRPCRoute`, `TLSRoute`) that have proper OpenAPI schema validation, typed fields, and role-separated resources (cluster admins control Gateways, namespace teams control Routes).
+
+---
+
+## Summary Checksheet
+
+- [ ] Know why annotations exist: Ingress spec is minimal, controllers extend via annotations
+- [ ] Know the canary pattern: two Ingresses for same host (stable + canary with weight/header/cookie)
+- [ ] Know CORS annotation set: `enable-cors`, `cors-allow-origin`, `cors-allow-methods`, `cors-allow-credentials`
+- [ ] Know `auth-url` delegates authentication — NGINX `auth_request` module, 200=allow, 401/403=redirect
+- [ ] Know `configuration-snippet` is disabled by default since v1.9 (security risk)
+- [ ] Know annotations' limitations: not portable, not validated, no role separation
+- [ ] Understand Gateway API is the future replacement for annotation-heavy patterns

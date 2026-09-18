@@ -1,0 +1,153 @@
+---
+title: "Chapter 2 — BGP Path Selection: 9-Step Decision Algorithm, Local Preference & Communities"
+sidebar_position: 1
+module: "Module 8.2 — BGP Policies"
+description: "Master the deterministic BGP Best Path Selection Algorithm — Weight, Local Preference, AS-Path Prepending, Origin, MED, eBGP vs iBGP, IGP Metric, and BGP Communities."
+---
+
+# Chapter 2 — BGP Path Selection: 9-Step Decision Algorithm, Local Preference & Communities
+
+> **Goal:** Master the deterministic BGP Best Path Selection Algorithm. Understand how BGP routes traffic not based on simple bandwidth or hop counts, but through policy-driven path attributes: Cisco Weight, Local Preference (outbound traffic engineering), AS-Path Prepending (inbound traffic engineering), Multi-Exit Discriminator (MED), and standard/extended BGP Communities.
+>
+> By the end of this chapter, you will understand:
+> 1. The strict sequential 9-step BGP Best Path Selection Algorithm
+> 2. Outbound Traffic Engineering using `LOCAL_PREF` (Higher is preferred)
+> 3. Inbound Traffic Engineering using `AS-Path Prepending` and `MED` (Lower is preferred)
+> 4. BGP Communities (Well-known: `NO_EXPORT`, `NO_ADVERTISE`, `BLACKHOLE`) and Large Communities (RFC 8092)
+> 5. Route-maps, prefix-lists, and BGP policy enforcement filters
+> 6. CLI verification of BGP attributes and route manipulation
+
+---
+
+## Real-Life Analogy
+
+Think of BGP Path Selection as **a corporate procurement board selecting a commercial freight vendor**:
+
+- **Step 1 — Local Preference (Internal Company Policy):**
+  - Board rule: *"Always prefer Vendor A (Local-Pref 200) over Vendor B (Local-Pref 100) because we own equity in Vendor A"*.
+- **Step 2 — AS-Path Length (Shortest Country Border Hops):**
+  - If Local-Pref is tied, pick the route crossing the fewest foreign borders: `[AS100 -> AS200]` ($2\text{ hops}$) beats `[AS100 -> AS300 -> AS400 -> AS200]` ($4\text{ hops}$).
+- **Step 3 — AS-Path Prepending (Artificially Making a Route Look Long):**
+  - If you want foreign customers to avoid your expensive backup satellite uplink, you advertise: `[AS100, AS100, AS100, AS100]`. Foreign routers see 4 hops and choose your cheap terrestrial fiber link instead!
+- **Step 4 — BGP Communities (Color-Coded Shipping Tags):**
+  - You slap a red sticker on a package labeled *"Do not export beyond European borders"* (**`NO_EXPORT`**).
+
+---
+
+## Architecture Diagram
+
+```text
+                  The BGP 9-Step Best Path Decision Pipeline
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ 1. Weight (Cisco Proprietary - Local to router only, Higher is preferred)   │
+ │         │                                                                   │
+ │ 2. LOCAL_PREFERENCE (Propagated throughout entire AS, Higher is preferred)  │
+ │         │                                                                   │
+ │ 3. Locally Originated Routes (Network / Aggregate / Redistributed > Learned)│
+ │         │                                                                   │
+ │ 4. Shortest AS_PATH Length (Fewest AS hops; ignore if 'as-path ignore')     │
+ │         │                                                                   │
+ │ 5. ORIGIN Code (IGP [i] > EGP [e] > Incomplete [?])                         │
+ │         │                                                                   │
+ │ 6. Lowest MED (Multi-Exit Discriminator - Inbound hint from neighbor AS)   │
+ │         │                                                                   │
+ │ 7. eBGP over iBGP Paths (External routes preferred over internal routes)    │
+ │         │                                                                   │
+ │ 8. Lowest IGP Metric to the BGP Next-Hop (Shortest internal path)           │
+ │         │                                                                   │
+ │ 9. Lowest Router ID / Lowest Neighbor IP Address (Deterministic Tie-Breaker)│
+ └─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Inbound vs Outbound Traffic Engineering
+
+```text
+ ┌──────────────────────────┬──────────────────────┬─────────────────────────────────────────────────────────┐
+ │ Goal                     │ Primary BGP Attribute│ Operational Mechanism                                   │
+ │──────────────────────────┼──────────────────────┼─────────────────────────────────────────────────────────┤
+ │ **Influence Outbound**   │ `LOCAL_PREF`         │ Set higher Local-Pref (e.g. 200) on primary ISP router. │
+ │ (Traffic leaving your AS)│ (Values: 0–4294967295)│ All internal iBGP routers automatically choose ISP 1.   │
+ │──────────────────────────┼──────────────────────┼─────────────────────────────────────────────────────────┤
+ │ **Influence Inbound**    │ `AS-Path Prepending` │ Prepend your own ASN multiple times on backup ISP link. │
+ │ (Traffic entering your AS)│ (e.g. `64512 64512`) │ Remote Internet ASNs see longer path and choose ISP 1.  │
+ │──────────────────────────┼──────────────────────┼─────────────────────────────────────────────────────────┤
+ │ **Inbound Fine-Tuning**  │ `MED` (Metric)       │ Advertised to neighbor AS to influence which ingress link│
+ │ (Across dual links to 1 AS)│ (Lower is preferred)│ they send traffic into (only compared across same AS).  │
+ └──────────────────────────┴──────────────────────┴─────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2. Standard & Well-Known BGP Communities
+
+A BGP Community is a 32-bit tag formatted as `ASN:Value` (e.g., `64512:100`):
+
+```text
+ ┌──────────────────────┬──────────────────────────┬──────────────────────────────────────────────────────────┐
+ │ Well-Known Community │ Hex Value                │ Operational Action & Behavior                            │
+ │──────────────────────┼──────────────────────────┼──────────────────────────────────────────────────────────┤
+ │ **`NO_EXPORT`**      │ `0xFFFFFF01`             │ Do not advertise this route to eBGP peers outside the AS │
+ │ **`NO_ADVERTISE`**   │ `0xFFFFFF02`             │ Do not advertise this route to ANY peer (eBGP or iBGP)   │
+ │ **`BLACKHOLE`**      │ `0xFFFF0295` (RFC 7999)  │ Instructs upstream ISP to drop traffic to this IP at edge│
+ │                      │                          │ (Remediates massive DDoS attacks instantly)              │
+ └──────────────────────┴──────────────────────────┴──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Hands-On Lab: Simulating BGP Route Maps & Communities
+
+```bash
+# Example FRR / Cisco configuration snippet for Local Preference & AS Prepending:
+#
+# route-map PRIMARY_IN permit 10
+#   set local-preference 200
+#
+# route-map BACKUP_OUT permit 10
+#   set as-path prepend 64512 64512 64512
+#
+# route-map DDOS_MITIGATION permit 10
+#   set community 65535:666 additive    # Blackhole community
+
+# Step 1: Verify BGP table output showing attributes in vtysh (if FRR/BIRD active)
+# vtysh -c "show ip bgp 1.1.1.0/24"
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: How do you force traffic leaving your enterprise network to prefer ISP 1 over ISP 2?**
+
+You apply an inbound route-map on the BGP peering session with ISP 1 that sets `LOCAL_PREFERENCE = 200`, and set `LOCAL_PREFERENCE = 100` on the session with ISP 2. Because `LOCAL_PREF` is evaluated at Step 2 of the decision algorithm and is distributed across all internal iBGP routers, all outbound traffic automatically exits via ISP 1.
+
+**Q2: What is AS-Path Prepending and what is its primary operational limitation?**
+
+AS-Path Prepending is a technique where an AS appends its own ASN multiple times (e.g. `64512 64512 64512`) when advertising prefixes to a backup transit provider to make the path appear artificially longer. **Limitation:** Remote ASNs that configure explicit **Local Preference overrides** will completely ignore AS-Path length, meaning prepending cannot 100% guarantee that incoming traffic will avoid the backup link.
+
+**Q3: How does the BGP Blackhole Community (RFC 7999) mitigate a 500 Gbps DDoS attack?**
+
+When a single IP (e.g. `203.0.113.50/32`) is targeted by a volumetric DDoS attack that saturates an enterprise's 10 Gbps uplinks, the enterprise tags the `/32` host route with the `BLACKHOLE` community (`65535:666` or `ASN:666`) and announces it to its Tier-1 transit providers. The transit provider's edge routers rewrite the next-hop to `Null0`, dropping the DDoS attack traffic at the ISP edge before it ever reaches the customer's physical uplink.
+
+**Q4: Why does BGP compare MED (Multi-Exit Discriminator) only between routes from the SAME Autonomous System by default?**
+
+MED is designed as a suggestion from a specific neighbor AS regarding which of its multiple peering links it prefers you to use. Because different ASNs may use completely different internal metric scales (e.g. AS 100 uses scale 1–100 while AS 200 uses scale 1000–10000), comparing MED across different ASNs is meaningless and disabled by default (unless `bgp always-compare-med` is enabled).
+
+**Q5: What are BGP Large Communities (RFC 8092) and why were they created?**
+
+Standard BGP Communities are 32 bits, formatted as `16-bit ASN : 16-bit Value`. When 32-bit (4-byte) ASNs were introduced, an organization with a 4-byte ASN (e.g. `ASN 131072`) could not fit its ASN into the 16-bit field. **Large Communities** allocate **96 bits** (three 32-bit integers: `Global Administrator : Function : Parameter`), allowing full compatibility with 4-byte ASNs.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the strict 9-step BGP Best Path decision algorithm
+- [ ] Understand `LOCAL_PREF` for outbound traffic steering (higher wins)
+- [ ] Understand `AS-Path Prepending` for inbound traffic steering
+- [ ] Master well-known communities: `NO_EXPORT`, `NO_ADVERTISE`, and `BLACKHOLE`
+- [ ] Know the difference between Standard, Extended, and Large Communities (RFC 8092)

@@ -1,0 +1,172 @@
+---
+title: "Chapter 3 — Kubernetes Ingress vs Gateway API: Ingress Spec, HTTPRoute & Canary Routing"
+sidebar_position: 1
+module: "Module 18.3 — Ingress & Gateway API"
+description: "Master Kubernetes edge routing — Ingress specification limitations (annotation bloat), Gateway API architecture (GatewayClass, Gateway, HTTPRoute, GRPCRoute), role-oriented RBAC, and canary traffic splitting."
+---
+
+# Chapter 3 — Kubernetes Ingress vs Gateway API: Ingress Spec, HTTPRoute & Canary Routing
+
+> **Goal:** Master the architectural evolution of Kubernetes ingress routing from legacy **`Ingress`** (RFC-style single-resource spec with vendor annotation bloat) to the modern **Kubernetes Gateway API (v1.0+ GA)**. Understand the role-oriented resource model (Infrastructure Provider $\to$ Cluster Operator $\to$ Application Developer), `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, cross-namespace routing, and native weight-based canary deployments without proprietary annotations.
+>
+> By the end of this chapter, you will understand:
+> 1. Legacy Ingress Controller mechanics: NGINX Ingress, Traefik, HAProxy, and AWS Load Balancer Controller
+> 2. The structural limitations of Ingress: single-namespace binding, lack of native canary splitting, and annotation explosion
+> 3. Gateway API Resource Hierarchy: `GatewayClass` (Infra), `Gateway` (Cluster Admin), and `xRoute` (App Developer)
+> 4. Route types: `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `UDPRoute`, and `TLSRoute`
+> 5. Cross-namespace routing security with `ReferenceGrant` (preventing unauthorized cross-namespace service hijacking)
+> 6. Native traffic shifting, header matching, and zero-annotation canary routing manifests
+
+---
+
+## Real-Life Analogy
+
+Think of Ingress vs Gateway API as **a single shared master bulletin board vs a modern airport terminal delegation system**:
+
+- **Legacy Ingress (The Single Chaotic Bulletin Board):**
+  - Infrastructure admins and application developers all write on the **exact same paper poster (`Ingress` object)**.
+  - To add advanced features like rate limiting, timeouts, or SSL certs, developers write vendor-specific scribbles in tiny margins (**`nginx.ingress.kubernetes.io/proxy-body-size: "50m"`**). If you switch from NGINX to Traefik, none of your annotations work and you must rewrite 500 YAML files!
+- **Gateway API (The Structured Airport Terminal System):**
+  - **Infrastructure Provider:** Defines the runway standards (**`GatewayClass`**).
+  - **Airport Operations (Cluster Admin):** Deploys the physical gates, listeners, and master TLS certificates (**`Gateway`**).
+  - **Airlines (App Developers):** Only control their own flight arrival gates and boarding schedules (**`HTTPRoute`**) without needing permissions on the physical building!
+
+---
+
+## Architecture Diagram
+
+```text
+                  Kubernetes Gateway API Role-Oriented Architecture
+                  
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ ROLE 1: INFRASTRUCTURE PROVIDER (Cloud / Network Vendor)                    │
+ │                                                                             │
+ │   [GatewayClass: `cilium` / `envoy` / `istio` / `aws-alb`]                  │
+ └──────────────────────────────────────┬──────────────────────────────────────┘
+                                        │ Implements
+                                        ▼
+ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ ROLE 2: CLUSTER OPERATOR / DEVOPS PLATFORM TEAM (Namespace: `infra-gateway`) │
+ │                                                                             │
+ │   [Gateway: `production-gateway`]                                           │
+ │   - Listeners: Port 443 (HTTPS), Hostname: `*.company.com`                  │
+ │   - TLS Secret: `wildcard-tls-cert`                                         │
+ │   - AllowedRoutes: Namespaces: `prod-apps`, `payment-apps`                  │
+ └──────────────────┬──────────────────────────────────────┬───────────────────┘
+                    │ Attached Route                       │ Attached Route
+                    ▼                                      ▼
+ ┌──────────────────────────────────────┐   ┌──────────────────────────────────┐
+ │ ROLE 3: APP DEVELOPER (Team Payments)│   │ ROLE 3: APP DEVELOPER (Team Web) │
+ │ Namespace: `payment-apps`            │   │ Namespace: `prod-apps`           │
+ │                                      │   │                                  │
+ │ [HTTPRoute: `payment-route`]         │   │ [HTTPRoute: `web-route`]         │
+ │ Path: `/api/v1/pay`                  │   │ Path: `/`                        │
+ │ ├── 90% -> Service: `payment-v1:8080`│   │ └── 100% -> Service: `web-v1:80` │
+ │ └── 10% -> Service: `payment-v2:8080`│   │                                  │
+ └──────────────────────────────────────┘   └──────────────────────────────────┘
+```
+
+---
+
+## Deep Technical Content
+
+### 1. Ingress vs Gateway API Architectural Comparison
+
+```text
+ ┌──────────────────────┬──────────────────────────────────────────┬──────────────────────────────────────────┐
+ │ Feature              │ Legacy Ingress Spec                      │ Kubernetes Gateway API (v1.0+ GA)        │
+ │──────────────────────┼──────────────────────────────────────────┼──────────────────────────────────────────┤
+ │ **RBAC Model**       │ Monolithic single resource               │ **Role-Oriented** (Class, Gateway, Route)│
+ │ **Advanced Routing** │ Requires vendor-specific annotations     │ **Native First-Class Specification**     │
+ │ **Canary / Weighting**│ Proprietary annotations only (NGINX/Argo)│ **Native `weight` field on backends**     │
+ │ **Protocols**        │ HTTP / HTTPS only                        │ HTTP, HTTPS, **gRPC, TCP, UDP, TLS**     │
+ │ **Cross-Namespace**  │ Forbidden (Must be in same namespace)    │ **Allowed with `ReferenceGrant` security**│
+ │ **Portability**      │ Poor (Annotations break between vendors) │ **100% Vendor-Portable Conformance**     │
+ └──────────────────────┴──────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### 2. Native Canary Traffic Splitting with HTTPRoute
+
+No vendor annotations required; 100% portable across Envoy, Cilium, NGINX, and AWS Gateway controllers:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: order-service-canary
+  namespace: prod-apps
+spec:
+  parentRefs:
+    - name: production-gateway
+      namespace: infra-gateway
+  hostnames:
+    - "orders.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/v1/orders
+      backendRefs:
+        - name: order-service-v1
+          port: 8080
+          weight: 90
+        - name: order-service-v2
+          port: 8080
+          weight: 10
+```
+
+---
+
+## Hands-On Lab: Querying Gateway API Resources
+
+```bash
+# Step 1: Check if Gateway API CRDs are installed on the cluster
+# kubectl get crd | grep gateway.networking.k8s.io
+
+# Step 2: List all available GatewayClasses installed
+# kubectl get gatewayclasses
+
+# Step 3: List all deployed Gateways and their public external IPs
+# kubectl get gateways -A
+
+# Step 4: Inspect attached HTTPRoutes and backend status
+# kubectl get httproutes -A
+```
+
+---
+
+## Common Interview Questions
+
+**Q1: Why did the Kubernetes community design the Gateway API to replace the Ingress specification?**
+
+1. **Role Separation:** Ingress forced infrastructure admins and app developers to share one object. Gateway API splits roles cleanly across `GatewayClass` (Infra), `Gateway` (Ops), and `HTTPRoute` (App Devs).
+2. **Elimination of Annotation Bloat:** Advanced features (header routing, rate limiting, traffic splitting, URL rewrites) were never standardized in Ingress, resulting in hundreds of non-portable vendor annotations (`nginx.ingress...`). Gateway API standardizes these features natively in the core spec.
+3. **Multi-Protocol Support:** Ingress only supported HTTP/HTTPS. Gateway API supports **gRPC, TCP, UDP, and raw TLS**.
+
+**Q2: What is the `ReferenceGrant` resource in the Gateway API and why is it critical for security?**
+
+By default, an `HTTPRoute` in the `developer` namespace cannot forward traffic to a Service in the `database` namespace, nor can it attach to a `Gateway` in the `infra` namespace without permission. **`ReferenceGrant`** is a security resource created in the target namespace that explicitly grants permission for routes in other namespaces to reference its Services or Secrets, **permanently preventing cross-namespace service hijacking**.
+
+**Q3: How does the Gateway API handle gRPC routing compared to legacy Ingress?**
+
+In legacy Ingress, gRPC routing required custom backend protocol annotations (`nginx.ingress.kubernetes.io/backend-protocol: "GRPC"`). The Gateway API introduces **`GRPCRoute`** as a first-class citizen with native matching on gRPC **Services** and **Methods** (e.g. matching `package.OrderService/CreateOrder`), header matching, and gRPC status code translation.
+
+**Q4: Can a single Gateway handle both HTTP and raw TCP/UDP listeners simultaneously?**
+
+Yes. A single `Gateway` resource can define multiple independent `listeners` on different ports and protocols (e.g. Port 443 HTTPS for web apps, Port 50051 for gRPC, and Port 9092 TCP for Kafka), attaching `HTTPRoute`, `GRPCRoute`, and `TCPRoute` resources to their respective listeners.
+
+**Q5: What is the conformance testing suite in the Gateway API?**
+
+The Gateway API project maintains an automated, open-source **Conformance Testing Suite**. Any network vendor (Envoy Gateway, Cilium, Istio, Traefik, Kong, AWS, Google Cloud) that builds a Gateway controller must run the test suite and prove 100% compliance with core profiles (`HTTPRoute`, `TLS`), ensuring developers can switch underlying controllers with **zero code changes**.
+
+---
+
+## Summary Checksheet
+
+- [ ] Master the 3-tier role separation: `GatewayClass` $\to$ `Gateway` $\to$ `HTTPRoute`
+- [ ] Understand why annotations in legacy Ingress were problematic
+- [ ] Master native weight-based Canary routing in `HTTPRoute`
+- [ ] Understand cross-namespace security enforcement with `ReferenceGrant`
+- [ ] Know the supported route types: `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`
